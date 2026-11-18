@@ -14,6 +14,7 @@ import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility
 import { createModuleApi } from "./api.js";
 import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
+import { createFireteamService } from "./fireteam.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
@@ -44,6 +45,12 @@ Hooks.once("init", () => {
         _registerExecutorService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register executor service`, err);
+    }
+
+    try {
+        _registerFireteamService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register fireteam service`, err);
     }
 
     try {
@@ -132,6 +139,19 @@ function _registerExecutorService(api) {
     if (!api?.services) return;
     if (!api.services.has("executor")) {
         api.services.register("executor", createExecutorService({ api }));
+    }
+}
+
+/**
+ * Register the `fireteam` service on the module API (issue #408). Sibling
+ * services (planner, authority) are resolved lazily through the registry,
+ * so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerFireteamService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("fireteam")) {
+        api.services.register("fireteam", createFireteamService({ api }));
     }
 }
 

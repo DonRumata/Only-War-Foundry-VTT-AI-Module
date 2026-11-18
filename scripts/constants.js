@@ -27,16 +27,31 @@ export const OVERRIDE_MODES = Object.freeze([
     "disabled"
 ]);
 
+/** Temporary fireteam tasks assigned inside a single TeamPlan (issue #408). */
+export const FIRETEAM_TASKS = Object.freeze([
+    "support",
+    "advance",
+    "flank",
+    "assault",
+    "regroup"
+]);
+
+/** Default preferred fireteam cohesion distance in scene units (metres). */
+export const DEFAULT_PREFERRED_COHESION = 5;
+
 /** Flag keys inside the `flags["only-war-ai"]` namespace. */
 export const FLAG_KEYS = Object.freeze({
     actorConfig: "config",
-    override: "override"
+    override: "override",
+    memory: "memory",
+    fireteam: "fireteam"
 });
 
 /** World setting keys. */
 export const SETTING_KEYS = Object.freeze({
     executionMode: "executionMode",
-    diagnosticsEnabled: "diagnosticsEnabled"
+    diagnosticsEnabled: "diagnosticsEnabled",
+    preferredCohesion: "preferredCohesion"
 });
 
 /** Execution modes for the world setting. */
