@@ -1,0 +1,48 @@
+{
+  "OWAI.Sheet.Section": "Only War AI",
+  "OWAI.Sheet.Enabled": "AI включён",
+  "OWAI.Sheet.Preset": "Пресет",
+  "OWAI.Sheet.Mode": "Режим переопределения AI",
+
+  "OWAI.Preset.none": "(без пресета)",
+  "OWAI.Preset.assault": "Штурм",
+  "OWAI.Preset.rangedCover": "Стрельба из укрытия",
+  "OWAI.Preset.hold": "Удержание позиции",
+  "OWAI.Preset.specOps": "Спецназ",
+
+  "OWAI.Mode.inherit": "Наследовать",
+  "OWAI.Mode.enabled": "Включён",
+  "OWAI.Mode.disabled": "Выключен",
+
+  "OWAI.Context.Inherit": "AI: наследовать от токена/актёра",
+  "OWAI.Context.Disable": "AI: отключить для этого боя",
+  "OWAI.Context.Enable.assault": "AI: включить (Штурм)",
+  "OWAI.Context.Enable.rangedCover": "AI: включить (Стрельба из укрытия)",
+  "OWAI.Context.Enable.hold": "AI: включить (Удержание позиции)",
+  "OWAI.Context.Enable.specOps": "AI: включить (Спецназ)",
+
+  "OWAI.Settings.ExecutionMode.Name": "Режим выполнения AI",
+  "OWAI.Settings.ExecutionMode.Hint": "Выполнять ходы AI автоматически или только показывать предпросмотр мастеру.",
+  "OWAI.Settings.ExecutionMode.Automatic": "Автоматический",
+  "OWAI.Settings.ExecutionMode.Preview": "Предпросмотр (рекомендуется)",
+
+  "OWAI.Settings.DiagnosticsEnabled.Name": "Диагностическое логирование AI",
+  "OWAI.Settings.DiagnosticsEnabled.Hint": "Писать подробную диагностику AI в консоль браузера (только мастер).",
+
+  "OWAI.Settings.Menu.Name": "Only War AI",
+  "OWAI.Settings.Menu.Label": "Настройка Only War AI",
+  "OWAI.Settings.Menu.Hint": "Состояние AI и очистка временных override бойцов.",
+  "OWAI.Settings.Menu.Title": "Настройка Only War AI",
+
+  "OWAI.Menu.Summary": "Текущее состояние AI на уровне мира. Мировые настройки редактируются в стандартной панели выше.",
+  "OWAI.Menu.Presets": "Доступные пресеты",
+  "OWAI.Menu.CombatantOverrides": "Override в активном бою",
+  "OWAI.Menu.NoActiveCombat": "Нет активного боя.",
+  "OWAI.Menu.NoOverrides": "Нет временных override.",
+  "OWAI.Menu.ClearOverrides": "Очистить все override бойцов",
+
+  "OWAI.Notifications.WrongSystem": "Only War AI отключён: требуется система \"{expected}\" (активна: {actual}).",
+  "OWAI.Notifications.ApiMissing": "Only War AI отключён: система не опубликовала game.darkHeresy.api.",
+  "OWAI.Notifications.VersionMismatch": "Only War AI отключён: требуется системный API major {expected} (фактически: {actual}).",
+  "OWAI.Notifications.OverridesCleared": "Only War AI: очищено override бойцов: {count}."
+}

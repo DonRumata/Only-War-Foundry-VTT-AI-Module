@@ -1,0 +1,101 @@
+name: Release module
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version without the v prefix, for example 0.1.1"
+        required: true
+        type: string
+      source_ref:
+        description: "Branch or commit to release"
+        required: true
+        default: "main"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Package and publish release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          TAG_VERSION: ${{ github.ref_name }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            version="v${INPUT_VERSION#v}"
+          else
+            version="$TAG_VERSION"
+          fi
+
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid release version: $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_number=${version#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag for manual release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$VERSION" >/dev/null 2>&1; then
+            echo "Tag already exists: $VERSION" >&2
+            exit 1
+          fi
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Validate and stage module
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version_number }}
+        run: |
+          jq empty module.json
+          test "$(jq -r '.id' module.json)" = "only-war-ai"
+
+          rm -rf release
+          mkdir -p release/only-war-ai
+          cp -r languages scripts styles templates module.json README.md LICENSE release/only-war-ai/
+
+          jq --arg version "$VERSION" '.version = $version' \
+            module.json > release/only-war-ai/module.json
+          jq empty release/only-war-ai/module.json
+
+      - name: Build release archive
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version_number }}
+        run: |
+          cd release/only-war-ai
+          zip -qr "../only-war-ai-$VERSION.zip" .
+          cp module.json "../module.json"
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.version }}
+          generate_release_notes: true
+          files: |
+            release/only-war-ai-${{ steps.release.outputs.version_number }}.zip
+            release/module.json

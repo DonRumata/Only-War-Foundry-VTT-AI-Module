@@ -1,0 +1,12 @@
+# IDE / version control / OS
+/.git/
+/.idea/
+/.DS_Store
+Thumbs.db
+
+# Dependencies
+/node_modules/
+package-lock.json
+
+# Test outputs
+/tests/foundry-e2e/screenshots/

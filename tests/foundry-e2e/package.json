@@ -1,0 +1,14 @@
+{
+  "name": "only-war-ai-e2e",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node module-foundation.test.mjs",
+    "test:foundation": "node module-foundation.test.mjs",
+    "test:all": "npm run test:foundation"
+  },
+  "devDependencies": {
+    "playwright-core": "1.61.1"
+  }
+}

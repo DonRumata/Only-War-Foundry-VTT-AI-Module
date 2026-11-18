@@ -1,0 +1,51 @@
+{
+  "id": "only-war-ai",
+  "title": "Only War AI",
+  "description": "Opt-in AI module for the Only War Foundry VTT system. Per-actor AI configuration with token and combatant overrides, fixed behaviour presets and a preview-first execution model. Planner and turn execution arrive in follow-up updates.",
+  "version": "0.1.0",
+  "socket": false,
+  "authors": [
+    {
+      "name": "DonRumata",
+      "url": "https://github.com/DonRumata"
+    }
+  ],
+  "compatibility": {
+    "minimum": "13",
+    "verified": "13",
+    "maximum": "14"
+  },
+  "relationships": {
+    "systems": [
+      {
+        "id": "only-war-local",
+        "type": "system",
+        "compatibility": {
+          "minimum": "0"
+        }
+      }
+    ]
+  },
+  "esmodules": [
+    "scripts/module.js"
+  ],
+  "styles": [
+    "styles/only-war-ai.css"
+  ],
+  "languages": [
+    {
+      "lang": "en",
+      "name": "English",
+      "path": "languages/en.json"
+    },
+    {
+      "lang": "ru",
+      "name": "Русский",
+      "path": "languages/ru.json"
+    }
+  ],
+  "url": "https://github.com/DonRumata/Only-War-Foundry-VTT-AI-Module",
+  "manifest": "https://github.com/DonRumata/Only-War-Foundry-VTT-AI-Module/releases/latest/download/module.json",
+  "license": "LICENSE",
+  "readme": "README.md"
+}

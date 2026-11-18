@@ -1,0 +1,48 @@
+{
+  "OWAI.Sheet.Section": "Only War AI",
+  "OWAI.Sheet.Enabled": "AI enabled",
+  "OWAI.Sheet.Preset": "Preset",
+  "OWAI.Sheet.Mode": "AI override mode",
+
+  "OWAI.Preset.none": "(no preset)",
+  "OWAI.Preset.assault": "Assault",
+  "OWAI.Preset.rangedCover": "Ranged / Cover",
+  "OWAI.Preset.hold": "Hold position",
+  "OWAI.Preset.specOps": "Spec Ops",
+
+  "OWAI.Mode.inherit": "Inherit",
+  "OWAI.Mode.enabled": "Enabled",
+  "OWAI.Mode.disabled": "Disabled",
+
+  "OWAI.Context.Inherit": "AI: inherit from token/actor",
+  "OWAI.Context.Disable": "AI: disable for this combat",
+  "OWAI.Context.Enable.assault": "AI: enable (Assault)",
+  "OWAI.Context.Enable.rangedCover": "AI: enable (Ranged / Cover)",
+  "OWAI.Context.Enable.hold": "AI: enable (Hold position)",
+  "OWAI.Context.Enable.specOps": "AI: enable (Spec Ops)",
+
+  "OWAI.Settings.ExecutionMode.Name": "AI execution mode",
+  "OWAI.Settings.ExecutionMode.Hint": "Whether AI turns execute automatically or are only previewed for the GM.",
+  "OWAI.Settings.ExecutionMode.Automatic": "Automatic",
+  "OWAI.Settings.ExecutionMode.Preview": "Preview (recommended)",
+
+  "OWAI.Settings.DiagnosticsEnabled.Name": "AI diagnostics logging",
+  "OWAI.Settings.DiagnosticsEnabled.Hint": "Write detailed AI diagnostics to the browser console (GM only).",
+
+  "OWAI.Settings.Menu.Name": "Only War AI",
+  "OWAI.Settings.Menu.Label": "Only War AI configuration",
+  "OWAI.Settings.Menu.Hint": "Review AI state and clear temporary combatant overrides.",
+  "OWAI.Settings.Menu.Title": "Only War AI configuration",
+
+  "OWAI.Menu.Summary": "Current world-level AI state. World settings are edited in the standard module settings above.",
+  "OWAI.Menu.Presets": "Available presets",
+  "OWAI.Menu.CombatantOverrides": "Active combat overrides",
+  "OWAI.Menu.NoActiveCombat": "No active combat.",
+  "OWAI.Menu.NoOverrides": "No temporary overrides.",
+  "OWAI.Menu.ClearOverrides": "Clear all combatant overrides",
+
+  "OWAI.Notifications.WrongSystem": "Only War AI disabled: requires the \"{expected}\" system (active: {actual}).",
+  "OWAI.Notifications.ApiMissing": "Only War AI disabled: the system did not publish game.darkHeresy.api.",
+  "OWAI.Notifications.VersionMismatch": "Only War AI disabled: system API major {expected} required (actual: {actual}).",
+  "OWAI.Notifications.OverridesCleared": "Only War AI: cleared {count} combatant override(s)."
+}
