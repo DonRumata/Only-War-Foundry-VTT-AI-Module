@@ -14,6 +14,7 @@ import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility
 import { createModuleApi } from "./api.js";
 import { createPlannerService } from "./planner.js";
 import { registerAssaultPreset } from "./presets/assault.js";
+import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -104,6 +105,8 @@ function _registerPlannerService(api) {
         const planner = createPlannerService({ api });
         // Issue #404: replace the assault skeleton with the real preset.
         registerAssaultPreset(planner);
+        // Issue #405: replace the ranged-cover skeleton with the real preset.
+        registerRangedCoverPreset(planner);
         api.services.register("planner", planner);
     }
 }

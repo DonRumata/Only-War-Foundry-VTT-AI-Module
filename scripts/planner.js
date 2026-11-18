@@ -1285,6 +1285,7 @@ export function createPlannerService({
             id,
             weights: { ...DEFAULT_PRESET_WEIGHTS, ...(def.weights ?? {}) },
             evaluate: typeof def.evaluate === "function" ? def.evaluate : null,
+            veto: typeof def.veto === "function" ? def.veto : null,
             allowNoTarget: def.allowNoTarget === true,
             allowNoAction: def.allowNoAction === true,
             alwaysOfferHold: def.alwaysOfferHold === true
@@ -1513,7 +1514,6 @@ export function createPlannerService({
             candidates.push({ variant: "hold", target: targets[0] ?? null, action: null, move: null });
         }
 
-        diagnostics.candidatesCount = candidates.length;
         if (!candidates.length) {
             return {
                 status: routesMissing ? PLANNER_STATUS.noRoute : PLANNER_STATUS.noAction,
@@ -1523,12 +1523,47 @@ export function createPlannerService({
             };
         }
 
-        const scored = candidates.map((candidate, index) => {
+        // Preset hooks see the caller context enriched with the resolved
+        // runtime facts — service lookups, scene, token and normalized
+        // targets — so evaluators can run LOS/cover probes without their
+        // own registry access. Caller-injected keys always win.
+        const evalContext = {
+            combat,
+            combatant,
+            scene,
+            token: tokenDoc,
+            selfPos,
+            perception,
+            navigation,
+            resolvedTargets: targets,
+            usableActions,
+            ...context
+        };
+        const scored = [];
+        candidates.forEach((candidate, index) => {
             const factors = _factorsOf({ ...candidate, moveBudget });
+            // Presets may veto candidates outright (e.g. a ranged preset
+            // refusing attacks without a resolved line of sight); vetoed
+            // entries land in `rejected` diagnostics instead of ranking.
+            if (typeof preset.veto === "function") {
+                let vetoReason = null;
+                try {
+                    vetoReason = preset.veto({ factors, candidate, context: evalContext }) ?? null;
+                } catch(err) {
+                    vetoReason = null;
+                }
+                if (vetoReason) {
+                    diagnostics.rejected.push({
+                        candidate: _candidateId(candidate, index),
+                        reason: typeof vetoReason === "string" ? vetoReason : "preset-veto"
+                    });
+                    return;
+                }
+            }
             let evaluation;
             if (typeof preset.evaluate === "function") {
                 const custom = preset.evaluate({
-                    factors, candidate, weights: preset.weights, context
+                    factors, candidate, weights: preset.weights, context: evalContext
                 });
                 evaluation = Number.isFinite(custom)
                     ? { score: custom, breakdown: { factors, custom: true } }
@@ -1539,19 +1574,30 @@ export function createPlannerService({
             } else {
                 evaluation = evaluateFactors(factors, preset.weights);
             }
-            return {
+            scored.push({
                 ...candidate,
                 id: _candidateId(candidate, index),
                 factors,
                 score: evaluation.score,
                 breakdown: evaluation.breakdown
-            };
-        }).sort((a, b) => (b.score - a.score) || String(a.id).localeCompare(String(b.id)));
+            });
+        });
+        scored.sort((a, b) => (b.score - a.score) || String(a.id).localeCompare(String(b.id)));
 
+        diagnostics.candidatesCount = scored.length;
         diagnostics.ranking = scored.map(entry => ({
             candidate: entry.id,
             score: entry.score
         }));
+
+        if (!scored.length) {
+            return {
+                status: PLANNER_STATUS.noAction,
+                reason: "no-valid-plan",
+                plan: null,
+                diagnostics
+            };
+        }
 
         const top = scored.filter(entry => entry.score === scored[0].score);
         const winner = top.length > 1 ? _seededPick(top, seed) : top[0];
@@ -1785,9 +1831,10 @@ export function createPlannerService({
     /**
      * Register or replace a preset definition. `weights` merge over the
      * defaults; `evaluate(context)` may return a score number or
-     * `{score, breakdown}`.
+     * `{score, breakdown}`; `veto({factors, candidate, context})` may
+     * return a reason string to exclude a candidate from ranking.
      * @param {string} id Preset id.
-     * @param {object} def `{weights?, evaluate?, allowNoTarget?, allowNoAction?}`.
+     * @param {object} def `{weights?, evaluate?, veto?, allowNoTarget?, allowNoAction?}`.
      * @returns {object} The stored preset.
      */
     function registerPreset(id, def = {}) {
@@ -1801,6 +1848,7 @@ export function createPlannerService({
             id,
             weights: { ...DEFAULT_PRESET_WEIGHTS, ...(def.weights ?? {}) },
             evaluate: typeof def.evaluate === "function" ? def.evaluate : null,
+            veto: typeof def.veto === "function" ? def.veto : null,
             allowNoTarget: def.allowNoTarget === true,
             allowNoAction: def.allowNoAction === true,
             alwaysOfferHold: def.alwaysOfferHold === true

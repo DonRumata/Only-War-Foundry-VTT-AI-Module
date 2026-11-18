@@ -6,7 +6,7 @@
 
   "OWAI.Preset.none": "(no preset)",
   "OWAI.Preset.assault": "Assault",
-  "OWAI.Preset.rangedCover": "Ranged / Cover",
+  "OWAI.Preset.rangedCover": "Ranged (seek cover)",
   "OWAI.Preset.hold": "Hold position",
   "OWAI.Preset.specOps": "Spec Ops",
 
@@ -17,7 +17,7 @@
   "OWAI.Context.Inherit": "AI: inherit from token/actor",
   "OWAI.Context.Disable": "AI: disable for this combat",
   "OWAI.Context.Enable.assault": "AI: enable (Assault)",
-  "OWAI.Context.Enable.rangedCover": "AI: enable (Ranged / Cover)",
+  "OWAI.Context.Enable.rangedCover": "AI: enable (Ranged (seek cover))",
   "OWAI.Context.Enable.hold": "AI: enable (Hold position)",
   "OWAI.Context.Enable.specOps": "AI: enable (Spec Ops)",
 
