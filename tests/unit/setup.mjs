@@ -81,10 +81,15 @@ globalThis.ui = {
 
 globalThis.duplicate = (data) => foundry.utils.deepClone(data);
 
+// The module always publishes its api on `init`; the ready-check flips
+// `api.enabled`. Unit tests default to a compatible, master-enabled world.
+game.modules.set("only-war-ai", { api: { enabled: true } });
+
 // Test helper: reset registered settings/menus and stored values.
 globalThis._resetMocks = () => {
     registeredSettings.length = 0;
     registeredMenus.length = 0;
     settingValues.clear();
     game.combat = null;
+    game.modules.set("only-war-ai", { api: { enabled: true } });
 };

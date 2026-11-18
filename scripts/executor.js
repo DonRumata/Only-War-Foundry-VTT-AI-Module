@@ -36,6 +36,7 @@
 import { MODULE_ID } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import { STALE_REASONS } from "./planner.js";
+import { isModuleEnabled } from "./module-state.js";
 import {
     getExecutionMode,
     isDiagnosticsEnabled,
@@ -56,6 +57,7 @@ export const EXECUTOR_REASONS = Object.freeze({
     notController: "not-controller",
     controllerChanged: "controller-changed",
     configDisabled: "config-disabled",
+    moduleDisabled: "module-disabled",
     previewMode: "preview-mode",
     systemApiMissing: "system-api-missing",
     noPlanner: "no-planner",
@@ -166,6 +168,8 @@ function _mergeDelta(ledger, delta) {
  * @param {object} [deps]
  * @param {object} [deps.api] Module API for lazy service lookups.
  * @param {Function} [deps.resolveConfig] Effective-config resolver.
+ * @param {Function} [deps.isEnabled] Module-enabled predicate
+ *   (compatibility + master switch).
  * @param {Function} [deps.getMode] `() => "automatic"|"preview"`.
  * @param {object} [deps.hooks] Hooks implementation (`on`/`callAll`).
  * @param {Function} [deps.idGen] Operation id fallback generator.
@@ -176,6 +180,7 @@ function _mergeDelta(ledger, delta) {
 export function createExecutorService({
     api = null,
     resolveConfig = resolveEffectiveConfig,
+    isEnabled = isModuleEnabled,
     getMode = getExecutionMode,
     hooks = globalThis.Hooks ?? null,
     idGen = null,
@@ -746,6 +751,17 @@ export function createExecutorService({
      * @returns {Promise<object|null>} Early result or null.
      */
     async function _preflight(context, run) {
+        if (!isEnabled()) {
+            const result = _result({
+                status: EXECUTOR_STATUS.cancelled,
+                reason: EXECUTOR_REASONS.moduleDisabled,
+                operationId: run.operationId
+            });
+            // Master switch off: close the operation but keep the turn
+            // under manual GM control.
+            await _finish(context, run, result, false);
+            return result;
+        }
         if (!_isController(context)) {
             return _result({
                 status: EXECUTOR_STATUS.cancelled,
@@ -804,6 +820,12 @@ export function createExecutorService({
                 if (run.signal?.aborted === true) {
                     status = EXECUTOR_STATUS.cancelled;
                     reason = EXECUTOR_REASONS.controllerChanged;
+                    failedStep = step.id;
+                    break;
+                }
+                if (!isEnabled()) {
+                    status = EXECUTOR_STATUS.cancelled;
+                    reason = EXECUTOR_REASONS.moduleDisabled;
                     failedStep = step.id;
                     break;
                 }

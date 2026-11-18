@@ -13,7 +13,6 @@
   "OWAI.Task.flank": "Фланговый обход",
   "OWAI.Task.assault": "Штурм",
   "OWAI.Task.regroup": "Перегруппировка",
-
   "OWAI.Tactic.flank-and-fix": "Фланговый обход и сковывание",
   "OWAI.Tactic.coordinated-assault": "Согласованный штурм",
   "OWAI.Tactic.covering-advance": "Продвижение под прикрытием",
@@ -50,11 +49,9 @@
   "OWAI.Menu.NoActiveCombat": "Нет активного боя.",
   "OWAI.Menu.NoOverrides": "Нет временных override.",
   "OWAI.Menu.ClearOverrides": "Очистить все override бойцов",
-
   "OWAI.Authority.Status.Ready": "AI-контроллер активен",
   "OWAI.Authority.Status.WaitingForGm": "AI ожидает мастера",
   "OWAI.Authority.Status.Disabled": "Модуль AI отключён",
-
   "OWAI.Notifications.WrongSystem": "Only War AI отключён: требуется система \"{expected}\" (активна: {actual}).",
   "OWAI.Notifications.ApiMissing": "Only War AI отключён: система не опубликовала game.darkHeresy.api.",
   "OWAI.Notifications.VersionMismatch": "Only War AI отключён: требуется системный API major {expected} (фактически: {actual}).",
@@ -109,5 +106,7 @@
   "OWAI.Preview.Factor.budgetOver": "Превышение бюджета",
   "OWAI.Notifications.PreviewCancelled": "Only War AI: план для {name} отменён ({reason}). Ход остаётся под ручным управлением мастера.",
   "OWAI.Notifications.PreviewTimeout": "Only War AI: предпросмотр плана для {name} истёк и был отменён. Ход остаётся под ручным управлением мастера.",
-  "OWAI.Notifications.ReplanFailed": "Only War AI: перепланирование для {name} не удалось ({reason})."
+  "OWAI.Notifications.ReplanFailed": "Only War AI: перепланирование для {name} не удалось ({reason}).",
+  "OWAI.Settings.MasterEnabled.Name": "Включить Only War AI",
+  "OWAI.Settings.MasterEnabled.Hint": "Общий выключатель модуля. Выкл: AI-ходы не заявляются и не исполняются, GM-превью не открывается, внедрённые элементы интерфейса скрыты. Флаги NPC сохраняются и снова заработают при включении."
 }

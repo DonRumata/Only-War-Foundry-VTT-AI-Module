@@ -35,7 +35,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - Token: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`.
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
-- World settings: `executionMode = "automatic"|"preview"` (default `"preview"`),
+- World settings: `masterEnabled` (default `true`) — общий выключатель модуля:
+  при выключении ходы не заявляются и не исполняются, preview не открывается,
+  внедрённые UI-секции скрыты, executor отвечает `module-disabled`.
+  `executionMode = "automatic"|"preview"` (default `"preview"`),
   `diagnosticsEnabled` (default `false`), `preferredCohesion` (default 5),
   `previewTimeoutSeconds` (default 60, `0` — без авто-отмены).
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,

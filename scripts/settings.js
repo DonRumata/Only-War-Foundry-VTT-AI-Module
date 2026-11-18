@@ -1,6 +1,8 @@
 /**
  * World settings for the Only War AI module (issue #399).
  *
+ * - `masterEnabled`: boolean — GM-only kill switch for the whole module;
+ *   when false no AI turn is claimed, executed or previewed (UI hidden).
  * - `executionMode`: "automatic" | "preview" — GM-only, defaults to "preview"
  *   so AI never executes turns without an explicit opt-in.
  * - `diagnosticsEnabled`: boolean — GM-only diagnostic logging.
@@ -17,6 +19,15 @@ import {
 
 /** Register the module's world settings. Called on `init`. */
 export function registerSettings() {
+    game.settings.register(MODULE_ID, SETTING_KEYS.masterEnabled, {
+        name: "OWAI.Settings.MasterEnabled.Name",
+        hint: "OWAI.Settings.MasterEnabled.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: true
+    });
+
     game.settings.register(MODULE_ID, SETTING_KEYS.executionMode, {
         name: "OWAI.Settings.ExecutionMode.Name",
         hint: "OWAI.Settings.ExecutionMode.Hint",
@@ -69,6 +80,21 @@ export function getExecutionMode() {
         return EXECUTION_MODES.includes(value) ? value : "preview";
     } catch(_err) {
         return "preview";
+    }
+}
+
+/**
+ * Master kill switch for the whole module. When false the module behaves as
+ * if it were incompatible: no turn claims, no execution, no preview and no
+ * injected UI. Missing or damaged values fall back to `true`.
+ * @returns {boolean}
+ */
+export function isMasterEnabled() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.masterEnabled);
+        return value !== false;
+    } catch(_err) {
+        return true;
     }
 }
 

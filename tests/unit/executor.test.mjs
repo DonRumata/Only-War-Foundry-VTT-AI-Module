@@ -497,6 +497,36 @@ test("a disabled effective config refuses execution without advancing", async ()
     }
 });
 
+test("the master switch refuses execution without advancing", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({
+            api,
+            getMode: () => "automatic",
+            isEnabled: () => false
+        });
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "module-disabled");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(rolls.executeCalls.length, 0);
+        // The operation is closed but the turn stays under manual control.
+        assert.equal(completed.length, 1);
+        assert.equal(completed[0].result.advanceTurn, false);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
 test("a missing system rolls API stops safely with system-api-missing", async () => {
     const world = makeWorld();
     const { api, completed } = makeApi();

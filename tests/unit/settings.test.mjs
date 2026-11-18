@@ -9,6 +9,7 @@ import {
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
     isDiagnosticsEnabled,
+    isMasterEnabled,
     registerSettings
 } from "../../scripts/settings.js";
 import {
@@ -22,7 +23,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 4);
+    assert.equal(registered.length, 5);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -92,4 +93,28 @@ test("previewTimeoutSeconds defaults to 60, honours 0 and rejects damaged values
     assert.equal(getPreviewTimeoutSeconds(), 0);
     await game.settings.set(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, -10);
     assert.equal(getPreviewTimeoutSeconds(), DEFAULT_PREVIEW_TIMEOUT_SECONDS);
+});
+
+test("masterEnabled defaults to true and reads a stored value", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.masterEnabled);
+    assert.ok(entry, "masterEnabled registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, true);
+    assert.equal(isMasterEnabled(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.masterEnabled, false);
+    assert.equal(isMasterEnabled(), false);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.masterEnabled, true);
+    assert.equal(isMasterEnabled(), true);
+});
+
+test("isMasterEnabled falls back to true on damaged values", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.masterEnabled, "garbage");
+    assert.equal(isMasterEnabled(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.masterEnabled, 0);
+    // Only an explicit false disables the module.
+    assert.equal(isMasterEnabled(), true);
 });

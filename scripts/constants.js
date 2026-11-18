@@ -50,6 +50,7 @@ export const FLAG_KEYS = Object.freeze({
 
 /** World setting keys. */
 export const SETTING_KEYS = Object.freeze({
+    masterEnabled: "masterEnabled",
     executionMode: "executionMode",
     diagnosticsEnabled: "diagnosticsEnabled",
     preferredCohesion: "preferredCohesion",

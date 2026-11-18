@@ -13,7 +13,6 @@
   "OWAI.Task.flank": "Flank",
   "OWAI.Task.assault": "Assault",
   "OWAI.Task.regroup": "Regroup",
-
   "OWAI.Tactic.flank-and-fix": "Flank and fix",
   "OWAI.Tactic.coordinated-assault": "Coordinated assault",
   "OWAI.Tactic.covering-advance": "Covering advance",
@@ -50,11 +49,9 @@
   "OWAI.Menu.NoActiveCombat": "No active combat.",
   "OWAI.Menu.NoOverrides": "No temporary overrides.",
   "OWAI.Menu.ClearOverrides": "Clear all combatant overrides",
-
   "OWAI.Authority.Status.Ready": "AI controller active",
   "OWAI.Authority.Status.WaitingForGm": "AI waiting for a GM",
   "OWAI.Authority.Status.Disabled": "AI module disabled",
-
   "OWAI.Notifications.WrongSystem": "Only War AI disabled: requires the \"{expected}\" system (active: {actual}).",
   "OWAI.Notifications.ApiMissing": "Only War AI disabled: the system did not publish game.darkHeresy.api.",
   "OWAI.Notifications.VersionMismatch": "Only War AI disabled: system API major {expected} required (actual: {actual}).",
@@ -109,5 +106,7 @@
   "OWAI.Preview.Factor.budgetOver": "Over budget",
   "OWAI.Notifications.PreviewCancelled": "Only War AI: plan for {name} cancelled ({reason}). The turn stays under manual GM control.",
   "OWAI.Notifications.PreviewTimeout": "Only War AI: plan preview for {name} timed out and was cancelled. The turn stays under manual GM control.",
-  "OWAI.Notifications.ReplanFailed": "Only War AI: replan for {name} failed ({reason})."
+  "OWAI.Notifications.ReplanFailed": "Only War AI: replan for {name} failed ({reason}).",
+  "OWAI.Settings.MasterEnabled.Name": "Enable Only War AI",
+  "OWAI.Settings.MasterEnabled.Hint": "Master switch for the whole module. Off: no AI turns are claimed or executed, the GM preview never opens and injected UI is hidden. Individual NPC flags are kept for when it is turned back on."
 }

@@ -6,11 +6,15 @@
  * appear when the module stayed disabled.
  */
 import { MODULE_ID } from "./constants.js";
+import { isMasterEnabled } from "./settings.js";
 
 /**
- * Whether the module passed the system compatibility check on `ready`.
+ * Whether the module may run AI logic this session: the system
+ * compatibility check passed on `ready` AND the GM master switch
+ * (`masterEnabled` world setting) is on.
  * @returns {boolean}
  */
 export function isModuleEnabled() {
-    return game.modules.get(MODULE_ID)?.api?.enabled === true;
+    return game.modules.get(MODULE_ID)?.api?.enabled === true
+        && isMasterEnabled();
 }
