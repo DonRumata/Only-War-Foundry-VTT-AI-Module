@@ -44,5 +44,7 @@
   "OWAI.Notifications.WrongSystem": "Only War AI отключён: требуется система \"{expected}\" (активна: {actual}).",
   "OWAI.Notifications.ApiMissing": "Only War AI отключён: система не опубликовала game.darkHeresy.api.",
   "OWAI.Notifications.VersionMismatch": "Only War AI отключён: требуется системный API major {expected} (фактически: {actual}).",
-  "OWAI.Notifications.OverridesCleared": "Only War AI: очищено override бойцов: {count}."
+  "OWAI.Notifications.OverridesCleared": "Only War AI: очищено override бойцов: {count}.",
+  "OWAI.Notifications.ExecutorStopped": "Only War AI: {name} остановился во время хода ({reason}).",
+  "OWAI.Chat.ExecutorDiagnostics": "Only War AI — диагностика хода {name} ({reason}, план {plan})."
 }

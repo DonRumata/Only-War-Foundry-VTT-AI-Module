@@ -13,6 +13,7 @@ import { MODULE_ID } from "./constants.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
 import { createPlannerService } from "./planner.js";
+import { createExecutorService } from "./executor.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
@@ -37,6 +38,12 @@ Hooks.once("init", () => {
         _registerPlannerService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register planner service`, err);
+    }
+
+    try {
+        _registerExecutorService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register executor service`, err);
     }
 
     try {
@@ -111,6 +118,20 @@ function _registerPlannerService(api) {
         // Issue #406: replace the hold skeleton with the real preset.
         registerHoldPreset(planner);
         api.services.register("planner", planner);
+    }
+}
+
+/**
+ * Register the `executor` service on the module API (issue #407). The
+ * service resolves siblings lazily (`api.services.get("authority" |
+ * "planner" | "operations")`), so it registers safely whether or not the
+ * stacked authority branch is present.
+ * @param {object} api Module API object.
+ */
+function _registerExecutorService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("executor")) {
+        api.services.register("executor", createExecutorService({ api }));
     }
 }
 

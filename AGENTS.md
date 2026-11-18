@@ -60,6 +60,30 @@ actor preset → `hold` (если enabled явно) → disabled.
   реестр для будущих planner/executor из следующих подзадач;
 - `enabled`, `incompatibleReason` — состояние после `ready`-проверки.
 
+## Executor (issue #407)
+
+`scripts/executor.js` — выполнение сериализуемого plan шаг за шагом:
+`api.services.get("executor").runPlan({combat, operation, operations,
+signal})` — точка интеграции authority (#400); `executePlan(plan, context)`
+— прямой запуск готового плана. Только controller
+(`api.services.get("authority")?.isController?.() ?? game.user.isGM`)
+меняет документы; не controller — `not-controller` no-op. Перед каждым
+state-changing шагом `planner.validateSnapshot(plan)`; позиция токена
+сверяется с ожидаемой отдельно (ручное перемещение — `token-moved`).
+`move` — `TokenDocument#move` (Foundry 13+) по сериализованным waypoints
+из плана без пересчёта пути (fallback `update({x, y})`); `attack`/`test` —
+`game.darkHeresy.api.rolls` (`prepare*` + `execute*(prepared,
+{operationId})`, system PR #440), отсутствие API — `system-api-missing`.
+Stale → один replan через `planner.shouldReplan`; повторный stale —
+hold-and-report. operationId дедупликация: повторный вызов возвращает
+прежний результат, roll-шаги проксируют step-scoped operationId, move к
+уже достигнутой точке пропускается. Терминальные статусы
+(`completed`/`partial`/`failed`) закрывают операцию через
+`operations.completeTurn` и переводят ход ровно один раз — хуком
+`only-war-ai.operationCompleted` (#400) либо прямым `combat.nextTurn()`
+fallback; `cancelled` и `preview` документов не трогают. Результат:
+`{status, stepsDone[], failedStep?, reason, operationId, planId,
+replanCount, resourceDelta, chatMessageIds}`.
 ## Права
 
 Actor/Token настройки меняют GM и владельцы с update permission; временный

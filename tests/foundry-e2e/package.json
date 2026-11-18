@@ -7,6 +7,7 @@
     "test": "node module-foundation.test.mjs",
     "test:foundation": "node module-foundation.test.mjs",
     "test:planner": "node planner.test.mjs",
+    "test:executor": "node executor.test.mjs",
     "test:all": "npm run test:foundation && npm run test:planner && npm run test:assault && npm run test:ranged-cover",
     "test:assault": "node preset-assault.test.mjs",
     "test:ranged-cover": "node preset-ranged-cover.test.mjs"
