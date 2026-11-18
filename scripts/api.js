@@ -35,6 +35,10 @@ export function createModuleApi() {
         /** Capability discovery map, mirrors the system API style. */
         capabilities: Object.freeze({
             "config.resolveEffectiveConfig": true,
+            "navigation.planRoute": true,
+            "navigation.canReach": true,
+            "navigation.findCandidates": true,
+            "navigation.movementBudget": true,
             "services.register": true,
             "services.get": true,
             "ui.npcSheet": true,
