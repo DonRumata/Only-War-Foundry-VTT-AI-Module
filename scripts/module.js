@@ -15,6 +15,7 @@ import { createModuleApi } from "./api.js";
 import { createPlannerService } from "./planner.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
+import { registerHoldPreset } from "./presets/hold.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -107,6 +108,8 @@ function _registerPlannerService(api) {
         registerAssaultPreset(planner);
         // Issue #405: replace the ranged-cover skeleton with the real preset.
         registerRangedCoverPreset(planner);
+        // Issue #406: replace the hold skeleton with the real preset.
+        registerHoldPreset(planner);
         api.services.register("planner", planner);
     }
 }
