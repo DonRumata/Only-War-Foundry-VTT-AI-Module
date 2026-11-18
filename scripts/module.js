@@ -14,6 +14,7 @@ import { createAuthorityService } from "./authority.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
 import { createOperationService } from "./operations.js";
+import { createPerceptionService } from "./perception.js";
 import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
@@ -43,6 +44,12 @@ Hooks.once("init", () => {
         _registerAuthorityServices(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register authority services`, err);
+    }
+
+    try {
+        _registerPerceptionService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register perception service`, err);
     }
 
     try {
@@ -129,6 +136,14 @@ Hooks.once("ready", () => {
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start authority service`, err);
     }
+
+    // Start the perception service: LOS watchers and combat memory
+    // maintenance only run in a compatible world.
+    try {
+        api?.services?.get?.("perception")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start perception service`, err);
+    }
     console.log(`${MODULE_ID} | Ready`);
 });
 
@@ -148,6 +163,19 @@ function _registerAuthorityServices(api) {
             api,
             operations: api.services.get("operations")
         }));
+    }
+}
+
+/**
+ * Register the `perception` service on the module API (issue #401). The
+ * service is created lazily at init and only started on `ready` after the
+ * compatibility check.
+ * @param {object} api Module API object.
+ */
+function _registerPerceptionService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("perception")) {
+        api.services.register("perception", createPerceptionService({ api, hooks: Hooks }));
     }
 }
 
