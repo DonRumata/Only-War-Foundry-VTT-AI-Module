@@ -6,6 +6,7 @@
   "scripts": {
     "test": "node module-foundation.test.mjs",
     "test:foundation": "node module-foundation.test.mjs",
+    "test:planner": "node planner.test.mjs",
     "test:all": "npm run test:foundation"
   },
   "devDependencies": {

@@ -12,6 +12,7 @@
 import { MODULE_ID } from "./constants.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
+import { createPlannerService } from "./planner.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -27,6 +28,12 @@ Hooks.once("init", () => {
         mod.api = createModuleApi();
     } else {
         console.error(`${MODULE_ID} | Module record not found; API not published`);
+    }
+
+    try {
+        _registerPlannerService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register planner service`, err);
     }
 
     try {
@@ -83,6 +90,19 @@ Hooks.once("ready", () => {
     }
     console.log(`${MODULE_ID} | Ready`);
 });
+
+/**
+ * Register the `planner` service on the module API (issue #403). The
+ * service is pure/deterministic — no hooks, no lifecycle — so it is
+ * available immediately for the executor and macros.
+ * @param {object} api Module API object.
+ */
+function _registerPlannerService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("planner")) {
+        api.services.register("planner", createPlannerService({ api }));
+    }
+}
 
 /**
  * Show a single GM-facing notification for an incompatible environment.
