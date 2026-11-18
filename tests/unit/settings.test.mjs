@@ -7,16 +7,22 @@ import assert from "node:assert/strict";
 import {
     getExecutionMode,
     getPreferredCohesion,
+    getPreviewTimeoutSeconds,
     isDiagnosticsEnabled,
     registerSettings
 } from "../../scripts/settings.js";
-import { DEFAULT_PREFERRED_COHESION, MODULE_ID, SETTING_KEYS } from "../../scripts/constants.js";
+import {
+    DEFAULT_PREFERRED_COHESION,
+    DEFAULT_PREVIEW_TIMEOUT_SECONDS,
+    MODULE_ID,
+    SETTING_KEYS
+} from "../../scripts/constants.js";
 
 test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 3);
+    assert.equal(registered.length, 4);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -70,4 +76,20 @@ test("preferredCohesion defaults to 5 and reads a stored value", async () => {
     assert.equal(getPreferredCohesion(), 8);
     await game.settings.set(MODULE_ID, SETTING_KEYS.preferredCohesion, -1);
     assert.equal(getPreferredCohesion(), DEFAULT_PREFERRED_COHESION);
+});
+
+test("previewTimeoutSeconds defaults to 60, honours 0 and rejects damaged values", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.previewTimeoutSeconds);
+    assert.ok(entry, "previewTimeoutSeconds registered");
+    assert.equal(entry.data.default, DEFAULT_PREVIEW_TIMEOUT_SECONDS);
+    assert.equal(getPreviewTimeoutSeconds(), DEFAULT_PREVIEW_TIMEOUT_SECONDS);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, 5);
+    assert.equal(getPreviewTimeoutSeconds(), 5);
+    // 0 is a valid opt-out (no auto-cancel).
+    await game.settings.set(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, 0);
+    assert.equal(getPreviewTimeoutSeconds(), 0);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, -10);
+    assert.equal(getPreviewTimeoutSeconds(), DEFAULT_PREVIEW_TIMEOUT_SECONDS);
 });

@@ -36,7 +36,8 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
 - World settings: `executionMode = "automatic"|"preview"` (default `"preview"`),
-  `diagnosticsEnabled` (default `false`).
+  `diagnosticsEnabled` (default `false`), `preferredCohesion` (default 5),
+  `previewTimeoutSeconds` (default 60, `0` — без авто-отмены).
 
 Фиксированные пресеты: `assault`, `rangedCover`, `hold`, `specOps`.
 
@@ -84,6 +85,28 @@ hold-and-report. operationId дедупликация: повторный выз
 fallback; `cancelled` и `preview` документов не трогают. Результат:
 `{status, stepsDone[], failedStep?, reason, operationId, planId,
 replanCount, resourceDelta, chatMessageIds}`.
+
+## GM preview (issue #409)
+
+`scripts/ui/preview-dialog.js` — модальный предпросмотр плана у controller-GM
+в режиме `executionMode === "preview"`. Executor (#407) в preview-режиме
+возвращает `{status:"preview", plan}` и эмитит хук
+`only-war-ai.previewRequested` ({combat, combatant, operation, operationId,
+plan, planContext}); контроллер `api.services.get("preview")` открывает
+диалог `templates/ai-preview.hbs` (NPC/пресет, цель, действие, маршрут,
+шаги, projected resource cost, score breakdown, collapse-секция diagnostics
+при `diagnosticsEnabled`). Единая точка решений —
+`resolvePreview(operationId, decision)`: confirm ре-валидирует snapshot,
+переводит операцию `awaiting-preview → executing` (при наличии
+operations-сервиса) и запускает `executor.executePlan`; cancel/timeout
+закрывают операцию `cancelled` без смены документов — ход остаётся под
+ручным управлением GM (advanceTurn: false); replan запрашивает новый план в
+пределах `planner.maxReplans`. Таймаут — world setting
+`previewTimeoutSeconds` (default 60, `0` отключает). Документ-хуки
+ре-валидируют открытый preview: `turn-stale`/`combat-ended` — авто-отмена,
+остальные stale — баннер + disabled Confirm. Закрытие окна без решения =
+cancel, не confirm. Сервис работает headless, если Application недоступен.
+
 ## Права
 
 Actor/Token настройки меняют GM и владельцы с update permission; временный

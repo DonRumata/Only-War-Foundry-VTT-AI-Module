@@ -4,9 +4,12 @@
  * - `executionMode`: "automatic" | "preview" — GM-only, defaults to "preview"
  *   so AI never executes turns without an explicit opt-in.
  * - `diagnosticsEnabled`: boolean — GM-only diagnostic logging.
+ * - `preferredCohesion`: default fireteam cohesion distance (issue #408).
+ * - `previewTimeoutSeconds`: GM preview auto-cancel timeout (issue #409).
  */
 import {
     DEFAULT_PREFERRED_COHESION,
+    DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     EXECUTION_MODES,
     MODULE_ID,
     SETTING_KEYS
@@ -44,6 +47,15 @@ export function registerSettings() {
         type: Number,
         default: DEFAULT_PREFERRED_COHESION
     });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, {
+        name: "OWAI.Settings.PreviewTimeout.Name",
+        hint: "OWAI.Settings.PreviewTimeout.Hint",
+        scope: "world",
+        config: true,
+        type: Number,
+        default: DEFAULT_PREVIEW_TIMEOUT_SECONDS
+    });
 }
 
 /**
@@ -72,6 +84,21 @@ export function getPreferredCohesion() {
         return Number.isFinite(value) && value > 0 ? value : DEFAULT_PREFERRED_COHESION;
     } catch(_err) {
         return DEFAULT_PREFERRED_COHESION;
+    }
+}
+
+/**
+ * GM preview timeout in seconds (issue #409). `0` disables the timeout so a
+ * preview waits for a decision forever; damaged or missing values fall back
+ * to {@link DEFAULT_PREVIEW_TIMEOUT_SECONDS}.
+ * @returns {number}
+ */
+export function getPreviewTimeoutSeconds() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds);
+        return Number.isFinite(value) && value >= 0 ? value : DEFAULT_PREVIEW_TIMEOUT_SECONDS;
+    } catch(_err) {
+        return DEFAULT_PREVIEW_TIMEOUT_SECONDS;
     }
 }
 

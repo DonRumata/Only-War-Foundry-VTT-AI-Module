@@ -47,7 +47,8 @@ export function createModuleApi() {
             "services.get": true,
             "ui.npcSheet": true,
             "ui.tokenConfig": true,
-            "ui.combatTracker": true
+            "ui.combatTracker": true,
+            "ui.preview": true
         }),
 
         /** Fixed AI presets and override modes exposed to consumers. */
