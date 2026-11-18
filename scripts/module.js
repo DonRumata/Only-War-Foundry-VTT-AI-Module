@@ -18,6 +18,7 @@ import { createFireteamService } from "./fireteam.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
+import { registerSpecOpsPreset } from "./presets/spec-ops.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -131,6 +132,8 @@ function _registerPlannerService(api) {
         registerRangedCoverPreset(planner);
         // Issue #406: replace the hold skeleton with the real preset.
         registerHoldPreset(planner);
+        // Issue #412: replace the spec-ops skeleton with the real preset.
+        registerSpecOpsPreset(planner);
         api.services.register("planner", planner);
     }
 }

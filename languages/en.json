@@ -13,6 +13,11 @@
   "OWAI.Task.flank": "Flank",
   "OWAI.Task.assault": "Assault",
   "OWAI.Task.regroup": "Regroup",
+
+  "OWAI.Tactic.flank-and-fix": "Flank and fix",
+  "OWAI.Tactic.coordinated-assault": "Coordinated assault",
+  "OWAI.Tactic.covering-advance": "Covering advance",
+  "OWAI.Tactic.regroup-fallback": "Regroup / fallback",
   "OWAI.Preset.none": "(no preset)",
   "OWAI.Preset.assault": "Assault",
   "OWAI.Preset.rangedCover": "Ranged (seek cover)",

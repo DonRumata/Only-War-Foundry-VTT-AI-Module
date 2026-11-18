@@ -13,6 +13,11 @@
   "OWAI.Task.flank": "Фланговый обход",
   "OWAI.Task.assault": "Штурм",
   "OWAI.Task.regroup": "Перегруппировка",
+
+  "OWAI.Tactic.flank-and-fix": "Фланговый обход и сковывание",
+  "OWAI.Tactic.coordinated-assault": "Согласованный штурм",
+  "OWAI.Tactic.covering-advance": "Продвижение под прикрытием",
+  "OWAI.Tactic.regroup-fallback": "Перегруппировка / отход",
   "OWAI.Preset.none": "(без пресета)",
   "OWAI.Preset.assault": "Штурм",
   "OWAI.Preset.rangedCover": "Дальний бой (укрытие)",
