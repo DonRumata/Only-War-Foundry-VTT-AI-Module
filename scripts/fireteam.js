@@ -44,6 +44,10 @@ import {
     stableStringify
 } from "./planner.js";
 import { getPreferredCohesion, logDiagnostics } from "./settings.js";
+import {
+    SPEC_OPS_PRESET_ID,
+    specOpsTactic
+} from "./presets/spec-ops.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
 export const FIRETEAM_STATUS = Object.freeze({
@@ -1049,6 +1053,54 @@ export function createFireteamService({
     }
 
     /**
+     * Resolve the bounded team tactic for this plan (issue #412).
+     * `context.tactic` may be a tactic factory `(input) => descriptor` or
+     * a ready serializable descriptor `{name, reason, assignments,
+     * allowFlank, regroup, objective, maxDetachedPhases, breakdown}`; it
+     * defaults to the spec-ops selector when the team runs on
+     * `teamPreset === "specOps"` or every member resolves to `specOps`.
+     * `context.tactic === null`/`false` explicitly disables the hook.
+     * @param {object} input
+     * @param {object[]} input.members Filtered member entries.
+     * @param {string|null} input.leaderId Elected leader combatant id.
+     * @param {string} input.teamId
+     * @param {string|null} input.teamPreset Resolved shared team preset.
+     * @param {number} input.seed Plan seed.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @returns {object|null} Tactic descriptor or null (default policy).
+     */
+    function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context }) {
+        let source = context.tactic;
+        if (source === undefined) {
+            const specOpsTeam = teamPreset === SPEC_OPS_PRESET_ID
+                || (teamPreset === null && members.length > 0
+                    && members.every(m => m.preset === SPEC_OPS_PRESET_ID));
+            if (specOpsTeam) source = specOpsTactic;
+        }
+        if (source === undefined || source === null || source === false) return null;
+        if (typeof source === "function") {
+            try {
+                return source({
+                    members,
+                    leaderId,
+                    teamId,
+                    seed,
+                    targets: Array.isArray(context.targets) ? context.targets : null,
+                    objective: context.objective ?? null,
+                    casualties: _finiteOr(context.casualties, 0),
+                    scene: context.scene ?? combat?.scene ?? null,
+                    combat,
+                    context
+                }) ?? null;
+            } catch(err) {
+                return { name: null, reason: "tactic-error" };
+            }
+        }
+        return typeof source === "object" ? source : null;
+    }
+
+    /**
      * Build the serializable TeamPlan for one team of a combat. Only
      * AI-enabled combatants with a matching fireteam `teamId` participate;
      * each member plan is produced by `planner.planTurn` with the shared
@@ -1058,10 +1110,11 @@ export function createFireteamService({
      *   preferredCohesion?}`, a bare team id, or a document carrying the
      *   fireteam flag.
      * @param {object} [context] Optional overrides/services: `seed`,
-     *   `objective`, `assignments`, `allowFlank`, `regroup`,
-     *   `detachedUntilPhase`, `maxDetachedPhases`, `preferredCohesion`,
-     *   `targets`, `actions`, `moves`, `perception`, `navigation`,
-     *   `authority`, `planner`, `taskCapacities`, `replanCount`.
+     *   `objective`, `assignments`, `allowFlank`, `regroup`, `tactic`,
+     *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
+     *   `preferredCohesion`, `targets`, `actions`, `moves`, `perception`,
+     *   `navigation`, `authority`, `planner`, `taskCapacities`,
+     *   `replanCount`.
      * @returns {Promise<object>} `{status, teamPlan?, reason?, diagnostics?}`.
      */
     async function buildTeamPlan(combat, team, context = {}) {
@@ -1136,21 +1189,55 @@ export function createFireteamService({
             };
         }
 
-        const teamPreset = context.teamPreset ?? teamRef.teamPreset ?? null;
+        // Shared team preset: explicit context, then the team reference,
+        // then the members' own fireteam flags (deterministic order —
+        // members arrive sorted by combatant id).
+        const teamPreset = context.teamPreset ?? teamRef.teamPreset
+            ?? members.map(m => m.team?.teamPreset)
+                .find(p => AI_PRESETS.includes(p))
+            ?? null;
         const memberPlanner = _memberPlanner(teamPreset, context.planner);
         const preferredCohesion = diagnostics.preferredCohesion;
+
+        // Team tactic (issue #412): a preset tactic factory may bind the
+        // maneuver — assignments, flank policy, regroup and the shared
+        // objective. Explicit caller context fields always win.
+        const tactic = _resolveTactic({
+            members,
+            leaderId: election.combatantId,
+            teamId,
+            teamPreset,
+            seed,
+            combat,
+            context
+        });
+        diagnostics.tactic = tactic
+            ? _jsonClone({
+                name: tactic.name ?? tactic.tactic ?? null,
+                reason: tactic.reason ?? null,
+                breakdown: tactic.breakdown ?? null
+            })
+            : null;
         const maxDetachedPhases = _finiteOr(
-            context.maxDetachedPhases, DEFAULT_MAX_DETACHED_PHASES);
+            context.maxDetachedPhases ?? tactic?.maxDetachedPhases,
+            DEFAULT_MAX_DETACHED_PHASES);
 
         const assignments = assignTasks(members, {
             leaderId: election.combatantId,
-            assignments: context.assignments,
-            allowFlank: context.allowFlank,
-            regroup: context.regroup,
-            objective: context.objective
+            assignments: context.assignments ?? tactic?.assignments,
+            allowFlank: context.allowFlank ?? tactic?.allowFlank,
+            regroup: context.regroup ?? tactic?.regroup,
+            objective: context.objective ?? tactic?.objective
         });
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
+
+        // Team anchor for task-scoped member evaluation (issue #412):
+        // the leader position is the cohesion centre and the first
+        // rejoin/regroup point of detached maneuvers.
+        const leaderPos = members
+            .find(m => m.combatantId === election.combatantId)?.position ?? null;
+        const rejoinPoints = regroupPoints(members, { leaderId: election.combatantId });
 
         // Planning order: leader first, then flank group, then the rest —
         // reservation priority follows maneuver priority.
@@ -1175,11 +1262,15 @@ export function createFireteamService({
                 ...context,
                 seed,
                 replanCount: _finiteOr(context.replanCount, 0),
+                tactic: tactic?.name ?? tactic?.tactic ?? null,
                 team: {
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
-                    leaderId: election.combatantId
+                    leaderId: election.combatantId,
+                    center: leaderPos,
+                    regroupPoint: assignment.task === "regroup"
+                        ? (rejoinPoints[0] ?? null) : null
                 }
             };
             const memberTargets = _memberTargets({
@@ -1266,9 +1357,7 @@ export function createFireteamService({
         // Cohesion evaluation: leader position is the team centre; detached
         // maneuvers need a reachable endpoint, a bounded separation and a
         // legal rejoin point.
-        const leader = members.find(m => m.combatantId === election.combatantId);
-        const center = leader?.position ?? null;
-        const rejoinPoints = regroupPoints(members, { leaderId: election.combatantId });
+        const center = leaderPos;
         const memberEntries = [];
         let cohesionPenalty = 0;
         let score = 0;
@@ -1363,6 +1452,7 @@ export function createFireteamService({
             leaderId: election.combatantId,
             teamPreset: teamPreset && AI_PRESETS.includes(teamPreset)
                 ? teamPreset : null,
+            tactic: diagnostics.tactic?.name ?? null,
             revision,
             seed,
             members: memberEntries,
