@@ -35,6 +35,9 @@ export function createModuleApi() {
         /** Capability discovery map, mirrors the system API style. */
         capabilities: Object.freeze({
             "config.resolveEffectiveConfig": true,
+            "perception.snapshot": true,
+            "perception.memory": true,
+            "perception.targets": true,
             "services.register": true,
             "services.get": true,
             "ui.npcSheet": true,

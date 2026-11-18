@@ -6,7 +6,8 @@
   "scripts": {
     "test": "node module-foundation.test.mjs",
     "test:foundation": "node module-foundation.test.mjs",
-    "test:all": "npm run test:foundation"
+    "test:perception": "node perception.test.mjs",
+    "test:all": "npm run test:foundation && npm run test:perception"
   },
   "devDependencies": {
     "playwright-core": "1.61.1"
