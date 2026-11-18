@@ -12,6 +12,7 @@
 import { MODULE_ID } from "./constants.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
+import { createPerceptionService } from "./perception.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -27,6 +28,12 @@ Hooks.once("init", () => {
         mod.api = createModuleApi();
     } else {
         console.error(`${MODULE_ID} | Module record not found; API not published`);
+    }
+
+    try {
+        _registerPerceptionService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register perception service`, err);
     }
 
     try {
@@ -81,8 +88,28 @@ Hooks.once("ready", () => {
         api._state.enabled = true;
         api._state.incompatibleReason = null;
     }
+    // Start the perception service: LOS watchers and combat memory
+    // maintenance only run in a compatible world.
+    try {
+        api?.services?.get?.("perception")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start perception service`, err);
+    }
     console.log(`${MODULE_ID} | Ready`);
 });
+
+/**
+ * Register the `perception` service on the module API (issue #401). The
+ * service is created lazily at init and only started on `ready` after the
+ * compatibility check.
+ * @param {object} api Module API object.
+ */
+function _registerPerceptionService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("perception")) {
+        api.services.register("perception", createPerceptionService({ api, hooks: Hooks }));
+    }
+}
 
 /**
  * Show a single GM-facing notification for an incompatible environment.

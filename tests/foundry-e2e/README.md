@@ -33,3 +33,4 @@ npm test
 | Тест | Что проверяет |
 |---|---|
 | `module-foundation.test.mjs` | Модуль активен, `api` опубликован (version/capabilities/services/resolver), world settings зарегистрированы, флаги `flags["only-war-ai"]` пишутся и читаются на Actor/Token/Combatant, resolver даёт ожидаемый приоритет, секция на листе NPC (при включённом модуле). |
+| `perception.test.mjs` | Issue #401: сервис `perception` — `hasLineOfSight`/`visibleTargets` на реальных токенах со стеной, hidden-цель не утекает в цели, память last-known: запись → потеря LOS → истечение через 3 полных раунда, `scoreTarget` детерминирован. |

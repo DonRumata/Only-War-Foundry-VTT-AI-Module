@@ -60,6 +60,39 @@ actor preset → `hold` (если enabled явно) → disabled.
   реестр для будущих planner/executor из следующих подзадач;
 - `enabled`, `incompatibleReason` — состояние после `ready`-проверки.
 
+## Perception (issue #401)
+
+`scripts/perception.js` — сервис `perception` (`api.services`):
+
+- LOS/видимость строго с перспективы NPC-токена: `hasLineOfSight(from, to)`
+  обходит `canvas.visibility.testVisibility` (v13+) → `canvas.effects.visibility`
+  → `token.testVisibility` → `visionSource` → геометрический fallback по стенам
+  (`canvas.walls.checkCollision` или ручной тест сегментов; v13 и legacy-схемы
+  `sight`/`door`). GM-only данные не используются: скрытые от NPC токены не
+  попадают в цели только потому, что controller — GM.
+- `visibleTargets(token)` — кандидаты в цели: противоположная disposition
+  (hostile↔friendly; neutral — только через `includeNeutral`/`dispositions`),
+  без dead/defeated/hidden; `blinded` viewer не видит никого. Записи:
+  `{tokenId, tokenUuid, actorId, name, sceneId, disposition, x, y, elevation,
+  distance, hidden, canAttack}` — hidden-цели никогда не атакуемы.
+- `buildPerceptionSnapshot({combat, combatant, token})` — immutable
+  `{status, sceneId, round, turn, viewer, visibleTargets, lastKnownTargets,
+  revision}`; без сцены/токена — `perception-unavailable`.
+- Память последней позиции на флаге Combatant
+  `flags["only-war-ai"].memory[targetTokenUuid] = {sceneId, x, y, elevation,
+  lastSeenRound, lastSeenTurn, dispositionAtDetection}` — sanitized, без
+  actor-данных и текущих скрытых координат; пишет только authority controller
+  (`authority.isController()` при наличии сервиса #400, иначе `game.user.isGM`).
+  Запись истекает через 3 полных раунда без повторного обнаружения; last-known
+  разрешает поиск/движение, но не прямую атаку. Pure-функции: `sanitizeMemory`,
+  `rememberContact`, `expireMemoryEntries`, `pruneMemory`, `isMemoryExpired`.
+- `scoreTarget(npc, target, {weights})` / `rankTargets` — pure
+  детерминированный utility: canAttack-гейт, ожидаемая эффективность
+  (damage + penetration − armour), угроза, дистанция; веса пресета через
+  `context.weights`.
+- Debounce ~150 мс на `updateCombat` (round/turn), `updateToken`
+  (x/y/elevation/hidden/disposition/sight), `deleteToken`, `canvasReady`.
+
 ## Права
 
 Actor/Token настройки меняют GM и владельцы с update permission; временный

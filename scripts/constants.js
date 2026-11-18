@@ -30,7 +30,8 @@ export const OVERRIDE_MODES = Object.freeze([
 /** Flag keys inside the `flags["only-war-ai"]` namespace. */
 export const FLAG_KEYS = Object.freeze({
     actorConfig: "config",
-    override: "override"
+    override: "override",
+    memory: "memory"
 });
 
 /** World setting keys. */
