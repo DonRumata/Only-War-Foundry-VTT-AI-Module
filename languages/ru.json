@@ -6,7 +6,7 @@
 
   "OWAI.Preset.none": "(без пресета)",
   "OWAI.Preset.assault": "Штурм",
-  "OWAI.Preset.rangedCover": "Стрельба из укрытия",
+  "OWAI.Preset.rangedCover": "Дальний бой (укрытие)",
   "OWAI.Preset.hold": "Удержание позиции",
   "OWAI.Preset.specOps": "Спецназ",
 
@@ -17,7 +17,7 @@
   "OWAI.Context.Inherit": "AI: наследовать от токена/актёра",
   "OWAI.Context.Disable": "AI: отключить для этого боя",
   "OWAI.Context.Enable.assault": "AI: включить (Штурм)",
-  "OWAI.Context.Enable.rangedCover": "AI: включить (Стрельба из укрытия)",
+  "OWAI.Context.Enable.rangedCover": "AI: включить (Дальний бой (укрытие))",
   "OWAI.Context.Enable.hold": "AI: включить (Удержание позиции)",
   "OWAI.Context.Enable.specOps": "AI: включить (Спецназ)",
 
