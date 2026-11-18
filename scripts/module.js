@@ -22,6 +22,7 @@ import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
 import { registerConfigMenu } from "./ui/config-menu.js";
+import { registerPreviewUI } from "./ui/preview-dialog.js";
 
 Hooks.once("init", () => {
     console.log(`${MODULE_ID} | Initializing Only War AI`);
@@ -51,6 +52,12 @@ Hooks.once("init", () => {
         _registerFireteamService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register fireteam service`, err);
+    }
+
+    try {
+        _registerPreviewService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register preview UI`, err);
     }
 
     try {
@@ -152,6 +159,20 @@ function _registerFireteamService(api) {
     if (!api?.services) return;
     if (!api.services.has("fireteam")) {
         api.services.register("fireteam", createFireteamService({ api }));
+    }
+}
+
+/**
+ * Register the `preview` service on the module API (issue #409): the GM
+ * preview controller plus its hook subscriptions (`previewRequested`,
+ * `phaseChanged` and the stale-watch document hooks). Sibling services are
+ * resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerPreviewService(api) {
+    const controller = registerPreviewUI();
+    if (api?.services && !api.services.has("preview")) {
+        api.services.register("preview", controller);
     }
 }
 

@@ -30,6 +30,8 @@
  *   combat turn exactly once — through the `only-war-ai.operationCompleted`
  *   hook (#400) when the operations service emits it, or via a direct
  *   `combat.nextTurn()` fallback. `cancelled` and `preview` write nothing.
+ * - Preview mode emits `only-war-ai.previewRequested` (issue #409) with the
+ *   serialized plan so the GM preview dialog can confirm/cancel/replan.
  */
 import { MODULE_ID } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
@@ -1030,9 +1032,26 @@ export function createExecutorService({
             }
 
             // Preview mode: preflight only — the operation stays in
-            // `awaiting-preview` and no document is touched.
+            // `awaiting-preview` and no document is touched. The
+            // `previewRequested` hook hands the serialized plan to the GM
+            // preview UI (issue #409); Confirm launches `executePlan`
+            // separately, so nothing here mutates state.
             if (getMode() !== "automatic") {
                 const verdict = _validate(run, context);
+                if (typeof hooks?.callAll === "function") {
+                    try {
+                        hooks.callAll(`${MODULE_ID}.previewRequested`, {
+                            combat: context.combat ?? null,
+                            combatant: run.combatant,
+                            operation: context.operation ?? null,
+                            operationId,
+                            plan: run.plan,
+                            planContext: context.planContext ?? null
+                        });
+                    } catch(err) {
+                        console.error(`${MODULE_ID} | previewRequested hook failed`, err);
+                    }
+                }
                 return _result({
                     status: EXECUTOR_STATUS.preview,
                     reason: verdict.valid

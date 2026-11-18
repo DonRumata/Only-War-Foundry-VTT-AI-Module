@@ -51,8 +51,12 @@ export const FLAG_KEYS = Object.freeze({
 export const SETTING_KEYS = Object.freeze({
     executionMode: "executionMode",
     diagnosticsEnabled: "diagnosticsEnabled",
-    preferredCohesion: "preferredCohesion"
+    preferredCohesion: "preferredCohesion",
+    previewTimeoutSeconds: "previewTimeoutSeconds"
 });
+
+/** Default GM preview timeout in seconds (issue #409); 0 disables it. */
+export const DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60;
 
 /** Execution modes for the world setting. */
 export const EXECUTION_MODES = Object.freeze([
