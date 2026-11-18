@@ -34,12 +34,15 @@ export function createModuleApi() {
 
         /** Capability discovery map, mirrors the system API style. */
         capabilities: Object.freeze({
+            "authority.election": true,
+            "authority.socket": true,
             "config.resolveEffectiveConfig": true,
             "executor.executePlan": true,
             "executor.runPlan": true,
             "fireteam.buildTeamPlan": true,
             "fireteam.electLeader": true,
             "fireteam.validateTeamPlan": true,
+            "operations.lifecycle": true,
             "planner.planTurn": true,
             "planner.presets": true,
             "planner.validateSnapshot": true,

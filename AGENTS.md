@@ -38,6 +38,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - World settings: `executionMode = "automatic"|"preview"` (default `"preview"`),
   `diagnosticsEnabled` (default `false`), `preferredCohesion` (default 5),
   `previewTimeoutSeconds` (default 60, `0` — без авто-отмены).
+- Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
+  phase, revision, startedAt, completedAt?, reason?, result? }` —
+  авторитетная запись жизненного цикла AI-хода; пишет только
+  выбранный controller (issue #400).
 
 Фиксированные пресеты: `assault`, `rangedCover`, `hold`, `specOps`.
 
@@ -60,6 +64,33 @@ actor preset → `hold` (если enabled явно) → disabled.
 - `services.register(name, impl)` / `get` / `has` / `list` / `unregister` —
   реестр для будущих planner/executor из следующих подзадач;
 - `enabled`, `incompatibleReason` — состояние после `ready`-проверки.
+
+## Authority и lifecycle AI-хода (issue #400)
+
+`scripts/authority.js` — детерминированный выбор единственного controller:
+`electController(users)` возвращает активного GM с наименьшим стабильным
+user id; все клиенты вычисляют его одинаково без голосования. Нет активного
+GM — статус `waiting-for-gm`, документы не меняются. Сервис подписан на
+`userConnected`/`updateUser` (смена controller → незавершённые операции
+помечаются `controller-changed`, локальный процесс останавливается, новый
+controller перечитывает документы) и на `updateCombat`/`updateCombatant`/
+`updateToken`/`updateActor`/delete-хуки с фильтром релевантных изменений и
+debounce. Точка интеграции executor — `runAIPlan`/`api.services.get("executor")`
+(#407); без него операция безопасно завершается (`no-executor`).
+
+`scripts/operations.js` — state machine операции на флаге Combat:
+`idle → planning → awaiting-preview → executing → completed/failed/cancelled`.
+`claimTurn` (compare-before-update, повторный claim → `operation-exists`),
+`transitionOperation` (ожидаемая phase ≠ текущей → `phase-mismatch`),
+`completeTurn` (идемпотентен, повтор → `already-completed`; перевод хода —
+интеграционная точка `only-war-ai.operationCompleted` для executor),
+`abortIfControllerChanged`, `markTurnStale`, `computeRevision`
+(стабильный FNV-1a fingerprint round/turn/позиции токена).
+
+Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
+игнорируются на не-controller клиентах, реальные изменения документов делает
+только controller. Сервисы опубликованы как `api.services` → `authority`,
+`operations`.
 
 ## Executor (issue #407)
 

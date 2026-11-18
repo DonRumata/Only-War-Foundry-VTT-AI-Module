@@ -50,6 +50,11 @@
   "OWAI.Menu.NoActiveCombat": "Нет активного боя.",
   "OWAI.Menu.NoOverrides": "Нет временных override.",
   "OWAI.Menu.ClearOverrides": "Очистить все override бойцов",
+
+  "OWAI.Authority.Status.Ready": "AI-контроллер активен",
+  "OWAI.Authority.Status.WaitingForGm": "AI ожидает мастера",
+  "OWAI.Authority.Status.Disabled": "Модуль AI отключён",
+
   "OWAI.Notifications.WrongSystem": "Only War AI отключён: требуется система \"{expected}\" (активна: {actual}).",
   "OWAI.Notifications.ApiMissing": "Only War AI отключён: система не опубликовала game.darkHeresy.api.",
   "OWAI.Notifications.VersionMismatch": "Only War AI отключён: требуется системный API major {expected} (фактически: {actual}).",

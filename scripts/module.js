@@ -10,8 +10,10 @@
  *   activates NPCs on its own.
  */
 import { MODULE_ID } from "./constants.js";
+import { createAuthorityService } from "./authority.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
+import { createOperationService } from "./operations.js";
 import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
@@ -35,6 +37,12 @@ Hooks.once("init", () => {
         mod.api = createModuleApi();
     } else {
         console.error(`${MODULE_ID} | Module record not found; API not published`);
+    }
+
+    try {
+        _registerAuthorityServices(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register authority services`, err);
     }
 
     try {
@@ -113,8 +121,35 @@ Hooks.once("ready", () => {
         api._state.enabled = true;
         api._state.incompatibleReason = null;
     }
+
+    // Start the active-GM authority service: watcher hooks, socket protocol
+    // and turn detection only run in a compatible world.
+    try {
+        api?.services?.get?.("authority")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start authority service`, err);
+    }
     console.log(`${MODULE_ID} | Ready`);
 });
+
+/**
+ * Register the `operations` and `authority` services on the module API
+ * (issue #400). The authority service is created lazily at init and only
+ * started on `ready` after the compatibility check.
+ * @param {object} api Module API object.
+ */
+function _registerAuthorityServices(api) {
+    if (!api?.services) return;
+    if (!api.services.has("operations")) {
+        api.services.register("operations", createOperationService({ hooks: Hooks }));
+    }
+    if (!api.services.has("authority")) {
+        api.services.register("authority", createAuthorityService({
+            api,
+            operations: api.services.get("operations")
+        }));
+    }
+}
 
 /**
  * Register the `planner` service on the module API (issue #403). The
