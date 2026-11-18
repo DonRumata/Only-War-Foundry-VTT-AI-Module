@@ -4,9 +4,10 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node module-foundation.test.mjs",
+    "test": "node module-foundation.test.mjs && node authority.test.mjs",
     "test:foundation": "node module-foundation.test.mjs",
-    "test:all": "npm run test:foundation"
+    "test:authority": "node authority.test.mjs",
+    "test:all": "npm run test:foundation && npm run test:authority"
   },
   "devDependencies": {
     "playwright-core": "1.61.1"
