@@ -3,6 +3,17 @@
   "OWAI.Sheet.Enabled": "AI enabled",
   "OWAI.Sheet.Preset": "Preset",
   "OWAI.Sheet.Mode": "AI override mode",
+  "OWAI.Sheet.Fireteam.Section": "Fireteam",
+  "OWAI.Sheet.Fireteam.TeamId": "Team id",
+  "OWAI.Sheet.Fireteam.Leader": "Team leader",
+  "OWAI.Sheet.Fireteam.TeamPreset": "Team preset",
+  "OWAI.Sheet.Fireteam.Cohesion": "Preferred cohesion (m)",
+
+  "OWAI.Task.support": "Support",
+  "OWAI.Task.advance": "Advance",
+  "OWAI.Task.flank": "Flank",
+  "OWAI.Task.assault": "Assault",
+  "OWAI.Task.regroup": "Regroup",
 
   "OWAI.Preset.none": "(no preset)",
   "OWAI.Preset.assault": "Assault",
@@ -28,6 +39,9 @@
 
   "OWAI.Settings.DiagnosticsEnabled.Name": "AI diagnostics logging",
   "OWAI.Settings.DiagnosticsEnabled.Hint": "Write detailed AI diagnostics to the browser console (GM only).",
+
+  "OWAI.Settings.PreferredCohesion.Name": "Default fireteam cohesion",
+  "OWAI.Settings.PreferredCohesion.Hint": "Preferred cohesion distance in metres used when a fireteam flag does not override it.",
 
   "OWAI.Settings.Menu.Name": "Only War AI",
   "OWAI.Settings.Menu.Label": "Only War AI configuration",

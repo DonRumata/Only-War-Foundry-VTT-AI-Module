@@ -6,6 +6,7 @@
  * - `diagnosticsEnabled`: boolean — GM-only diagnostic logging.
  */
 import {
+    DEFAULT_PREFERRED_COHESION,
     EXECUTION_MODES,
     MODULE_ID,
     SETTING_KEYS
@@ -34,6 +35,15 @@ export function registerSettings() {
         type: Boolean,
         default: false
     });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.preferredCohesion, {
+        name: "OWAI.Settings.PreferredCohesion.Name",
+        hint: "OWAI.Settings.PreferredCohesion.Hint",
+        scope: "world",
+        config: true,
+        type: Number,
+        default: DEFAULT_PREFERRED_COHESION
+    });
 }
 
 /**
@@ -47,6 +57,21 @@ export function getExecutionMode() {
         return EXECUTION_MODES.includes(value) ? value : "preview";
     } catch(_err) {
         return "preview";
+    }
+}
+
+/**
+ * World-level default preferred fireteam cohesion distance in scene units
+ * (issue #408). Fireteam flags may override it per team; damaged or missing
+ * values fall back to {@link DEFAULT_PREFERRED_COHESION}.
+ * @returns {number}
+ */
+export function getPreferredCohesion() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.preferredCohesion);
+        return Number.isFinite(value) && value > 0 ? value : DEFAULT_PREFERRED_COHESION;
+    } catch(_err) {
+        return DEFAULT_PREFERRED_COHESION;
     }
 }
 

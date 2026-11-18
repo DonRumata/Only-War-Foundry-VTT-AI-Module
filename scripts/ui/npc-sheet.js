@@ -64,6 +64,8 @@ function _injectNpcSection(html, actor) {
         </fieldset>
     `);
 
+    section.appendChild(_buildFireteamSection(actor, actor.id));
+
     section.querySelectorAll("[data-ow-ai-field]").forEach(input => {
         input.addEventListener("change", () => _saveActorConfig(actor, section));
     });
@@ -103,10 +105,98 @@ function _injectTokenSection(html, token) {
         </fieldset>
     `);
 
+    section.appendChild(_buildFireteamSection(token, token.id));
+
     section.querySelectorAll("[data-ow-ai-field]").forEach(input => {
         input.addEventListener("change", () => _saveOverride(token, section));
     });
     _append(root, section);
+}
+
+/**
+ * Build the minimal fireteam sub-section (issue #408): team id text field,
+ * leader checkbox, optional team preset and a preferred cohesion number.
+ * Writes `flags["only-war-ai"].fireteam` on the owning document.
+ * @param {object} doc Owning document (Actor or TokenDocument).
+ * @param {string|null} selfId Document id recorded as `leaderId`.
+ * @returns {HTMLElement}
+ */
+function _buildFireteamSection(doc, selfId) {
+    const fireteam = doc.getFlag?.(MODULE_ID, FLAG_KEYS.fireteam) ?? {};
+    const teamId = typeof fireteam.teamId === "string" ? fireteam.teamId : "";
+    const isLeader = fireteam.leaderId !== null && fireteam.leaderId !== undefined;
+    const teamPreset = AI_PRESETS.includes(fireteam.teamPreset) ? fireteam.teamPreset : "";
+    const cohesion = Number.isFinite(fireteam.preferredCohesion)
+        ? fireteam.preferredCohesion : "";
+
+    const section = _buildElement(`
+        <fieldset class="ow-ai-config ow-ai-fireteam" data-ow-ai-fireteam>
+            <legend>${_localize("OWAI.Sheet.Fireteam.Section")}</legend>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.Fireteam.TeamId")}</label>
+                <input type="text" data-ow-ft-field="teamId" value="${_escapeAttr(teamId)}">
+            </div>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.Fireteam.Leader")}</label>
+                <input type="checkbox" data-ow-ft-field="leader" ${isLeader ? "checked" : ""}>
+            </div>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.Fireteam.TeamPreset")}</label>
+                <select data-ow-ft-field="teamPreset">
+                    ${_presetOptions(teamPreset, true)}
+                </select>
+            </div>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.Fireteam.Cohesion")}</label>
+                <input type="number" min="0" step="0.5" data-ow-ft-field="cohesion" value="${cohesion}">
+            </div>
+        </fieldset>
+    `);
+
+    section.querySelectorAll("[data-ow-ft-field]").forEach(input => {
+        input.addEventListener("change", () => _saveFireteam(doc, section, selfId));
+    });
+    return section;
+}
+
+/**
+ * Persist the `fireteam` flag from the injected fireteam section.
+ * @param {object} doc Owning document (Actor or TokenDocument).
+ * @param {HTMLElement} section
+ * @param {string|null} selfId Document id recorded as `leaderId`.
+ */
+async function _saveFireteam(doc, section, selfId) {
+    const teamIdRaw = section.querySelector("[data-ow-ft-field=teamId]")?.value ?? "";
+    const teamId = teamIdRaw.trim() || null;
+    const leader = section.querySelector("[data-ow-ft-field=leader]")?.checked === true;
+    const presetValue = section.querySelector("[data-ow-ft-field=teamPreset]")?.value ?? "";
+    const teamPreset = AI_PRESETS.includes(presetValue) ? presetValue : null;
+    const cohesionRaw = Number(section.querySelector("[data-ow-ft-field=cohesion]")?.value);
+    const preferredCohesion = Number.isFinite(cohesionRaw) && cohesionRaw > 0
+        ? cohesionRaw : null;
+    try {
+        await doc.setFlag(MODULE_ID, FLAG_KEYS.fireteam, {
+            teamId,
+            leaderId: leader ? selfId : null,
+            teamPreset,
+            preferredCohesion
+        });
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to save fireteam config`, err);
+    }
+}
+
+/**
+ * Escape a value for use inside a double-quoted HTML attribute.
+ * @param {*} value
+ * @returns {string}
+ */
+function _escapeAttr(value) {
+    return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
 }
 
 /**

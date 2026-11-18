@@ -3,6 +3,17 @@
   "OWAI.Sheet.Enabled": "AI включён",
   "OWAI.Sheet.Preset": "Пресет",
   "OWAI.Sheet.Mode": "Режим переопределения AI",
+  "OWAI.Sheet.Fireteam.Section": "Огневая группа",
+  "OWAI.Sheet.Fireteam.TeamId": "ID группы",
+  "OWAI.Sheet.Fireteam.Leader": "Лидер группы",
+  "OWAI.Sheet.Fireteam.TeamPreset": "Пресет группы",
+  "OWAI.Sheet.Fireteam.Cohesion": "Предпочтительная связность (м)",
+
+  "OWAI.Task.support": "Поддержка",
+  "OWAI.Task.advance": "Продвижение",
+  "OWAI.Task.flank": "Фланговый обход",
+  "OWAI.Task.assault": "Штурм",
+  "OWAI.Task.regroup": "Перегруппировка",
 
   "OWAI.Preset.none": "(без пресета)",
   "OWAI.Preset.assault": "Штурм",
@@ -28,6 +39,9 @@
 
   "OWAI.Settings.DiagnosticsEnabled.Name": "Диагностическое логирование AI",
   "OWAI.Settings.DiagnosticsEnabled.Hint": "Писать подробную диагностику AI в консоль браузера (только мастер).",
+
+  "OWAI.Settings.PreferredCohesion.Name": "Связность группы по умолчанию",
+  "OWAI.Settings.PreferredCohesion.Hint": "Предпочтительная дистанция связности в метрах, если флаг группы её не переопределяет.",
 
   "OWAI.Settings.Menu.Name": "Only War AI",
   "OWAI.Settings.Menu.Label": "Настройка Only War AI",

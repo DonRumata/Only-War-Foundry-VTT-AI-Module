@@ -6,16 +6,17 @@ import assert from "node:assert/strict";
 
 import {
     getExecutionMode,
+    getPreferredCohesion,
     isDiagnosticsEnabled,
     registerSettings
 } from "../../scripts/settings.js";
-import { MODULE_ID, SETTING_KEYS } from "../../scripts/constants.js";
+import { DEFAULT_PREFERRED_COHESION, MODULE_ID, SETTING_KEYS } from "../../scripts/constants.js";
 
 test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 2);
+    assert.equal(registered.length, 3);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -56,4 +57,17 @@ test("isDiagnosticsEnabled reads the stored value", async () => {
     registerSettings();
     await game.settings.set(MODULE_ID, SETTING_KEYS.diagnosticsEnabled, true);
     assert.equal(isDiagnosticsEnabled(), true);
+});
+
+test("preferredCohesion defaults to 5 and reads a stored value", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.preferredCohesion);
+    assert.ok(entry, "preferredCohesion registered");
+    assert.equal(entry.data.default, DEFAULT_PREFERRED_COHESION);
+    assert.equal(getPreferredCohesion(), DEFAULT_PREFERRED_COHESION);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.preferredCohesion, 8);
+    assert.equal(getPreferredCohesion(), 8);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.preferredCohesion, -1);
+    assert.equal(getPreferredCohesion(), DEFAULT_PREFERRED_COHESION);
 });
