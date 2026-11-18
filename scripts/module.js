@@ -15,6 +15,7 @@ import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility
 import { createModuleApi } from "./api.js";
 import { createOperationService } from "./operations.js";
 import { createPerceptionService } from "./perception.js";
+import { createNavigationService } from "./navigation.js";
 import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
@@ -50,6 +51,12 @@ Hooks.once("init", () => {
         _registerPerceptionService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register perception service`, err);
+    }
+
+    try {
+        _registerNavigationService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register navigation service`, err);
     }
 
     try {
@@ -225,6 +232,19 @@ function _registerFireteamService(api) {
     if (!api?.services) return;
     if (!api.services.has("fireteam")) {
         api.services.register("fireteam", createFireteamService({ api }));
+    }
+}
+
+/**
+ * Register the `navigation` service on the module API (issue #402). The
+ * service is pure/read-only — no hooks, no lifecycle — so it is available
+ * immediately for the planner and macros.
+ * @param {object} api Module API object.
+ */
+function _registerNavigationService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("navigation")) {
+        api.services.register("navigation", createNavigationService({ api }));
     }
 }
 
