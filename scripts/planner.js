@@ -92,29 +92,39 @@ export const DEFAULT_MELEE_RANGE = 2;
 export const SCORE_FACTORS = Object.freeze([
     "attackNow",
     "attackAfterMove",
+    "charge",
+    "melee",
     "advance",
     "threat",
     "proximity",
     "los",
     "cover",
+    "exposure",
     "holdPosition",
-    "lastKnown"
+    "lastKnown",
+    "budgetOver"
 ]);
 
 /**
- * Default weight set — used verbatim by the `assault` skeleton and as the
- * merge base for custom presets registered at runtime.
+ * Default weight set — the merge base for every registered preset. Combat
+ * presets (issue #404+) override these values; the `0` entries simply keep
+ * the new factors visible in score breakdowns without changing skeleton
+ * behaviour.
  */
 export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     attackNow: 10,
     attackAfterMove: 6,
+    charge: 0,
+    melee: 0,
     advance: 2,
     threat: 2,
     proximity: 1,
     los: 1,
     cover: 0,
+    exposure: 0,
     holdPosition: 0,
-    lastKnown: 0.5
+    lastKnown: 0.5,
+    budgetOver: 0
 });
 
 /**
@@ -470,7 +480,40 @@ function _actionRange(action) {
     const raw = action?.range;
     const value = Number.isFinite(raw) ? raw : _finiteOr(raw?.value, NaN);
     if (Number.isFinite(value) && value > 0) return value;
-    return action?.class === "melee" || action?.melee === true ? DEFAULT_MELEE_RANGE : 0;
+    return _isMeleeAction(action) ? DEFAULT_MELEE_RANGE : 0;
+}
+
+/**
+ * Whether an action candidate is a melee attack.
+ * @param {object|null} action Normalized action candidate.
+ * @returns {boolean}
+ */
+function _isMeleeAction(action) {
+    return action?.melee === true
+        || _isChargeAction(action)
+        || String(action?.class ?? "").toLowerCase() === "melee";
+}
+
+/**
+ * Whether an action candidate is an explicit charge attack mode.
+ * @param {object|null} action Normalized action candidate.
+ * @returns {boolean}
+ */
+function _isChargeAction(action) {
+    return action?.charge === true || String(action?.mode ?? "").toLowerCase() === "charge";
+}
+
+/**
+ * Action-economy cost of an action candidate: a bare number, an object
+ * with an `actions` field, or the default single action.
+ * @param {object|null} action Normalized action candidate.
+ * @returns {number}
+ */
+function _actionCost(action) {
+    const cost = action?.cost;
+    if (Number.isFinite(cost)) return cost;
+    if (cost && typeof cost === "object") return _finiteOr(cost.actions, 1);
+    return 1;
 }
 
 /**
@@ -874,13 +917,16 @@ function _normalizeAction(raw, index) {
         ? raw.type
         : (raw.type === "attack" || raw.attack === true || raw.itemUuid || raw.weapon ? "attack" : "test");
     const id = typeof raw.id === "string" && raw.id ? raw.id : `action-${index}`;
+    const cls = raw.class ?? raw.system?.class ?? null;
     return {
         id,
         type,
         name: raw.name ?? id,
         itemUuid: raw.itemUuid ?? raw.item?.uuid ?? null,
         itemId: raw.itemId ?? raw.item?.id ?? null,
-        class: raw.class ?? raw.system?.class ?? null,
+        class: cls,
+        melee: raw.melee === true || String(cls ?? "").toLowerCase() === "melee",
+        charge: raw.charge === true || String(raw.mode ?? "").toLowerCase() === "charge",
         range: Number.isFinite(raw.range) ? raw.range
             : (Number.isFinite(raw.range?.value) ? raw.range.value
                 : (Number.isFinite(raw.system?.range) ? raw.system.range : null)),
@@ -1078,15 +1124,16 @@ function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navi
  * @param {object|null} input.target Normalized target entry.
  * @param {object|null} input.move Normalized move candidate.
  * @param {object|null} input.action Normalized action candidate.
- * @param {number} input.range Attack range in scene units.
+ * @param {number|null} [input.moveBudget] Numeric movement budget for the
+ *   `budgetOver` penalty factor (null/unknown disables it).
  * @returns {object}
  */
-function _factorsOf({ variant, target, move, action, range }) {
+function _factorsOf({ variant, target, move, action, moveBudget = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
     const attackNow = variant === "attack-in-place" && canAttack ? 1 : 0;
-    const attackAfterMove = variant === "move-attack" && canAttack ? 1 : 0;
+    const attackAfterMove = (variant === "move-attack" || variant === "charge") && canAttack ? 1 : 0;
     let advance = 0;
     if (move && !move.stay && Number.isFinite(targetDistance) && targetDistance > 0
         && Number.isFinite(postDistance)) {
@@ -1096,17 +1143,26 @@ function _factorsOf({ variant, target, move, action, range }) {
         ? 1 / (1 + (postDistance / 10))
         : 0;
     const los = target?.source === "visible" || move?.los === true ? 1 : 0;
+    const cover = Math.max(0, Math.min(1, _finiteOr(move?.cover, 0)));
     const holdPosition = variant === "hold" || variant === "attack-in-place" || move?.stay === true ? 1 : 0;
+    const budget = Number.isFinite(moveBudget) && moveBudget > 0 ? moveBudget : null;
+    const budgetOver = budget !== null && move
+        ? Math.max(0, (_finiteOr(move.cost, 0) - budget) / budget)
+        : 0;
     return {
         attackNow,
         attackAfterMove,
+        charge: variant === "charge" ? 1 : 0,
+        melee: _isMeleeAction(action) ? 1 : 0,
         advance,
         threat: Math.max(0, Math.min(1, _finiteOr(target?.threat, 0))),
         proximity,
         los,
-        cover: Math.max(0, Math.min(1, _finiteOr(move?.cover, 0))),
+        cover,
+        exposure: move && move.stay !== true ? Math.max(0, 1 - cover) : 0,
         holdPosition,
-        lastKnown: target?.source === "last-known" ? 1 : 0
+        lastKnown: target?.source === "last-known" ? 1 : 0,
+        budgetOver
     };
 }
 
@@ -1123,11 +1179,12 @@ export function evaluateFactors(factors, weights) {
     for (const [key, weight] of Object.entries(weights ?? {})) {
         if (!Number.isFinite(weight) || weight === 0) continue;
         const contribution = (_finiteOr(factors?.[key], 0)) * weight;
-        contributions[key] = Math.round(contribution * 1e4) / 1e4;
+        // `+ 0` normalizes -0 so plans stay JSON-round-trip stable.
+        contributions[key] = (Math.round(contribution * 1e4) / 1e4) + 0;
         total += contribution;
     }
     return {
-        score: Math.round(total * 1e6) / 1e6,
+        score: (Math.round(total * 1e6) / 1e6) + 0,
         breakdown: { factors: { ...factors }, contributions, weights: { ...weights } }
     };
 }
@@ -1148,6 +1205,9 @@ function _seededPick(tied, seed) {
     }
     return shuffled[0];
 }
+
+/** Candidate variants that produce an attack/test step. */
+const ATTACK_VARIANTS = Object.freeze(new Set(["attack-in-place", "move-attack", "charge"]));
 
 /**
  * Serialize a plan candidate variant into executable action steps.
@@ -1172,7 +1232,8 @@ function _stepsFor({ candidate }) {
             projectedResourceDelta: { movement: -(_finiteOr(move.cost, 0)) }
         });
     }
-    if (action && target && (variant === "attack-in-place" || variant === "move-attack")) {
+    const attacks = action && target && ATTACK_VARIANTS.has(variant);
+    if (attacks) {
         steps.push({
             id: `step-${action.type === "attack" ? "attack" : "test"}-${steps.length + 1}`,
             type: action.type === "attack" ? "attack" : "test",
@@ -1183,7 +1244,8 @@ function _stepsFor({ candidate }) {
                 itemUuid: action.itemUuid,
                 targetTokenUuid: target.tokenUuid,
                 targetTokenId: target.tokenId,
-                range: _actionRange(action)
+                range: _actionRange(action),
+                ...(variant === "charge" ? { mode: "charge" } : {})
             },
             preconditions: ["turn", "target", "resources"],
             projectedResourceDelta: action.type === "attack" ? { ammo: -1 } : {}
@@ -1193,7 +1255,7 @@ function _stepsFor({ candidate }) {
         id: `step-end-turn-${steps.length + 1}`,
         type: "end-turn",
         cost: {},
-        input: {},
+        input: attacks ? {} : { reason: variant === "hold" ? "hold-position" : "no-attack" },
         preconditions: ["turn"],
         projectedResourceDelta: {}
     });
@@ -1265,9 +1327,10 @@ export function createPlannerService({
      * @param {object} combatant Active combatant document.
      * @param {object} [context] Optional overrides/services:
      *   `seed`, `operation`, `replanCount`, `targets`, `actions`,
-     *   `actionsApi`, `moves`, `moveBudget`, `rates`, `perception`,
-     *   `navigation`, `authority`, `scene`, `token`, `collisionRevision`,
-     *   `maxTargets`, `maxActions`, `approximateMoves`.
+     *   `actionsApi`, `moves`, `moveBudget`, `actionBudget`, `rates`,
+     *   `perception`, `navigation`, `authority`, `scene`, `token`,
+     *   `collisionRevision`, `maxTargets`, `maxActions`,
+     *   `approximateMoves`.
      * @returns {Promise<object>} `{status, plan?, reason?, diagnostics?}`.
      */
     async function planTurn(combat, combatant, context = {}) {
@@ -1333,63 +1396,109 @@ export function createPlannerService({
             };
         }
 
-        const bestAction = usableActions[0] ?? null;
-        const range = bestAction ? _actionRange(bestAction) : 0;
+        // Numeric movement budget used by the `budgetOver` factor; injected
+        // budgets may be a number or `{budget|limit}` objects from callers
+        // like the executor.
+        const moveBudget = Number.isFinite(context.moveBudget)
+            ? context.moveBudget
+            : _finiteOr(context.moveBudget?.budget ?? context.moveBudget?.limit, null);
+        const actionBudget = _finiteOr(context.actionBudget, 1);
+        // Fallback approach points aim for the shortest usable range so a
+        // melee-capable NPC keeps closing instead of stopping at gun range.
+        const positiveRanges = usableActions
+            .map(action => _actionRange(action))
+            .filter(value => value > 0);
+        const approachRange = positiveRanges.length ? Math.min(...positiveRanges) : 0;
         const targetPosOf = target => ({ x: target?.x ?? null, y: target?.y ?? null });
 
         const candidates = [];
         let routesMissing = false;
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
-            const candidateBase = { target, action: bestAction, move: null };
             const distance = _finiteOr(target.distance, Infinity);
-            const canAttackNow = target.canAttack === true
-                && bestAction !== null
-                && distance <= range + 1e-9;
-
-            if (canAttackNow) {
-                candidates.push({ ...candidateBase, variant: "attack-in-place" });
-            } else {
-                diagnostics.rejected.push({
-                    candidate: `attack-in-place|${target.tokenUuid}`,
-                    reason: target.canAttack === true
-                        ? (bestAction ? "out-of-range" : "no-action")
-                        : "target-not-attackable"
-                });
-            }
-
             const moves = _resolveMoves({
-                tokenDoc, target, range,
+                tokenDoc, target, range: approachRange,
                 selfPos, targetPos: targetPosOf(target),
                 grid, navigation, perception, context
             });
             diagnostics.metrics.movesEvaluated += moves.length;
-            let attackMoveFound = false;
+
             let approachMove = null;
             for (const move of moves) {
                 if (move.stay) continue;
-                if (bestAction && target.canAttack === true
-                    && Number.isFinite(move.distance) && move.distance <= range + 1e-9) {
-                    candidates.push({ ...candidateBase, variant: "move-attack", move });
-                    attackMoveFound = true;
-                }
                 if (!approachMove || (_finiteOr(move.distance, Infinity)
                     < _finiteOr(approachMove.distance, Infinity))) {
                     approachMove = move;
                 }
             }
+
+            let attackFound = false;
+            if (target.canAttack !== true) {
+                diagnostics.rejected.push({
+                    candidate: `attack|${target.tokenUuid}`,
+                    reason: "target-not-attackable"
+                });
+            } else if (!usableActions.length) {
+                diagnostics.rejected.push({
+                    candidate: `attack|${target.tokenUuid}`,
+                    reason: "no-action"
+                });
+            } else {
+                // One attack variant per legal action so presets can prefer
+                // melee charge plans over a higher-damage ranged option.
+                for (const action of usableActions) {
+                    const tag = `${action.id}|${target.tokenUuid}`;
+                    if (_actionCost(action) > actionBudget) {
+                        diagnostics.rejected.push({
+                            candidate: `action|${tag}`,
+                            reason: "over-budget"
+                        });
+                        continue;
+                    }
+                    const range = _actionRange(action);
+                    const melee = _isMeleeAction(action);
+                    let inPlace = false;
+                    if (distance <= range + 1e-9) {
+                        candidates.push({ target, action, move: null, variant: "attack-in-place" });
+                        inPlace = true;
+                        attackFound = true;
+                    } else {
+                        diagnostics.rejected.push({
+                            candidate: `attack-in-place|${tag}`,
+                            reason: "out-of-range"
+                        });
+                    }
+                    let attackMoveFound = false;
+                    // A charge exists to close distance — when a melee
+                    // attack is already possible in place, repositioning
+                    // move-attacks are only generated for ranged actions.
+                    if (!melee || !inPlace) {
+                        for (const move of moves) {
+                            if (move.stay) continue;
+                            if (!Number.isFinite(move.distance) || move.distance > range + 1e-9) continue;
+                            // Moving into melee reach is a charge; any
+                            // other move inside weapon range is move+attack.
+                            const variant = melee ? "charge" : "move-attack";
+                            candidates.push({ target, action, move, variant });
+                            attackMoveFound = true;
+                            attackFound = true;
+                        }
+                    }
+                    if (!inPlace && !attackMoveFound) {
+                        diagnostics.rejected.push({
+                            candidate: `${melee ? "charge" : "move-attack"}|${tag}`,
+                            reason: moves.some(move => !move.stay) ? "out-of-range" : "no-route"
+                        });
+                    }
+                }
+            }
+
             if (approachMove) {
-                candidates.push({ ...candidateBase, variant: "approach", move: approachMove });
-            } else if (!canAttackNow) {
+                candidates.push({ target, action: null, move: approachMove, variant: "approach" });
+            } else if (!attackFound) {
                 routesMissing = true;
                 diagnostics.rejected.push({
                     candidate: `approach|${target.tokenUuid}`,
                     reason: "no-route"
-                });
-            }
-            if (!attackMoveFound && bestAction && target.canAttack === true && !canAttackNow) {
-                diagnostics.rejected.push({
-                    candidate: `move-attack|${target.tokenUuid}`,
-                    reason: moves.some(move => !move.stay) ? "out-of-range" : "no-route"
                 });
             }
         }
@@ -1415,7 +1524,7 @@ export function createPlannerService({
         }
 
         const scored = candidates.map((candidate, index) => {
-            const factors = _factorsOf({ ...candidate, range });
+            const factors = _factorsOf({ ...candidate, moveBudget });
             let evaluation;
             if (typeof preset.evaluate === "function") {
                 const custom = preset.evaluate({
