@@ -41,6 +41,10 @@
   "OWAI.Menu.NoOverrides": "No temporary overrides.",
   "OWAI.Menu.ClearOverrides": "Clear all combatant overrides",
 
+  "OWAI.Authority.Status.Ready": "AI controller active",
+  "OWAI.Authority.Status.WaitingForGm": "AI waiting for a GM",
+  "OWAI.Authority.Status.Disabled": "AI module disabled",
+
   "OWAI.Notifications.WrongSystem": "Only War AI disabled: requires the \"{expected}\" system (active: {actual}).",
   "OWAI.Notifications.ApiMissing": "Only War AI disabled: the system did not publish game.darkHeresy.api.",
   "OWAI.Notifications.VersionMismatch": "Only War AI disabled: system API major {expected} required (actual: {actual}).",

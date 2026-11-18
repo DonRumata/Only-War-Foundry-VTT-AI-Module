@@ -30,7 +30,8 @@ export const OVERRIDE_MODES = Object.freeze([
 /** Flag keys inside the `flags["only-war-ai"]` namespace. */
 export const FLAG_KEYS = Object.freeze({
     actorConfig: "config",
-    override: "override"
+    override: "override",
+    operation: "operation"
 });
 
 /** World setting keys. */
@@ -50,3 +51,68 @@ export const REQUIRED_SYSTEM_ID = "only-war-local";
 
 /** Required major version of the public system API (`game.darkHeresy.api`). */
 export const REQUIRED_SYSTEM_API_MAJOR = "1";
+
+/**
+ * AI turn operation lifecycle phases (issue #400):
+ * `idle → planning → awaiting-preview → executing → completed/failed/cancelled`.
+ */
+export const OPERATION_PHASES = Object.freeze([
+    "idle",
+    "planning",
+    "awaiting-preview",
+    "executing",
+    "completed",
+    "failed",
+    "cancelled"
+]);
+
+/** Phases after which an operation is finished and never resumes. */
+export const OPERATION_TERMINAL_PHASES = Object.freeze([
+    "completed",
+    "failed",
+    "cancelled"
+]);
+
+/** Allowed phase transitions for the compare-before-update state machine. */
+export const OPERATION_TRANSITIONS = Object.freeze({
+    idle: ["planning"],
+    planning: ["awaiting-preview", "executing", "failed", "cancelled"],
+    "awaiting-preview": ["executing", "failed", "cancelled"],
+    executing: ["completed", "failed", "cancelled"],
+    completed: [],
+    failed: [],
+    cancelled: []
+});
+
+/** Stable reason codes for operation results and the authority status. */
+export const OPERATION_REASONS = Object.freeze({
+    alreadyCompleted: "already-completed",
+    controllerChanged: "controller-changed",
+    error: "error",
+    invalidArgument: "invalid-argument",
+    invalidTransition: "invalid-transition",
+    noExecutor: "no-executor",
+    notController: "not-controller",
+    operationExists: "operation-exists",
+    operationMismatch: "operation-mismatch",
+    operationMissing: "operation-missing",
+    phaseMismatch: "phase-mismatch",
+    turnStale: "turn-stale",
+    waitingForGm: "waiting-for-gm"
+});
+
+/** Authority (controller election) status values. */
+export const AUTHORITY_STATUS = Object.freeze({
+    disabled: "disabled",
+    ready: "ready",
+    waitingForGm: "waiting-for-gm"
+});
+
+/** Foundry socket channel used by the module protocol. */
+export const SOCKET_CHANNEL = `module.${MODULE_ID}`;
+
+/** Module socket message types. */
+export const SOCKET_MESSAGE_TYPES = Object.freeze({
+    request: "ai-request",
+    status: "ai-status"
+});

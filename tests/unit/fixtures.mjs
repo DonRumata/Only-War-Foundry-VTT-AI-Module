@@ -130,6 +130,55 @@ export function makeCombatant({ actor, token, mode, preset, rawOverride, destroy
 }
 
 /**
+ * User fixture for controller-election tests.
+ * @param {object} [options]
+ * @param {string} [options.id] Stable user id.
+ * @param {boolean} [options.isGM] Foundry `isGM` flag.
+ * @param {boolean} [options.active] Whether the user is connected.
+ * @param {number} [options.role] Foundry role (4 = GAMEMASTER); defaults to
+ *   `isGM ? 4 : 1`.
+ * @returns {object}
+ */
+export function makeUser({ id, isGM = false, active = true, role } = {}) {
+    const userId = id ?? _nextId();
+    return {
+        id: userId,
+        name: `User ${userId}`,
+        isGM,
+        active,
+        role: role ?? (isGM ? 4 : 1)
+    };
+}
+
+/**
+ * Combat fixture with the surface the authority services touch: `id`,
+ * `round`, `turn`, `combatants` collection, `turns`, `combatant` getter and
+ * flag accessors from {@link FixtureDocument}.
+ * @param {object} [options]
+ * @param {string} [options.id] Stable combat id.
+ * @param {number} [options.round] Current round.
+ * @param {number} [options.turn] Current turn index.
+ * @param {object[]} [options.combatants] Combatant fixtures in turn order.
+ * @returns {FixtureDocument}
+ */
+export function makeCombat({ id, round = 0, turn = 0, combatants = [] } = {}) {
+    const combat = new FixtureDocument("Combat", { id: id ?? _nextId(), name: "Test Combat" });
+    combat.round = round;
+    combat.turn = turn;
+    const collection = new Map(combatants.map(c => [c.id, c]));
+    collection.contents = combatants;
+    combat.combatants = collection;
+    combat.turns = combatants;
+    Object.defineProperty(combat, "combatant", {
+        configurable: true,
+        get() {
+            return this.turns[this.turn] ?? null;
+        }
+    });
+    return combat;
+}
+
+/**
  * Scene stub for square/hex grids.
  * @param {object} [options]
  * @param {"square"|"hex"} [options.grid]

@@ -3,7 +3,7 @@
   "title": "Only War AI",
   "description": "Opt-in AI module for the Only War Foundry VTT system. Per-actor AI configuration with token and combatant overrides, fixed behaviour presets and a preview-first execution model. Planner and turn execution arrive in follow-up updates.",
   "version": "0.1.0",
-  "socket": false,
+  "socket": true,
   "authors": [
     {
       "name": "DonRumata",

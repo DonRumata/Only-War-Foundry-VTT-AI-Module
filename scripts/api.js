@@ -34,7 +34,10 @@ export function createModuleApi() {
 
         /** Capability discovery map, mirrors the system API style. */
         capabilities: Object.freeze({
+            "authority.election": true,
+            "authority.socket": true,
             "config.resolveEffectiveConfig": true,
+            "operations.lifecycle": true,
             "services.register": true,
             "services.get": true,
             "ui.npcSheet": true,
