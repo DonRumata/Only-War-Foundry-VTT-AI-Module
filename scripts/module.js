@@ -13,6 +13,7 @@ import { MODULE_ID } from "./constants.js";
 import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
 import { createModuleApi } from "./api.js";
 import { createPlannerService } from "./planner.js";
+import { registerAssaultPreset } from "./presets/assault.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -100,7 +101,10 @@ Hooks.once("ready", () => {
 function _registerPlannerService(api) {
     if (!api?.services) return;
     if (!api.services.has("planner")) {
-        api.services.register("planner", createPlannerService({ api }));
+        const planner = createPlannerService({ api });
+        // Issue #404: replace the assault skeleton with the real preset.
+        registerAssaultPreset(planner);
+        api.services.register("planner", planner);
     }
 }
 

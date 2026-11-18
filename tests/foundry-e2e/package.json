@@ -7,7 +7,8 @@
     "test": "node module-foundation.test.mjs",
     "test:foundation": "node module-foundation.test.mjs",
     "test:planner": "node planner.test.mjs",
-    "test:all": "npm run test:foundation"
+    "test:all": "npm run test:foundation && npm run test:planner && npm run test:assault",
+    "test:assault": "node preset-assault.test.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.61.1"
