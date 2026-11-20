@@ -349,8 +349,15 @@ export function createExecutorService({
         const combatant = _combatantOf(context, context.combat);
         const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
         const expected = run.expectedPosition ?? _selfPosition(plan);
+        // _source carries the applied position; doc.x lags behind while
+        // the placeable finishes its movement animation.
+        const liveX = tokenDoc?._source?.x ?? tokenDoc?.x;
+        const liveY = tokenDoc?._source?.y ?? tokenDoc?.y;
+        // Hex grids snap the stored position to the cell — a fractional
+        // plan endpoint lands <0.5px off; a manual drag is at least a
+        // full cell, so a sub-pixel tolerance keeps token-moved real.
         if (tokenDoc && expected
-            && (tokenDoc.x !== expected.x || tokenDoc.y !== expected.y)) {
+            && (Math.abs(liveX - expected.x) >= 0.5 || Math.abs(liveY - expected.y) >= 0.5)) {
             return { valid: false, reason: STALE_REASONS.tokenMoved };
         }
         const planner = _planner(context);
@@ -359,8 +366,18 @@ export function createExecutorService({
         }
         try {
             const self = plan?.snapshot?.self;
+            // Spreading a Document drops prototype getters (id,
+            // documentName) — restore them plus a patched _source so the
+            // snapshot fingerprint keeps matching.
             const tokenView = tokenDoc && self && Number.isFinite(self.x)
-                ? { ...tokenDoc, x: self.x, y: self.y }
+                ? {
+                    ...tokenDoc,
+                    _source: { ...tokenDoc._source, x: self.x, y: self.y },
+                    x: self.x,
+                    y: self.y,
+                    id: tokenDoc.id,
+                    documentName: tokenDoc.documentName
+                }
                 : tokenDoc;
             return planner.validateSnapshot(plan, {
                 combat: context.combat ?? null,
@@ -417,7 +434,11 @@ export function createExecutorService({
         if (!Number.isFinite(to?.x) || !Number.isFinite(to?.y)) {
             return { ok: false, reason: EXECUTOR_REASONS.invalidStep };
         }
-        if (tokenDoc.x === to.x && tokenDoc.y === to.y) {
+        // Hex grids snap the token to the cell — the plan's fractional `to`
+        // and the stored integer position differ by <0.5px.
+        const curX = tokenDoc._source?.x ?? tokenDoc.x;
+        const curY = tokenDoc._source?.y ?? tokenDoc.y;
+        if (Math.abs(curX - to.x) < 0.5 && Math.abs(curY - to.y) < 0.5) {
             return {
                 ok: true,
                 skipped: true,
@@ -462,6 +483,9 @@ export function createExecutorService({
      */
     function _rollInput(step, plan, operationId) {
         const input = { ...(step?.input ?? {}) };
+        // Steps serialize `itemUuid`; the rolls API expects `weaponId` —
+        // an owned item id or UUID both resolve through `_findActorItem`.
+        input.weaponId = input.weaponId ?? input.weaponItemId ?? input.itemUuid ?? null;
         input.actorUuid = input.actorUuid ?? plan?.actorUuid ?? plan?.snapshot?.self?.actorUuid ?? null;
         input.actorId = input.actorId ?? plan?.snapshot?.self?.actorId ?? null;
         input.tokenUuid = input.tokenUuid ?? plan?.tokenUuid ?? plan?.snapshot?.self?.tokenUuid ?? null;

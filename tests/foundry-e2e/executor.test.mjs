@@ -35,6 +35,9 @@ async function setup() {
   // A short-range pistol (10 m) with a loaded clip: the enemy stands ~12 m
   // away, so the plan must move before shooting.
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
+    // Agility feeds `computeMovement` — without it the move budget is 0
+    // and the planner legitimately picks attack-in-place.
+    await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       {
         name: 'Auto Pistol',

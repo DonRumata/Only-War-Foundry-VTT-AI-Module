@@ -85,6 +85,15 @@ function _tokenObject(token) {
 function _positionOf(token) {
     const obj = _tokenObject(token);
     const doc = _tokenDocument(token);
+    // The document source is authoritative: a placeable's center/x
+    // lags behind update() during Foundry's movement animation, while
+    // _source carries the applied position immediately.
+    if (Number.isFinite(doc?._source?.x) && Number.isFinite(doc?._source?.y)) {
+        const size = globalThis.canvas?.scene?.grid?.size ?? globalThis.canvas?.dimensions?.size ?? 100;
+        const w = (doc?.width ?? (Number.isFinite(obj?.w) ? obj.w / size : 1)) * size;
+        const h = (doc?.height ?? (Number.isFinite(obj?.h) ? obj.h / size : 1)) * size;
+        return { x: doc._source.x + (w / 2), y: doc._source.y + (h / 2) };
+    }
     const center = obj?.center ?? doc?.center;
     if (center && Number.isFinite(center.x) && Number.isFinite(center.y)) {
         return { x: center.x, y: center.y };
@@ -272,7 +281,19 @@ export function hasLineOfSight(from, to) {
     const layer = globalThis.canvas?.visibility ?? globalThis.canvas?.effects?.visibility;
     if (layer && typeof layer.testVisibility === "function") {
         const seen = _tryTestVisibility(layer, target, { object: viewer, tolerance: 2 });
-        if (seen !== null) return seen;
+        // When core reports "visible" the walls still apply: scenes with
+        // vision disabled or an uninitialized visibility layer answer
+        // permissively, so cross-check the geometry before trusting it.
+        if (seen === true) return _geometricLineOfSight(origin, target);
+        if (seen === false) {
+            // A probe point with an explicitly null document is not a real
+            // canvas token: core reports it "not visible" regardless of
+            // walls — for such probes the wall geometry is the authority.
+            if (from?.document === null || viewer?.document === null) {
+                return _geometricLineOfSight(origin, target);
+            }
+            return false;
+        }
     }
     if (viewer && typeof viewer.testVisibility === "function") {
         const seen = _tryTestVisibility(viewer, target, { tolerance: 2 });
@@ -295,8 +316,22 @@ export function hasLineOfSight(from, to) {
 function _geometricLineOfSight(origin, target) {
     const ray = { A: { x: origin.x, y: origin.y }, B: { x: target.x, y: target.y } };
     try {
+        // Foundry v13+: the sight polygon backend is the authoritative wall
+        // collision API; walls.checkCollision returns opaque results there.
+        const backends = globalThis.CONFIG?.Canvas?.polygonBackends;
+        const backend = backends?.sight ?? backends?.limited;
+        if (typeof backend?.testCollision === "function") {
+            const hit = backend.testCollision(origin, target, { type: "sight", mode: "any" });
+            if (typeof hit === "boolean") return !hit;
+        }
+    } catch(_err) {
+        // Fall through to the manual segment test below.
+    }
+    try {
         if (typeof globalThis.canvas?.walls?.checkCollision === "function") {
-            return globalThis.canvas.walls.checkCollision(ray, { type: "sight", mode: "all" }) !== true;
+            const hit = globalThis.canvas.walls.checkCollision(origin, target,
+                { type: "sight", mode: "any" });
+            if (typeof hit === "boolean") return !hit;
         }
     } catch(_err) {
         // Fall through to the manual segment test below.
@@ -531,7 +566,14 @@ export function sanitizeMemoryEntry(entry) {
 export function sanitizeMemory(memory) {
     const next = {};
     if (!memory || typeof memory !== "object") return next;
-    for (const [uuid, entry] of Object.entries(memory)) {
+    // Storage shape is an array of {tokenUuid, ...entry}: Foundry expands
+    // dotted object keys (token uuids contain dots) into nested paths, so
+    // the flag must never store the map as a bare object.
+    const pairs = Array.isArray(memory)
+        ? memory.map(item => [item?.tokenUuid, item])
+        : Object.entries(memory);
+    for (const [uuid, entry] of pairs) {
+        if (typeof uuid !== "string" || !uuid) continue;
         const clean = sanitizeMemoryEntry(entry);
         if (clean) next[uuid] = clean;
     }
@@ -1060,7 +1102,9 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
      */
     async function _writeMemory(combatant, memory) {
         if (typeof combatant?.setFlag === "function") {
-            await combatant.setFlag(MODULE_ID, FLAG_KEYS.memory, memory);
+            const entries = Object.entries(memory ?? {})
+                .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }));
+            await combatant.setFlag(MODULE_ID, FLAG_KEYS.memory, entries);
         } else if (combatant && typeof combatant === "object") {
             combatant.flags = combatant.flags ?? {};
             combatant.flags[MODULE_ID] = {

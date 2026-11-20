@@ -124,7 +124,8 @@ async function testAutoClaimOnTurnStart() {
   }
 
   // Enable AI on the actor, then start the combat: the authority service must
-  // claim the turn, transition phases and safely complete without an executor.
+  // claim the turn, run the integrated plan pipeline and park in
+  // `awaiting-preview` (preview is the default execution mode).
   await h.setActorAiConfig(page, npcId, { enabled: true, preset: 'assault' });
   await page.evaluate(async (cid) => {
     const combat = game.combats.get(cid);
@@ -138,8 +139,8 @@ async function testAutoClaimOnTurnStart() {
   }, combatId, { timeout: 10000 });
   await page.waitForFunction((cid) => {
     const op = game.combats.get(cid)?.getFlag('only-war-ai', 'operation');
-    return op && ['completed', 'failed', 'cancelled'].includes(op.phase);
-  }, combatId, { timeout: 10000 });
+    return op && ['awaiting-preview', 'executing', 'completed', 'failed', 'cancelled'].includes(op.phase);
+  }, combatId, { timeout: 15000 });
 
   const op = await page.evaluate((cid) =>
     game.combats.get(cid)?.getFlag('only-war-ai', 'operation') ?? null, combatId);
@@ -147,9 +148,34 @@ async function testAutoClaimOnTurnStart() {
   assert.ok(op, 'authority service wrote the operation flag on turn start');
   assert.equal(op.controllerId, await page.evaluate(() => game.user.id), 'controller is self');
   assert.equal(op.combatantId, combatantId);
-  assert.equal(op.phase, 'completed', 'no executor: operation completed safely');
-  assert.equal(op.result.completed, false);
-  assert.equal(op.reason, 'no-executor');
+
+  // With the executor integrated the operation is previewed, not
+  // auto-completed. Close it through the operations service — the terminal
+  // phase must persist (the full preview flow is covered by preview.test.mjs).
+  const terminal = await page.evaluate(async (cid) => {
+    const api = game.modules.get('only-war-ai')?.api;
+    const combat = game.combats.get(cid);
+    const current = combat?.getFlag('only-war-ai', 'operation');
+    if (!current) return null;
+    if (['completed', 'failed', 'cancelled'].includes(current.phase)) return current;
+    const preview = api?.services?.get?.('preview');
+    const out = { preview: !!preview, decision: null, complete: null };
+    out.decision = await preview?.resolvePreview?.(current.id, 'cancel').catch((e) => ({ err: e.message }));
+    if (out.decision?.ok !== true) {
+      out.complete = await api?.services?.get?.('operations')?.completeTurn?.(combat, current.id,
+        { cancelled: true, reason: 'e2e-close', advanceTurn: false }).catch((e) => ({ err: e.message }));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    out.op = game.combats.get(cid)?.getFlag('only-war-ai', 'operation') ?? null;
+    return out;
+  }, combatId);
+  if (terminal?.op) terminal.op._debug = terminal;
+  const finalOp = terminal?.op ?? null;
+  console.log('terminal debug:', JSON.stringify({ decision: terminal?.decision, complete: terminal?.complete, phase: finalOp?.phase }));
+
+  assert.ok(finalOp, 'operation reached a terminal or preview phase');
+  assert.ok(['cancelled', 'completed', 'failed'].includes(finalOp.phase),
+    `terminal phase persisted (got ${finalOp.phase})`);
 }
 
 async function testSocketProtocol() {

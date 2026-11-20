@@ -130,8 +130,8 @@ function _tokenDoc(token) {
  * @returns {{x: number|null, y: number|null}}
  */
 function _tokenPosition(doc) {
-    const x = doc?.x ?? doc?.object?.x;
-    const y = doc?.y ?? doc?.object?.y;
+    const x = doc?._source?.x ?? doc?.x ?? doc?.object?.x;
+    const y = doc?._source?.y ?? doc?.y ?? doc?.object?.y;
     return {
         x: Number.isFinite(x) ? x : null,
         y: Number.isFinite(y) ? y : null
@@ -1513,7 +1513,10 @@ export function createFireteamService({
         if (liveRevision === teamPlan.revision) {
             return { valid: true, reason: null, successor: null };
         }
-        if (combat.round !== teamPlan.round || combat.turn !== teamPlan.turn) {
+        // Foundry reports `combat.turn` as `null` until the first turn
+        // advances; plans normalize the missing value to 0 at build time.
+        if (_finiteOr(combat.round, 0) !== _finiteOr(teamPlan.round, 0)
+            || _finiteOr(combat.turn, 0) !== _finiteOr(teamPlan.turn, 0)) {
             return fail(TEAM_PLAN_REASONS.turnStale);
         }
         const seed = _finiteOr(teamPlan.seed, 0);

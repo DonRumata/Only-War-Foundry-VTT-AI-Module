@@ -3,7 +3,7 @@
  * candidate scoring, serializable plans and the stale-plan/replan policy.
  *
  * Design contract (epic #363):
- * - Planning works on an immutable DTO snapshot — a plain, JSON-serializable
+ * - Planning works on an immutable DTO snapshot вЂ” a plain, JSON-serializable
  *   object captured at planning time. Plans never hold Document instances.
  * - `planTurn(combat, combatant, context)` is deterministic: identical
  *   snapshot + preset weights + seed always produce the identical plan.
@@ -11,7 +11,7 @@
  *   by the recorded `plan.seed`.
  * - Sibling services are resolved lazily through the registry
  *   (`api.services.get("authority" | "perception" | "navigation")`) or
- *   injected via `context` — every lookup degrades to a safe fallback so
+ *   injected via `context` вЂ” every lookup degrades to a safe fallback so
  *   the planner works before/without the other stacked branches.
  * - `validateSnapshot(plan, currentContext)` runs before every
  *   state-changing step: a cheap revision fingerprint is compared first,
@@ -32,6 +32,7 @@ export const PLANNER_STATUS = Object.freeze({
     noAction: "no-action",
     noRoute: "no-route",
     disabled: "disabled",
+    unsupported: "unsupported",
     waitingForGm: "waiting-for-gm"
 });
 
@@ -106,7 +107,7 @@ export const SCORE_FACTORS = Object.freeze([
 ]);
 
 /**
- * Default weight set — the merge base for every registered preset. Combat
+ * Default weight set вЂ” the merge base for every registered preset. Combat
  * presets (issue #404+) override these values; the `0` entries simply keep
  * the new factors visible in score breakdowns without changing skeleton
  * behaviour.
@@ -218,7 +219,7 @@ export function stableStringify(value) {
 }
 
 /**
- * Mulberry32 PRNG — small, fast and fully deterministic for a given seed.
+ * Mulberry32 PRNG вЂ” small, fast and fully deterministic for a given seed.
  * @param {number} seed 32-bit integer seed.
  * @returns {Function} `() => number` in `[0, 1)`.
  */
@@ -301,8 +302,8 @@ function _actorOf(ref) {
  * @returns {{x: number|null, y: number|null}}
  */
 function _tokenPosition(doc) {
-    const x = doc?.x ?? doc?.object?.x;
-    const y = doc?.y ?? doc?.object?.y;
+    const x = doc?._source?.x ?? doc?.x ?? doc?.object?.x;
+    const y = doc?._source?.y ?? doc?.y ?? doc?.object?.y;
     return {
         x: Number.isFinite(x) ? x : null,
         y: Number.isFinite(y) ? y : null
@@ -402,7 +403,7 @@ function _resourcesOf(actor) {
 }
 
 /**
- * Fingerprint of the actor resource summary — compared by the
+ * Fingerprint of the actor resource summary вЂ” compared by the
  * `resources-changed` stale check.
  * @param {object|null} actor
  * @returns {string}
@@ -543,8 +544,8 @@ function _turnRevision(combat, combatant, authority) {
         round: combat?.round ?? null,
         turn: combat?.turn ?? null,
         tokenId: combatant?.tokenId ?? tokenDoc?.id ?? null,
-        x: tokenDoc?.x ?? null,
-        y: tokenDoc?.y ?? null,
+        x: tokenDoc?._source?.x ?? tokenDoc?.x ?? null,
+        y: tokenDoc?._source?.y ?? tokenDoc?.y ?? null,
         elevation: tokenDoc?.elevation ?? null,
         hidden: tokenDoc?.hidden === true,
         defeated: combatant?.defeated === true,
@@ -555,7 +556,7 @@ function _turnRevision(combat, combatant, authority) {
 
 /**
  * Fingerprint of exactly the fields the stale checks inspect. Compared
- * first in `validateSnapshot` — equal fingerprints mean the plan is still
+ * first in `validateSnapshot` вЂ” equal fingerprints mean the plan is still
  * valid without running the detailed checks.
  * @param {object} input Fingerprint input.
  * @param {object|null} input.combat Live combat document.
@@ -674,7 +675,7 @@ function _findToken(tokenId, { combat = null, scene = null } = {}) {
 }
 
 /**
- * Whether two dispositions are hostile to each other (hostile ↔ friendly).
+ * Whether two dispositions are hostile to each other (hostile в†” friendly).
  * Neutral tokens fight no one.
  * @param {*} a
  * @param {*} b
@@ -688,7 +689,7 @@ function _hostileTo(a, b) {
 
 /**
  * Build the immutable `PlanningSnapshot` for an AI combatant. Plain,
- * JSON-serializable data only — never Document references.
+ * JSON-serializable data only вЂ” never Document references.
  * @param {object} input Builder input.
  * @param {object|null} [input.combat] Combat document.
  * @param {object|null} [input.combatant] Active combatant document.
@@ -913,25 +914,35 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
  */
 function _normalizeAction(raw, index) {
     if (!raw || typeof raw !== "object") return null;
-    const type = STEP_TYPES.includes(raw.type) && raw.type !== "move" && raw.type !== "end-turn"
-        ? raw.type
-        : (raw.type === "attack" || raw.attack === true || raw.itemUuid || raw.weapon ? "attack" : "test");
+    if (raw.available === false) return null;
+    const kind = raw.kind ?? raw.type ?? null;
+    const attackLike = kind === "attack" || raw.attack === true || raw.itemUuid != null
+        || raw.weapon != null || raw.weaponId != null || raw.attackType != null;
+    let type;
+    if (attackLike) type = "attack";
+    else if (kind === "test" || kind === null || raw.test === true) type = "test";
+    else return null; // Movement/aim/etc are not attack/test candidates.
     const id = typeof raw.id === "string" && raw.id ? raw.id : `action-${index}`;
     const cls = raw.class ?? raw.system?.class ?? null;
+    const attackType = typeof raw.attackType === "string" ? raw.attackType : null;
     return {
         id,
         type,
-        name: raw.name ?? id,
-        itemUuid: raw.itemUuid ?? raw.item?.uuid ?? null,
-        itemId: raw.itemId ?? raw.item?.id ?? null,
+        attackType,
+        name: raw.name ?? raw.weaponName ?? id,
+        itemUuid: raw.itemUuid ?? raw.weaponUuid ?? raw.item?.uuid ?? null,
+        itemId: raw.itemId ?? raw.weaponId ?? raw.item?.id ?? null,
         class: cls,
         melee: raw.melee === true || String(cls ?? "").toLowerCase() === "melee",
-        charge: raw.charge === true || String(raw.mode ?? "").toLowerCase() === "charge",
+        charge: raw.charge === true || attackType === "charge"
+            || String(raw.mode ?? "").toLowerCase() === "charge",
         range: Number.isFinite(raw.range) ? raw.range
             : (Number.isFinite(raw.range?.value) ? raw.range.value
                 : (Number.isFinite(raw.system?.range) ? raw.system.range : null)),
         damage: _expectedDamage(raw.damage ?? raw.system?.damage ?? 0),
-        cost: raw.cost ?? null
+        cost: typeof raw.cost === "string"
+            ? { actions: raw.cost === "free" ? 0 : 1 }
+            : (raw.cost ?? null)
     };
 }
 
@@ -987,10 +998,53 @@ async function _resolveActions(actor, context) {
         ? raw.map((entry, index) => _normalizeAction(entry, index)).filter(Boolean)
         : [];
     if (!actions.length) actions = _fallbackActions(actor);
-    return actions
+    // Enrich normalized entries with the referenced weapon item: the system
+    // API action shape carries only weaponId/weaponName, not class/range/
+    // damage/uuid вЂ” melee detection and range depend on the item data.
+    const itemById = new Map();
+    for (const item of _list(actor?.items)) {
+        if (item?.id) itemById.set(item.id, item);
+    }
+    actions = actions.map(action => {
+        const item = action.itemId ? itemById.get(action.itemId) : null;
+        if (!item) return action;
+        const cls = action.class ?? item.system?.class ?? null;
+        return {
+            ...action,
+            itemUuid: action.itemUuid ?? item.uuid ?? null,
+            class: cls,
+            melee: action.melee || String(cls ?? "").toLowerCase() === "melee",
+            range: action.range ?? (Number.isFinite(item.system?.range) ? item.system.range : null),
+            damage: action.damage > 0 ? action.damage : _expectedDamage(item.system?.damage ?? 0)
+        };
+    });
+    actions = actions
         .sort((a, b) => (b.damage - a.damage)
             || ((_actionRange(b) - _actionRange(a)))
             || String(a.id).localeCompare(String(b.id)));
+    // The system API exposes one entry per attack type per weapon
+    // (standard/charge/allOut/вЂ¦) вЂ” deduplicate those per weapon so a
+    // multi-type weapon cannot crowd others out under DEFAULT_MAX_ACTIONS.
+    // Injected/custom actions (no attackType) always pass through.
+    const apiGroups = new Map();
+    const passthrough = [];
+    for (const action of actions) {
+        if (action.attackType == null) {
+            passthrough.push(action);
+            continue;
+        }
+        const key = action.itemUuid ?? action.itemId ?? action.id;
+        let group = apiGroups.get(key);
+        if (!group) {
+            group = [];
+            apiGroups.set(key, group);
+        }
+        group.push(action);
+    }
+    for (const group of apiGroups.values()) {
+        passthrough.push(group.find(a => a.attackType === "standard") ?? group[0]);
+    }
+    return passthrough;
 }
 
 /**
@@ -1108,7 +1162,23 @@ function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navi
     const stay = _normalizeMove({ x: selfPos.x, y: selfPos.y, cost: 0, key: "stay" },
         { ...input, stay: true });
     const moves = raw
-        .map(entry => _normalizeMove(entry, input))
+        .map(entry => {
+            const move = _normalizeMove(entry, input);
+            // Injected moves may arrive without a cover estimate; compute
+            // it through the navigation service so scoring sees the same
+            // data findCandidates would have produced.
+            if (move && !Number.isFinite(entry?.cover)
+                && navigation && typeof navigation.coverEstimate === "function") {
+                try {
+                    const estimate = navigation.coverEstimate(tokenDoc,
+                        { x: move.x, y: move.y }, targetPos);
+                    if (Number.isFinite(estimate)) move.cover = estimate;
+                } catch(_err) {
+                    // Cover stays 0.
+                }
+            }
+            return move;
+        })
         .filter(Boolean);
     if (stay && !moves.some(move => move.stay)) moves.unshift(stay);
     return moves
@@ -1117,7 +1187,7 @@ function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navi
 }
 
 /**
- * Factor vector of a candidate variant — the shared, data-driven scoring
+ * Factor vector of a candidate variant вЂ” the shared, data-driven scoring
  * input presets weight.
  * @param {object} input Factor input.
  * @param {string} input.variant Candidate variant kind.
@@ -1167,7 +1237,7 @@ function _factorsOf({ variant, target, move, action, moveBudget = null }) {
 }
 
 /**
- * Default utility evaluation: `Σ weight_i × factor_i` with an explainable
+ * Default utility evaluation: `ОЈ weight_i Г— factor_i` with an explainable
  * per-factor breakdown.
  * @param {object} factors
  * @param {object} weights
@@ -1190,7 +1260,7 @@ export function evaluateFactors(factors, weights) {
 }
 
 /**
- * Seeded Fisher–Yates pick inside the equal-score tie group. The same
+ * Seeded FisherвЂ“Yates pick inside the equal-score tie group. The same
  * seed always selects the same candidate; different seeds may differ.
  * @param {object[]} tied Candidates sharing the top score (pre-sorted).
  * @param {number} seed
@@ -1245,6 +1315,7 @@ function _stepsFor({ candidate }) {
                 targetTokenUuid: target.tokenUuid,
                 targetTokenId: target.tokenId,
                 range: _actionRange(action),
+                ...(action.attackType ? { attackType: action.attackType } : {}),
                 ...(variant === "charge" ? { mode: "charge" } : {})
             },
             preconditions: ["turn", "target", "resources"],
@@ -1369,9 +1440,29 @@ export function createPlannerService({
         const scene = _sceneOf(context, combat);
         const sceneId = scene?.id ?? null;
         const grid = _gridInfo(scene);
+        // Gridless scenes are rejected before planning: movement
+        // candidates and route scoring need a square/hex grid (issue
+        // #410). Navigation answers `gridless-unsupported` the same way.
+        if (grid.type === 0) {
+            return {
+                status: PLANNER_STATUS.unsupported,
+                reason: "gridless-unsupported",
+                plan: null,
+                diagnostics
+            };
+        }
         const selfPos = _tokenPosition(tokenDoc);
         const perception = _service("perception", context.perception);
         const navigation = _service("navigation", context.navigation);
+        // Prime the per-actor movement-rate cache: findCandidates is
+        // synchronous and resolves {mode} budgets only against prefetched
+        // rates (issue #398 system API or actor.system.movement).
+        if (navigation && context.rates == null
+            && typeof navigation.getMovementRates === "function") {
+            try { await navigation.getMovementRates(tokenDoc); } catch(_err) {
+                // Rates stay unresolved; findCandidates degrades to stay.
+            }
+        }
 
         const targets = _resolveTargets({
             combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context
@@ -1469,7 +1560,7 @@ export function createPlannerService({
                         });
                     }
                     let attackMoveFound = false;
-                    // A charge exists to close distance — when a melee
+                    // A charge exists to close distance вЂ” when a melee
                     // attack is already possible in place, repositioning
                     // move-attacks are only generated for ranged actions.
                     if (!melee || !inPlace) {
@@ -1524,8 +1615,8 @@ export function createPlannerService({
         }
 
         // Preset hooks see the caller context enriched with the resolved
-        // runtime facts — service lookups, scene, token and normalized
-        // targets — so evaluators can run LOS/cover probes without their
+        // runtime facts вЂ” service lookups, scene, token and normalized
+        // targets вЂ” so evaluators can run LOS/cover probes without their
         // own registry access. Caller-injected keys always win.
         const evalContext = {
             combat,
@@ -1688,7 +1779,7 @@ export function createPlannerService({
     /**
      * Validate a plan's snapshot against live state. Called by the
      * executor immediately before every state-changing step. The cheap
-     * stale fingerprint is compared first — an equal fingerprint returns
+     * stale fingerprint is compared first вЂ” an equal fingerprint returns
      * `valid` without running any detailed checks.
      * @param {object} plan Serialized plan with `snapshot`.
      * @param {object} [currentContext] Live overrides: `combat`,
@@ -1728,7 +1819,10 @@ export function createPlannerService({
             return { valid: true, reason: null };
         }
 
-        if (combat.round !== snapshot.round || combat.turn !== snapshot.turn) {
+        // Turn index stays null until the first advance; snapshots
+        // normalize both fields to 0, so the comparison must too.
+        if (_finiteOr(combat.round, 0) !== _finiteOr(snapshot.round, 0)
+            || _finiteOr(combat.turn, 0) !== _finiteOr(snapshot.turn, 0)) {
             return { valid: false, reason: STALE_REASONS.turnStale };
         }
         const position = _tokenPosition(tokenDoc);
@@ -1743,10 +1837,20 @@ export function createPlannerService({
         }
         if (snapshot.target) {
             const targetCombatant = _findCombatantByToken(combat, snapshot.target.tokenId);
+            // Perception stores token centres, injected targets may carry
+            // top-left positions вЂ” accept either coordinate basis so a
+            // standing target does not look "moved".
             const targetPos = _tokenPosition(targetToken);
-            if (!_targetAlive(targetToken, targetCombatant)
-                || targetPos.x !== snapshot.target.x
-                || targetPos.y !== snapshot.target.y) {
+            const targetDoc = _tokenDoc(targetToken);
+            const gridSize = snapshot.scene?.grid?.size ?? scene?.grid?.size ?? 100;
+            const halfW = (_finiteOr(targetDoc?.width, 1) * gridSize) / 2;
+            const halfH = (_finiteOr(targetDoc?.height, 1) * gridSize) / 2;
+            const unmoved = [
+                { x: targetPos.x, y: targetPos.y },
+                { x: targetPos.x + halfW, y: targetPos.y + halfH }
+            ].some(point => point.x === snapshot.target.x
+                && point.y === snapshot.target.y);
+            if (!_targetAlive(targetToken, targetCombatant) || !unmoved) {
                 return { valid: false, reason: STALE_REASONS.targetGone };
             }
         }
@@ -1756,7 +1860,7 @@ export function createPlannerService({
         if ((collision ?? null) !== (snapshot.scene?.collisionRevision ?? null)) {
             return { valid: false, reason: STALE_REASONS.collisionChanged };
         }
-        // Fingerprint covered a field no check owns — defensive fallback.
+        // Fingerprint covered a field no check owns вЂ” defensive fallback.
         return { valid: false, reason: STALE_REASONS.stale };
     }
 
@@ -1787,7 +1891,7 @@ export function createPlannerService({
      * @param {object|string} failure `{reason, plan?, replanCount?,
      *   maxReplans?}` or a bare reason string.
      * @returns {object} `{replan, action, reason, originalReason,
-     *   replanCount, report}` — `action` is `"replan"` or
+     *   replanCount, report}` вЂ” `action` is `"replan"` or
      *   `"hold-and-report"`.
      */
     function shouldReplan(failure = {}) {

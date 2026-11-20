@@ -877,15 +877,23 @@ export function createGridAdapter(env = {}) {
         if (!sc) return null;
         const dims = sc.dimensions ?? _canvas()?.dimensions ?? {};
         const size = describe()?.size ?? 100;
-        const x0 = Number.isFinite(dims.sceneX) ? dims.sceneX : 0;
-        const y0 = Number.isFinite(dims.sceneY) ? dims.sceneY : 0;
-        const width = Number.isFinite(dims.width) ? dims.width : (sc.width ?? 0);
-        const height = Number.isFinite(dims.height) ? dims.height : (sc.height ?? 0);
+        // `toOffset` resolves scene-space coordinates (token x/y start at
+        // 0,0 on the scene rect), so the bounds must come from the scene
+        // rect in scene space. sceneX/sceneY/width/height on dimensions
+        // describe the padded canvas rect instead — using them would
+        // shift the playable area by the padding and mark tokens near
+        // the scene edge out of bounds (issue #410).
+        const width = Number.isFinite(sc.width) ? sc.width
+            : (Number.isFinite(dims.sceneWidth) ? dims.sceneWidth
+                : (Number.isFinite(dims.width) ? dims.width : 0));
+        const height = Number.isFinite(sc.height) ? sc.height
+            : (Number.isFinite(dims.sceneHeight) ? dims.sceneHeight
+                : (Number.isFinite(dims.height) ? dims.height : 0));
         if (width <= 0 || height <= 0) {
             return { iMin: 0, jMin: 0, iMax: 0, jMax: 0 };
         }
-        const min = toOffset({ x: x0 + 1, y: y0 + 1 }) ?? { i: 0, j: 0 };
-        const max = toOffset({ x: x0 + width - 1, y: y0 + height - 1 })
+        const min = toOffset({ x: 1, y: 1 }) ?? { i: 0, j: 0 };
+        const max = toOffset({ x: width - 1, y: height - 1 })
             ?? { i: Math.ceil(height / size) - 1, j: Math.ceil(width / size) - 1 };
         return { iMin: min.i, jMin: min.j, iMax: max.i, jMax: max.j };
     }
@@ -1139,7 +1147,12 @@ export function buildNavigationContext(token, options = {}) {
         };
     }
     const doc = _tokenDoc(token);
-    const origin = doc ? adapter.toOffset({ x: doc.x ?? token?.object?.x, y: doc.y ?? token?.object?.y }) : null;
+    const origin = doc
+        ? adapter.toOffset({
+            x: doc._source?.x ?? doc.x ?? token?.object?.x,
+            y: doc._source?.y ?? doc.y ?? token?.object?.y
+        })
+        : null;
     if (!doc || !origin) {
         return {
             status: NAVIGATION_STATUS.failed,
@@ -1262,8 +1275,8 @@ export function buildNavigationContext(token, options = {}) {
     }
 
     const center = {
-        x: doc.x + (fw / 2),
-        y: doc.y + (fh / 2)
+        x: (doc._source?.x ?? doc.x) + (fw / 2),
+        y: (doc._source?.y ?? doc.y) + (fh / 2)
     };
 
     return {
@@ -1288,6 +1301,7 @@ export function buildNavigationContext(token, options = {}) {
         toOffset: point => adapter.toOffset(point),
         toPoint: offset => footprintCenter(offset),
         los: (a, b) => adapter.hasLineOfSight(a, b),
+        moveBlocked: (a, b) => adapter.checkCollision(a, b, "move"),
         measureCost: points => adapter.measurePathCost(doc, points)
     };
 }
@@ -1312,8 +1326,10 @@ function _destinationOffset(destination, context) {
         return context.toOffset(destination);
     }
     const doc = _tokenDoc(destination);
-    if (doc && Number.isFinite(doc.x) && Number.isFinite(doc.y)) {
-        return context.toOffset({ x: doc.x, y: doc.y });
+    const docX = doc?._source?.x ?? doc?.x;
+    const docY = doc?._source?.y ?? doc?.y;
+    if (doc && Number.isFinite(docX) && Number.isFinite(docY)) {
+        return context.toOffset({ x: docX, y: docY });
     }
     return null;
 }
@@ -1636,8 +1652,6 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
     if (reachable.status !== NAVIGATION_STATUS.ok) return reachable;
 
     const size = context.grid.size;
-    const fw = context.footprint.w * size;
-    const fh = context.footprint.h * size;
     const candidates = [];
     for (const cell of reachable.cells) {
         const point = { x: cell.x, y: cell.y };
@@ -1656,15 +1670,7 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
         }
         let cover = null;
         if (targetPoint && options.includeCover === true) {
-            const probes = [
-                point,
-                { x: point.x - (0.45 * fw), y: point.y - (0.45 * fh) },
-                { x: point.x + (0.45 * fw), y: point.y - (0.45 * fh) },
-                { x: point.x - (0.45 * fw), y: point.y + (0.45 * fh) },
-                { x: point.x + (0.45 * fw), y: point.y + (0.45 * fh) }
-            ];
-            const blocked = probes.filter(p => !context.los(p, targetPoint)).length;
-            cover = blocked / probes.length;
+            cover = estimateCover(point, targetPoint, context);
         }
         const score = (weights.distance * -(distance ?? 0))
             + (weights.los * (los === true ? 1 : 0))
@@ -1776,6 +1782,37 @@ export function resolveBudget(budget, rates = null, gridDistance = 1) {
         cells: meters / distance,
         mode
     };
+}
+
+/**
+ * Fraction of footprint probe points blocked from the target point by
+ * walls — the same estimate {@link findCandidates} attaches to move
+ * candidates. Shared so callers injecting their own moves (planner
+ * tests, presets) get identical cover semantics.
+ * @param {{x: number, y: number}} point Cell centre in pixels.
+ * @param {{x: number, y: number}} targetPoint Target point in pixels.
+ * @param {object} context Navigation context from
+ *   {@link buildNavigationContext}.
+ * @returns {number} 0..1 cover fraction.
+ */
+export function estimateCover(point, targetPoint, context) {
+    if (typeof context?.los !== "function" || !point || !targetPoint) return 0;
+    const size = context?.grid?.size ?? 100;
+    const fw = (context?.footprint?.w ?? 1) * size;
+    const fh = (context?.footprint?.h ?? 1) * size;
+    const probes = [
+        point,
+        { x: point.x - (0.45 * fw), y: point.y - (0.45 * fh) },
+        { x: point.x + (0.45 * fw), y: point.y - (0.45 * fh) },
+        { x: point.x - (0.45 * fw), y: point.y + (0.45 * fh) },
+        { x: point.x + (0.45 * fw), y: point.y + (0.45 * fh) }
+    ];
+    // A probe counts as covered when the line crosses a wall in any sense:
+    // sight walls give full concealment, move-only walls (barricades) give
+    // partial cover without breaking line of sight.
+    const covered = p => context.los(p, targetPoint) !== true
+        || context.moveBlocked?.(p, targetPoint) === true;
+    return probes.filter(covered).length / probes.length;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2040,6 +2077,22 @@ export function createNavigationService({ api = null, adapter = null } = {}) {
         gridInfo,
         getMovementRates: movementRates,
         resolveBudget,
+        /**
+         * Cover fraction of a candidate cell against a target point.
+         * Builds the navigation context internally.
+         * @param {*} token Token document used for the footprint context.
+         * @param {{x: number, y: number}} point Candidate centre in pixels.
+         * @param {{x: number, y: number}} targetPoint Target point.
+         * @param {object} [options] Context overrides.
+         * @returns {number}
+         */
+        coverEstimate(token, point, targetPoint, options = {}) {
+            try {
+                return estimateCover(point, targetPoint, _context(token, options));
+            } catch(_err) {
+                return 0;
+            }
+        },
         planRoute,
         planRouteForMode,
         canReach,

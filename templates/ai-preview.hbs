@@ -19,7 +19,7 @@
             <span class="ow-ai-value">{{npc.presetLabel}}</span>
         </div>
         <div class="form-group">
-            <label>{{localize "OWAI.Preview.Target"}}</label>
+            <label>{{localize "OWAI.Preview.Target.Label"}}</label>
             <span class="ow-ai-value">
                 {{#if target}}
                 {{target.name}}{{#if target.x}} ({{target.x}}, {{target.y}}){{/if}}
@@ -29,7 +29,7 @@
             </span>
         </div>
         <div class="form-group">
-            <label>{{localize "OWAI.Preview.Action"}}</label>
+            <label>{{localize "OWAI.Preview.Action.Label"}}</label>
             <span class="ow-ai-value">
                 {{#if action}}
                 {{action.typeLabel}}{{#if action.name}}: {{action.name}}{{/if}}{{#if action.mode}} ({{action.mode}}){{/if}}
@@ -48,7 +48,7 @@
     </div>
 
     <fieldset>
-        <legend>{{localize "OWAI.Preview.Route"}}</legend>
+        <legend>{{localize "OWAI.Preview.Route.Label"}}</legend>
         {{#if route}}
         <ol class="ow-ai-route">
             {{#each route.points}}
@@ -76,7 +76,7 @@
     </fieldset>
 
     <fieldset>
-        <legend>{{localize "OWAI.Preview.Projected"}}</legend>
+        <legend>{{localize "OWAI.Preview.Projected.Label"}}</legend>
         <ul class="ow-ai-resources">
             {{#each resources}}
             <li>{{this.label}}: {{this.value}}</li>

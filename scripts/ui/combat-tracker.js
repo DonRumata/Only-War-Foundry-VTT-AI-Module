@@ -16,7 +16,9 @@ import { isModuleEnabled } from "../module-state.js";
 /** Register the combat tracker context menu hook. Called on `init`. */
 export function registerCombatTrackerControls() {
     Hooks.on("getCombatTrackerEntryContext", (_html, menu) => {
-        if (!isModuleEnabled()) return;
+        // AI controls are GM-only: a player client never sees them, just
+        // like the preview dialog.
+        if (!isModuleEnabled() || !game.user?.isGM) return;
         if (!Array.isArray(menu)) return;
 
         menu.push({

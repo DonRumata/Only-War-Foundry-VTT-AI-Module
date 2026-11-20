@@ -731,9 +731,14 @@ test("rememberPositions records visible contacts into the combatant flag", async
     const restore = installCanvas({ tokens: [viewer, target], testVisibility: () => true });
     try {
         const memory = await service.rememberPositions(combat, combatant);
+        // Storage shape is an array of {tokenUuid, ...} entries (Foundry
+        // expands dotted object keys in flags, so the map cannot persist
+        // as a bare object).
         const stored = combatant.getFlag(MODULE_ID, FLAG_KEYS.memory);
-        assert.deepEqual(stored, memory, "memory persisted on the combatant flag");
-        const entry = stored[target.uuid];
+        assert.ok(Array.isArray(stored), "memory persisted as an entry array");
+        assert.deepEqual(stored.map((e) => e.tokenUuid).sort(), Object.keys(memory).sort(),
+            "every remembered uuid persisted");
+        const entry = stored.find((e) => e.tokenUuid === target.uuid);
         assert.ok(entry, "contact recorded");
         assert.equal(entry.sceneId, "scene-1");
         assert.equal(entry.x, 250);
@@ -824,7 +829,7 @@ test("expireMemory removes entries after three rounds and forgetToken prunes del
         // Three full rounds → forgotten.
         combat = mockCombat({ round: 5, combatants: [combatant] });
         assert.equal(await service.expireMemory(combat), 1);
-        assert.deepEqual(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory), {});
+        assert.deepEqual(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory), []);
 
         // Re-record, then the token disappears → forgetToken prunes it.
         await combatant.setFlag(MODULE_ID, FLAG_KEYS.memory, {
@@ -834,7 +839,7 @@ test("expireMemory removes entries after three rounds and forgetToken prunes del
         game.combat = combat;
         try {
             assert.equal(await service.forgetToken(target.uuid), 1);
-            assert.deepEqual(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory), {});
+            assert.deepEqual(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory), []);
         } finally {
             game.combat = previousCombat;
         }

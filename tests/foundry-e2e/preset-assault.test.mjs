@@ -26,6 +26,7 @@ async function setup() {
   // NPC with a melee weapon and a short-range lasgun so the assault
   // preset can express charge vs move+ranged choices deterministically.
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
+    await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       { name: 'Chainsword', type: 'weapon', system: { class: 'melee', damage: '1d10+4' } },
       { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 8, damage: '1d10+3' } }

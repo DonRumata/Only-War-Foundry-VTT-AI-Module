@@ -301,6 +301,20 @@ test("planTurn returns no-route when a far target cannot be reached", async () =
     assert.equal(result.reason, "no-route");
 });
 
+test("planTurn rejects gridless scenes with a controlled unsupported result", async () => {
+    const world = makeWorld();
+    world.combat.scene = {
+        ...world.scene,
+        grid: { type: 0, size: world.scene.grid.size, distance: world.scene.grid.distance }
+    };
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, { seed: 1 });
+    assert.equal(result.status, PLANNER_STATUS.unsupported);
+    assert.equal(result.reason, "gridless-unsupported");
+    assert.equal(result.plan, null);
+    assert.ok(result.diagnostics, "diagnostics still returned for the report");
+});
+
 test("validateSnapshot accepts an unchanged world (revision fast-path)", async () => {
     const world = makeWorld();
     const planner = createPlannerService();

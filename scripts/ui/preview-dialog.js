@@ -28,6 +28,7 @@
  *   cancels — never confirms.
  */
 import { MODULE_ID } from "../constants.js";
+import { isModuleEnabled } from "../module-state.js";
 import { STALE_REASONS } from "../planner.js";
 import {
     getExecutionMode,
@@ -821,7 +822,9 @@ export function createPreviewController({
      *   session?: object, duplicate?: boolean}}
      */
     function openPreview(payload = {}) {
-        if (api && api.enabled === false) {
+        // The master switch (`isModuleEnabled`) disables previews too —
+        // `api.enabled` alone only reflects the compatibility gate.
+        if (!isModuleEnabled()) {
             return { ok: false, reason: PREVIEW_REASONS.moduleDisabled };
         }
         if (getMode() !== "preview") {
@@ -1021,7 +1024,14 @@ export function createPreviewController({
  * `module.js`). Called on `init`.
  * @returns {object} Preview controller.
  */
-export function registerPreviewUI() {
+/**
+ * Register the preview UI: build the controller with the module API (for
+ * lazy service lookups — operations/authority/executor/planner), wire the
+ * hooks and return the controller.
+ * @param {object} [api] Module API object (`api.services` registry).
+ * @returns {object} Preview controller.
+ */
+export function registerPreviewUI(api = null) {
     const ApplicationBase = globalThis.foundry?.appv1?.api?.Application
         ?? globalThis.Application
         ?? null;
@@ -1125,7 +1135,7 @@ export function registerPreviewUI() {
         console.warn(`${MODULE_ID} | Application class unavailable; GM preview runs headless`);
     }
 
-    controller = createPreviewController({ present });
+    controller = createPreviewController({ api, present });
 
     if (typeof globalThis.Hooks?.on !== "function") return controller;
 

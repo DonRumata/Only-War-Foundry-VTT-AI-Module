@@ -135,12 +135,17 @@ async function testMemoryLifecycle() {
     const combatant = combat.combatants.get(data.combatantId);
     await combat.update({ round: 1, turn: 0 });
     const memory = await perception.rememberPositions(combat, combatant);
-    const stored = combatant.getFlag('only-war-ai', 'memory') ?? {};
+    const rawStored = combatant.getFlag('only-war-ai', 'memory');
+    // Storage shape is an array of {tokenUuid, ...} (uuid keys with dots
+    // cannot be stored as a bare flag object).
+    const stored = Array.isArray(rawStored)
+      ? rawStored.map((e) => e?.tokenUuid)
+      : Object.keys(rawStored ?? {});
     const npc = canvas.tokens.get(data.npcTokenId);
     const snapshot = perception.buildPerceptionSnapshot({ combat, combatant, token: npc });
     return {
       memoryKeys: Object.keys(memory),
-      storedKeys: Object.keys(stored),
+      storedKeys: stored,
       snapshotVisible: snapshot.visibleTargets.map((t) => t.tokenId),
       snapshotKnown: snapshot.lastKnownTargets.map((t) => t.tokenUuid),
       snapshotStatus: snapshot.status,
@@ -160,7 +165,7 @@ async function testMemoryLifecycle() {
   const second = await page.evaluate(async (data) => {
     const perception = game.modules.get('only-war-ai')?.api?.services?.get?.('perception');
     const tokenDoc = canvas.scene.tokens.get(data.openTokenId);
-    await tokenDoc.update({ x: 1700, y: 1100 });
+    await tokenDoc.update({ x: 1700, y: 400 }, { animate: false });
     const combat = game.combats.get(data.combatId);
     const combatant = combat.combatants.get(data.combatantId);
     const npc = canvas.tokens.get(data.npcTokenId);

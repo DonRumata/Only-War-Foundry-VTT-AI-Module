@@ -235,7 +235,9 @@ function _selfPos(context = {}) {
     const raw = context.selfPos ?? context.position ?? null;
     if (Number.isFinite(raw?.x) && Number.isFinite(raw?.y)) return { x: raw.x, y: raw.y };
     const doc = _contextToken(context);
-    if (Number.isFinite(doc?.x) && Number.isFinite(doc?.y)) return { x: doc.x, y: doc.y };
+    const docX = doc?._source?.x ?? doc?.x;
+    const docY = doc?._source?.y ?? doc?.y;
+    if (Number.isFinite(docX) && Number.isFinite(docY)) return { x: docX, y: docY };
     return null;
 }
 

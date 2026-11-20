@@ -13,10 +13,31 @@ fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 
 export async function getPage(browser) {
   const context = browser.contexts()[0] || await browser.newContext();
-  return context.pages()[0] || await context.newPage();
+  const pages = context.pages();
+  // A stale player tab can outrank `pages()[0]` after multi-client tests —
+  // prefer the page joined as a GM when one is already in the world.
+  for (const candidate of pages) {
+    try {
+      const isGM = await candidate.evaluate(() => globalThis.game?.user?.isGM === true);
+      if (isGM) return candidate;
+    } catch { /* tab without a game session */ }
+  }
+  return pages[0] || await context.newPage();
 }
 
-export async function ensureJoinedGame(page) {
+export async function getGmPage(browser) {
+  const context = browser.contexts()[0] || await browser.newContext();
+  // A stale player tab may outrank `pages()[0]` — pick the GM client.
+  for (const candidate of context.pages()) {
+    try {
+      const isGM = await candidate.evaluate(() => globalThis.game?.user?.isGM === true);
+      if (isGM) return candidate;
+    } catch { /* tab without a game session */ }
+  }
+  return getPage(browser);
+}
+
+export async function ensureJoinedGame(page, { preferGM = true } = {}) {
   await page.setViewportSize({ width: 1400, height: 900 });
   await page.setExtraHTTPHeaders({
     'Cache-Control': 'no-cache, no-store, must-revalidate',
@@ -24,14 +45,30 @@ export async function ensureJoinedGame(page) {
   });
   const url = page.url();
 
-  if (url.includes('/game') && !process.env.FOUNDRY_RELOAD) {
-    await page.waitForTimeout(500);
-    return;
-  }
-
   if (url.includes('/game')) {
-    await page.evaluate(() => window.location.reload(true));
-    await page.waitForLoadState('load');
+    if (process.env.FOUNDRY_RELOAD) {
+      await page.evaluate(() => window.location.reload(true));
+      await page.waitForLoadState('load');
+    }
+    await page.waitForFunction(
+      () => typeof game !== 'undefined' && game?.ready && game?.user,
+      { timeout: 30000 }).catch(() => {});
+    // The browser profile auto-joins the last-used user — a stale player
+    // session must be logged out before joining as GM.
+    const isGM = await page.evaluate(() => globalThis.game?.user?.isGM === true)
+        .catch(() => false);
+    if (!preferGM || isGM) {
+      await page.waitForTimeout(500);
+      return;
+    }
+    try {
+      await Promise.all([
+        page.waitForURL(`${FOUNDRY_URL}/join`, { timeout: 15000 }),
+        page.evaluate(() => game.logOut())
+      ]);
+    } catch {
+      await page.goto(`${FOUNDRY_URL}/join`, { waitUntil: 'load' });
+    }
   } else {
     await page.goto(`${FOUNDRY_URL}/game`, { waitUntil: 'load' });
   }
@@ -48,9 +85,12 @@ export async function ensureJoinedGame(page) {
     return options.some((o) => o.value);
   }, { timeout: 10000 });
   const userId = await page.evaluate(() => {
-    const options = Array.from(document.querySelectorAll('select[name="userid"] option'));
-    const first = options.find((o) => o.value);
-    return first ? first.value : null;
+    const options = Array.from(document.querySelectorAll('select[name="userid"] option'))
+        .filter((o) => o.value);
+    // Prefer a GM-looking user — a fresh page must never join as an
+    // E2E player account left over from multi-client tests.
+    const gm = options.find((o) => /gamemaster|\bgm\b/i.test(o.textContent ?? ''));
+    return (gm ?? options[0])?.value ?? null;
   });
   if (!userId) throw new Error('No selectable user on /join page');
   await page.locator('select[name="userid"]').selectOption(userId, { force: true });
@@ -106,7 +146,7 @@ export async function openActorSheet(page, actorId) {
 }
 
 export async function createTestScene(page, { grid = 1, size = 100 } = {}) {
-  return page.evaluate(async (data) => {
+  const sceneId = await page.evaluate(async (data) => {
     const scene = await Scene.create({
       name: `E2E Scene ${Date.now()}`,
       active: true,
@@ -117,6 +157,13 @@ export async function createTestScene(page, { grid = 1, size = 100 } = {}) {
     if (canvas.scene?.id !== scene.id) await scene.activate();
     return scene.id;
   }, { grid, size });
+  // Scene activation re-draws the canvas asynchronously; dependent-token
+  // updates (actor flags) crash while RenderFlags queues are unavailable.
+  await page.waitForFunction((sid) =>
+    canvas.scene?.id === sid && !!canvas.pendingRenderFlags && !!canvas.tokens,
+    sceneId, { timeout: 15000 });
+  await page.waitForTimeout(300);
+  return sceneId;
 }
 
 export async function deleteScene(page, sceneId) {
@@ -148,6 +195,9 @@ export async function createCombat(page, tokenIds) {
     const combat = await Combat.create({ scene: canvas.scene?.id ?? null });
     await combat.createEmbeddedDocuments('Combatant', ids.map((tokenId) => ({ tokenId })));
     await combat.activate();
+    // v13: game.combat resolves to the tracker's viewed combat, not the
+    // active one — pin the created encounter so tests see it via game.combat.
+    try { if (ui.combat) ui.combat.viewed = combat; } catch { /* headless */ }
     return combat.id;
   }, tokenIds);
 }

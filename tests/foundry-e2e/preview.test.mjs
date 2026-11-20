@@ -37,6 +37,9 @@ async function setup() {
   console.log('Connected to Foundry game session');
 
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
+    // Agility feeds `computeMovement` — without it the move budget is 0
+    // and the planner legitimately picks attack-in-place.
+    await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       {
         name: 'Auto Pistol',
@@ -105,7 +108,11 @@ async function runPlan() {
 async function npcPosition() {
   return page.evaluate((tid) => {
     const token = canvas.scene?.tokens?.get(tid);
-    return token ? { x: token.x, y: token.y } : null;
+    // `token.x` is the animated position — `_source` holds the applied
+    // document coordinates even while the placeable is still moving.
+    return token
+      ? { x: token._source?.x ?? token.x, y: token._source?.y ?? token.y }
+      : null;
   }, npcTokenId);
 }
 
@@ -140,7 +147,9 @@ async function testConfirmExecutes() {
   await page.waitForFunction(
     (data) => {
       const token = canvas.scene?.tokens?.get(data.npcTokenId);
-      return token && (token.x !== data.x || token.y !== data.y);
+      const x = token?._source?.x ?? token?.x;
+      const y = token?._source?.y ?? token?.y;
+      return token && (x !== data.x || y !== data.y);
     },
     { npcTokenId, x: before.x, y: before.y },
     { timeout: 15000 }

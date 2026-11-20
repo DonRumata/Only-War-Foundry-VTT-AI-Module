@@ -27,6 +27,7 @@ async function setup() {
   // NPC carries a single lasgun (10u range) so the ranged-cover preset
   // picks firing positions; the enemy is a plain hostile.
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
+    await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 10, damage: '1d10+3' } }
     ]);
@@ -49,7 +50,7 @@ async function setup() {
     const scene = game.scenes.get(data.sceneId);
     const walls = await scene.createEmbeddedDocuments('Wall', [
       { c: [650, 200, 650, 800], sight: 20, move: 20, door: 0 },
-      { c: [800, 600, 800, 700], sight: 0, move: 20, door: 0 }
+      { c: [800, 600, 800, 680], sight: 0, move: 20, door: 0 }
     ]);
     return walls.map((w) => w.id);
   }, { sceneId });

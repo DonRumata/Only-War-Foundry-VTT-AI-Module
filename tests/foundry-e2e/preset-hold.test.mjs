@@ -27,6 +27,7 @@ async function setup() {
   // NPC carries a single lasgun (30u range) so the hold preset keeps a
   // firing position; the enemy is a plain hostile.
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
+    await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 30, damage: '1d10+3' } }
     ]);

@@ -1,4 +1,4 @@
-import { chromium } from 'playwright-core';
+﻿import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
 import * as h from './lib.mjs';
 
@@ -24,6 +24,11 @@ async function setup() {
 
   actorIds.push(await h.createTestActor(page, 'npc', names.leader));
   actorIds.push(await h.createTestActor(page, 'npc', names.flanker));
+  await page.evaluate(async (ids) => {
+    for (const id of ids.slice(0, 2)) {
+      await game.actors.get(id).update({ 'system.characteristics.agility.base': 40 });
+    }
+  }, actorIds);
   for (const name of names.enemies) {
     actorIds.push(await h.createTestActor(page, 'npc', name));
   }
@@ -55,7 +60,7 @@ async function testSpecOpsFlankAndFix() {
   }, npcTokenIds);
   assert.ok(combatantIds && combatantIds.length === 2, 'two npc combatants in team alpha');
 
-  // Injected shared targets: the three enemy tokens (outnumbered → the
+  // Injected shared targets: the three enemy tokens (outnumbered в†’ the
   // spec-ops selector should commit to flank-and-fix on open ground).
   const targets = await page.evaluate((tids) => tids.map((tid) => {
     const doc = canvas.scene?.tokens?.get(tid);
@@ -120,7 +125,7 @@ async function testLeaderLossDeterministicSuccessor(state) {
     .get('only-war-ai').api.services.get('fireteam').validateTeamPlan(p, { combat: game.combat }), plan);
   assert.equal(fresh.valid, true, 'fresh spec-ops plan validates');
 
-  // Leader defeated → leader-lost + deterministic successor election.
+  // Leader defeated в†’ leader-lost + deterministic successor election.
   await page.evaluate(async (cid) => {
     await game.combat.combatants.get(cid).update({ defeated: true });
   }, plan.leaderId);
@@ -163,6 +168,6 @@ async function cleanup() {
     process.exit(1);
   } finally {
     try { await cleanup(); } catch { /* ignore */ }
-    try { await browser?.close(); } catch { /* ignore */ }
+    // CDP: browser.close() would tear down the shared context — the connection ends with the process.
   }
 })();

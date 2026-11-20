@@ -295,7 +295,11 @@ function _selfPos(context = {}) {
     const raw = context.selfPos ?? context.position ?? null;
     if (Number.isFinite(raw?.x) && Number.isFinite(raw?.y)) return { x: raw.x, y: raw.y };
     const doc = context.token?.document ?? context.token ?? null;
-    if (Number.isFinite(doc?.x) && Number.isFinite(doc?.y)) return { x: doc.x, y: doc.y };
+    const docX = doc?._source?.x ?? doc?.x;
+    const docY = doc?._source?.y ?? doc?.y;
+    if (Number.isFinite(docX) && Number.isFinite(docY)) {
+        return _centerOf({ ...doc, x: docX, y: docY }, context);
+    }
     return null;
 }
 
@@ -315,6 +319,28 @@ function _candidatePoint(candidate = {}, context = {}) {
 }
 
 /**
+ * Centre point of a token-like target entry. Planner targets carry the
+ * top-left document position; LOS/cover probes must aim at the token
+ * centre, not its corner.
+ * @param {object|null} entry
+ * @param {object} context
+ * @returns {{x: number, y: number}|null}
+ */
+function _centerOf(entry = {}, context = {}) {
+    if (Number.isFinite(entry?.center?.x) && Number.isFinite(entry?.center?.y)) {
+        return { x: entry.center.x, y: entry.center.y };
+    }
+    const x = _finiteOr(entry?.x, NaN);
+    const y = _finiteOr(entry?.y, NaN);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const size = _finiteOr(context?.grid?.size,
+        _finiteOr(globalThis.canvas?.scene?.grid?.size, 100));
+    const halfW = (size * _finiteOr(entry?.width ?? entry?.w, 1)) / 2;
+    const halfH = (size * _finiteOr(entry?.height ?? entry?.h, 1)) / 2;
+    return { x: x + halfW, y: y + halfH };
+}
+
+/**
  * The nearest hostile threat to a point: the closest entry of the
  * context's target list — injected `context.targets`, else the planner's
  * resolved `context.resolvedTargets` (stable first-wins order) — or the
@@ -331,21 +357,16 @@ function _threatPoint(candidate = {}, context = {}, from = null) {
     let best = null;
     let bestDistance = Infinity;
     for (const entry of pool) {
-        const x = _finiteOr(entry?.x, NaN);
-        const y = _finiteOr(entry?.y, NaN);
-        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
-        const distance = from ? Math.hypot(x - from.x, y - from.y) : 0;
+        const center = _centerOf(entry, context);
+        if (!center) continue;
+        const distance = from ? Math.hypot(center.x - from.x, center.y - from.y) : 0;
         if (distance < bestDistance) {
             bestDistance = distance;
-            best = { x, y };
+            best = center;
         }
     }
     if (best) return best;
-    const target = candidate.target;
-    if (Number.isFinite(target?.x) && Number.isFinite(target?.y)) {
-        return { x: target.x, y: target.y };
-    }
-    return null;
+    return _centerOf(candidate.target ?? null, context);
 }
 
 /**
@@ -393,9 +414,7 @@ function _probeCandidate(candidate = {}, context = {}) {
     const walls = _wallsOf(context);
     const point = _candidatePoint(candidate, context);
     const target = candidate.target ?? null;
-    const to = Number.isFinite(target?.x) && Number.isFinite(target?.y)
-        ? { x: target.x, y: target.y }
-        : null;
+    const to = _centerOf(target, context);
     const threat = _threatPoint(candidate, context, point) ?? to;
     const los = _losAt({ from: point, to, move: candidate.move, context, walls });
     const crossed = _crossingCount(point, threat, walls, ["sight", "move"]);

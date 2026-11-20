@@ -256,7 +256,7 @@ function _registerNavigationService(api) {
  * @param {object} api Module API object.
  */
 function _registerPreviewService(api) {
-    const controller = registerPreviewUI();
+    const controller = registerPreviewUI(api);
     if (api?.services && !api.services.has("preview")) {
         api.services.register("preview", controller);
     }

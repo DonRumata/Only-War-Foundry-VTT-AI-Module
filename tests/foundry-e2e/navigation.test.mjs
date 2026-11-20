@@ -1,4 +1,4 @@
-import { chromium } from 'playwright-core';
+﻿import { chromium } from 'playwright-core';
 import assert from 'node:assert/strict';
 import * as h from './lib.mjs';
 
@@ -73,17 +73,22 @@ async function testServiceRegistered() {
 async function testSquareRouteAroundWall() {
     const sceneId = await createScene(1);
     const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
-    // Vertical wall at x=1000 covering y=400..1600 — the route from
+    // Vertical wall at x=1000 covering y=400..1600 вЂ” the route from
     // (5,5) to (5,15) must detour to rows 0-3 or 16-19.
     await createWalls(sceneId, [
-        { c: [1000, 400, 1000, 1600], move: 1, sight: 1, door: 0 }
+        { c: [1000, 400, 1000, 1600], move: 20, sight: 20, door: 0 }
     ]);
     const result = await planRoute(sceneId, tokenId, { x: 1550, y: 550 }, 30);
     assert.equal(result.status, 'ok', `expected exact route, got ${result.status}:${result.reason}`);
     assert.equal(result.exact, true);
-    const distance = await page.evaluate(() => canvas.scene.grid.distance);
-    const straight = 10 * distance;
-    assert.ok(result.cost > straight, `detour cost ${result.cost} exceeds straight ${straight}`);
+    // Equidistant diagonals cost 1 step, so the detour can equal the
+    // straight-line cell cost вЂ” assert the *pixel* length instead.
+    let length = 0;
+    for (let i = 1; i < result.path.length; i++) {
+        length += Math.hypot(result.path[i].x - result.path[i - 1].x,
+            result.path[i].y - result.path[i - 1].y);
+    }
+    assert.ok(length > 1000, `detour length ${length} exceeds straight 1000px`);
     assert.ok(Array.isArray(result.path) && result.path.length >= 2);
     assert.ok(result.path.every(w => Number.isFinite(w.x) && Number.isFinite(w.y)
         && Number.isFinite(w.i) && Number.isFinite(w.j)), 'path is serializable');
@@ -103,12 +108,12 @@ async function testSquareRouteAroundWall() {
 async function testUnreachableEndpoint() {
     const sceneId = await createScene(1);
     const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
-    // Seal cell (5,15) — walls on all four sides.
+    // Seal cell (5,15) вЂ” walls on all four sides.
     await createWalls(sceneId, [
-        { c: [1500, 500, 1500, 600], move: 1, sight: 1, door: 0 },
-        { c: [1600, 500, 1600, 600], move: 1, sight: 1, door: 0 },
-        { c: [1500, 500, 1600, 500], move: 1, sight: 1, door: 0 },
-        { c: [1500, 600, 1600, 600], move: 1, sight: 1, door: 0 }
+        { c: [1500, 500, 1500, 600], move: 20, sight: 20, door: 0 },
+        { c: [1600, 500, 1600, 600], move: 20, sight: 20, door: 0 },
+        { c: [1500, 500, 1600, 500], move: 20, sight: 20, door: 0 },
+        { c: [1500, 600, 1600, 600], move: 20, sight: 20, door: 0 }
     ]);
     const result = await planRoute(sceneId, tokenId, { x: 1550, y: 550 }, 60);
     assert.ok(['partial', 'failed'].includes(result.status),
@@ -166,7 +171,7 @@ async function testMovementBudgetFromSystem() {
         const token = scene.tokens.get(data.tokenId);
         return nav.getMovementRates(token);
     }, { sceneId, tokenId });
-    // The system API may not be merged yet — both contract paths are valid.
+    // The system API may not be merged yet вЂ” both contract paths are valid.
     assert.ok(['ok', 'failed'].includes(budget.status));
     if (budget.status === 'ok') {
         for (const key of ['half', 'full', 'charge', 'run']) {
@@ -212,6 +217,6 @@ async function cleanup() {
         process.exit(1);
     } finally {
         await cleanup().catch(() => {});
-        try { await browser?.close(); } catch { /* ignore */ }
+        // CDP: browser.close() would tear down the shared context — the connection ends with the process.
     }
 })();
