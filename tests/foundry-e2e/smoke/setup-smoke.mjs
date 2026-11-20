@@ -205,11 +205,26 @@ const tokenIds = await page.evaluate(async (data) => {
     const docs = data.layout.map((t) => ({
         actorId: data.actors[t.actor],
         x: t.x, y: t.y, width: 1, height: 1,
-        name: t.actor, disposition: t.disp
+        name: t.actor, disposition: t.disp,
+        // Basic sight so core visibility APIs treat the token as a real
+        // viewer; the AI's own LOS math is geometric and doesn't need it.
+        sight: { enabled: true, range: 30, angle: 360, visionMode: 'basic' }
     }));
     const created = await scene.createEmbeddedDocuments('Token', docs);
+    // Mirror the fireteam flag onto the token document so the token config
+    // UI shows the team exactly like a GM-set token override would.
+    for (const spec of data.bots) {
+        if (!spec.team) continue;
+        const token = created.find((t) => t.name === spec.name);
+        await token.setFlag('only-war-ai', 'fireteam', {
+            teamId: spec.team,
+            leaderId: spec.leader ? spec.name : null,
+            teamPreset: spec.preset,
+            preferredCohesion: spec.cohesion
+        });
+    }
     return Object.fromEntries(created.map((t) => [t.name, t.id]));
-}, { sceneId, layout, actors: { ...pcIds, ...botIds } });
+}, { sceneId, layout, actors: { ...pcIds, ...botIds }, bots: BOTS });
 console.log('tokens:', Object.keys(tokenIds).length);
 
 // --- Staged combat ---------------------------------------------------------
