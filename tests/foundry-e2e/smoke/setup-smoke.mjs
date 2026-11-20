@@ -1,4 +1,4 @@
-import { chromium } from 'playwright-core';
+﻿import { chromium } from 'playwright-core';
 import * as h from '../lib.mjs';
 
 /**
@@ -6,7 +6,7 @@ import * as h from '../lib.mjs';
  * scenario (docs in smoke/README.md):
  * - 3 Player users + 3 acolyte characters with OWNER permission;
  * - bot teams: alpha (assault, melee/ranged hybrids), beta (rangedCover),
- *   spec (specOps pair), solo hold NPC — AI config + fireteam flags;
+ *   spec (specOps pair), solo hold NPC вЂ” AI config + fireteam flags;
  * - a square-grid arena: open field, central building with door, cover
  *   walls and a flank route;
  * - a staged combat with every token on the scene.
@@ -24,21 +24,21 @@ const NAMES = {
 };
 
 const BOTS = [
-    // Assault team — hybrid loadout so melee-vs-ranged selection shows.
+    // Assault team вЂ” hybrid loadout so melee-vs-ranged selection shows.
     ...[1, 2, 3, 4].map(i => ({
         name: `Alpha Trooper ${i}`, preset: 'assault',
         team: 'alpha-smoke', leader: i === 1, cohesion: 5,
         weapons: [
-            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 0, full: 0 } },
+            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } },
             { name: 'Chainsword', cls: 'melee', damage: '1d10+4' }
         ]
     })),
-    // Ranged-cover team — keeps distance behind cover.
+    // Ranged-cover team вЂ” keeps distance behind cover.
     ...[1, 2, 3].map(i => ({
         name: `Beta Rifleman ${i}`, preset: 'rangedCover',
         team: 'beta-smoke', leader: i === 1, cohesion: 6,
         weapons: [
-            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 0, full: 0 } }
+            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } }
         ]
     })),
     // Spec-ops pair for coordinated tactics.
@@ -46,7 +46,7 @@ const BOTS = [
         name: `Spec Operative ${i}`, preset: 'specOps',
         team: 'spec-smoke', leader: i === 1, cohesion: 4,
         weapons: [
-            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 0, full: 0 } },
+            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } },
             { name: 'Combat Knife', cls: 'melee', damage: '1d5+2' }
         ]
     })),
@@ -54,7 +54,7 @@ const BOTS = [
     {
         name: 'Hold Gunner', preset: 'hold', team: null,
         weapons: [
-            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 0, full: 0 } }
+            { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } }
         ]
     }
 ];
@@ -99,7 +99,7 @@ const pcIds = await page.evaluate(async (data) => {
         await actor.createEmbeddedDocuments('Item', [
             { name: 'Lasgun', type: 'weapon',
                 system: { class: 'basic', range: 30, damage: '1d10+3',
-                    clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 0, full: 0 } } }
+                    clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } } }
         ]);
         out[actor.name] = actor.id;
     }
@@ -237,6 +237,6 @@ await page.evaluate(async (data) => {
         Object.values(data.tokenIds).map((tokenId) => ({ tokenId })));
     return combat.id;
 }, { ...NAMES, sceneId, tokenIds });
-console.log('combat staged — GM hits "Begin Combat" to start');
+console.log('combat staged вЂ” GM hits "Begin Combat" to start');
 console.log('DONE');
 process.exit(0);
