@@ -1,0 +1,40 @@
+<form class="ow-ai-config-menu">
+    <p class="notes">{{localize "OWAI.Menu.Summary"}}</p>
+
+    <div class="form-group">
+        <label>{{localize "OWAI.Settings.ExecutionMode.Name"}}</label>
+        <span class="ow-ai-value">{{executionMode}}</span>
+    </div>
+    <div class="form-group">
+        <label>{{localize "OWAI.Settings.DiagnosticsEnabled.Name"}}</label>
+        <span class="ow-ai-value">{{diagnosticsEnabled}}</span>
+    </div>
+
+    <fieldset>
+        <legend>{{localize "OWAI.Menu.Presets"}}</legend>
+        <ul class="ow-ai-preset-list">
+            {{#each presets}}
+            <li><code>{{this}}</code> — {{localize (concat "OWAI.Preset." this)}}</li>
+            {{/each}}
+        </ul>
+    </fieldset>
+
+    <fieldset>
+        <legend>{{localize "OWAI.Menu.CombatantOverrides"}}</legend>
+        {{#if combatName}}
+        <p class="notes">{{combatName}}</p>
+        {{else}}
+        <p class="notes">{{localize "OWAI.Menu.NoActiveCombat"}}</p>
+        {{/if}}
+        <ul class="ow-ai-override-list">
+            {{#each combatantOverrides}}
+            <li>{{this.name}}</li>
+            {{else}}
+            <li>{{localize "OWAI.Menu.NoOverrides"}}</li>
+            {{/each}}
+        </ul>
+        <button type="button" data-action="clear-combatant-overrides">
+            <i class="fas fa-broom"></i> {{localize "OWAI.Menu.ClearOverrides"}}
+        </button>
+    </fieldset>
+</form>

@@ -1,0 +1,32 @@
+{
+  "name": "only-war-ai-e2e",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "node module-foundation.test.mjs && node authority.test.mjs && node perception.test.mjs",
+    "test:foundation": "node module-foundation.test.mjs",
+    "test:authority": "node authority.test.mjs",
+    "test:perception": "node perception.test.mjs",
+    "test:planner": "node planner.test.mjs",
+    "test:navigation": "node navigation.test.mjs",
+    "test:fireteam": "node fireteam.test.mjs",
+    "test:fireteam-tactics": "node fireteam-tactics.test.mjs",
+    "test:executor": "node executor.test.mjs",
+    "test:assault": "node preset-assault.test.mjs",
+    "test:ranged-cover": "node preset-ranged-cover.test.mjs",
+    "test:hold": "node preset-hold.test.mjs",
+    "test:spec-ops": "node preset-spec-ops.test.mjs",
+    "test:preview": "node preview.test.mjs",
+    "test:grid-types": "node grid-types.test.mjs",
+    "test:multi-gm": "node multi-gm.test.mjs",
+    "test:stale-replan": "node stale-replan.test.mjs",
+    "test:performance": "node performance.test.mjs",
+    "test:master-switch": "node master-switch.test.mjs",
+    "test:player-view": "node player-view.test.mjs",
+    "test:all": "npm run test:foundation && npm run test:authority && npm run test:perception && npm run test:planner && npm run test:navigation && npm run test:assault && npm run test:ranged-cover && npm run test:hold && npm run test:spec-ops && npm run test:executor && npm run test:fireteam && npm run test:fireteam-tactics && npm run test:preview && npm run test:grid-types && npm run test:multi-gm && npm run test:stale-replan && npm run test:master-switch && npm run test:player-view && npm run test:performance"
+  },
+  "devDependencies": {
+    "playwright-core": "1.61.1"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "only-war-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Only War AI — opt-in AI module for the Only War Foundry VTT system (issue #399, epic #363).",
+  "type": "module",
+  "scripts": {
+    "lint": "eslint \"scripts/**/*.js\"",
+    "lint:fix": "eslint \"scripts/**/*.js\" --fix",
+    "check": "node tools/check-syntax.mjs",
+    "test:unit": "node tests/run-unit-tests.mjs",
+    "test:e2e": "npm --prefix tests/foundry-e2e test",
+    "test": "npm run check && npm run test:unit"
+  },
+  "devDependencies": {
+    "@babel/core": "7.24.7",
+    "@babel/eslint-parser": "^7.22.5",
+    "eslint": "^8.57.0",
+    "eslint-plugin-jsdoc": "^46.2.6"
+  },
+  "license": "GPL-3.0-only"
+}
