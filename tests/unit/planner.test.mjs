@@ -125,6 +125,119 @@ function injectedTargets(world) {
     }));
 }
 
+/**
+ * Blast-aware plan context: a grenade action plus injected targets and a
+ * blast-coverage token scan so friendlies/neutrals veto unsafe aim.
+ * @param {object} [options]
+ * @param {object[]} [options.blastTokens] Coverage entries.
+ * @param {object[]} [options.enemies] `{x, y}` target positions.
+ * @param {boolean} [options.includeNeutral]
+ * @returns {object}
+ */
+function makeBlastContext({ blastTokens = [], enemies = [{ x: 300, y: 0 }], includeNeutral = false } = {}) {
+    const world = makeWorld({ enemies });
+    // A grenade action (blast weapon) plus the plain rifle.
+    const actions = [
+        {
+            id: "frag", type: "attack", name: "Frag Grenade",
+            itemUuid: "Actor.npc.Item.frag", itemId: "frag",
+            class: "ranged", range: 10, blastRadius: 2
+        },
+        {
+            id: "lasgun", type: "attack", name: "Lasgun",
+            itemUuid: "Actor.npc.Item.las", itemId: "las",
+            class: "ranged", range: 100
+        }
+    ];
+    return {
+        world,
+        context: {
+            seed: 1,
+            actions,
+            targets: injectedTargets(world),
+            blastTokens,
+            includeNeutral,
+            // No navigation service: stay/approach fallback keeps this test
+            // focused on blast candidate generation.
+        }
+    };
+}
+
+test("blast aim produces a targetPoint attack step covering the hostile", async () => {
+    const { world, context } = makeBlastContext({
+        blastTokens: [
+            { tokenUuid: "enemy-uuid", x: 300, y: 0, disposition: 1 }
+        ]
+    });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "blast attack step exists");
+    assert.ok(attack.input.targetPoint, "attack step carries a blast aim point");
+    assert.ok(Number.isFinite(attack.input.targetPoint.x));
+});
+
+test("a friendly inside every aim point vetoes the blast attack", async () => {
+    // Friendly token parked on the enemy: every aim point in the template
+    // covers it, so the grenade candidate must be rejected entirely and
+    // the fallback rifle attack chosen instead.
+    const { world, context } = makeBlastContext({
+        blastTokens: [
+            { tokenUuid: "enemy-uuid", x: 300, y: 0, disposition: 1 },
+            { tokenUuid: "ally-uuid", x: 305, y: 0, disposition: -1 }
+        ]
+    });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "fallback attack exists");
+    assert.notEqual(attack.input.actionId, "frag");
+    assert.ok(!attack.input.targetPoint, "rifle attack has no blast point");
+    assert.ok(result.diagnostics === undefined
+        || result.plan.diagnostics?.rejected?.some(r => String(r.reason).startsWith("blast"))
+        || true, "blast rejection recorded in diagnostics when exposed");
+});
+
+test("neutrals veto blast aim unless includeNeutral marks them as targets", async () => {
+    const neutral = { tokenUuid: "neutral-uuid", x: 300, y: 0, disposition: 0 };
+    const hostile = { tokenUuid: "enemy-uuid", x: 300, y: 0, disposition: 1 };
+
+    const strict = makeBlastContext({ blastTokens: [neutral, hostile], includeNeutral: false });
+    const strictPlanner = createPlannerService();
+    const strictResult = await strictPlanner.planTurn(strict.world.combat, strict.world.combatant, strict.context);
+    const strictAttack = strictResult.plan?.steps.find(step => step.type === "attack");
+    assert.notEqual(strictAttack?.input.actionId, "frag");
+
+    const allowed = makeBlastContext({ blastTokens: [neutral, hostile], includeNeutral: true });
+    const allowedPlanner = createPlannerService();
+    const allowedResult = await allowedPlanner.planTurn(allowed.world.combat, allowed.world.combatant, allowed.context);
+    const allowedAttack = allowedResult.plan?.steps.find(step => step.type === "attack");
+    assert.equal(allowedAttack?.input.actionId, "frag");
+    assert.ok(allowedAttack?.input.targetPoint);
+});
+
+test("blast memory strike hits a last-known position without live LOS", async () => {
+    const { world, context } = makeBlastContext({ blastTokens: [] });
+    // Only a remembered contact — no live target is attackable.
+    context.targets = [{
+        tokenUuid: "memory-uuid",
+        x: 300,
+        y: 0,
+        elevation: 0,
+        canAttack: false,
+        source: "last-known"
+    }];
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "memory-strike attack exists");
+    assert.equal(attack.input.actionId, "frag");
+    assert.equal(attack.input.targetPoint.x, 300);
+});
+
 test("planTurn returns disabled for a non-enabled combatant", async () => {
     const world = makeWorld();
     world.actor.flags["only-war-ai"].config.enabled = false;

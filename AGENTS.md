@@ -162,6 +162,18 @@ semi_auto, standard, ripper_charge, called_shot]`; `suppressing_fire`
 pinned/prone/stunned), `engaged`/`meleeEngage` (контакт ближнего боя после
 движения) — веса заданы в `scripts/presets/*.js`.
 
+Blast-awareness: blast-действия (`blastRadius` из `item.system.blastRadius`
+или `traits.blast`, метры) не целятся в токен — `_bestBlastAim` перебирает
+точку центра цели + 8 оффсетов на полрадиуса и выбирает максимум покрытых
+hostiles при строгом запрете союзных/нейтральных (нейтрали легальны только
+при `includeNeutral`) токенов в шаблоне (`_blastTokens` — инъекция
+`context.blastTokens` в тестах, canvas placeables live, боевой fallback).
+LOS до точки обязателен, кроме ударов по last-known позиции («зачистка
+комнаты» — запомненная точка считается одним предполагаемым hostile,
+`rangedCover` освобождает такие броски от LOS-вето). Шаг несёт
+`input.targetPoint` → `prepareAttack`. Фактор `area` = min(blastHits/2, 1);
+веса в пресетах (assault 4, specOps 5, rangedCover 3, hold 2).
+
 Статусы: `snapshot.self.statuses` — отсортированные id из `actor.statuses`
 + статусов токен-документа (+ `context.selfStatuses` для тестов); входят в
 stale fingerprint, расхождение даёт причину `statuses-changed`. Цели

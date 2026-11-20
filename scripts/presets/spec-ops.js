@@ -89,7 +89,8 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     cohesionRestore: 0,
     attackType: 0.15,
     vulnerable: 1,
-    meleeEngage: 3
+    meleeEngage: 3,
+    area: 5
 });
 
 /**

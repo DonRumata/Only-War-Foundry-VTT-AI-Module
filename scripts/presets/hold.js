@@ -91,7 +91,8 @@ export const HOLD_WEIGHTS = Object.freeze({
     aimOpportunity: 1.5,
     attackType: 0.05,
     vulnerable: 0.5,
-    meleeEngage: 2
+    meleeEngage: 2,
+    area: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

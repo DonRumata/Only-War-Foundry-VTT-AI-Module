@@ -109,7 +109,8 @@ export const SCORE_FACTORS = Object.freeze([
     "attackType",
     "vulnerable",
     "engaged",
-    "meleeEngage"
+    "meleeEngage",
+    "area"
 ]);
 
 /**
@@ -135,7 +136,8 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     attackType: 0,
     vulnerable: 0,
     engaged: 0,
-    meleeEngage: 0
+    meleeEngage: 0,
+    area: 0
 });
 
 /**
@@ -645,6 +647,171 @@ function _actionCost(action) {
 }
 
 /**
+ * Blast radius of an action in scene units (metres); `0` for regular attacks.
+ * @param {object|null} action Normalized action candidate.
+ * @returns {number}
+ */
+function _actionBlastRadius(action) {
+    return _finiteOr(action?.blastRadius, 0);
+}
+
+/**
+ * Pixels per scene unit derived from the normalized grid info.
+ * @param {object|null} grid Grid info `{size, distance}`.
+ * @returns {number}
+ */
+function _pxPerUnit(grid) {
+    const size = _finiteOr(grid?.size, 0);
+    const distance = _finiteOr(grid?.distance, 0);
+    return size > 0 && distance > 0 ? size / distance : 0;
+}
+
+/**
+ * Euclidean distance between two pixel points.
+ * @param {object|null} a `{x, y}`
+ * @param {object|null} b `{x, y}`
+ * @returns {number}
+ */
+function _distPx(a, b) {
+    if (!a || !b || !Number.isFinite(a.x) || !Number.isFinite(b.x)) return Infinity;
+    return Math.hypot(b.x - a.x, b.y - a.y);
+}
+
+/**
+ * Token list evaluated for blast coverage. Injected `context.blastTokens`
+ * (unit tests) wins; live runs scan the canvas placeables and flag the
+ * combat-defeated tokens via the combat combatant index; the last resort
+ * is the combat's own combatant tokens.
+ * @param {object} context Planning context.
+ * @param {object} combat Combat document.
+ * @param {string|null} sceneId Scene id for token uuid derivation.
+ * @returns {object[]} `{tokenUuid, x, y, disposition}` entries (pixels).
+ */
+function _blastTokens(context, combat, sceneId) {
+    if (Array.isArray(context.blastTokens)) return context.blastTokens;
+    const defeated = new Set();
+    const index = new Map();
+    for (const other of _list(combat?.combatants)) {
+        const doc = _tokenDoc(other?.token);
+        if (doc?.id) index.set(doc.id, other);
+        if (other?.defeated === true && doc?.id) defeated.add(doc.id);
+    }
+    const placeables = _list(globalThis.canvas?.tokens?.placeables);
+    const fromCanvas = placeables.map(token => {
+        const doc = _tokenDoc(token);
+        if (!doc || doc.destroyed === true || doc.hidden === true || !doc.actor) return null;
+        const combatant = index.get(doc.id);
+        if (combatant?.defeated === true) return null;
+        const pos = _tokenPosition(doc);
+        if (!pos) return null;
+        return {
+            tokenUuid: _tokenUuid(doc, sceneId) ?? doc.uuid ?? null,
+            tokenId: doc.id ?? null,
+            x: pos.x,
+            y: pos.y,
+            disposition: doc.disposition ?? combatant?.disposition ?? 0
+        };
+    }).filter(Boolean);
+    if (fromCanvas.length) return fromCanvas;
+    const fallback = [];
+    for (const other of _list(combat?.combatants)) {
+        const doc = _tokenDoc(other?.token);
+        if (!doc || doc.destroyed === true || doc.hidden === true || other?.defeated === true) continue;
+        const pos = _tokenPosition(doc);
+        if (!pos) continue;
+        fallback.push({
+            tokenUuid: _tokenUuid(doc, sceneId) ?? doc.uuid ?? null,
+            tokenId: doc.id ?? null,
+            x: pos.x,
+            y: pos.y,
+            disposition: doc.disposition ?? other?.disposition ?? 0
+        });
+    }
+    return fallback;
+}
+
+/**
+ * Aim-point candidates around a blast target: the target centre plus
+ * eight offsets at half the blast radius so the template can clip the
+ * target instead of landing dead-centre.
+ * @param {object} target Normalized target `{x, y}` (pixels).
+ * @param {number} radiusPx Blast radius in pixels.
+ * @returns {object[]}
+ */
+function _blastAimPoints(target, radiusPx) {
+    const cx = target?.x ?? 0;
+    const cy = target?.y ?? 0;
+    const r = radiusPx / 2;
+    const points = [{ x: cx, y: cy }];
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    for (const [dx, dy] of dirs) {
+        const scale = dx !== 0 && dy !== 0 ? r * Math.SQRT1_2 : r;
+        points.push({ x: cx + (dx * scale), y: cy + (dy * scale) });
+    }
+    return points;
+}
+
+/**
+ * Pick the blast aim point covering the most hostile tokens while keeping
+ * friendlies — and neutrals unless `options.includeNeutral` — outside the
+ * template. `presumedUuid` marks a last-known strike point whose
+ * remembered token is not locatable and counts as one presumed hostile.
+ * @param {object} input
+ * @param {object} input.tokenDoc Viewer token document.
+ * @param {object} input.origin Throw origin `{x, y}` (pixels).
+ * @param {object} input.target Normalized target (pixels; last-known ok).
+ * @param {number} input.rangePx Weapon range in pixels.
+ * @param {number} input.radiusPx Blast radius in pixels.
+ * @param {object[]} input.tokens Blast-coverage scan entries.
+ * @param {number} input.viewerDisposition Self disposition.
+ * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @param {object|null} input.perception Perception service (LOS probes).
+ * @param {string|null} [input.presumedUuid] Remembered target uuid.
+ * @param {boolean} [input.requireLos] LOS from origin to the aim point.
+ * @returns {{point: object, hits: number}|null}
+ */
+function _bestBlastAim({
+    tokenDoc, origin, target, rangePx, radiusPx, tokens,
+    viewerDisposition, options, perception,
+    presumedUuid = null, requireLos = true
+}) {
+    if (!origin || radiusPx <= 0) return null;
+    const points = presumedUuid
+        ? [{ x: target?.x ?? 0, y: target?.y ?? 0 }]
+        : _blastAimPoints(target, radiusPx);
+    let best = null;
+    for (const point of points) {
+        if (_distPx(origin, point) > rangePx + 1e-9) continue;
+        if (requireLos && perception && typeof perception.hasLineOfSight === "function") {
+            let los = true;
+            try {
+                los = perception.hasLineOfSight(tokenDoc, point) === true;
+            } catch(err) {
+                los = true;
+            }
+            if (!los) continue;
+        }
+        let hits = presumedUuid ? 1 : 0;
+        let blocked = false;
+        for (const token of tokens) {
+            if (presumedUuid && token.tokenUuid === presumedUuid) continue;
+            if (_distPx(point, token) > radiusPx + 1e-9) continue;
+            const disp = Math.sign(_finiteOr(token.disposition, 0));
+            if (_hostileTo(viewerDisposition, disp, options)) hits++;
+            else blocked = true;
+        }
+        if (blocked || hits <= 0) continue;
+        if (!best || hits > best.hits
+            || (hits === best.hits
+                && _distPx(point, { x: target?.x, y: target?.y })
+                    < _distPx(best.point, { x: target?.x, y: target?.y }))) {
+            best = { point, hits };
+        }
+    }
+    return best;
+}
+
+/**
  * Deterministic turn revision: delegates to the authority service's
  * `operations.computeRevision` (#400) when it is available so plan and
  * operation revisions agree, and falls back to an equivalent local
@@ -1095,6 +1262,8 @@ function _normalizeAction(raw, index) {
         range: Number.isFinite(raw.range) ? raw.range
             : (Number.isFinite(raw.range?.value) ? raw.range.value
                 : (Number.isFinite(raw.system?.range) ? raw.system.range : null)),
+        blastRadius: _finiteOr(raw.blastRadius ?? raw.system?.blastRadius
+            ?? raw.traits?.blast ?? raw.system?.traits?.blast, 0),
         damage: _expectedDamage(raw.damage ?? raw.system?.damage ?? 0),
         cost: typeof raw.cost === "string"
             ? { actions: raw.cost === "free" ? 0 : 1 }
@@ -1119,6 +1288,7 @@ function _fallbackActions(actor) {
             itemId: item.id ?? null,
             class: item.system?.class ?? null,
             range: item.system?.range ?? null,
+            blastRadius: item.system?.blastRadius ?? item.system?.traits?.blast ?? 0,
             damage: item.system?.damage ?? 0
         }, index))
         .filter(Boolean);
@@ -1171,6 +1341,8 @@ async function _resolveActions(actor, context) {
             class: cls,
             melee: action.melee || String(cls ?? "").toLowerCase() === "melee",
             range: action.range ?? (Number.isFinite(item.system?.range) ? item.system.range : null),
+            blastRadius: action.blastRadius > 0 ? action.blastRadius
+                : _finiteOr(item.system?.blastRadius ?? item.system?.traits?.blast, 0),
             damage: action.damage > 0 ? action.damage : _expectedDamage(item.system?.damage ?? 0)
         };
     });
@@ -1378,9 +1550,10 @@ function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navi
  * @param {object|null} input.action Normalized action candidate.
  * @param {number|null} [input.moveBudget] Numeric movement budget for the
  *   `budgetOver` penalty factor (null/unknown disables it).
+ * @param {number} [input.blastHits] Hostiles covered by a blast aim point.
  * @returns {object}
  */
-function _factorsOf({ variant, target, move, action, moveBudget = null }) {
+function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0 }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -1428,7 +1601,10 @@ function _factorsOf({ variant, target, move, action, moveBudget = null }) {
             : 0,
         vulnerable,
         engaged,
-        meleeEngage: melee * engaged
+        meleeEngage: melee * engaged,
+        // Blast coverage: 1+ hostiles under the template; a presumed
+        // last-known strike counts 0.5 of a confirmed two-target hit.
+        area: Math.min(_finiteOr(blastHits, 0) / 2, 1)
     };
 }
 
@@ -1512,7 +1688,10 @@ function _stepsFor({ candidate }) {
                 targetTokenId: target.tokenId,
                 range: _actionRange(action),
                 ...(action.attackType ? { attackType: action.attackType } : {}),
-                ...(variant === "charge" ? { mode: "charge" } : {})
+                ...(variant === "charge" ? { mode: "charge" } : {}),
+                ...(candidate.aim
+                    ? { targetPoint: { x: candidate.aim.x, y: candidate.aim.y } }
+                    : {})
             },
             preconditions: ["turn", "target", "resources"],
             projectedResourceDelta: action.type === "attack" ? { ammo: -1 } : {}
@@ -1760,6 +1939,18 @@ export function createPlannerService({
             rejectedOnce.add(key);
             diagnostics.rejected.push({ candidate, reason });
         };
+        // Blast-awareness context: aim points are searched once per
+        // action/target over this coverage set; friendlies always veto a
+        // point, neutrals veto it unless `includeNeutral` marks them as
+        // legitimate targets (hostage-execution scenes).
+        const blastOptions = {
+            includeNeutral: context.includeNeutral === true,
+            dispositions: Array.isArray(context.dispositions) ? context.dispositions : null
+        };
+        const blastTokens = _blastTokens(context, combat, sceneId);
+        const viewerDisposition = _finiteOr(
+            _tokenDoc(combatant?.token)?.disposition ?? combatant?.disposition, 0);
+        const pxPerUnit = _pxPerUnit(grid);
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             const moves = _resolveMoves({
@@ -1779,7 +1970,12 @@ export function createPlannerService({
             }
 
             let attackFound = false;
-            if (target.canAttack !== true) {
+            // Blast weapons may strike a last-known position (room
+            // clearing) even when the remembered target is not attackable.
+            const memoryStrike = target.source === "last-known"
+                && usableActions.some(action => _actionBlastRadius(action) > 0
+                    && !_isMeleeAction(action));
+            if (target.canAttack !== true && !memoryStrike) {
                 diagnostics.rejected.push({
                     candidate: `attack|${target.tokenUuid}`,
                     reason: "target-not-attackable"
@@ -1803,6 +1999,63 @@ export function createPlannerService({
                     }
                     const range = _actionRange(action);
                     const melee = _isMeleeAction(action);
+                    // Blast weapons do not attack the target token itself:
+                    // they aim at a point whose template covers hostiles
+                    // and never friendlies (`blastTokens` scan). Aiming at
+                    // a last-known memory position is allowed too — the
+                    // LOS gate drops for remembered strikes.
+                    if (_actionBlastRadius(action) > 0 && !melee) {
+                        const presumed = target.source === "last-known"
+                            ? (target.tokenUuid ?? null) : null;
+                        const aimInput = {
+                            tokenDoc,
+                            target,
+                            rangePx: range * pxPerUnit,
+                            radiusPx: _actionBlastRadius(action) * pxPerUnit,
+                            tokens: blastTokens,
+                            viewerDisposition,
+                            options: blastOptions,
+                            perception
+                        };
+                        const aim = _bestBlastAim({
+                            ...aimInput,
+                            origin: selfPos,
+                            presumedUuid: presumed,
+                            requireLos: presumed === null
+                        });
+                        if (aim) {
+                            candidates.push({
+                                target, action, move: null,
+                                variant: "attack-in-place",
+                                aim: aim.point,
+                                blastHits: aim.hits
+                            });
+                            attackFound = true;
+                        } else {
+                            rejectOnce(`blast|${tag}`, presumed === null
+                                ? "blast-no-safe-aim" : "blast-unclear-position");
+                        }
+                        if (!presumed && !isPinned) {
+                            for (const move of moves) {
+                                if (move.stay) continue;
+                                const aimFromMove = _bestBlastAim({
+                                    ...aimInput,
+                                    origin: { x: move.x, y: move.y },
+                                    presumedUuid: null,
+                                    requireLos: true
+                                });
+                                if (!aimFromMove) continue;
+                                candidates.push({
+                                    target, action, move,
+                                    variant: "move-attack",
+                                    aim: aimFromMove.point,
+                                    blastHits: aimFromMove.hits
+                                });
+                                attackFound = true;
+                            }
+                        }
+                        continue;
+                    }
                     // The weapon's own `charge` attack type — when the
                     // system API exposes one — is the canonical action
                     // for move-into-reach candidates; sibling attack

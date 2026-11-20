@@ -72,7 +72,8 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     aimOpportunity: 1.5,
     attackType: 0.1,
     vulnerable: 0.5,
-    meleeEngage: 2
+    meleeEngage: 2,
+    area: 3
 });
 
 /** Candidate variants whose action produces an attack/test step. */
@@ -491,6 +492,10 @@ function _aimAvailable(context = {}) {
  */
 export function rangedCoverVeto({ candidate = {}, context = {} } = {}) {
     if (!ATTACK_VARIANTS.has(candidate.variant)) return null;
+    // Blast memory strikes need no live LOS — the throw lands on a
+    // remembered position (room clearing); friendlies were already
+    // vetoed by the aim-point search in the planner.
+    if (candidate.aim && candidate.target?.source === "last-known") return null;
     const probe = _probeCandidate(candidate, context);
     return probe.los === false ? RANGED_COVER_VETO_NO_LOS : null;
 }
