@@ -60,14 +60,22 @@ export function resolveEffectiveConfig(document) {
         }
         if (override.mode === "enabled") {
             const preset = _presetOr(override.preset, actorConfig.preset);
-            return { enabled: true, preset, source: layer.source };
+            const result = { enabled: true, preset, source: layer.source };
+            if (_includeNeutralOf(actorConfig, override)) result.includeNeutral = true;
+            return result;
         }
         // "inherit" or damaged data falls through to the next layer.
     }
 
     // Actor-level default configuration.
     if (actorConfig.enabled) {
-        return { enabled: true, preset: actorConfig.preset ?? FALLBACK_PRESET, source: "actor" };
+        const result = {
+            enabled: true,
+            preset: actorConfig.preset ?? FALLBACK_PRESET,
+            source: "actor"
+        };
+        if (actorConfig.includeNeutral === true) result.includeNeutral = true;
+        return result;
     }
     return _disabledResult();
 }
@@ -124,7 +132,7 @@ function _normalizeActorConfig(actor) {
     }
     const enabled = config.enabled === true;
     const preset = AI_PRESETS.includes(config.preset) ? config.preset : null;
-    return { enabled, preset };
+    return { enabled, preset, includeNeutral: config.includeNeutral === true };
 }
 
 /**
@@ -142,7 +150,21 @@ function _normalizeOverride(doc) {
         ? override.mode
         : "inherit";
     const preset = AI_PRESETS.includes(override.preset) ? override.preset : null;
-    return { mode, preset };
+    return { mode, preset, includeNeutral: override.includeNeutral };
+}
+
+/**
+ * Effective `includeNeutral` for an enabled override layer: the override's
+ * explicit boolean wins, otherwise the actor config value applies.
+ * @param {object} actorConfig Normalized actor config.
+ * @param {object} override Normalized override.
+ * @returns {boolean}
+ */
+function _includeNeutralOf(actorConfig, override) {
+    if (override.includeNeutral === true || override.includeNeutral === false) {
+        return override.includeNeutral;
+    }
+    return actorConfig.includeNeutral === true;
 }
 
 /**

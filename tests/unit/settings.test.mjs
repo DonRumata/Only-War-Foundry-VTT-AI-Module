@@ -8,6 +8,7 @@ import {
     getExecutionMode,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
+    getTurnPacingMs,
     isDiagnosticsEnabled,
     isMasterEnabled,
     registerSettings
@@ -15,6 +16,7 @@ import {
 import {
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
+    DEFAULT_TURN_PACING_MS,
     MODULE_ID,
     SETTING_KEYS
 } from "../../scripts/constants.js";
@@ -23,7 +25,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 5);
+    assert.equal(registered.length, 6);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -93,6 +95,22 @@ test("previewTimeoutSeconds defaults to 60, honours 0 and rejects damaged values
     assert.equal(getPreviewTimeoutSeconds(), 0);
     await game.settings.set(MODULE_ID, SETTING_KEYS.previewTimeoutSeconds, -10);
     assert.equal(getPreviewTimeoutSeconds(), DEFAULT_PREVIEW_TIMEOUT_SECONDS);
+});
+
+test("turnPacingMs defaults, honours 0 and rejects damaged values", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.turnPacingMs);
+    assert.ok(entry, "turnPacingMs registered");
+    assert.equal(entry.data.default, DEFAULT_TURN_PACING_MS);
+    assert.equal(getTurnPacingMs(), DEFAULT_TURN_PACING_MS);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.turnPacingMs, 300);
+    assert.equal(getTurnPacingMs(), 300);
+    // 0 is a valid opt-out (no pacing delay).
+    await game.settings.set(MODULE_ID, SETTING_KEYS.turnPacingMs, 0);
+    assert.equal(getTurnPacingMs(), 0);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.turnPacingMs, -50);
+    assert.equal(getTurnPacingMs(), DEFAULT_TURN_PACING_MS);
 });
 
 test("masterEnabled defaults to true and reads a stored value", async () => {

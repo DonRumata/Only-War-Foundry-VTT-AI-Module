@@ -12,6 +12,7 @@
 import {
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
+    DEFAULT_TURN_PACING_MS,
     EXECUTION_MODES,
     MODULE_ID,
     SETTING_KEYS
@@ -66,6 +67,15 @@ export function registerSettings() {
         config: true,
         type: Number,
         default: DEFAULT_PREVIEW_TIMEOUT_SECONDS
+    });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.turnPacingMs, {
+        name: "OWAI.Settings.TurnPacing.Name",
+        hint: "OWAI.Settings.TurnPacing.Hint",
+        scope: "world",
+        config: true,
+        type: Number,
+        default: DEFAULT_TURN_PACING_MS
     });
 }
 
@@ -125,6 +135,22 @@ export function getPreviewTimeoutSeconds() {
         return Number.isFinite(value) && value >= 0 ? value : DEFAULT_PREVIEW_TIMEOUT_SECONDS;
     } catch(_err) {
         return DEFAULT_PREVIEW_TIMEOUT_SECONDS;
+    }
+}
+
+/**
+ * Pacing delay in milliseconds inserted between AI execution steps and
+ * before the combat turn advances, so automated turns stay watchable.
+ * `0` disables the delay; damaged or missing values fall back to
+ * {@link DEFAULT_TURN_PACING_MS}.
+ * @returns {number}
+ */
+export function getTurnPacingMs() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.turnPacingMs);
+        return Number.isFinite(value) && value >= 0 ? value : DEFAULT_TURN_PACING_MS;
+    } catch(_err) {
+        return DEFAULT_TURN_PACING_MS;
     }
 }
 

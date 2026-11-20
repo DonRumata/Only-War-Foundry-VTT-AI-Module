@@ -31,7 +31,9 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 
 Все данные модуля — в `flags["only-war-ai"]`; `actor.system` не трогаем:
 
-- Actor: `config = { enabled: boolean, preset: string|null }`.
+- Actor: `config = { enabled: boolean, preset: string|null,
+  includeNeutral?: boolean }` — `includeNeutral` разрешает атаковать
+  нейтральные токены (владение, казни заложников и т.п.).
 - Token: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`.
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
@@ -40,7 +42,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   внедрённые UI-секции скрыты, executor отвечает `module-disabled`.
   `executionMode = "automatic"|"preview"` (default `"preview"`),
   `diagnosticsEnabled` (default `false`), `preferredCohesion` (default 5),
-  `previewTimeoutSeconds` (default 60, `0` — без авто-отмены).
+  `previewTimeoutSeconds` (default 60, `0` — без авто-отмены),
+  `turnPacingMs` (default 800, `0` — без паузы) — пауза между шагами
+  AI-хода и перед `combat.nextTurn()`, чтобы автоходы оставались
+  наблюдаемыми.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -51,8 +56,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 ## Pure resolver
 
 `scripts/config-resolver.js` → `resolveEffectiveConfig(actorOrTokenOrCombatant)`
-возвращает `{enabled, preset, source}` (`source`: `"combatant" | "token" |
-"actor" | "none"`). Приоритет Combatant → Token → Actor → disabled. Resolver
+возвращает `{enabled, preset, source, includeNeutral?}` (`source`:
+`"combatant" | "token" | "actor" | "none"`; `includeNeutral` присутствует
+только при `true`: override > actor config). Приоритет Combatant → Token →
+Actor → disabled. Resolver
 read-only, детерминирован, не читает `game` и работает одинаково на всех
 клиентах; удалённые/повреждённые документы → disabled, неизвестный preset →
 actor preset → `hold` (если enabled явно) → disabled.
@@ -110,9 +117,12 @@ Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
   без dead/defeated/hidden; `blinded` viewer не видит никого. Записи:
   `{tokenId, tokenUuid, actorId, name, sceneId, disposition, x, y, elevation,
   distance, hidden, canAttack}` — hidden-цели никогда не атакуемы.
-- `buildPerceptionSnapshot({combat, combatant, token})` — immutable
-  `{status, sceneId, round, turn, viewer, visibleTargets, lastKnownTargets,
-  revision}`; без сцены/токена — `perception-unavailable`.
+- `buildPerceptionSnapshot({combat, combatant, token, includeNeutral,
+  dispositions})` — immutable `{status, sceneId, round, turn, viewer,
+  visibleTargets, lastKnownTargets, revision}`; без сцены/токена —
+  `perception-unavailable`. `includeNeutral`/`dispositions` пробрасываются
+  в `visibleTargets` (конфиг `config.includeNeutral` доезжает через
+  planContext из эффективной конфигурации).
 - Память последней позиции на флаге Combatant
   `flags["only-war-ai"].memory[targetTokenUuid] = {sceneId, x, y, elevation,
   lastSeenRound, lastSeenTurn, dispositionAtDetection}` — sanitized, без
@@ -180,7 +190,9 @@ state-changing шагом `planner.validateSnapshot(plan)`; позиция то�
 Stale → один replan через `planner.shouldReplan`; повторный stale —
 hold-and-report. operationId дедупликация: повторный вызов возвращает
 прежний результат, roll-шаги проксируют step-scoped operationId, move к
-уже достигнутой точке пропускается. Терминальные статусы
+уже достигнутой точке пропускается. Темп: между шагами и перед
+`nextTurn()` вставляется пауза `turnPacingMs` (deps `pacing`, `0` — без
+паузы). Терминальные статусы
 (`completed`/`partial`/`failed`) закрывают операцию через
 `operations.completeTurn` и переводят ход ровно один раз — хуком
 `only-war-ai.operationCompleted` (#400) либо прямым `combat.nextTurn()`

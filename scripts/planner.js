@@ -807,15 +807,21 @@ function _findToken(tokenId, { combat = null, scene = null } = {}) {
 
 /**
  * Whether two dispositions are hostile to each other (hostile в†” friendly).
- * Neutral tokens fight no one.
+ * Neutral tokens fight no one unless `options.includeNeutral` allows
+ * targeting them; `options.dispositions` overrides the rule entirely.
  * @param {*} a
  * @param {*} b
+ * @param {object} [options]
+ * @param {boolean} [options.includeNeutral] Accept neutral targets.
+ * @param {number[]|null} [options.dispositions] Explicit disposition allow-list.
  * @returns {boolean}
  */
-function _hostileTo(a, b) {
+function _hostileTo(a, b, { includeNeutral = false, dispositions = null } = {}) {
     const sa = Math.sign(_finiteOr(a, 0));
     const sb = Math.sign(_finiteOr(b, 0));
-    return sa !== 0 && sb !== 0 && sa !== sb;
+    if (Array.isArray(dispositions)) return dispositions.includes(sb);
+    if (sb === 0) return includeNeutral === true && sa !== 0;
+    return sa !== 0 && sa !== sb;
 }
 
 /**
@@ -963,7 +969,7 @@ function _fallbackTargets(combat, combatant, input) {
         if (doc.destroyed === true || doc.hidden === true) continue;
         if (other.defeated === true) continue;
         if (!_actorOf(other) && !_actorOf(doc)) continue;
-        if (!_hostileTo(selfDisposition, doc.disposition)) continue;
+        if (!_hostileTo(selfDisposition, doc.disposition, input.options ?? {})) continue;
         const position = _tokenPosition(doc);
         const target = _normalizeTarget({
             tokenId: id,
@@ -1004,7 +1010,17 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
         }
         return null;
     };
-    const input = { source: "fallback", sceneId, selfPos, grid, measure };
+    const input = {
+        source: "fallback",
+        sceneId,
+        selfPos,
+        grid,
+        measure,
+        options: {
+            includeNeutral: context.includeNeutral === true,
+            dispositions: Array.isArray(context.dispositions) ? context.dispositions : null
+        }
+    };
     let targets = [];
     if (Array.isArray(context.targets)) {
         targets = context.targets
@@ -1013,7 +1029,13 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
     } else if (perception && typeof perception.buildPerceptionSnapshot === "function") {
         let snapshot = null;
         try {
-            snapshot = perception.buildPerceptionSnapshot({ combat, combatant, token: tokenDoc });
+            snapshot = perception.buildPerceptionSnapshot({
+                combat,
+                combatant,
+                token: tokenDoc,
+                includeNeutral: context.includeNeutral === true,
+                dispositions: Array.isArray(context.dispositions) ? context.dispositions : null
+            });
         } catch(err) {
             snapshot = null;
         }

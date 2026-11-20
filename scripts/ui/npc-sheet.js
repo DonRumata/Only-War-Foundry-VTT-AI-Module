@@ -47,6 +47,7 @@ function _injectNpcSection(html, actor) {
     const config = actor.getFlag?.(MODULE_ID, FLAG_KEYS.actorConfig) ?? {};
     const enabled = config.enabled === true;
     const preset = AI_PRESETS.includes(config.preset) ? config.preset : "";
+    const includeNeutral = config.includeNeutral === true;
 
     const section = _buildElement(`
         <fieldset class="ow-ai-config" data-ow-ai-config>
@@ -60,6 +61,10 @@ function _injectNpcSection(html, actor) {
                 <select data-ow-ai-field="preset">
                     ${_presetOptions(preset, true)}
                 </select>
+            </div>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.IncludeNeutral")}</label>
+                <input type="checkbox" data-ow-ai-field="includeNeutral" ${includeNeutral ? "checked" : ""}>
             </div>
         </fieldset>
     `);
@@ -208,8 +213,9 @@ async function _saveActorConfig(actor, section) {
     const enabled = section.querySelector("[data-ow-ai-field=enabled]")?.checked === true;
     const presetValue = section.querySelector("[data-ow-ai-field=preset]")?.value ?? "";
     const preset = AI_PRESETS.includes(presetValue) ? presetValue : null;
+    const includeNeutral = section.querySelector("[data-ow-ai-field=includeNeutral]")?.checked === true;
     try {
-        await actor.setFlag(MODULE_ID, FLAG_KEYS.actorConfig, { enabled, preset });
+        await actor.setFlag(MODULE_ID, FLAG_KEYS.actorConfig, { enabled, preset, includeNeutral });
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to save actor AI config`, err);
     }

@@ -39,6 +39,7 @@ import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
     getExecutionMode,
+    getTurnPacingMs,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "./settings.js";
@@ -192,6 +193,7 @@ function _mergeDelta(ledger, delta) {
  * @param {Function} [deps.idGen] Operation id fallback generator.
  * @param {Function} [deps.diagnostics] Diagnostics-enabled predicate.
  * @param {Function} [deps.log] Diagnostic logger.
+ * @param {Function} [deps.pacing] Step/turn pacing delay getter (ms).
  * @returns {object} Executor service.
  */
 export function createExecutorService({
@@ -202,7 +204,8 @@ export function createExecutorService({
     hooks = globalThis.Hooks ?? null,
     idGen = null,
     diagnostics = isDiagnosticsEnabled,
-    log = (...args) => logDiagnostics(...args)
+    log = (...args) => logDiagnostics(...args),
+    pacing = getTurnPacingMs
 } = {}) {
     /** Operation id → {promise, hookAdvanced}: dedup of repeated executions. */
     const executions = new Map();
@@ -322,14 +325,16 @@ export function createExecutorService({
      * @param {object} context
      * @param {object|null} operation
      * @param {number} replanCount
+     * @param {object|null} [run] Shared execution state (config source).
      * @returns {object}
      */
-    function _planContext(context, operation, replanCount) {
+    function _planContext(context, operation, replanCount, run = null) {
         return {
             ...(context.planContext ?? {}),
             operation: operation ?? context.operation ?? null,
             operationId: context.operationId ?? operation?.id ?? null,
-            replanCount
+            replanCount,
+            includeNeutral: (run?.config ?? resolveConfig(run?.combatant ?? context.combatant))?.includeNeutral === true
         };
     }
 
@@ -622,7 +627,7 @@ export function createExecutorService({
                 replanned = await planner.planTurn(
                     context.combat,
                     run.combatant,
-                    _planContext(context, context.operation, run.replanCount)
+                    _planContext(context, context.operation, run.replanCount, run)
                 );
             } catch(err) {
                 replanned = null;
@@ -699,6 +704,8 @@ export function createExecutorService({
             // few seconds and re-drive while the op's turn is still held.
             for (let attempt = 0; attempt <= ADVANCE_VERIFY_RETRIES; attempt++) {
                 const before = key();
+                // Pacing before the advance keeps each bot's turn visible.
+                if (attempt === 0 && pacing() > 0) await _sleep(pacing());
                 try {
                     await combat.nextTurn();
                 } catch(err) {
@@ -903,6 +910,7 @@ export function createExecutorService({
             return result;
         }
         const config = resolveConfig(run.combatant);
+        run.config = config;
         if (!config?.enabled) {
             const result = _result({
                 status: EXECUTOR_STATUS.cancelled,
@@ -1011,6 +1019,9 @@ export function createExecutorService({
                         };
                     }
                     run.stepIndex++;
+                    // Pacing: let the move animation/roll card breathe so
+                    // automated turns stay watchable (world setting).
+                    if (run.stepIndex < steps.length) await _sleep(pacing());
                     continue;
                 }
 
@@ -1157,7 +1168,7 @@ export function createExecutorService({
                     planned = await planner.planTurn(
                         context.combat,
                         run.combatant,
-                        _planContext(context, context.operation, 0)
+                        _planContext(context, context.operation, 0, run)
                     );
                 } catch(err) {
                     planned = null;

@@ -11,6 +11,7 @@ import {
     isAiEnabled,
     resolveEffectiveConfig
 } from "../../scripts/config-resolver.js";
+import { MODULE_ID } from "../../scripts/constants.js";
 import {
     freezeDeep,
     makeActor,
@@ -243,6 +244,27 @@ test("resolver is deterministic: repeated calls return equal results", () => {
     const first = resolveEffectiveConfig(combatant);
     const second = resolveEffectiveConfig(combatant);
     assert.deepEqual(first, second);
+});
+
+test("includeNeutral carries from actor config to the enabled result", () => {
+    const actor = makeActor({ rawConfig: { enabled: true, preset: "assault", includeNeutral: true } });
+    assert.deepEqual(resolveEffectiveConfig(actor), {
+        enabled: true, preset: "assault", source: "actor", includeNeutral: true
+    });
+});
+
+test("includeNeutral defaults to absent and override may force it off", () => {
+    const actor = makeActor({ rawConfig: { enabled: true, preset: "assault", includeNeutral: true } });
+    // Token override without the flag keeps the actor setting.
+    const inheritToken = makeToken({ actor, mode: "enabled", preset: "hold" });
+    assert.equal(resolveEffectiveConfig(inheritToken).includeNeutral, true);
+    // Explicit false on the override wins over the actor flag.
+    const overrideToken = makeToken({ actor, mode: "enabled", preset: "hold" });
+    overrideToken.flags[MODULE_ID].override.includeNeutral = false;
+    const result = resolveEffectiveConfig(overrideToken);
+    assert.equal(result.includeNeutral === true, false);
+    // Actor config without the flag resolves without includeNeutral.
+    assert.equal(resolveEffectiveConfig(makeActor({ enabled: true, preset: "hold" })).includeNeutral, undefined);
 });
 
 test("isAiEnabled mirrors resolveEffectiveConfig", () => {

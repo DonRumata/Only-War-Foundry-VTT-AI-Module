@@ -54,8 +54,12 @@ export const SETTING_KEYS = Object.freeze({
     executionMode: "executionMode",
     diagnosticsEnabled: "diagnosticsEnabled",
     preferredCohesion: "preferredCohesion",
-    previewTimeoutSeconds: "previewTimeoutSeconds"
+    previewTimeoutSeconds: "previewTimeoutSeconds",
+    turnPacingMs: "turnPacingMs"
 });
+
+/** Default pacing delay between AI execution steps in milliseconds. */
+export const DEFAULT_TURN_PACING_MS = 800;
 
 /** Default GM preview timeout in seconds (issue #409); 0 disables it. */
 export const DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60;

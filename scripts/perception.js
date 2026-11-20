@@ -727,9 +727,17 @@ function _deepFreeze(value) {
  * @param {object} [input.combat]
  * @param {object} [input.combatant]
  * @param {object} [input.token] Viewer token of the combatant.
+ * @param {boolean} [input.includeNeutral] Also accept neutral targets.
+ * @param {number[]|null} [input.dispositions] Explicit disposition allow-list.
  * @returns {object} Frozen snapshot.
  */
-export function buildPerceptionSnapshot({ combat = null, combatant = null, token = null } = {}) {
+export function buildPerceptionSnapshot({
+    combat = null,
+    combatant = null,
+    token = null,
+    includeNeutral = false,
+    dispositions = null
+} = {}) {
     if (!globalThis.canvas?.scene || !token) {
         return _deepFreeze({
             status: PERCEPTION_STATUS.unavailable,
@@ -748,7 +756,7 @@ export function buildPerceptionSnapshot({ combat = null, combatant = null, token
     const sceneId = globalThis.canvas.scene.id ?? null;
     const round = Number.isFinite(combat?.round) ? combat.round : 0;
     const turn = Number.isFinite(combat?.turn) ? combat.turn : 0;
-    const visible = visibleTargets(token, { combat });
+    const visible = visibleTargets(token, { combat, includeNeutral, dispositions });
     const visibleUuids = new Set(visible.map(t => t.tokenUuid).filter(Boolean));
     const memory = pruneMemory(expireMemoryEntries(_readMemory(combatant), round), {
         sceneId,
