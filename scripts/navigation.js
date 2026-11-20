@@ -1679,10 +1679,22 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
     }
     candidates.sort((a, b) => (b.score - a.score) || (a.i - b.i) || (a.j - b.j));
     const count = Number.isFinite(options.count) ? options.count : DEFAULT_CANDIDATE_COUNT;
+    const selected = candidates.slice(0, Math.max(0, count));
+    // Attach wall-aware waypoints so consumers (planner move steps,
+    // preview routes, fireteam reservations) can serialize an executable
+    // path instead of straight-lining into a wall. Only the selected
+    // destinations get an A* pass — scoring stays flood-fill cheap.
+    for (const candidate of selected) {
+        const route = planRouteOnContext(context, { i: candidate.i, j: candidate.j },
+            budgetCells, options);
+        if (route.status === NAVIGATION_STATUS.ok && Array.isArray(route.waypoints)) {
+            candidate.waypoints = route.waypoints;
+        }
+    }
     return _deepFreeze({
         status: NAVIGATION_STATUS.ok,
         reason: null,
-        candidates: candidates.slice(0, Math.max(0, count)),
+        candidates: selected,
         evaluated: candidates.length,
         visitedNodes: reachable.visitedNodes,
         sceneId: context.sceneId

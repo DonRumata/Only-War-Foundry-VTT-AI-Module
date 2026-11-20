@@ -137,6 +137,7 @@ export function createAuthorityService(deps = {}) {
         status: AUTHORITY_STATUS.waitingForGm,
         /** Turn keys already claimed by this client — dedup of repeat hooks. */
         claimedKeys: new Set(),
+        claimAttempts: new Map(),
         /** Operation ids owned by this client's local process. */
         localOperations: new Set(),
         /** Combats that reported a turn/round change since the last flush. */
@@ -325,6 +326,7 @@ export function createAuthorityService(deps = {}) {
     function _onControllerChanged(previous) {
         state.localOperations.clear();
         state.claimedKeys.clear();
+        state.claimAttempts.clear();
         log("controller changed", previous, "->", state.controllerId);
         if (isController() && isEnabled()) {
             _track(abortIfControllerChanged());
@@ -436,6 +438,7 @@ export function createAuthorityService(deps = {}) {
         } catch(err) {
             state.claimedKeys.delete(key);
             console.error(`${MODULE_ID} | claimTurn failed`, err);
+            _requeueClaim(combat, key);
             return;
         }
         if (!claim.ok) {
@@ -443,12 +446,34 @@ export function createAuthorityService(deps = {}) {
             // messages must never retry the same claim.
             if (claim.reason !== OPERATION_REASONS.operationExists) {
                 state.claimedKeys.delete(key);
+                _requeueClaim(combat, key);
             }
             log("claim rejected:", claim.reason);
             return;
         }
+        state.claimAttempts.delete(key);
         state.localOperations.add(claim.operation.id);
         await _advanceAfterClaim(combat, claim.operation);
+    }
+
+    /** Bounded retry budget for a transiently rejected turn claim. */
+    const CLAIM_RETRY_LIMIT = 3;
+
+    /**
+     * Re-queue a combat whose turn claim failed transiently so the turn is
+     * retried on the next debounced flush instead of parking forever.
+     * Bounded by {@link CLAIM_RETRY_LIMIT} — a persistently broken turn
+     * reports the failure and gives up.
+     * @param {object} combat Combat document.
+     * @param {string} key Claim dedup key.
+     */
+    function _requeueClaim(combat, key) {
+        const attempts = (state.claimAttempts.get(key) ?? 0) + 1;
+        state.claimAttempts.set(key, attempts);
+        if (attempts <= CLAIM_RETRY_LIMIT && combat) {
+            state.pendingTurns.set(combat.id ?? combat, combat);
+            _schedule();
+        }
     }
 
     /**

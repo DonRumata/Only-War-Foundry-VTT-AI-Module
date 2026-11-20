@@ -109,6 +109,9 @@ function makeWorld({ enemy = { x: 300, y: 0 }, preset = "assault", enabled = tru
     combat.scene = scene;
     combat.nextTurn = async () => {
         nextTurnCalls.count++;
+        // Mirror Foundry semantics: nextTurn mutates (round, turn) so the
+        // executor's advance verification sees a real transition.
+        combat.turn += 1;
         return combat;
     };
     return {

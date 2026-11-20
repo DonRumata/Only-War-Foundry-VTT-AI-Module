@@ -86,6 +86,23 @@ export const STEP_STATUS = Object.freeze({
     failed: "failed"
 });
 
+/** Settle windows checked after each turn advance (cumulative ~4.5 s). */
+const ADVANCE_VERIFY_WINDOWS = Object.freeze([600, 1200, 2400]);
+
+/** Retry budget for a silently reverted turn advance. */
+const ADVANCE_VERIFY_RETRIES = 2;
+
+/**
+ * Sleep helper for the advance-verification window.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function _sleep(ms) {
+    return new Promise(resolve => {
+        globalThis.setTimeout(resolve, ms);
+    });
+}
+
 /**
  * Normalize a Foundry collection/Map/array into a plain array.
  * @param {*} collection
@@ -240,9 +257,7 @@ export function createExecutorService({
                 if (operation?.result?.advanceTurn === false) return;
                 if (combat?.ended === true) return;
                 if (!_isController({}) || typeof combat?.nextTurn !== "function") return;
-                Promise.resolve(combat.nextTurn()).catch(err => {
-                    console.error(`${MODULE_ID} | nextTurn failed`, err);
-                });
+                _advanceForOperation(combat, operation, {});
             } catch(err) {
                 console.error(`${MODULE_ID} | operationCompleted handler failed`, err);
             }
@@ -645,6 +660,65 @@ export function createExecutorService({
         return outcome?.reason ?? "step-failed";
     }
 
+    /** In-flight turn advances per combat — serializes `nextTurn` calls. */
+    const advanceChains = new Map();
+
+    /**
+     * Advance the combat turn once for one operation — turn-keyed, chained
+     * and verified. Two advances for the same operation can never race:
+     * requests queue behind the in-flight one, and a caller whose turn is
+     * already past `operation.{round,turn}` is a no-op. This matters
+     * because two overlapping `nextTurn` calls can land out of order and
+     * restore an older turn — observed in live sessions as a parked combat.
+     * After a short settle window the pair is re-read and the call retries
+     * a bounded number of times before reporting a controlled diagnostic.
+     * @param {object} combat Combat document.
+     * @param {object} operation Operation record carrying `round`/`turn`.
+     * @param {object} context
+     * @returns {Promise<boolean>} true when the turn moved past the op.
+     */
+    async function _advanceForOperation(combat, operation, context) {
+        if (!combat || combat.ended === true) return false;
+        if (!_isController(context)) return false;
+        if (typeof combat.nextTurn !== "function") return false;
+        const onTurn = () => {
+            // Operations without turn coordinates (direct runPlan callers)
+            // keep the legacy always-advance semantics.
+            if (!Number.isFinite(operation?.round) || !Number.isFinite(operation?.turn)) return true;
+            return combat.round === operation.round && combat.turn === operation.turn;
+        };
+        if (!onTurn()) return true;
+        const id = combat.id ?? "combat";
+        const prior = advanceChains.get(id) ?? Promise.resolve();
+        const next = prior.then(async () => {
+            if (!onTurn()) return true;
+            const key = () => `${combat.round}:${combat.turn}`;
+            // A resolved `nextTurn` can be silently reverted well after it
+            // resolves (out-of-order document writes); keep verifying for a
+            // few seconds and re-drive while the op's turn is still held.
+            for (let attempt = 0; attempt <= ADVANCE_VERIFY_RETRIES; attempt++) {
+                const before = key();
+                try {
+                    await combat.nextTurn();
+                } catch(err) {
+                    console.error(`${MODULE_ID} | nextTurn failed`, err);
+                }
+                for (const window of ADVANCE_VERIFY_WINDOWS) {
+                    await _sleep(window);
+                    if (key() !== before) return true;
+                }
+            }
+            log(`advance stalled: ${key()} unchanged after ${ADVANCE_VERIFY_RETRIES + 1} attempts`);
+            return false;
+        });
+        advanceChains.set(id, next);
+        try {
+            return await next;
+        } finally {
+            if (advanceChains.get(id) === next) advanceChains.delete(id);
+        }
+    }
+
     /**
      * Advance the combat turn once. The `operationCompleted` hook emitted
      * by `completeTurn` (#400) is the primary handoff; when no operations
@@ -659,11 +733,7 @@ export function createExecutorService({
         if (context.combat?.ended === true) return;
         if (!_isController(context)) return;
         if (typeof context.combat?.nextTurn !== "function") return;
-        try {
-            await context.combat.nextTurn();
-        } catch(err) {
-            console.error(`${MODULE_ID} | nextTurn failed`, err);
-        }
+        await _advanceForOperation(context.combat, context.operation ?? run.operation, context);
     }
 
     /**
