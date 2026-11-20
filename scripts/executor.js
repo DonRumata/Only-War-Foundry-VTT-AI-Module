@@ -634,6 +634,7 @@ export function createExecutorService({
                 log(`replan ${run.replanCount}: ${failReason} -> ${replanned.plan.id}`);
                 return { action: "replan" };
             }
+            run.report = replanned?.diagnostics ?? run.report;
             return {
                 action: "stop",
                 reason: replanned?.reason ?? EXECUTOR_REASONS.planFailed
@@ -774,6 +775,28 @@ export function createExecutorService({
     }
 
     /**
+     * Compact summary of the planner's rejected candidates for GM-facing
+     * diagnostics ("pinned ×3, no-los ×2"). Returns `null` when the report
+     * carries no rejection list.
+     * @param {*} report Planner diagnostics or a replan report.
+     * @returns {string|null}
+     */
+    function _rejectedSummary(report) {
+        const rejected = Array.isArray(report?.rejected) ? report.rejected : [];
+        if (!rejected.length) return null;
+        const counts = new Map();
+        for (const entry of rejected) {
+            const reason = entry?.reason ?? "unknown";
+            counts.set(reason, (counts.get(reason) ?? 0) + 1);
+        }
+        return [...counts.entries()]
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 4)
+            .map(([reason, count]) => (count > 1 ? `${reason} ×${count}` : reason))
+            .join(", ");
+    }
+
+    /**
      * GM-facing diagnostics for stopped turns: a warning notification plus
      * a whispered chat card with the plan diagnostics when diagnostics are
      * enabled.
@@ -795,10 +818,16 @@ export function createExecutorService({
         }
         log(`execution ${run.operationId} stopped: ${result.reason}`, run.report ?? "");
         if (diagnostics() && typeof globalThis.ChatMessage !== "undefined") {
+            const rejected = _rejectedSummary(run.report);
+            const detail = rejected
+                ? (i18n?.format?.("OWAI.Chat.ExecutorDiagnosticsDetail", { list: rejected })
+                    ?? ` rejected: ${rejected}`)
+                : "";
             const content = i18n?.format?.("OWAI.Chat.ExecutorDiagnostics", {
                 name,
                 reason: result.reason ?? "unknown",
-                plan: result.planId ?? "—"
+                plan: result.planId ?? "—",
+                detail
             }) ?? message;
             const whisper = _list(globalThis.game?.users)
                 .filter(user => user?.isGM)
@@ -1134,6 +1163,7 @@ export function createExecutorService({
                     planned = null;
                 }
                 if (planned?.status !== "ok" || !planned.plan) {
+                    run.report = planned?.diagnostics ?? null;
                     const result = _result({
                         status: EXECUTOR_STATUS.failed,
                         reason: planned?.reason ?? EXECUTOR_REASONS.planFailed,
