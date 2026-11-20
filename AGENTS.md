@@ -8,6 +8,8 @@
 `game.darkHeresy.api` (issue #398) — модуль не импортирует `script/common/*`
 системы.
 
+Сводка возможностей API и ботов + явные границы — `docs/capabilities.md`.
+
 ## Структура
 
 - `scripts/` — ES-модули: bootstrap, resolver, settings, API, UI-хуки.
