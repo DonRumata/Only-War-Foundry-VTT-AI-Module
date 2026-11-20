@@ -363,6 +363,25 @@ test("visibleTargets: defeated combatant and destroyed token are excluded", () =
     }
 });
 
+test("visibleTargets entries carry sorted status ids", () => {
+    const viewer = mockToken({ id: "viewer", x: 0, y: 0, disposition: -1 });
+    const target = mockToken({
+        id: "target",
+        x: 200,
+        y: 0,
+        disposition: 1,
+        statuses: ["stunned", "pinned"]
+    });
+    const restore = installCanvas({ tokens: [viewer, target], testVisibility: () => true });
+    try {
+        const targets = visibleTargets(viewer);
+        assert.deepEqual(targets.map(t => t.tokenId), ["target"]);
+        assert.deepEqual(targets[0].statuses, ["pinned", "stunned"]);
+    } finally {
+        restore();
+    }
+});
+
 test("visibleTargets: blinded viewer sees nothing", () => {
     const viewer = mockToken({ id: "viewer", x: 0, y: 0, disposition: -1, statuses: ["blinded"] });
     const target = mockToken({ id: "target", x: 200, y: 0, disposition: 1 });

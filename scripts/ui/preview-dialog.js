@@ -71,6 +71,23 @@ const TURN_ENDING_STALE = Object.freeze(new Set([
     STALE_REASONS.invalidPlan
 ]));
 
+/**
+ * I18n keys for planner stale reasons shown inside the
+ * `OWAI.Preview.Stale` banner — `{reason}` interpolates with the
+ * localized label, falling back to the raw code for unmapped reasons.
+ */
+const STALE_REASON_LABEL_KEYS = Object.freeze({
+    [STALE_REASONS.turnStale]: "OWAI.STALE.TURN_STALE",
+    [STALE_REASONS.tokenMoved]: "OWAI.STALE.TOKEN_MOVED",
+    [STALE_REASONS.targetGone]: "OWAI.STALE.TARGET_GONE",
+    [STALE_REASONS.resourcesChanged]: "OWAI.STALE.RESOURCES_CHANGED",
+    [STALE_REASONS.collisionChanged]: "OWAI.STALE.COLLISION_CHANGED",
+    [STALE_REASONS.statusesChanged]: "OWAI.STALE.STATUS_CHANGED",
+    [STALE_REASONS.combatEnded]: "OWAI.STALE.COMBAT_ENDED",
+    [STALE_REASONS.invalidPlan]: "OWAI.STALE.INVALID_PLAN",
+    [STALE_REASONS.stale]: "OWAI.STALE.STALE"
+});
+
 /** Document hooks whose changes may invalidate an open preview. */
 const STALE_WATCH_HOOKS = Object.freeze([
     "updateToken",
@@ -408,7 +425,9 @@ export function localizePreviewViewModel(vm, i18n = null) {
             label: _label(i18nSource, `OWAI.Preview.Factor.${entry.factor}`, entry.factor)
         })),
         staleLabel: vm.stale
-            ? (i18nSource?.format?.("OWAI.Preview.Stale", { reason: vm.stale }) ?? vm.stale)
+            ? (i18nSource?.format?.("OWAI.Preview.Stale", {
+                reason: _label(i18nSource, STALE_REASON_LABEL_KEYS[vm.stale] ?? "", vm.stale)
+            }) ?? vm.stale)
             : null,
         timeoutLabel: vm.timeoutSeconds
             ? (i18nSource?.format?.("OWAI.Preview.Timeout", { seconds: vm.timeoutSeconds }) ?? null)

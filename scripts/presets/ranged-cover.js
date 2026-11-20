@@ -69,7 +69,10 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     lastKnown: 1,
     budgetOver: -8,
     rangeBand: 6,
-    aimOpportunity: 1.5
+    aimOpportunity: 1.5,
+    attackType: 0.1,
+    vulnerable: 0.5,
+    meleeEngage: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

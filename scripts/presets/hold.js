@@ -88,7 +88,10 @@ export const HOLD_WEIGHTS = Object.freeze({
     escapeMelee: 10,
     searchMove: 14,
     anchorDrift: -4,
-    aimOpportunity: 1.5
+    aimOpportunity: 1.5,
+    attackType: 0.05,
+    vulnerable: 0.5,
+    meleeEngage: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

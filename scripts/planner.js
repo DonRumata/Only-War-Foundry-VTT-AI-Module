@@ -46,6 +46,7 @@ export const STALE_REASONS = Object.freeze({
     targetGone: "target-gone",
     resourcesChanged: "resources-changed",
     collisionChanged: "collision-changed",
+    statusesChanged: "statuses-changed",
     combatEnded: "combat-ended",
     invalidPlan: "invalid-plan",
     stale: "stale"
@@ -61,6 +62,7 @@ export const REPLAN_REASONS = Object.freeze(new Set([
     STALE_REASONS.targetGone,
     STALE_REASONS.resourcesChanged,
     STALE_REASONS.collisionChanged,
+    STALE_REASONS.statusesChanged,
     "step-failed",
     "operation-conflict"
 ]));
@@ -103,7 +105,11 @@ export const SCORE_FACTORS = Object.freeze([
     "exposure",
     "holdPosition",
     "lastKnown",
-    "budgetOver"
+    "budgetOver",
+    "attackType",
+    "vulnerable",
+    "engaged",
+    "meleeEngage"
 ]);
 
 /**
@@ -125,7 +131,11 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     exposure: 0,
     holdPosition: 0,
     lastKnown: 0.5,
-    budgetOver: 0
+    budgetOver: 0,
+    attackType: 0,
+    vulnerable: 0,
+    engaged: 0,
+    meleeEngage: 0
 });
 
 /**
@@ -186,6 +196,61 @@ const RESOURCE_KEYS = Object.freeze([
 
 /** Cap on item summaries stored in a snapshot. */
 const MAX_SNAPSHOT_ITEMS = 16;
+
+/**
+ * Desire value of each system-API attack type (issue #413) — the
+ * `attackType` factor presets weight. Unknown/custom types score the
+ * neutral default.
+ */
+const ATTACK_TYPE_DESIRE = Object.freeze({
+    allOut: 0.8,
+    lightning: 0.9,
+    swift: 0.6,
+    charge: 0.6,
+    standard: 0.5,
+    semi_auto: 0.7,
+    full_auto: 0.9,
+    ripper_charge: 0.6,
+    called_shot: 0.4
+});
+
+/** Neutral `attackType` factor for null/custom attack types. */
+const ATTACK_TYPE_DESIRE_DEFAULT = 0.5;
+
+/**
+ * Per-weapon cap of attack-type candidates kept by the curation in
+ * {@link _resolveActions} so one weapon cannot crowd out others under
+ * `DEFAULT_MAX_ACTIONS`.
+ */
+const MAX_ATTACK_TYPES_PER_WEAPON = 3;
+
+/** Curated preference order of melee attack types (best first). */
+const MELEE_ATTACK_TYPE_ORDER = Object.freeze([
+    "allOut",
+    "charge",
+    "standard",
+    "lightning",
+    "swift",
+    "called_shot"
+]);
+
+/** Curated preference order of ranged attack types (best first). */
+const RANGED_ATTACK_TYPE_ORDER = Object.freeze([
+    "full_auto",
+    "semi_auto",
+    "standard",
+    "ripper_charge",
+    "called_shot"
+]);
+
+/**
+ * Attack types never kept as candidates: `suppressing_fire` needs a
+ * targetPoint/template the plan-step contract cannot express yet.
+ */
+const EXCLUDED_ATTACK_TYPES = Object.freeze(new Set(["suppressing_fire"]));
+
+/** Status ids that mark a target as vulnerable to attack. */
+const VULNERABLE_STATUSES = Object.freeze(new Set(["pinned", "prone", "stunned"]));
 
 /**
  * Deterministic 32-bit FNV-1a fingerprint, identical on every client.
@@ -441,6 +506,48 @@ function _itemSummaries(actor) {
 }
 
 /**
+ * Sorted, deduplicated status ids collected from Foundry-style status
+ * sources (Set/array/iterable of ids, or a `{id: truthy}` map). Mirrors
+ * `statusIdsOf` in `perception.js`, kept local so the planner stays
+ * self-contained for unit fixtures.
+ * @param {...*} sources Status collections (`actor.statuses`,
+ *   `token.statuses`, injected arrays).
+ * @returns {string[]}
+ */
+function _statusIds(...sources) {
+    const ids = new Set();
+    for (const source of sources) {
+        if (!source) continue;
+        if (typeof source[Symbol.iterator] === "function") {
+            for (const id of source) ids.add(String(id));
+        } else if (typeof source === "object") {
+            for (const key of Object.keys(source)) {
+                if (source[key]) ids.add(String(key));
+            }
+        }
+    }
+    return [...ids].sort();
+}
+
+/**
+ * Self status ids for the snapshot: `actor.statuses` merged with the
+ * statuses carried by the token documents, plus the injected
+ * `context.selfStatuses` array used by unit-test fixtures.
+ * @param {object|null} actor Self actor document.
+ * @param {object|null} tokenDoc Self token document.
+ * @param {string[]|null} [injected] `context.selfStatuses` fixture array.
+ * @returns {string[]} Sorted status ids.
+ */
+function _selfStatuses(actor, tokenDoc, injected = null) {
+    return _statusIds(
+        injected,
+        actor?.statuses,
+        tokenDoc?.statuses,
+        tokenDoc?.actor?.statuses
+    );
+}
+
+/**
  * Numeric helper: value when finite, otherwise fallback.
  * @param {*} value
  * @param {number} fallback
@@ -448,6 +555,26 @@ function _itemSummaries(actor) {
  */
 function _finiteOr(value, fallback) {
     return Number.isFinite(value) ? value : fallback;
+}
+
+/**
+ * Halve a movement budget for a prone (crawling) combatant: numeric
+ * budgets are floored to half, `{mode}` budgets degrade to the `half`
+ * movement mode, other shapes pass through untouched.
+ * @param {*} budget Numeric, `{meters|cells|budget|limit|mode}` budget.
+ * @returns {*}
+ */
+function _halveMoveBudget(budget) {
+    if (Number.isFinite(budget)) return Math.floor(budget / 2);
+    if (budget && typeof budget === "object") {
+        const copy = { ...budget };
+        for (const key of ["meters", "cells", "budget", "limit"]) {
+            if (Number.isFinite(copy[key])) copy[key] = Math.floor(copy[key] / 2);
+        }
+        if (typeof copy.mode === "string") copy.mode = "half";
+        return copy;
+    }
+    return budget;
 }
 
 /**
@@ -565,11 +692,14 @@ function _turnRevision(combat, combatant, authority) {
  * @param {object|null} input.actor Live self actor document.
  * @param {object|null} input.targetToken Live target token document.
  * @param {string|null} input.collision Live collision revision.
+ * @param {string[]|null} [input.selfStatuses] Injected fixture statuses
+ *   (`context.selfStatuses`) that must merge into the live computation.
  * @param {object} input.snapshot Stored plan snapshot.
  * @returns {string}
  */
 function _staleFingerprint(input) {
-    const { combat, combatant, token, actor, targetToken, collision, snapshot } = input;
+    const { combat, combatant, token, actor, targetToken, collision,
+        selfStatuses, snapshot } = input;
     const position = _tokenPosition(token);
     const targetPosition = _tokenPosition(targetToken);
     const targetCombatant = _findCombatantByToken(combat, snapshot?.target?.tokenId ?? null);
@@ -582,7 +712,8 @@ function _staleFingerprint(input) {
             position.y,
             token?.elevation ?? null,
             token?.hidden === true,
-            combatant?.defeated === true
+            combatant?.defeated === true,
+            _selfStatuses(actor, token, selfStatuses)
         ],
         target: snapshot?.target
             ? (targetToken
@@ -730,6 +861,7 @@ export function buildPlanSnapshot({ combat = null, combatant = null, context = {
             defeated: combatant?.defeated === true,
             initiative: combatant?.initiative ?? null,
             disposition: _finiteOr(tokenDoc?.disposition ?? combatant?.disposition, 0),
+            statuses: _selfStatuses(actor, tokenDoc, context?.selfStatuses),
             resources: _resourcesOf(actor),
             resourcesHash: _resourcesFingerprint(actor),
             items: _itemSummaries(actor)
@@ -802,6 +934,7 @@ function _normalizeTarget(raw, { source, sceneId, selfPos, grid, measure }) {
         threat: _finiteOr(raw.threat, 0),
         canAttack: source === "last-known" ? false : raw.canAttack !== false,
         hidden: raw.hidden === true,
+        statuses: _statusIds(raw.statuses),
         source
     };
 }
@@ -839,7 +972,8 @@ function _fallbackTargets(combat, combatant, input) {
             y: position.y,
             elevation: doc.elevation,
             canAttack: true,
-            hidden: false
+            hidden: false,
+            statuses: _statusIds(doc.actor?.statuses, doc.statuses)
         }, { ...input, source: "fallback" });
         if (target) targets.push(target);
     }
@@ -1023,8 +1157,11 @@ async function _resolveActions(actor, context) {
             || ((_actionRange(b) - _actionRange(a)))
             || String(a.id).localeCompare(String(b.id)));
     // The system API exposes one entry per attack type per weapon
-    // (standard/charge/allOut/вЂ¦) вЂ” deduplicate those per weapon so a
-    // multi-type weapon cannot crowd others out under DEFAULT_MAX_ACTIONS.
+    // (standard/charge/allOut/…) — curate per weapon: keep all available
+    // attack types but cap each weapon to MAX_ATTACK_TYPES_PER_WEAPON
+    // picks in curated preference order so a multi-type weapon cannot
+    // crowd others out under DEFAULT_MAX_ACTIONS. `suppressing_fire` is
+    // excluded outright (it needs a targetPoint/template).
     // Injected/custom actions (no attackType) always pass through.
     const apiGroups = new Map();
     const passthrough = [];
@@ -1042,9 +1179,32 @@ async function _resolveActions(actor, context) {
         group.push(action);
     }
     for (const group of apiGroups.values()) {
-        passthrough.push(group.find(a => a.attackType === "standard") ?? group[0]);
+        passthrough.push(..._curateAttackTypes(group));
     }
     return passthrough;
+}
+
+/**
+ * Pick the best attack-type candidates of a single weapon: drop excluded
+ * types, order by the curated melee/ranged preference list (unknown types
+ * last, stable) and keep at most {@link MAX_ATTACK_TYPES_PER_WEAPON}.
+ * @param {object[]} group Normalized actions sharing one weapon.
+ * @returns {object[]}
+ */
+function _curateAttackTypes(group) {
+    const melee = group.some(action => _isMeleeAction(action));
+    const order = melee ? MELEE_ATTACK_TYPE_ORDER : RANGED_ATTACK_TYPE_ORDER;
+    const rank = new Map(order.map((type, index) => [type, index]));
+    return group
+        .map((action, index) => ({
+            action,
+            index,
+            rank: rank.has(action.attackType) ? rank.get(action.attackType) : order.length
+        }))
+        .filter(entry => !EXCLUDED_ATTACK_TYPES.has(entry.action.attackType))
+        .sort((a, b) => (a.rank - b.rank) || (a.index - b.index))
+        .slice(0, MAX_ATTACK_TYPES_PER_WEAPON)
+        .map(entry => entry.action);
 }
 
 /**
@@ -1219,11 +1379,19 @@ function _factorsOf({ variant, target, move, action, moveBudget = null }) {
     const budgetOver = budget !== null && move
         ? Math.max(0, (_finiteOr(move.cost, 0) - budget) / budget)
         : 0;
+    const melee = _isMeleeAction(action) ? 1 : 0;
+    // Melee reach of the evaluated endpoint: the melee action's own
+    // range when the candidate carries one, the default reach otherwise
+    // — a ranged candidate still counts as engaged in close contact.
+    const meleeReach = melee ? _actionRange(action) : DEFAULT_MELEE_RANGE;
+    const engaged = Number.isFinite(postDistance) && postDistance <= meleeReach + 1e-9 ? 1 : 0;
+    const vulnerable = (target?.statuses ?? [])
+        .some(status => VULNERABLE_STATUSES.has(status)) ? 1 : 0;
     return {
         attackNow,
         attackAfterMove,
         charge: variant === "charge" ? 1 : 0,
-        melee: _isMeleeAction(action) ? 1 : 0,
+        melee,
         advance,
         threat: Math.max(0, Math.min(1, _finiteOr(target?.threat, 0))),
         proximity,
@@ -1232,7 +1400,13 @@ function _factorsOf({ variant, target, move, action, moveBudget = null }) {
         exposure: move && move.stay !== true ? Math.max(0, 1 - cover) : 0,
         holdPosition,
         lastKnown: target?.source === "last-known" ? 1 : 0,
-        budgetOver
+        budgetOver,
+        attackType: action
+            ? (ATTACK_TYPE_DESIRE[action.attackType] ?? ATTACK_TYPE_DESIRE_DEFAULT)
+            : 0,
+        vulnerable,
+        engaged,
+        meleeEngage: melee * engaged
     };
 }
 
@@ -1402,7 +1576,7 @@ export function createPlannerService({
      *   `actionsApi`, `moves`, `moveBudget`, `actionBudget`, `rates`,
      *   `perception`, `navigation`, `authority`, `scene`, `token`,
      *   `collisionRevision`, `maxTargets`, `maxActions`,
-     *   `approximateMoves`.
+     *   `approximateMoves`, `selfStatuses`.
      * @returns {Promise<object>} `{status, plan?, reason?, diagnostics?}`.
      */
     async function planTurn(combat, combatant, context = {}) {
@@ -1452,6 +1626,45 @@ export function createPlannerService({
             };
         }
         const selfPos = _tokenPosition(tokenDoc);
+        // Self status constraints (issue #413): deterministic rules read
+        // from actor/token statuses merged with the injected
+        // `context.selfStatuses` fixture array.
+        // - `stunned`: OW combatants take no actions — short-circuit to an
+        //   ok plan whose only step is `end-turn` stamped `stunned`.
+        // - `pinned`: no charge and no move that ends closer to the
+        //   target; attack-in-place and distance-keeping moves stay legal.
+        // - `prone`: the movement budget halves (floor; crawl) and charge
+        //   is vetoed.
+        const selfStatuses = _selfStatuses(actor, tokenDoc, context.selfStatuses);
+        diagnostics.selfStatuses = selfStatuses;
+        if (selfStatuses.includes("stunned")) {
+            const steps = [{
+                id: "step-end-turn-1",
+                type: "end-turn",
+                cost: {},
+                input: { reason: "stunned" },
+                preconditions: ["turn"],
+                projectedResourceDelta: {}
+            }];
+            diagnostics.chosenStep = steps[0].id;
+            const plan = _assemblePlan({
+                combat, combatant, context, authority, seed, presetId,
+                diagnostics, steps,
+                winner: { score: 0, breakdown: { reason: "stunned" }, target: null },
+                targets: [],
+                actions: []
+            });
+            log(`plan ${plan.id} preset=${presetId} stunned hold`);
+            return { status: PLANNER_STATUS.ok, plan, reason: null };
+        }
+        const isPinned = selfStatuses.includes("pinned");
+        const isProne = selfStatuses.includes("prone");
+        // Prone halves the numeric movement budget (floor; crawl) — both
+        // the navigation findCandidates input and the `budgetOver`
+        // factor see the reduced value.
+        const planContext = isProne
+            ? { ...context, moveBudget: _halveMoveBudget(context.moveBudget ?? { mode: "full" }) }
+            : context;
         const perception = _service("perception", context.perception);
         const navigation = _service("navigation", context.navigation);
         // Prime the per-actor movement-rate cache: findCandidates is
@@ -1478,7 +1691,17 @@ export function createPlannerService({
         }
 
         const actions = await _resolveActions(actor, context);
-        const usableActions = actions.slice(0, _finiteOr(context.maxActions, DEFAULT_MAX_ACTIONS));
+        // `maxActions` bounds weapons, not action rows: curated attack
+        // types of one weapon must not crowd other weapons out.
+        const actionGroups = new Map();
+        for (const action of actions) {
+            const key = action.itemUuid ?? action.itemId ?? action.name ?? action.id;
+            if (!actionGroups.has(key)) actionGroups.set(key, []);
+            actionGroups.get(key).push(action);
+        }
+        const usableActions = [...actionGroups.values()]
+            .slice(0, _finiteOr(context.maxActions, DEFAULT_MAX_ACTIONS))
+            .flat();
         if (!usableActions.length && !preset.allowNoAction && targets.length) {
             return {
                 status: PLANNER_STATUS.noAction,
@@ -1490,10 +1713,11 @@ export function createPlannerService({
 
         // Numeric movement budget used by the `budgetOver` factor; injected
         // budgets may be a number or `{budget|limit}` objects from callers
-        // like the executor.
-        const moveBudget = Number.isFinite(context.moveBudget)
-            ? context.moveBudget
-            : _finiteOr(context.moveBudget?.budget ?? context.moveBudget?.limit, null);
+        // like the executor. `planContext` already carries the halved
+        // prone budget.
+        const moveBudget = Number.isFinite(planContext.moveBudget)
+            ? planContext.moveBudget
+            : _finiteOr(planContext.moveBudget?.budget ?? planContext.moveBudget?.limit, null);
         const actionBudget = _finiteOr(context.actionBudget, 1);
         // Fallback approach points aim for the shortest usable range so a
         // melee-capable NPC keeps closing instead of stopping at gun range.
@@ -1505,12 +1729,21 @@ export function createPlannerService({
 
         const candidates = [];
         let routesMissing = false;
+        // Dedup guard so a status veto logs one diagnostics entry per
+        // candidate/reason instead of one per enumerated move.
+        const rejectedOnce = new Set();
+        const rejectOnce = (candidate, reason) => {
+            const key = `${candidate}|${reason}`;
+            if (rejectedOnce.has(key)) return;
+            rejectedOnce.add(key);
+            diagnostics.rejected.push({ candidate, reason });
+        };
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             const moves = _resolveMoves({
                 tokenDoc, target, range: approachRange,
                 selfPos, targetPos: targetPosOf(target),
-                grid, navigation, perception, context
+                grid, navigation, perception, context: planContext
             });
             diagnostics.metrics.movesEvaluated += moves.length;
 
@@ -1548,6 +1781,23 @@ export function createPlannerService({
                     }
                     const range = _actionRange(action);
                     const melee = _isMeleeAction(action);
+                    // The weapon's own `charge` attack type — when the
+                    // system API exposes one — is the canonical action
+                    // for move-into-reach candidates; sibling attack
+                    // types of the same weapon defer to it instead of
+                    // duplicating the charge variant.
+                    const weaponKey = action.itemUuid ?? action.itemId
+                        ?? action.name ?? action.id;
+                    const chargePeer = action.attackType === "charge" ? null
+                        : usableActions.find(other => other !== action
+                            && other.attackType === "charge"
+                            && (other.itemUuid ?? other.itemId ?? other.name ?? other.id)
+                                === weaponKey);
+                    // Status constraints: pinned and prone combatants
+                    // cannot charge at all; a pinned combatant may still
+                    // reposition while keeping or increasing the distance
+                    // to the target.
+                    const chargeVeto = isPinned ? "pinned" : (isProne ? "prone" : null);
                     let inPlace = false;
                     if (distance <= range + 1e-9) {
                         candidates.push({ target, action, move: null, variant: "attack-in-place" });
@@ -1570,6 +1820,23 @@ export function createPlannerService({
                             // Moving into melee reach is a charge; any
                             // other move inside weapon range is move+attack.
                             const variant = melee ? "charge" : "move-attack";
+                            // Pinned/prone veto charges outright; a
+                            // sibling `charge` attack type owns the
+                            // variant so other types skip it (dedup, not
+                            // a rejection).
+                            if (variant === "charge" && chargeVeto) {
+                                rejectOnce(`charge|${tag}`, chargeVeto);
+                                continue;
+                            }
+                            if (variant === "charge" && chargePeer) continue;
+                            // Pinned: a move-attack that ends closer to
+                            // the target is vetoed; distance-keeping
+                            // moves stay legal.
+                            if (variant === "move-attack" && isPinned
+                                && move.distance < distance) {
+                                rejectOnce(`move-attack|${tag}`, "pinned");
+                                continue;
+                            }
                             candidates.push({ target, action, move, variant });
                             attackMoveFound = true;
                             attackFound = true;
@@ -1584,8 +1851,19 @@ export function createPlannerService({
                 }
             }
 
-            if (approachMove) {
+            // A closing approach is a relocation that ends nearer the
+            // target — pinned combatants may only move while keeping or
+            // increasing the distance, exactly like move-attack.
+            const approachVetoed = approachMove !== null && isPinned
+                && Number.isFinite(approachMove.distance)
+                && approachMove.distance < distance;
+            if (approachMove && !approachVetoed) {
                 candidates.push({ target, action: null, move: approachMove, variant: "approach" });
+            } else if (approachVetoed) {
+                diagnostics.rejected.push({
+                    candidate: `approach|${target.tokenUuid}`,
+                    reason: "pinned"
+                });
             } else if (!attackFound) {
                 routesMissing = true;
                 diagnostics.rejected.push({
@@ -1628,7 +1906,7 @@ export function createPlannerService({
             navigation,
             resolvedTargets: targets,
             usableActions,
-            ...context
+            ...planContext
         };
         const scored = [];
         candidates.forEach((candidate, index) => {
@@ -1696,6 +1974,38 @@ export function createPlannerService({
         const steps = _stepsFor({ candidate: winner });
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
+        const plan = _assemblePlan({
+            combat, combatant, context, authority, seed, presetId,
+            diagnostics, steps, winner, targets, actions: usableActions
+        });
+        log(`plan ${plan.id} preset=${presetId} score=${winner.score} steps=${steps.length}`);
+        return { status: PLANNER_STATUS.ok, plan, reason: null };
+    }
+
+    /**
+     * Assemble the serialized plan: finalized snapshot (self, targets,
+     * actions, chosen target), stale/revision fingerprints and the frozen
+     * plan document shared by the normal scoring path and the stunned
+     * short-circuit.
+     * @param {object} input
+     * @param {object} input.combat Combat document.
+     * @param {object} input.combatant Active combatant document.
+     * @param {object} input.context Planning context overrides.
+     * @param {object|null} input.authority Authority service or null.
+     * @param {number} input.seed Deterministic plan seed.
+     * @param {string} input.presetId Resolved preset id.
+     * @param {object} input.diagnostics Diagnostics record.
+     * @param {object[]} input.steps Serialized plan steps.
+     * @param {object} input.winner `{score, breakdown, target}` triple.
+     * @param {object[]} input.targets Normalized targets for the snapshot.
+     * @param {object[]} input.actions Usable actions for the snapshot.
+     * @returns {object} Frozen plan.
+     */
+    function _assemblePlan({ combat, combatant, context, authority, seed,
+        presetId, diagnostics, steps, winner, targets, actions }) {
+        const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
+        const actor = _actorOf(combatant) ?? _actorOf(tokenDoc);
+        const scene = _sceneOf(context, combat);
         const base = buildPlanSnapshot({ combat, combatant, context, authority });
         const snapshot = _jsonClone({
             ...base,
@@ -1708,9 +2018,10 @@ export function createPlannerService({
                 elevation: target.elevation,
                 distance: target.distance,
                 canAttack: target.canAttack,
+                statuses: Array.isArray(target.statuses) ? [...target.statuses] : [],
                 source: target.source
             })),
-            actions: usableActions.map(action => ({
+            actions: actions.map(action => ({
                 id: action.id,
                 type: action.type,
                 name: action.name,
@@ -1723,7 +2034,10 @@ export function createPlannerService({
                     tokenUuid: winner.target.tokenUuid,
                     x: winner.target.x,
                     y: winner.target.y,
-                    elevation: winner.target.elevation
+                    elevation: winner.target.elevation,
+                    statuses: Array.isArray(winner.target.statuses)
+                        ? [...winner.target.statuses]
+                        : []
                 }
                 : null,
             seed
@@ -1736,6 +2050,7 @@ export function createPlannerService({
             actor,
             targetToken: snapshot.target ? _findToken(snapshot.target.tokenId, { combat, scene }) : null,
             collision: snapshot.scene.collisionRevision,
+            selfStatuses: context.selfStatuses,
             snapshot
         });
         snapshot.staleFingerprint = staleFingerprint;
@@ -1743,7 +2058,7 @@ export function createPlannerService({
 
         const replanCount = _finiteOr(context.replanCount, 0);
         const planId = `plan-${fnv1a(`${snapshot.revision}|${presetId}|${seed}|${replanCount}`)}`;
-        const plan = _deepFreeze({
+        return _deepFreeze({
             id: planId,
             operationId: context.operation?.id ?? context.operationId ?? null,
             actorUuid: snapshot.self.actorUuid,
@@ -1759,8 +2074,6 @@ export function createPlannerService({
             diagnostics,
             debug: { seed }
         });
-        log(`plan ${plan.id} preset=${presetId} score=${winner.score} steps=${steps.length}`);
-        return { status: PLANNER_STATUS.ok, plan, reason: null };
     }
 
     /**
@@ -1813,7 +2126,8 @@ export function createPlannerService({
         // Fast path: the fingerprint covers every field the checks below
         // inspect, so an equal fingerprint means the plan is still valid.
         const live = _staleFingerprint({
-            combat, combatant, token: tokenDoc, actor, targetToken, collision, snapshot
+            combat, combatant, token: tokenDoc, actor, targetToken, collision,
+            selfStatuses: currentContext.selfStatuses, snapshot
         });
         if (live === snapshot.staleFingerprint) {
             return { valid: true, reason: null };
@@ -1856,6 +2170,13 @@ export function createPlannerService({
         }
         if (_resourcesFingerprint(actor) !== self.resourcesHash) {
             return { valid: false, reason: STALE_REASONS.resourcesChanged };
+        }
+        // Self statuses (pinned/prone/stunned/…) gate which candidates are
+        // legal, so any drift invalidates the plan with its own reason.
+        const liveStatuses = _selfStatuses(actor, tokenDoc, currentContext.selfStatuses);
+        const plannedStatuses = Array.isArray(self.statuses) ? self.statuses : [];
+        if (liveStatuses.join("|") !== plannedStatuses.join("|")) {
+            return { valid: false, reason: STALE_REASONS.statusesChanged };
         }
         if ((collision ?? null) !== (snapshot.scene?.collisionRevision ?? null)) {
             return { valid: false, reason: STALE_REASONS.collisionChanged };

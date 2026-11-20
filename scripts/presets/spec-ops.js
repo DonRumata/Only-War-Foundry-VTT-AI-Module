@@ -86,7 +86,10 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     lastKnown: 1,
     budgetOver: -6,
     flankAngle: 0,
-    cohesionRestore: 0
+    cohesionRestore: 0,
+    attackType: 0.15,
+    vulnerable: 1,
+    meleeEngage: 3
 });
 
 /**
@@ -133,7 +136,9 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         proximity: 3,
         los: 1,
         cover: 1,
-        holdPosition: -2
+        holdPosition: -2,
+        attackType: 0.2,
+        meleeEngage: 4
     }),
     regroup: Object.freeze({
         attackNow: 4,
@@ -159,7 +164,10 @@ export const SPEC_OPS_SOLO_WEIGHTS = Object.freeze({
     threat: 3,
     los: 2,
     cover: 2,
-    holdPosition: 2
+    holdPosition: 2,
+    attackType: 0.1,
+    vulnerable: 0.5,
+    meleeEngage: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

@@ -128,6 +128,41 @@ Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
 - Debounce ~150 мс на `updateCombat` (round/turn), `updateToken`
   (x/y/elevation/hidden/disposition/sight), `deleteToken`, `canvasReady`.
 
+## Planner (issue #403, статусы/типы атак — #413)
+
+`scripts/planner.js` — сервис `planner` (`api.services`): `planTurn(combat,
+combatant, context)` строит immutable DTO-снапшот и детерминированно выбирает
+план из кандидатов (`attack-in-place`, `move-attack`, `charge`, `approach`,
+`hold`) по взвешенному factor-вектору пресета; равные оценки разрешаются
+mulberry32 по `plan.seed`. План сериализуем (`move`/`attack`/`test`/
+`end-turn` шаги), `validateSnapshot` перед каждым state-changing шагом
+сверяет дешёвый fingerprint и выдаёт стабильную причину (`turn-stale`,
+`token-moved`, `target-gone`, `resources-changed`, `collision-changed`,
+`statuses-changed`, `combat-ended`); `shouldReplan` разрешает не более
+`maxReplans` (default 1) перепланировок за ход.
+
+Типы атак системного API (`actions.list(actor)` — по записи на attackType
+на оружие): недоступные (`available === false`) отбрасываются; для каждого
+оружия сохраняется до 3 типов в курируемом порядке — melee `[allOut,
+charge, standard, lightning, swift, called_shot]`, ranged `[full_auto,
+semi_auto, standard, ripper_charge, called_shot]`; `suppressing_fire`
+исключён полностью (нужен targetPoint/шаблон). Вариант `charge` использует
+действие с `attackType: "charge"` того же оружия, если оно есть. Новые
+факторы: `attackType` (привлекательность типа атаки), `vulnerable` (цель
+pinned/prone/stunned), `engaged`/`meleeEngage` (контакт ближнего боя после
+движения) — веса заданы в `scripts/presets/*.js`.
+
+Статусы: `snapshot.self.statuses` — отсортированные id из `actor.statuses`
++ статусов токен-документа (+ `context.selfStatuses` для тестов); входят в
+stale fingerprint, расхождение даёт причину `statuses-changed`. Цели
+(`visibleTargets`, combatant-fallback) несут `statuses` — только id, без
+actor-данных; в fingerprint цели не входят. Детерминированные ограничения:
+`stunned` — короткий ok-план из одного `end-turn` с причиной `stunned`;
+`pinned` — вето `charge` и любых перемещений, заканчивающихся ближе к цели
+(`move.distance < target.distance`), легальны атака на месте и движение с
+сохранением/увеличением дистанции; `prone` — бюджет движения делится
+пополам (floor, ползком; `{mode}` → `half`) и вето `charge`.
+
 ## Executor (issue #407)
 
 `scripts/executor.js` — выполнение сериализуемого plan шаг за шагом:

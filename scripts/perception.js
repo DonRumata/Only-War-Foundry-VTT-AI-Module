@@ -479,7 +479,9 @@ function _combatantIndex(combat) {
  * `options.ignoreLOS` — with an actual line of sight. Hidden tokens are
  * excluded entirely by default so GM-only data cannot leak; with
  * `options.includeHidden` they appear flagged `hidden: true,
- * canAttack: false` for diagnostics.
+ * canAttack: false` for diagnostics. Each entry also carries `statuses` —
+ * a sorted array of the target's status ids only (no actor data), so the
+ * planner can weigh pinned/prone/stunned targets without document access.
  * @param {object} viewer Viewer token (placeable or document).
  * @param {object} [options]
  * @param {object} [options.combat] Combat providing combatant flags
@@ -526,6 +528,7 @@ export function visibleTargets(viewer, options = {}) {
             y: position?.y ?? null,
             elevation: _elevationOf(candidate),
             distance: measureDistance(viewer, candidate),
+            statuses: [...statusIdsOf(candidate)].sort(),
             hidden,
             canAttack: !hidden
         });

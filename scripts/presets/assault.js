@@ -44,7 +44,10 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     exposure: -1,
     holdPosition: -4,
     lastKnown: 0.5,
-    budgetOver: -8
+    budgetOver: -8,
+    attackType: 0.2,
+    vulnerable: 1,
+    meleeEngage: 6
 });
 
 /**
