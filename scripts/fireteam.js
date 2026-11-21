@@ -7,7 +7,8 @@
  * Design contract (epic #363, issue #408):
  * - Fireteam membership lives in `flags["only-war-ai"].fireteam` on the
  *   Actor, TokenDocument and Combatant layers:
- *   `{teamId, leaderId, teamPreset, preferredCohesion}`. The Combatant layer
+ *   `{teamId, leaderId, teamPreset, preferredCohesion, character}`. The
+ *   Combatant layer
  *   wins, then Token, then Actor — mirroring the override resolver.
  * - A `TeamPlan` is a plain, JSON-serializable DTO — never a Document — that
  *   describes one bounded team maneuver for the current round:
@@ -33,6 +34,7 @@
 import {
     AI_PRESETS,
     DEFAULT_PREFERRED_COHESION,
+    FIRETEAM_CHARACTERS,
     FIRETEAM_TASKS,
     FLAG_KEYS,
     MODULE_ID
@@ -226,7 +228,8 @@ function _jsonClone(value) {
  * Normalize the raw `fireteam` flag of one document into a per-field map.
  * @param {object|null} doc
  * @returns {{teamId: string|null, leaderId: string|null,
- *   teamPreset: string|null, preferredCohesion: number|null}}
+ *   teamPreset: string|null, preferredCohesion: number|null,
+ *   character: string|null}}
  */
 function _normalizeFireteamFlag(doc) {
     const flag = _readFlag(doc, FLAG_KEYS.fireteam);
@@ -234,7 +237,8 @@ function _normalizeFireteamFlag(doc) {
         teamId: null,
         leaderId: null,
         teamPreset: null,
-        preferredCohesion: null
+        preferredCohesion: null,
+        character: null
     };
     if (!flag || typeof flag !== "object") return empty;
     return {
@@ -246,7 +250,11 @@ function _normalizeFireteamFlag(doc) {
         teamPreset: AI_PRESETS.includes(flag.teamPreset) ? flag.teamPreset : null,
         preferredCohesion: Number.isFinite(flag.preferredCohesion)
             && flag.preferredCohesion > 0
-            ? flag.preferredCohesion : null
+            ? flag.preferredCohesion : null,
+        // Issue #19: the team's shared temperament — one of
+        // `disciplined|shock|elite|rabble`.
+        character: FIRETEAM_CHARACTERS.includes(flag.character)
+            ? flag.character : null
     };
 }
 
@@ -258,7 +266,7 @@ function _normalizeFireteamFlag(doc) {
  * @param {object} document Actor, TokenDocument, Token placeable or Combatant.
  * @returns {{teamId: string|null, leaderId: string|null,
  *   teamPreset: string|null, preferredCohesion: number|null,
- *   source: string}}
+ *   character: string|null, source: string}}
  */
 export function resolveTeamConfig(document) {
     const none = {
@@ -266,6 +274,7 @@ export function resolveTeamConfig(document) {
         leaderId: null,
         teamPreset: null,
         preferredCohesion: null,
+        character: null,
         source: "none"
     };
     const doc = document?.document?.documentName === "Token"
@@ -290,7 +299,7 @@ export function resolveTeamConfig(document) {
     }
 
     const result = { ...none };
-    const fields = ["teamId", "leaderId", "teamPreset", "preferredCohesion"];
+    const fields = ["teamId", "leaderId", "teamPreset", "preferredCohesion", "character"];
     const remaining = new Set(fields);
     for (const layer of layers) {
         if (_isMissing(layer.doc)) continue;
@@ -889,7 +898,8 @@ export function createFireteamService({
                 teamId: team || null,
                 leaderId: null,
                 teamPreset: null,
-                preferredCohesion: null
+                preferredCohesion: null,
+                character: null
             };
         }
         if (team && typeof team === "object") {
@@ -900,7 +910,8 @@ export function createFireteamService({
                     teamId: resolved.teamId,
                     leaderId: resolved.leaderId,
                     teamPreset: resolved.teamPreset,
-                    preferredCohesion: resolved.preferredCohesion
+                    preferredCohesion: resolved.preferredCohesion,
+                    character: resolved.character
                 };
             }
             return {
@@ -909,6 +920,8 @@ export function createFireteamService({
                 teamPreset: team.teamPreset ?? null,
                 preferredCohesion: Number.isFinite(team.preferredCohesion)
                     ? team.preferredCohesion : null,
+                character: FIRETEAM_CHARACTERS.includes(team.character)
+                    ? team.character : null,
                 members: team.members
             };
         }
@@ -916,7 +929,8 @@ export function createFireteamService({
             teamId: null,
             leaderId: null,
             teamPreset: null,
-            preferredCohesion: null
+            preferredCohesion: null,
+            character: null
         };
     }
 
@@ -1390,6 +1404,16 @@ export function createFireteamService({
             ?? members.map(m => m.team?.teamPreset)
                 .find(p => AI_PRESETS.includes(p))
             ?? null;
+        // Issue #19: the shared team character — explicit context, then
+        // the team reference, then the first member flag in the
+        // deterministic member order.
+        const character = FIRETEAM_CHARACTERS.includes(context.character)
+            ? context.character
+            : (teamRef.character
+                ?? members.map(m => m.team?.character)
+                    .find(c => FIRETEAM_CHARACTERS.includes(c))
+                ?? null);
+        diagnostics.character = character;
         const memberPlanner = _memberPlanner(teamPreset, context.planner);
         const preferredCohesion = diagnostics.preferredCohesion;
 
@@ -1480,6 +1504,7 @@ export function createFireteamService({
                     groupId: assignment.groupId,
                     leaderId: election.combatantId,
                     center: leaderPos,
+                    character,
                     regroupPoint: assignment.task === "regroup"
                         ? (rejoinPoints[0] ?? null) : null
                 }
@@ -1551,7 +1576,8 @@ export function createFireteamService({
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
-                    leaderId: election.combatantId
+                    leaderId: election.combatantId,
+                    character
                 }
             });
             plans.set(member.combatantId, retry);
@@ -1663,6 +1689,7 @@ export function createFireteamService({
             leaderId: election.combatantId,
             teamPreset: teamPreset && AI_PRESETS.includes(teamPreset)
                 ? teamPreset : null,
+            character,
             tactic: diagnostics.tactic?.name ?? null,
             convergence,
             revision,

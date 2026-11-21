@@ -28,6 +28,12 @@
   модельный 2-ply lookahead (λ=0.5, top-4, hard по умолчанию),
   `aiDifficulty` (easy ~30% намеренных промахов; опора для #19),
   fireteam kill-EV конвергенция цели.
+- `feature/personalities-19` — #19: личности ботов — пул 24 черт
+  (`scripts/personalities.js`, дельты весов + jitter-байасы), seeded
+  генерация по `actor.id`, флаг `personality` (override списком),
+  `fireteam.character` (disciplined|shock|elite|rabble) с командным
+  overlay, difficulty-bias пула и seeded jitter ≤ ±15% на кандидата,
+  черты в GM preview/NPC-sheet/диагностике.
 
 ## Открытые issues (эпик #363)
 
@@ -36,6 +42,8 @@
   `feature/templates-14`).
 - ~~**#16**~~ — реализовано на `feature/tactical-16` (поверх
   `feature/integration-ai`).
+- ~~**#19**~~ — реализовано на `feature/personalities-19` (поверх
+  `feature/tactical-16`).
 - Системная сторона: `rolls.executeDamage`/`applyDamage`/`evasionTest` —
   обсуждалось, issue ещё НЕ заведено (модуль кидает только тест
   попадания — урон/уворот ручные). Авто-реакция бота (триггер
@@ -61,7 +69,7 @@ RoF очередей. Надо:
 - Модуль: `OnlyWarAIModule`, ветка `feature/integration-ai`.
 - Deploy: копирование `scripts/`+`languages/` в
   `%LOCALAPPDATA%\FoundryVTT\Data\modules\only-war-ai`.
-- Юниты: `npm run test:unit` (339/339), `npm run check` (48 файлов),
+- Юниты: `npm run test:unit` (357/357), `npm run check` (50 файлов),
   `npx eslint scripts/`.
 - Live: Playwright CDP (`tests/foundry-e2e/smoke/`): `setup-smoke.mjs`
   строит мир (Smoke Arena, 4000×3000, grid 100px=1м, стены/двери/укрытия),

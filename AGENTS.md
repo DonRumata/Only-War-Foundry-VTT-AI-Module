@@ -39,6 +39,13 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - Token: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`.
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
+- Actor/Token/Combatant: `personality = string[]` — явный список черт
+  личности (issue #19, id из пула `scripts/personalities.js`); резолвится
+  той же цепочкой Combatant → Token → Actor, без флага черты
+  генерируются seeded по `actor.id`.
+- Actor/Token/Combatant: `fireteam = { teamId, leaderId, teamPreset,
+  preferredCohesion, character }` — `character` (`disciplined|shock|
+  elite|rabble`, issue #19) задаёт командный overlay на веса всех членов.
 - World settings: `masterEnabled` (default `true`) — общий выключатель модуля:
   при выключении ходы не заявляются и не исполняются, preview не открывается,
   внедрённые UI-секции скрыты, executor отвечает `module-disabled`.
@@ -58,10 +65,11 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 ## Pure resolver
 
 `scripts/config-resolver.js` → `resolveEffectiveConfig(actorOrTokenOrCombatant)`
-возвращает `{enabled, preset, source, includeNeutral?}` (`source`:
-`"combatant" | "token" | "actor" | "none"`; `includeNeutral` присутствует
-только при `true`: override > actor config). Приоритет Combatant → Token →
-Actor → disabled. Resolver
+возвращает `{enabled, preset, source, includeNeutral?, personality?}`
+(`source`: `"combatant" | "token" | "actor" | "none"`; `includeNeutral`
+присутствует только при `true`: override > actor config; `personality` —
+только при непустом списке черт из флага, issue #19). Приоритет Combatant →
+Token → Actor → disabled. Resolver
 read-only, детерминирован, не читает `game` и работает одинаково на всех
 клиентах; удалённые/повреждённые документы → disabled, неизвестный preset →
 actor preset → `hold` (если enabled явно) → disabled.
@@ -186,6 +194,32 @@ actor-данных; в fingerprint цели не входят. Детермин�
 (`move.distance < target.distance`), легальны атака на месте и движение с
 сохранением/увеличением дистанции; `prone` — бюджет движения делится
 пополам (floor, ползком; `{mode}` → `half`) и вето `charge`.
+
+## Личности ботов (issue #19)
+
+`scripts/personalities.js` — data-driven пул из 24 черт (`PERSONALITIES`,
+категории courage/skill/maneuver/command): каждая черта несёт аддитивные
+`deltas` на веса `SCORE_FACTORS` (плюс preset-only `flankAngle`/
+`cohesionRestore`), `jitter`-смещение, базовый `weight` и `bias` по
+сложности, опционально `flags` (`fanatic.ignoreRegroup` реализован
+дельтами — отдельных веток кандидатов нет). `resolvePersonality` —
+приоритет `context.personality` (`false` отключает систему) → флаг
+`personality` (из `resolveEffectiveConfig`) → seeded генерация
+`generatePersonalityTraits` (fnv1a+mulberry32 от `actor.id`/`tokenUuid`,
+1–2 черты взвешенным пулом, bias по `aiDifficulty`; стабильна между
+клиентами и боями). `applyPersonalityOverlay` мерджит дельты поверх
+`preset.weights` до scoring'а (паттерн SPEC_OPS-оверлеев, но аддитивный);
+личные дельты заменяют командные при конфликте фактора. Jitter —
+`personalityJitterFactor`: seeded мультипликатор `1 ± amp` на оценку
+кандидата keyed по candidate id; `amp` = baseline сложности
+(easy 0.04/normal 0.02/hard 0) + черты + `fireteam.character`, кап 0.15.
+`fireteam.character` (`disciplined|shock|elite|rabble`) — поле флага
+через `resolveTeamConfig`, едет в `context.team.character` всех
+member-планов `buildTeamPlan` и в `teamPlan.character`. Видимость:
+`plan.personality {traits, character, source}`, `diagnostics.personality`
+(+`flags`, `jitter`), `breakdown.jitter`, строка в GM preview
+(`OWAI.Personality.*`/`OWAI.FireteamCharacter.*`), ввод черт +
+resolved-строка и селект характера в NPC-sheet.
 
 ## Executor (issue #407)
 

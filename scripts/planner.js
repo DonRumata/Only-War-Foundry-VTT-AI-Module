@@ -28,6 +28,14 @@ import {
     MODULE_ID
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
+import {
+    applyPersonalityOverlay,
+    personalityBehaviorFlags,
+    personalityIdentity,
+    personalityJitter,
+    personalityJitterFactor,
+    resolvePersonality
+} from "./personalities.js";
 import { getAIDifficulty, logDiagnostics } from "./settings.js";
 import {
     buildThreatMap,
@@ -2359,7 +2367,9 @@ export function createPlannerService({
      *   `actionsApi`, `moves`, `moveBudget`, `actionBudget`, `rates`,
      *   `perception`, `navigation`, `authority`, `scene`, `token`,
      *   `collisionRevision`, `maxTargets`, `maxActions`,
-     *   `approximateMoves`, `selfStatuses`.
+     *   `approximateMoves`, `selfStatuses`, `difficulty`,
+     *   `personality` (trait list or `false` to disable, issue #19),
+     *   `team` (`{task, character, center, regroupPoint, ...}`).
      * @returns {Promise<object>} `{status, plan?, reason?, diagnostics?}`.
      */
     async function planTurn(combat, combatant, context = {}) {
@@ -2414,6 +2424,41 @@ export function createPlannerService({
             };
         }
         const selfPos = _tokenPosition(tokenDoc);
+        // Issue #19 personalities: explicit `context.personality` or the
+        // resolved `flags["only-war-ai"].personality` list wins, otherwise
+        // 1–2 traits are generated seeded from the stable document
+        // identity. Additive weight deltas merge over the preset weights
+        // (same overlay pattern as the spec-ops task weights); a seeded
+        // per-candidate jitter then wobbles the final scores. The
+        // fireteam `character` arrives as `context.team.character`.
+        const personality = resolvePersonality({
+            explicit: context.personality,
+            flagged: config.personality,
+            character: context.team?.character,
+            difficulty,
+            identity: personalityIdentity({ combatant, token: tokenDoc, actor })
+        });
+        // `context.personality === false` disables the whole system —
+        // no traits and no jitter, a fully deterministic pick.
+        const personalityAmp = personality.source === "disabled"
+            ? 0
+            : personalityJitter({
+                traits: personality.traits,
+                character: personality.character,
+                difficulty
+            });
+        diagnostics.personality = {
+            traits: [...personality.traits],
+            character: personality.character,
+            source: personality.source,
+            jitter: personalityAmp,
+            flags: personalityBehaviorFlags(personality.traits)
+        };
+        const effectiveWeights = applyPersonalityOverlay(preset.weights, {
+            traits: personality.traits,
+            character: personality.character
+        });
+        diagnostics.weights = { ...effectiveWeights };
         // Self status constraints (issue #413): deterministic rules read
         // from actor/token statuses merged with the injected
         // `context.selfStatuses` fixture array.
@@ -2437,7 +2482,7 @@ export function createPlannerService({
             diagnostics.chosenStep = steps[0].id;
             const plan = _assemblePlan({
                 combat, combatant, context, authority, seed, presetId,
-                diagnostics, steps,
+                diagnostics, steps, personality,
                 winner: { score: 0, breakdown: { reason: "stunned" }, target: null },
                 targets: [],
                 actions: []
@@ -3017,7 +3062,7 @@ export function createPlannerService({
             let evaluation;
             if (typeof preset.evaluate === "function") {
                 const custom = preset.evaluate({
-                    factors, candidate, weights: preset.weights, context: evalContext
+                    factors, candidate, weights: effectiveWeights, context: evalContext
                 });
                 evaluation = Number.isFinite(custom)
                     ? { score: custom, breakdown: { factors, custom: true } }
@@ -3026,14 +3071,33 @@ export function createPlannerService({
                         breakdown: custom?.breakdown ?? { factors, custom: true }
                     };
             } else {
-                evaluation = evaluateFactors(factors, preset.weights);
+                evaluation = evaluateFactors(factors, effectiveWeights);
             }
+            // Issue #19: seeded per-candidate jitter — a deterministic
+            // multiplier keyed by the stable candidate id that lets
+            // unsteady personalities pick off the argmax while identical
+            // input + seed still reproduces the identical plan.
+            const candidateId = _candidateId(candidate, index);
+            const jitterFactor = personalityJitterFactor({
+                seed, candidateId, amp: personalityAmp
+            });
+            const score = jitterFactor === 1
+                ? evaluation.score
+                : (Math.round(evaluation.score * jitterFactor * 1e6) / 1e6) + 0;
             scored.push({
                 ...candidate,
-                id: _candidateId(candidate, index),
+                id: candidateId,
                 factors,
-                score: evaluation.score,
-                breakdown: evaluation.breakdown
+                score,
+                breakdown: jitterFactor !== 1
+                    ? {
+                        ...evaluation.breakdown,
+                        jitter: {
+                            amp: personalityAmp,
+                            factor: Math.round(jitterFactor * 1e6) / 1e6
+                        }
+                    }
+                    : evaluation.breakdown
             });
         });
         scored.sort((a, b) => (b.score - a.score) || String(a.id).localeCompare(String(b.id)));
@@ -3117,7 +3181,8 @@ export function createPlannerService({
 
         const plan = _assemblePlan({
             combat, combatant, context, authority, seed, presetId,
-            diagnostics, steps, winner, targets, actions: usableActions
+            diagnostics, steps, winner, targets, personality,
+            actions: usableActions
         });
         log(`plan ${plan.id} preset=${presetId} score=${winner.score} steps=${steps.length}`);
         return { status: PLANNER_STATUS.ok, plan, reason: null };
@@ -3140,10 +3205,12 @@ export function createPlannerService({
      * @param {object} input.winner `{score, breakdown, target}` triple.
      * @param {object[]} input.targets Normalized targets for the snapshot.
      * @param {object[]} input.actions Usable actions for the snapshot.
+     * @param {object|null} [input.personality] Issue #19 profile
+     *   `{traits, character, source}` recorded on the plan.
      * @returns {object} Frozen plan.
      */
     function _assemblePlan({ combat, combatant, context, authority, seed,
-        presetId, diagnostics, steps, winner, targets, actions }) {
+        presetId, diagnostics, steps, winner, targets, actions, personality = null }) {
         const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
         const actor = _actorOf(combatant) ?? _actorOf(tokenDoc);
         const scene = _sceneOf(context, combat);
@@ -3208,6 +3275,15 @@ export function createPlannerService({
             seed,
             replanCount,
             difficulty: _difficultyOf(context),
+            // Issue #19: the resolved personality rides on the plan so the
+            // GM preview and executor diagnostics can show it.
+            personality: personality
+                ? {
+                    traits: [...personality.traits],
+                    character: personality.character ?? null,
+                    source: personality.source ?? "generated"
+                }
+                : null,
             score: winner.score,
             breakdown: winner.breakdown,
             target: snapshot.target,

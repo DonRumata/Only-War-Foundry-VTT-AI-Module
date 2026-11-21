@@ -47,8 +47,21 @@ export const FLAG_KEYS = Object.freeze({
     memory: "memory",
     fireteam: "fireteam",
     overwatch: "overwatch",
-    aim: "aim"
+    aim: "aim",
+    personality: "personality"
 });
+
+/**
+ * Fireteam "characters" (issue #19): the shared temperament of a team
+ * recorded on the `fireteam` flag. Each character contributes a weight
+ * overlay and a jitter bias applied to every member's plan.
+ */
+export const FIRETEAM_CHARACTERS = Object.freeze([
+    "disciplined",
+    "shock",
+    "elite",
+    "rabble"
+]);
 
 /** World setting keys. */
 export const SETTING_KEYS = Object.freeze({
