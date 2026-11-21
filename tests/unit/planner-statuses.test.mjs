@@ -407,6 +407,7 @@ test("attackType factor prefers full_auto for a ranged attack-in-place", async (
     registerAssaultPreset(planner);
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 1,
+        personality: false,
         targets: injectedTargets(world),
         actions: rangedApiActions(),
         maxActions: 10

@@ -185,6 +185,60 @@ execute: расхождение — `stale-state` (перемещение, см�
   приоритет — `context.objective`/тактика/`context.assignments`,
   отключение — `context.convergence === false`.
 
+#### Личности ботов (issue #19)
+
+- **`scripts/personalities.js`** — data-driven пул из 24 черт в 4
+  категориях (агрессия/смелость, навык/опыт, позиция/манёвр, командность):
+  `brave, reckless, fanatic, bloodthirsty, cunning, cautious, cowardly,
+  veteran, marksman, rookie, heavyHanded, grenadier, duelist, sniper,
+  flanker, sentinel, pursuer, wanderer, liaison, loner, leader, executor,
+  thrifty, unsteady`. Каждая черта — `{category, deltas, jitter, weight,
+  bias, flags?}`: `deltas` — аддитивные смещения на веса `SCORE_FACTORS`
+  (плюс preset-only `flankAngle`/`cohesionRestore` — инертны вне specOps),
+  `jitter` — смещение амплитуды шума, `bias` — мультипликаторы пула по
+  сложности.
+- **Генерация seeded**: `fnv1a("personality|<actor.id>")` → mulberry32,
+  1–2 черты взвешенной выборкой без повторов. Сид — только стабильный id
+  документа (`actor.id → token.uuid → token.id → combatant.id`), не
+  бой/раунд — личность одинакова на всех клиентах и сохраняется между
+  боями. Сложность смещает пул: easy тянет к
+  cowardly/rookie/unsteady/reckless, hard — к
+  veteran/marksman/flanker/cunning, normal — полный пул.
+- **`flags["only-war-ai"].personality`** — явный override списком id черт
+  (массив или строка через запятую); резолвится по цепочке
+  combatant → token → actor в `resolveEffectiveConfig` (поле
+  `personality` результата). Повреждённые значения игнорируются —
+  откат на генерацию. `context.personality` (массив/false) —
+  план-оверрайд и способ отключить систему целиком
+  (`source: "disabled"`).
+- **Интеграция со скорингом**: дельты черт складываются и мерджатся поверх
+  `preset.weights` до scoring'а (тот же overlay-паттерн, что у
+  SPEC_OPS_TASK_WEIGHTS, но аддитивный); `diagnostics.weights` несёт уже
+  эффективные веса. Поведенческие флаги (`fanatic.ignoreRegroup`)
+  работают через сильные отрицательные дельты (`cohesionRestore −12`),
+  отдельных веток генерации кандидатов нет. Победитель получает
+  `breakdown.jitter {amp, factor}`, план — `personality {traits,
+  character, source}`, диагностика — `personality {traits, character,
+  source, jitter, flags}`.
+- **Jitter**: seeded мультипликатор `1 ± amp` на оценку каждого
+  кандидата, keyed по стабильному id кандидата (не индексу) через
+  XOR-поток mulberry32. Амплитуда = baseline сложности (easy 0.04 /
+  normal 0.02 / hard 0) + Σ смещений черт + смещение характера, кап
+  0.15: `unsteady` ≈ ±14–15%, `rookie` средний, `veteran` → 0.
+- **`fireteam.character`** (`disciplined|shock|elite|rabble`) — поле
+  fireteam-флага, резолвится `resolveTeamConfig` по той же цепочке
+  (в `buildTeamPlan` — `context.character` → team ref → первый член с
+  флагом). Командный overlay применяется к весам каждого члена
+  (`context.team.character` в member-планах): disciplined — связность,
+  shock — charge/штурм, elite — низкий jitter, rabble — высокий jitter и
+  слабая связность. Персональные черты поверх командного overlay; при
+  конфликте по фактору личная дельта заменяет командную. Поле едет в
+  `teamPlan.character` и `diagnostics.character`.
+- **Видимость**: строка личности в GM preview (`OWAI.Personality.*` /
+  `OWAI.FireteamCharacter.*`), поле ввода черт и resolved-строка в
+  NPC-sheet, селект характера в fireteam-секции, `plan.personality` и
+  `diagnostics.personality` для диагностики.
+
 #### Экономия действий (issue #15)
 
 - Бюджет хода — две half-actions: `cost` из `actions.list` нормализуется
@@ -233,8 +287,10 @@ execute: расхождение — `stale-state` (перемещение, см�
 
 ### Fireteam (issue #408)
 
-- Флаги `fireteam = {teamId, leaderId, teamPreset, preferredCohesion}` на
-  актёре и/или токене (TokenConfig отображает только token-флаги).
+- Флаги `fireteam = {teamId, leaderId, teamPreset, preferredCohesion,
+  character}` на актёре и/или токене (TokenConfig отображает только
+  token-флаги). `character` (issue #19) — общий темперамент группы,
+  overlay на веса всех членов.
 - `TeamPlan` координирует задания (`support|advance|flank|assault|regroup`)
   и мягкую связность; исполнение всё равно пер-член на своём ходу —
   превью идёт per-бот.
@@ -253,6 +309,9 @@ execute: расхождение — `stale-state` (перемещение, см�
 - `flags["only-war-ai"].config` на актёре: `{enabled, preset,
   includeNeutral}`; token/combatant `override = {mode, preset,
   includeNeutral?}` — `resolveEffectiveConfig` (combatant → token → actor).
+- `flags["only-war-ai"].personality` (issue #19): явный список черт на
+  любом из трёх уровней — `resolveEffectiveConfig` возвращает поле
+  `personality`; без флага черты генерируются seeded по id документа.
 - Все AI-визуалы/диагностика — GM-only (whisper на GM-пользователей);
   игрокам ничего не утекает (проверено smoke).
 
@@ -286,7 +345,8 @@ disposition-матрица).
 | Gridless | Не поддерживается (контролируемый отказ) |
 | Бот защищается | Нет авто-уворота (защищающийся — ручной) |
 | Тактический lookahead | 2-ply модельный (top-K + λ·counterEV, issue #16) — MCTS/глубокий поиск не планируется |
-| Сложность AI | `aiDifficulty` easy/normal/hard: easy ~30% намеренно не-оптимальных ходов, hard включает lookahead (issue #16) |
+| Сложность AI | `aiDifficulty` easy/normal/hard: easy ~30% намеренно не-оптимальных ходов, hard включает lookahead (issue #16); также смещает пул черт и baseline jitter личностей (#19) |
+| Личности ботов | 24 черты → аддитивные дельты весов + seeded jitter ≤ ±15%; флаги `ignoreRegroup` — через дельты, без отдельных веток кандидатов (issue #19) |
 | Карта угроз | danger-фактор на endpoint кандидата; цели без оружейного профиля угрозу не проецируют |
 
 ## 5. Точки расширения

@@ -18,6 +18,12 @@
             <label>{{localize "OWAI.Preview.Preset"}}</label>
             <span class="ow-ai-value">{{npc.presetLabel}}</span>
         </div>
+        {{#if npc.personalityLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Personality"}}</label>
+            <span class="ow-ai-value">{{npc.personalityLabel}}</span>
+        </div>
+        {{/if}}
         <div class="form-group">
             <label>{{localize "OWAI.Preview.Target.Label"}}</label>
             <span class="ow-ai-value">

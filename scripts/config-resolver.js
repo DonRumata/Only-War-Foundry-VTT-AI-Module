@@ -20,8 +20,11 @@ import {
 /**
  * Resolve the effective AI configuration for a document.
  * @param {object} document Actor, TokenDocument, Token placeable or Combatant.
- * @returns {{enabled: boolean, preset: string|null, source: string}}
- *   `source` is "combatant" | "token" | "actor" | "none".
+ * @returns {{enabled: boolean, preset: string|null, source: string,
+ *   personality?: string[]}}
+ *   `source` is "combatant" | "token" | "actor" | "none"; `personality`
+ *   (issue #19) is present only when a `flags["only-war-ai"].personality`
+ *   flag resolved a non-empty trait list down the same chain.
  */
 export function resolveEffectiveConfig(document) {
     const doc = _unwrapDocument(document);
@@ -51,17 +54,27 @@ export function resolveEffectiveConfig(document) {
 
     if (_isMissing(actor)) return _disabledResult();
     const actorConfig = _normalizeActorConfig(actor);
+    // Issue #19: the dedicated `personality` flag resolves down the same
+    // Combatant → Token → Actor chain; the first layer carrying a valid
+    // non-empty trait list wins.
+    const personality = _resolvePersonality([
+        ...overrides.map(layer => layer.doc),
+        actor
+    ]);
 
     // Highest-priority explicit overrides win first.
     for (const layer of overrides) {
         const override = _normalizeOverride(layer.doc);
         if (override.mode === "disabled") {
-            return { enabled: false, preset: null, source: layer.source };
+            const result = { enabled: false, preset: null, source: layer.source };
+            if (personality) result.personality = personality;
+            return result;
         }
         if (override.mode === "enabled") {
             const preset = _presetOr(override.preset, actorConfig.preset);
             const result = { enabled: true, preset, source: layer.source };
             if (_includeNeutralOf(actorConfig, override)) result.includeNeutral = true;
+            if (personality) result.personality = personality;
             return result;
         }
         // "inherit" or damaged data falls through to the next layer.
@@ -75,9 +88,12 @@ export function resolveEffectiveConfig(document) {
             source: "actor"
         };
         if (actorConfig.includeNeutral === true) result.includeNeutral = true;
+        if (personality) result.personality = personality;
         return result;
     }
-    return _disabledResult();
+    const disabled = _disabledResult();
+    if (personality) disabled.personality = personality;
+    return disabled;
 }
 
 /**
@@ -133,6 +149,32 @@ function _normalizeActorConfig(actor) {
     const enabled = config.enabled === true;
     const preset = AI_PRESETS.includes(config.preset) ? config.preset : null;
     return { enabled, preset, includeNeutral: config.includeNeutral === true };
+}
+
+/**
+ * Resolve the `personality` flag (issue #19) down the document chain.
+ * The raw value may be an array or a comma-separated string; only the
+ * string entries are kept — trait-id validation happens in
+ * `scripts/personalities.js` so damaged values degrade to a smaller
+ * list, and an empty result behaves as "no explicit personality"
+ * (the planner then falls back to seeded generation).
+ * @param {object[]} docs Combatant/Token/Actor documents, highest
+ *   priority first.
+ * @returns {string[]|null} Sanitized trait id list or null.
+ */
+function _resolvePersonality(docs) {
+    for (const doc of docs) {
+        if (_isMissing(doc)) continue;
+        const raw = _readFlag(doc, FLAG_KEYS.personality);
+        if (raw === undefined || raw === null) continue;
+        const list = Array.isArray(raw) ? raw
+            : (typeof raw === "string" ? raw.split(/[\s,;]+/) : []);
+        const traits = list
+            .map(entry => (typeof entry === "string" ? entry.trim() : ""))
+            .filter(entry => entry.length > 0);
+        if (traits.length) return traits;
+    }
+    return null;
 }
 
 /**

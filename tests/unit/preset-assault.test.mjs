@@ -268,6 +268,7 @@ test("advance-only plan ends with no-attack when nothing can fire", async () => 
     const planner = makePlanner();
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 5,
+        personality: false,
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([
             { x: 800, y: 0, i: 8, j: 0, cost: 8, distance: 123, los: true }
@@ -395,6 +396,7 @@ test("score breakdown explains the charge pick per factor", async () => {
     const planner = makePlanner();
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 5,
+        personality: false,
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([
             { x: 200, y: 0, i: 2, j: 0, cost: 2, distance: 1.5, los: true }
