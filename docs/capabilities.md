@@ -14,8 +14,9 @@ system API v1.x, issue #398/PR #440) и тому, что на нём постр�
 |---|---|
 | `api.version` / `api.capabilities` | `version` (`"1.x"`, major-совместимость), мапа поддерживаемых операций |
 | `api.movement.getRates(actor)` | `{half, full, charge, run}` — скорости движения актёра (метры) |
-| `api.actions.list(actor)` | Записи действий: по записи на `attackType` на оружие (`standard`, `semi_auto`, `full_auto`, `ripper_charge`, `called_shot`, melee: `allOut`, `charge`, `swift`, `lightning`, `suppressing_fire` при `canSuppress`). Поля: `{id, kind:"attack", weaponId, weaponName, attackType, cost, requirements[], available, reason}`. `available:false` когда тип запрещён RoF/блоком оружия |
-| `api.rolls.prepareAttack(input)` | JSON-сериализуемый prepared-объект (`fingerprint`, `refs`, `rollData`, `preview`) — без броска и без трат ресурсов. Вход: `actorUuid|actorId`, `weaponId|itemUuid`, `targetUuid`, `attackType`, `targetPoint`, `template` и флаги |
+| `api.actions.list(actor)` | Записи действий: по записи на `attackType` на оружие (`standard`, `semi_auto`, `full_auto`, `ripper_charge`, `called_shot`, melee: `allOut`, `charge`, `swift`, `lightning`, `suppressing_fire` при `canSuppress`) + `{id:"reload", kind:"reload"}` для clip-fed оружия (`cost` из `system.reload`, `spans` для «2 Full», `cause` недоступности). Поля: `{id, kind, weaponId, weaponName, attackType, cost, requirements[], available, reason}`. `available:false` когда тип запрещён RoF/блоком оружия |
+| `api.actions.reload(input, {operationId})` | Перезарядка clip-fed оружия: магазинное — своп на `magazineItemId` или самый полный совместимый запасной, интегральный клип — до `clip.max`. Идемпотентно по `operationId`, чат-карточка, `resourceDelta {clip, magazine}` |
+| `api.rolls.prepareAttack(input)` | JSON-сериализуемый prepared-объект (`fingerprint`, `refs`, `rollData`, `preview`) — без броска и без трат ресурсов. Вход: `actorUuid|actorId`, `weaponId|itemUuid`, `targetUuid`, `attackType`, `targetPoint`, `template`, `suppressionFire`+burst-mode и флаги |
 | `api.rolls.executeAttack(prepared, {operationId})` | Исполняет тест попадания и постит карточку в чат (speaker — актёр/токен атакующего, не выбор пользователя). Headless: диалоги не открываются, `game.user.targets` не читается |
 | `api.rolls.prepareTest(input)` / `executeTest` | Тест характеристики/навыка/специальности (characteristic/skill/speciality) без UI |
 
@@ -95,9 +96,9 @@ execute: расхождение — `stale-state` (перемещение, см�
   seeded pick (mulberry32).
 - Типы атаки из `actions.list`: на оружие кандидатизируется до 3 типов в
   курируемом порядке (ranged: `full_auto, semi_auto, standard, ripper_charge,
-  called_shot`; melee: `allOut, charge, standard, lightning, swift,
-  called_shot`); `suppressing_fire` исключён — шаг не умеет
-  `targetPoint`/`template` шаблоны (issue #14).
+  called_shot, suppressing_fire`; melee: `allOut, charge, standard, lightning,
+  swift, called_shot`); `suppressing_fire` — отдельная роль, проходит всегда
+  (issue #14).
 - Статусы: `stunned` → короткий `end-turn`-план; `pinned` — вето charge и
   сближающих перемещений; `prone` — бюджет движения пополам, вето charge.
 - `vulnerable`-фактор за цель pinned/prone/stunned; `engaged`/`meleeEngage`
@@ -124,11 +125,29 @@ execute: расхождение — `stale-state` (перемещение, см�
   точек маршрутов; memory-strike — только из текущей позиции; LOS к точке
   броска требуется (кроме memory-strike); высота не учитывается.
 
+#### Cone-awareness (spray и suppressing fire, issue #14)
+
+- Шаблонное оружие (`requirements` содержит `template` — spray 30°) и
+  `suppressing_fire` (45°) целится *направлением*, а не токеном:
+  `_bestConeAim` перебирает пеленги на каждого hostile + середину дуги
+  каждой влезающей в конус пары (кластер-центрированный конус).
+  Союзник/нейтрал в конусе — вето; требуется LOS хотя бы к одному
+  покрытому hostile.
+- Шаг несёт `input.template.direction` + `input.covered` (uuid покрытых);
+  для подавления — канонический `attackType:"suppressing_fire"` +
+  `suppressionFire:true` + `burstMode` (`semi_auto` при burst-RoF, иначе
+  `full_auto`). Executor транслирует это в системный вызов
+  (`attackType=burstMode, suppressionFire:true`).
+- Suppression — только из текущей позиции (длительная зона); spray может
+  идти после move-attack (прицел пересчитывается с конца маршрута).
+
 ### Executor (issue #407)
 
 - Шаги плана последовательно: `move` — `TokenDocument#move` по
   сериализованным waypoints (fallback `update({x,y})`); `attack`/`test` —
-  `prepare*`/`execute*` системного API со step-scoped `operationId`.
+  `prepare*`/`execute*` системного API со step-scoped `operationId`;
+  `overwatch` — заявка конуса через сервис overwatch (флаг Combatant +
+  GM-only конус на сцене, реакция — ручная у GM).
 - Безопасность: перед каждым шагом `validateSnapshot`; stale → один
   replan; повторный stale — hold-and-report. Без контроллера — `not-controller`.
 - Продвижение хода: сериализовано по боевому `id`, ключи `(round,turn)`,
@@ -183,8 +202,9 @@ disposition-матрица).
 | Область | Состояние |
 |---|---|
 | Урон/уворот/пари | Только тест попадания — урона/реакции нет (нужны `rolls.executeDamage`/`applyDamage`/`evasionTest` в системе) |
-| `suppressing_fire`, spray-оружие (огнемёты), overwatch-конусы | Шаг не передаёт `template` — **issue #14** |
-| Aim, half/full экономия, reload, реакции | Не моделируется — **issue #15** |
+| `suppressing_fire`, spray-оружие (огнемёты) | Поддержано: `template.direction` + вето союзников (issue #14) |
+| Overwatch-конусы | Заявка + GM-only отрисовка есть; авто-реакция и выбор в плане — **issue #15** |
+| Aim, half/full экономия, reload-шаг, реакции | Не моделируется — **issue #15** (`actions.reload` в системе уже есть) |
 | Гранаты на союзников | Нет (`blast-friendly-fire` вето); на нейтралов — только при `includeNeutral` |
 | GM «подтвердить команду/раунд» | Нет — только per-бот preview |
 | Нейтральный бот (disp 0) | Считает враждебными всех — ставить корректную disposition |
@@ -194,10 +214,12 @@ disposition-матрица).
 
 ## 5. Точки расширения
 
-- **Issue #14** — step-контракт `targetPoint`/`template` → spray,
-  `suppressing_fire`, GM-only overwatch-конусы.
+- ~~Issue #14~~ — реализовано: step-контракт `targetPoint`/`template`,
+  spray и `suppressing_fire` с конусным прицеливанием, заявочный
+  overwatch (флаг + GM-only конус).
 - **Issue #15** — модель действий: aim/overwatch/reload, half+half,
-  перенос aim-бонуса, реакции.
+  перенос aim-бонуса, реакции. Системный `actions.reload` уже готов
+  (PR #440).
 - **Системное расширение #398** — `rolls.executeDamage`,
   `rolls.applyDamage`, `rolls.evasionTest` — замыкает боевой цикл
   «попадание → урон → применение» и авто-реакцию AI-защитника.

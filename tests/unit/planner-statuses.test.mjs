@@ -364,7 +364,7 @@ test("stunned short-circuits to an end-turn-only plan", async () => {
     assert.deepEqual(verdict, { valid: true, reason: null });
 });
 
-test("attack-type curation keeps preferred types, drops unavailable and suppressing_fire", async () => {
+test("attack-type curation keeps preferred types, drops unavailable; suppression survives the cap", async () => {
     const world = makeWorld({ weapons: [RANGED_WEAPON, MELEE_WEAPON] });
     const planner = createPlannerService();
     const result = await planner.planTurn(world.combat, world.combatant, {
@@ -376,7 +376,7 @@ test("attack-type curation keeps preferred types, drops unavailable and suppress
     assert.equal(result.status, PLANNER_STATUS.ok);
     const ids = result.plan.snapshot.actions.map(action => action.id).sort();
     assert.deepEqual(ids, [
-        "w1-full", "w1-semi", "w1-std",
+        "w1-full", "w1-semi", "w1-std", "w1-supp",
         "w2-allout", "w2-charge", "w2-std"
     ]);
 });

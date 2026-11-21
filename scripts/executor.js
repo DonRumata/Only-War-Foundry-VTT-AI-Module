@@ -510,6 +510,13 @@ export function createExecutorService({
         input.actorId = input.actorId ?? plan?.snapshot?.self?.actorId ?? null;
         input.tokenUuid = input.tokenUuid ?? plan?.tokenUuid ?? plan?.snapshot?.self?.tokenUuid ?? null;
         input.targetUuid = input.targetUuid ?? input.targetTokenUuid ?? null;
+        // The step contract keeps the canonical `suppressing_fire` attack
+        // type; the system API expects the underlying burst mode plus the
+        // `suppressionFire` flag (`resolveSuppressionBurstMode` keeps it).
+        if (input.attackType === "suppressing_fire") {
+            input.suppressionFire = true;
+            input.attackType = input.burstMode ?? "semi_auto";
+        }
         input.flags = {
             ...(input.flags ?? {}),
             aiOperationId: operationId,
@@ -582,6 +589,39 @@ export function createExecutorService({
     }
 
     /**
+     * Execute an `overwatch` step: declare a watch cone on the combatant
+     * flag through the overwatch service (issue #14). Declare-only — the
+     * reaction shot itself stays with the GM.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepOverwatch(step, context, run) {
+        const overwatch = _service("overwatch", context.overwatch);
+        if (!overwatch || typeof overwatch.declare !== "function") {
+            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
+        }
+        const input = step?.input ?? {};
+        const outcome = await overwatch.declare({
+            combat: context.combat,
+            combatant: run.combatant,
+            spec: {
+                direction: input.direction,
+                arc: input.arc,
+                range: input.range,
+                weaponId: input.weaponId ?? input.itemUuid ?? null,
+                weaponName: input.name ?? input.weaponName ?? null,
+                attackType: input.attackType ?? null
+            }
+        });
+        if (!outcome?.ok) {
+            return { ok: false, reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed };
+        }
+        return { ok: true, record: outcome.record };
+    }
+
+    /**
      * Run one plan step.
      * @param {object} step
      * @param {object} context
@@ -595,6 +635,8 @@ export function createExecutorService({
             case "attack":
             case "test":
                 return _stepRoll(step.type, step, context, run.plan, run.operationId);
+            case "overwatch":
+                return _stepOverwatch(step, context, run);
             case "end-turn":
                 return { ok: true };
             default:

@@ -19,6 +19,7 @@ import { createNavigationService } from "./navigation.js";
 import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
+import { createOverwatchService } from "./overwatch.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
@@ -75,6 +76,12 @@ Hooks.once("init", () => {
         _registerFireteamService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register fireteam service`, err);
+    }
+
+    try {
+        _registerOverwatchService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register overwatch service`, err);
     }
 
     try {
@@ -150,6 +157,14 @@ Hooks.once("ready", () => {
         api?.services?.get?.("perception")?.start?.();
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start perception service`, err);
+    }
+
+    // Start the overwatch service: GM-only cone overlays and declaration
+    // expiry only run in a compatible world.
+    try {
+        api?.services?.get?.("overwatch")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start overwatch service`, err);
     }
     console.log(`${MODULE_ID} | Ready`);
 });
@@ -232,6 +247,19 @@ function _registerFireteamService(api) {
     if (!api?.services) return;
     if (!api.services.has("fireteam")) {
         api.services.register("fireteam", createFireteamService({ api }));
+    }
+}
+
+/**
+ * Register the `overwatch` service on the module API (issue #14):
+ * declare-only overwatch cones and their GM-only rendering. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerOverwatchService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("overwatch")) {
+        api.services.register("overwatch", createOverwatchService({ api }));
     }
 }
 

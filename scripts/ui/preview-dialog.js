@@ -288,6 +288,10 @@ export function buildPreviewViewModel(plan, context = {}) {
             type: actionStep.type,
             name: actionInput.name ?? actionInput.actionId ?? null,
             mode: actionInput.mode ?? null,
+            attackType: actionInput.attackType ?? null,
+            attackTypeLabel: actionInput.attackType
+                ? _label(i18nSource, `OWAI.AttackType.${actionInput.attackType}`, actionInput.attackType)
+                : null,
             range: Number.isFinite(actionInput.range) ? actionInput.range : null,
             targetNumber: Number.isFinite(targetNumber) ? targetNumber : null,
             itemUuid: actionInput.itemUuid ?? null
