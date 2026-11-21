@@ -485,6 +485,45 @@ test("a stale state mid-plan triggers exactly one replan", async () => {
     }
 });
 
+test("a GM drag counts its distance toward the replan movement budget", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    const rolls = mockRolls();
+    const seen = [];
+    const countingPlanner = {
+        ...planner,
+        planTurn: async (combat, combatant, ctx) => {
+            if (ctx?.replanCount > 0) seen.push(ctx);
+            return planner.planTurn(combat, combatant, ctx);
+        }
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const baseMove = world.token.move;
+        world.token.move = async (...args) => {
+            const result = await baseMove(...args);
+            // GM drags the token 3 cells further right after the AI move —
+            // the drift joins spent movement before the replan budgets.
+            world.token.x += 300;
+            return result;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planner: countingPlanner,
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.replanCount, 1);
+        assert.equal(seen.length, 1, "exactly one replan context");
+        // Executed move cost (2) + manual drag drift (3 cells) = 5.
+        assert.equal(seen[0].spent.movement, 5);
+    } finally {
+        clearRolls();
+    }
+});
+
 test("a second stale stops the turn with hold-and-report diagnostics", async () => {
     // The enemy is far away so every (re)plan keeps a move step whose mock
     // re-triggers the external drag — each follow-up validation is stale.

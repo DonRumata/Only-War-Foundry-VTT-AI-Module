@@ -402,6 +402,39 @@ test("planTurn returns no-target when nothing hostile exists", async () => {
     assert.ok(combatantOnly.id);
 });
 
+test("fallback targets respect the perception LOS gate", async () => {
+    const world = makeWorld();
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    // A healthy-but-empty snapshot falls through to the combatant
+    // fallback scan; without the LOS gate every hostile is attackable
+    // through walls.
+    const blind = {
+        buildPerceptionSnapshot: () => ({
+            status: "ok", visibleTargets: [], lastKnownTargets: []
+        }),
+        hasLineOfSight: () => false
+    };
+    const blocked = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1, perception: blind
+    });
+    const attack = blocked.plan?.steps?.find(step => step.type === "attack");
+    assert.equal(attack ?? null, null, "no attack on an unseen target");
+    // The same combat with clear LOS still produces an attack.
+    const clear = {
+        buildPerceptionSnapshot: () => ({
+            status: "ok", visibleTargets: [], lastKnownTargets: []
+        }),
+        hasLineOfSight: () => true
+    };
+    const free = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1, perception: clear
+    });
+    assert.equal(free.status, PLANNER_STATUS.ok);
+    assert.ok(free.plan.steps.some(step => step.type === "attack"),
+        "clear LOS keeps the fallback attack");
+});
+
 test("planTurn returns no-action when no usable action exists", async () => {
     const world = makeWorld({ weapon: false });
     const planner = createPlannerService();

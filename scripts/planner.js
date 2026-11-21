@@ -1397,6 +1397,18 @@ function _fallbackTargets(combat, combatant, input) {
         if (other.defeated === true) continue;
         if (!_actorOf(other) && !_actorOf(doc)) continue;
         if (!_hostileTo(selfDisposition, doc.disposition, input.options ?? {})) continue;
+        // The fallback scans combatants directly, so it must apply the
+        // same LOS gate the perception snapshot used — otherwise a
+        // wall-blind NPC still fires at a hostile it cannot see.
+        const losProbe = input.perception?.hasLineOfSight;
+        if (selfDoc && typeof losProbe === "function") {
+            try {
+                if (losProbe.call(input.perception, selfDoc, doc) !== true) continue;
+            } catch(err) {
+                // An undetermined probe keeps the candidate — a broken
+                // LOS check is safer than a blind veto.
+            }
+        }
         const position = _tokenPosition(doc);
         const target = _normalizeTarget({
             tokenId: id,
@@ -1443,6 +1455,7 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
         selfPos,
         grid,
         measure,
+        perception,
         options: {
             includeNeutral: context.includeNeutral === true,
             dispositions: Array.isArray(context.dispositions) ? context.dispositions : null

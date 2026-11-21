@@ -805,6 +805,22 @@ export function createExecutorService({
         run.report = decision.report ?? run.report ?? null;
         if (decision?.action === "replan" && typeof planner?.planTurn === "function") {
             run.replanCount = decision.replanCount ?? (run.replanCount + 1);
+            // Issue #33: a GM drag spends movement too — the drift
+            // between the last expected position and where the token
+            // sits now joins the accumulated spend, so the replanned
+            // turn only budgets the remainder.
+            const staleDoc = _tokenDoc(context.token ?? run.combatant?.token);
+            const liveX = staleDoc?._source?.x ?? staleDoc?.x;
+            const liveY = staleDoc?._source?.y ?? staleDoc?.y;
+            const expected = run.expectedPosition ?? _selfPosition(run.plan);
+            if (run.spent && Number.isFinite(liveX) && Number.isFinite(liveY)
+                && Number.isFinite(expected?.x) && Number.isFinite(expected?.y)) {
+                const drift = Math.hypot(liveX - expected.x, liveY - expected.y)
+                    / _gridSizeOf(context);
+                // Sub-cell drift is grid-snap noise (hex rounds to the
+                // cell) — a real drag is at least half a cell.
+                if (drift > 0.5) run.spent.movement += drift;
+            }
             let replanned = null;
             try {
                 replanned = await planner.planTurn(
