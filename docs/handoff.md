@@ -34,6 +34,7 @@
   `fireteam.character` (disciplined|shock|elite|rabble) с командным
   overlay, difficulty-bias пула и seeded jitter ≤ ±15% на кандидата,
   черты в GM preview/NPC-sheet/диагностике.
+- `docs/behavior.md` — baseline-спецификация поведения перед #24.
 
 ## Открытые issues (эпик #363)
 
@@ -44,10 +45,23 @@
   `feature/integration-ai`).
 - ~~**#19**~~ — реализовано на `feature/personalities-19` (поверх
   `feature/tactical-16`).
+- **#24** — архитектура слоёв L0–L4: воронка, скобы влияния, флаги
+  (родительский контракт, docs `docs/behavior.md` — baseline).
+- **#25** — L1 commitment: многоходовые планы, инвалидация,
+  GM-интервенция (`gm-controlled` деградация, reactive mode,
+  `manualOverrideGrace`).
+- **#26** — L2 morale: поза файртимы (confident/pressured/desperate),
+  счётчики + гистерезис, телеграфирование (intent-строка, barks).
+- **#27** — reason trace: слойная диагностика L0–L4 (`run.trace`,
+  `aiTraceVerbose`, превью-блок «Как думал»).
 - Системная сторона: `rolls.executeDamage`/`applyDamage`/`evasionTest` —
   обсуждалось, issue ещё НЕ заведено (модуль кидает только тест
   попадания — урон/уворот ручные). Авто-реакция бота (триггер
   overwatch) — следующая точка расширения.
+
+Порядок слойного rollout (зафиксирован в #24): commitment → morale →
+черты → lookahead. Черты и lookahead уже в коде — рефактор в основном
+добавляет L1/L2 и обязательный trace.
 
 ## Не проверено вживую (риски перед main)
 
