@@ -233,6 +233,171 @@ function clearRolls() {
     delete game.darkHeresy.api.rolls;
 }
 
+/**
+ * Injected plan whose attack step carries the issue #14 cone contract
+ * (`attackType: "suppressing_fire"`, `template`, `suppressionFire`).
+ * @param {object} world
+ * @param {object} options
+ * @returns {object}
+ */
+function suppressionPlan(world, { operationId = "op-supp" } = {}) {
+    return {
+        id: "plan-suppression",
+        operationId,
+        steps: [
+            {
+                id: "step-attack-1",
+                type: "attack",
+                cost: { actions: 1 },
+                preconditions: ["turn"],
+                input: {
+                    actionId: "supp",
+                    name: "Heavy Bolter",
+                    itemUuid: `Actor.${world.actor.id}.Item.w1`,
+                    targetTokenUuid: `Scene.${world.scene.id}.Token.${world.enemy.token.id}`,
+                    range: 60,
+                    attackType: "suppressing_fire",
+                    suppressionFire: true,
+                    burstMode: "semi_auto",
+                    template: { direction: 15 }
+                }
+            },
+            { id: "step-end-2", type: "end-turn", input: { reason: "done" } }
+        ],
+        snapshot: {
+            self: {
+                tokenId: world.token.id,
+                tokenUuid: `Scene.${world.scene.id}.Token.${world.token.id}`,
+                actorUuid: `Actor.${world.actor.id}`,
+                x: 0,
+                y: 0
+            },
+            revision: "supp-rev"
+        }
+    };
+}
+
+/**
+ * Injected plan with a declare-only `overwatch` step (issue #14).
+ * @param {object} world
+ * @param {object} options
+ * @returns {object}
+ */
+function overwatchPlan(world, { operationId = "op-ow" } = {}) {
+    return {
+        id: "plan-overwatch",
+        operationId,
+        steps: [
+            {
+                id: "step-ow-1",
+                type: "overwatch",
+                cost: { actions: 1 },
+                preconditions: ["turn"],
+                input: {
+                    direction: 45,
+                    arc: 45,
+                    range: 30,
+                    weaponId: "w1",
+                    name: "Lasgun",
+                    attackType: "standard"
+                }
+            },
+            { id: "step-end-2", type: "end-turn", input: { reason: "done" } }
+        ],
+        snapshot: {
+            self: {
+                tokenId: world.token.id,
+                tokenUuid: `Scene.${world.scene.id}.Token.${world.token.id}`,
+                actorUuid: `Actor.${world.actor.id}`,
+                x: 0,
+                y: 0
+            },
+            revision: "ow-rev"
+        }
+    };
+}
+
+/** Stub planner accepting every injected plan as valid. */
+function stubPlanner() {
+    return {
+        validateSnapshot: () => ({ valid: true, reason: null }),
+        shouldReplan: () => ({ replan: false })
+    };
+}
+
+test("suppressing_fire step translates to burst mode + suppressionFire for the system API", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: suppressionPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(rolls.prepareCalls.length, 1);
+        const input = rolls.prepareCalls[0];
+        assert.equal(input.attackType, "semi_auto", "burst mode replaces the canonical attack type");
+        assert.equal(input.suppressionFire, true);
+        assert.equal(input.template.direction, 15, "cone direction forwarded to prepareAttack");
+    } finally {
+        clearRolls();
+    }
+});
+
+test("an overwatch step declares the cone through the overwatch service", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const declarations = [];
+    const overwatch = {
+        declare: async ({ combat, combatant, spec }) => {
+            declarations.push({ combat, combatant, spec });
+            return { ok: true, record: { ...spec, combatantId: combatant.id } };
+        }
+    };
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+    const result = await executor.runPlan({
+        combat: world.combat,
+        combatant: world.combatant,
+        operation,
+        plan: overwatchPlan(world, { operationId: operation.id }),
+        planner: stubPlanner(),
+        overwatch
+    });
+
+    assert.equal(result.status, EXECUTOR_STATUS.completed);
+    assert.equal(declarations.length, 1);
+    assert.equal(declarations[0].combatant.id, world.combatant.id);
+    assert.equal(declarations[0].spec.direction, 45);
+    assert.equal(declarations[0].spec.range, 30);
+    assert.equal(world.nextTurnCalls.count, 1);
+});
+
+test("a missing overwatch service fails the step with system-api-missing", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+    const result = await executor.runPlan({
+        combat: world.combat,
+        combatant: world.combatant,
+        operation,
+        plan: overwatchPlan(world, { operationId: operation.id }),
+        planner: stubPlanner()
+    });
+
+    assert.equal(result.failedStep, "step-ow-1");
+    assert.equal(result.reason, "system-api-missing");
+    assert.equal(result.status, EXECUTOR_STATUS.failed);
+});
+
 test("happy path: move + attack + end-turn executes and advances the turn", async () => {
     const world = makeWorld();
     const { api, completed } = makeApi();

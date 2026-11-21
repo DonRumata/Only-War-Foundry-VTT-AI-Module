@@ -213,7 +213,8 @@ const ATTACK_TYPE_DESIRE = Object.freeze({
     semi_auto: 0.7,
     full_auto: 0.9,
     ripper_charge: 0.6,
-    called_shot: 0.4
+    called_shot: 0.4,
+    suppressing_fire: 0.55
 });
 
 /** Neutral `attackType` factor for null/custom attack types. */
@@ -242,14 +243,22 @@ const RANGED_ATTACK_TYPE_ORDER = Object.freeze([
     "semi_auto",
     "standard",
     "ripper_charge",
-    "called_shot"
+    "called_shot",
+    "suppressing_fire"
 ]);
 
 /**
- * Attack types never kept as candidates: `suppressing_fire` needs a
- * targetPoint/template the plan-step contract cannot express yet.
+ * Attack types never kept as candidates. Currently empty: the step
+ * contract carries `targetPoint`/`template` geometry, so even
+ * `suppressing_fire` is reachable (issue #14).
  */
-const EXCLUDED_ATTACK_TYPES = Object.freeze(new Set(["suppressing_fire"]));
+const EXCLUDED_ATTACK_TYPES = Object.freeze(new Set());
+
+/** Cone angle (degrees) the system places for spray weapons. */
+const SPRAY_CONE_DEG = 30;
+
+/** Cone angle (degrees) the system places for suppressing fire. */
+const SUPPRESSION_CONE_DEG = 45;
 
 /** Status ids that mark a target as vulnerable to attack. */
 const VULNERABLE_STATUSES = Object.freeze(new Set(["pinned", "prone", "stunned"]));
@@ -812,6 +821,186 @@ function _bestBlastAim({
 }
 
 /**
+ * Shortest absolute difference between two bearings in degrees (0..180).
+ * @param {number} a
+ * @param {number} b
+ * @returns {number}
+ */
+function _angleDiffDeg(a, b) {
+    return Math.abs(((((a - b) % 360) + 540) % 360) - 180);
+}
+
+/**
+ * Short-arc midpoint between two bearings, normalized to [0, 360).
+ * @param {number} a
+ * @param {number} b
+ * @returns {number}
+ */
+function _bearingMidpoint(a, b) {
+    const diff = ((((b - a) % 360) + 540) % 360) - 180;
+    return (a + (diff / 2) + 360) % 360;
+}
+
+/**
+ * Whether a token centre sits inside a directed cone: within `rangePx`
+ * and no further than `angleDeg/2` off-axis.
+ * @param {object} origin `{x, y}` pixels.
+ * @param {number} directionDeg Cone axis direction (degrees).
+ * @param {number} angleDeg Full cone angle (degrees).
+ * @param {number} rangePx Cone length (pixels).
+ * @param {object} token `{x, y}` pixels.
+ * @returns {boolean}
+ */
+function _tokenInCone(origin, directionDeg, angleDeg, rangePx, token) {
+    const dx = _finiteOr(token?.x, NaN) - _finiteOr(origin?.x, NaN);
+    const dy = _finiteOr(token?.y, NaN) - _finiteOr(origin?.y, NaN);
+    if (!Number.isFinite(dx) || !Number.isFinite(dy)) return false;
+    const dist = Math.hypot(dx, dy);
+    if (dist > rangePx + 1e-9) return false;
+    if (dist < 1e-9) return true;
+    const bearing = ((Math.atan2(dy, dx) * 180 / Math.PI) + 360) % 360;
+    return _angleDiffDeg(bearing, directionDeg) <= (angleDeg / 2) + 1e-9;
+}
+
+/**
+ * Cone spec of a template action: `suppressing_fire` fires a 45°
+ * suppression cone; spray weapons (`traits.spray` / a `template`
+ * requirement) fire a 30° cone. Regular attacks return null.
+ * @param {object} action Normalized action.
+ * @returns {{angle: number, spray?: boolean, suppression?: boolean, burstMode?: string}|null}
+ */
+function _coneSpecOf(action) {
+    if (!action) return null;
+    if (action.attackType === "suppressing_fire") {
+        const rof = action.rateOfFire ?? {};
+        const burstMode = Number(rof.burst) > 0
+            ? "semi_auto"
+            : (Number(rof.full) > 0 ? "full_auto" : "semi_auto");
+        return { angle: SUPPRESSION_CONE_DEG, suppression: true, burstMode };
+    }
+    if (action.spray === true || action.requirements?.includes("template")) {
+        return { angle: SPRAY_CONE_DEG, spray: true };
+    }
+    return null;
+}
+
+/**
+ * Pick the cone direction covering the most hostile tokens while keeping
+ * friendlies — and neutrals unless `options.includeNeutral` — outside the
+ * cone. Directions are searched over each hostile bearing plus the
+ * short-arc midpoint of every hostile pair that fits inside one cone, so
+ * clustered targets yield cluster-centred directions instead of a
+ * single-token lock.
+ * @param {object} input
+ * @param {object} input.tokenDoc Viewer token document (LOS probes).
+ * @param {object} input.origin Cone origin `{x, y}` (pixels).
+ * @param {number} input.rangePx Cone length in pixels.
+ * @param {number} input.angleDeg Full cone angle (degrees).
+ * @param {object[]} input.tokens Coverage scan entries (blastTokens shape).
+ * @param {number} input.viewerDisposition Self disposition.
+ * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @param {object|null} input.perception Perception service (LOS probes).
+ * @param {boolean} [input.requireLos] Require LOS to ≥1 covered hostile.
+ * @returns {{direction: number, hits: number, covered: object[]}|null}
+ */
+function _bestConeAim({
+    tokenDoc, origin, rangePx, angleDeg, tokens,
+    viewerDisposition, options, perception, requireLos = true
+}) {
+    if (!origin || rangePx <= 0 || !(angleDeg > 0)) return null;
+    const hostiles = (tokens ?? []).filter(token =>
+        _hostileTo(viewerDisposition, Math.sign(_finiteOr(token.disposition, 0)), options));
+    if (!hostiles.length) return null;
+    const bearings = hostiles.map(token =>
+        ((Math.atan2(token.y - origin.y, token.x - origin.x) * 180 / Math.PI) + 360) % 360);
+    const directions = new Set(bearings);
+    for (let i = 0; i < bearings.length; i++) {
+        for (let j = i + 1; j < bearings.length; j++) {
+            if (_angleDiffDeg(bearings[i], bearings[j]) <= angleDeg - 1e-9) {
+                directions.add(_bearingMidpoint(bearings[i], bearings[j]));
+            }
+        }
+    }
+    let best = null;
+    for (const direction of directions) {
+        let hits = 0;
+        let blocked = false;
+        const covered = [];
+        for (const token of tokens) {
+            if (!_tokenInCone(origin, direction, angleDeg, rangePx, token)) continue;
+            const disp = Math.sign(_finiteOr(token.disposition, 0));
+            if (_hostileTo(viewerDisposition, disp, options)) {
+                hits++;
+                covered.push({
+                    tokenUuid: token.tokenUuid ?? null,
+                    tokenId: token.tokenId ?? token.id ?? null,
+                    x: token.x,
+                    y: token.y,
+                    elevation: token.elevation ?? null
+                });
+            } else {
+                blocked = true;
+            }
+        }
+        if (blocked || hits <= 0) continue;
+        if (requireLos && perception && typeof perception.hasLineOfSight === "function") {
+            let anyLos = false;
+            for (const entry of covered) {
+                let los = true;
+                try {
+                    los = perception.hasLineOfSight(tokenDoc, { x: entry.x, y: entry.y }) === true;
+                } catch(err) {
+                    los = true;
+                }
+                if (los) {
+                    anyLos = true;
+                    break;
+                }
+            }
+            if (!anyLos) continue;
+        }
+        if (!best || hits > best.hits
+            || (hits === best.hits && direction < best.direction)) {
+            best = { direction, hits, covered };
+        }
+    }
+    if (best) best.covered.sort((a, b) => String(a.tokenUuid).localeCompare(String(b.tokenUuid)));
+    return best;
+}
+
+/**
+ * Factor-facing target entry of a cone candidate: the covered token that
+ * maps to a normalized target wins (real target data), otherwise the
+ * first covered token is synthesized into a minimal visible-target
+ * record so factors like `proximity`/`vulnerable` stay meaningful.
+ * @param {object|null} aim `_bestConeAim` result.
+ * @param {object[]} targets Normalized targets.
+ * @param {object} selfPos Self position `{x, y}` (pixels).
+ * @param {object} grid `_gridInfo` result.
+ * @returns {object|null}
+ */
+function _coneTargetOf(aim, targets, selfPos, grid) {
+    for (const covered of aim?.covered ?? []) {
+        const match = targets.find(target => target.tokenUuid === covered.tokenUuid);
+        if (match) return match;
+    }
+    const first = aim?.covered?.[0] ?? null;
+    if (!first) return null;
+    return {
+        tokenUuid: first.tokenUuid,
+        tokenId: first.tokenId,
+        x: first.x,
+        y: first.y,
+        elevation: first.elevation,
+        distance: _pixelDistance(selfPos, first, grid),
+        canAttack: true,
+        source: "visible",
+        statuses: [],
+        threat: 0
+    };
+}
+
+/**
  * Deterministic turn revision: delegates to the authority service's
  * `operations.computeRevision` (#400) when it is available so plan and
  * operation revisions agree, and falls back to an equivalent local
@@ -1265,6 +1454,9 @@ function _normalizeAction(raw, index) {
         blastRadius: _finiteOr(raw.blastRadius ?? raw.system?.blastRadius
             ?? raw.traits?.blast ?? raw.system?.traits?.blast, 0),
         damage: _expectedDamage(raw.damage ?? raw.system?.damage ?? 0),
+        requirements: Array.isArray(raw.requirements) ? raw.requirements.slice() : [],
+        spray: raw.spray === true || raw.traits?.spray === true,
+        rateOfFire: raw.rateOfFire ?? raw.system?.rateOfFire ?? null,
         cost: typeof raw.cost === "string"
             ? { actions: raw.cost === "free" ? 0 : 1 }
             : (raw.cost ?? null)
@@ -1343,6 +1535,8 @@ async function _resolveActions(actor, context) {
             range: action.range ?? (Number.isFinite(item.system?.range) ? item.system.range : null),
             blastRadius: action.blastRadius > 0 ? action.blastRadius
                 : _finiteOr(item.system?.blastRadius ?? item.system?.traits?.blast, 0),
+            spray: action.spray || /spray/i.test(String(item.system?.special ?? "")),
+            rateOfFire: action.rateOfFire ?? item.system?.rateOfFire ?? null,
             damage: action.damage > 0 ? action.damage : _expectedDamage(item.system?.damage ?? 0)
         };
     });
@@ -1397,7 +1591,10 @@ function _curateAttackTypes(group) {
         }))
         .filter(entry => !EXCLUDED_ATTACK_TYPES.has(entry.action.attackType))
         .sort((a, b) => (a.rank - b.rank) || (a.index - b.index))
-        .slice(0, MAX_ATTACK_TYPES_PER_WEAPON)
+        // `suppressing_fire` is a distinct role (area denial), not another
+        // damage attack type — it always survives the per-weapon cap.
+        .filter((entry, position) => position < MAX_ATTACK_TYPES_PER_WEAPON
+            || entry.action.attackType === "suppressing_fire")
         .map(entry => entry.action);
 }
 
@@ -1691,6 +1888,18 @@ function _stepsFor({ candidate }) {
                 ...(variant === "charge" ? { mode: "charge" } : {}),
                 ...(candidate.aim
                     ? { targetPoint: { x: candidate.aim.x, y: candidate.aim.y } }
+                    : {}),
+                ...(candidate.cone
+                    ? {
+                        template: { direction: candidate.cone.direction },
+                        covered: candidate.cone.covered.map(entry => entry.tokenUuid),
+                        ...(candidate.cone.spec?.suppression
+                            ? {
+                                suppressionFire: true,
+                                burstMode: candidate.cone.spec.burstMode
+                            }
+                            : {})
+                    }
                     : {})
             },
             preconditions: ["turn", "target", "resources"],
@@ -1997,6 +2206,9 @@ export function createPlannerService({
                         });
                         continue;
                     }
+                    // Cone weapons aim a direction, not a token — their
+                    // candidates are generated once after the target loop.
+                    if (_coneSpecOf(action)) continue;
                     const range = _actionRange(action);
                     const melee = _isMeleeAction(action);
                     // Blast weapons do not attack the target token itself:
@@ -2144,6 +2356,63 @@ export function createPlannerService({
                 diagnostics.rejected.push({
                     candidate: `approach|${target.tokenUuid}`,
                     reason: "no-route"
+                });
+            }
+        }
+
+        // Directed-cone weapons (spray, suppressing fire) cover a sector
+        // rather than a token: `_bestConeAim` sweeps firing directions for
+        // maximum hostile coverage under a strict friendly/neutral veto.
+        // One attack-in-place candidate per template action; spray may
+        // also reposition — suppression is a sustained area attack and
+        // never combines with movement.
+        for (const action of usableActions) {
+            const spec = _coneSpecOf(action);
+            if (!spec) continue;
+            const range = _actionRange(action);
+            const aimInput = {
+                tokenDoc,
+                rangePx: range * pxPerUnit,
+                angleDeg: spec.angle,
+                tokens: blastTokens,
+                viewerDisposition,
+                options: blastOptions,
+                perception
+            };
+            const aim = _bestConeAim({ ...aimInput, origin: selfPos });
+            if (!aim) {
+                diagnostics.rejected.push({
+                    candidate: `cone|${action.id}`,
+                    reason: "cone-no-safe-aim"
+                });
+                continue;
+            }
+            const coneTarget = _coneTargetOf(aim, targets, selfPos, grid);
+            candidates.push({
+                target: coneTarget, action, move: null,
+                variant: "attack-in-place",
+                cone: { ...aim, spec }
+            });
+            if (!spec.spray || isPinned) continue;
+            // Spray move-attack: aim is recomputed from each route
+            // endpoint so a repositioned cone still clears all friendlies.
+            const coneMoves = _resolveMoves({
+                tokenDoc, target: coneTarget, range,
+                selfPos, targetPos: { x: coneTarget?.x ?? null, y: coneTarget?.y ?? null },
+                grid, navigation, perception, context: planContext
+            });
+            diagnostics.metrics.movesEvaluated += coneMoves.length;
+            for (const move of coneMoves) {
+                if (move.stay) continue;
+                const aimFromMove = _bestConeAim({
+                    ...aimInput,
+                    origin: { x: move.x, y: move.y }
+                });
+                if (!aimFromMove) continue;
+                candidates.push({
+                    target: coneTarget, action, move,
+                    variant: "move-attack",
+                    cone: { ...aimFromMove, spec }
                 });
             }
         }

@@ -32,7 +32,7 @@
             <label>{{localize "OWAI.Preview.Action.Label"}}</label>
             <span class="ow-ai-value">
                 {{#if action}}
-                {{action.typeLabel}}{{#if action.name}}: {{action.name}}{{/if}}{{#if action.mode}} ({{action.mode}}){{/if}}
+                {{action.typeLabel}}{{#if action.name}}: {{action.name}}{{/if}}{{#if action.mode}} ({{action.mode}}){{/if}}{{#if action.attackTypeLabel}} ({{action.attackTypeLabel}}){{/if}}
                 {{#if action.targetNumber}} — {{localize "OWAI.Preview.TargetNumber"}}: {{action.targetNumber}}{{/if}}
                 {{else}}
                 {{localize "OWAI.Preview.Action.None"}}

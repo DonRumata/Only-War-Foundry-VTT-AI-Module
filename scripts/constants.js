@@ -45,7 +45,8 @@ export const FLAG_KEYS = Object.freeze({
     override: "override",
     operation: "operation",
     memory: "memory",
-    fireteam: "fireteam"
+    fireteam: "fireteam",
+    overwatch: "overwatch"
 });
 
 /** World setting keys. */
