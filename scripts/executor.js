@@ -33,11 +33,12 @@
  * - Preview mode emits `only-war-ai.previewRequested` (issue #409) with the
  *   serialized plan so the GM preview dialog can confirm/cancel/replan.
  */
-import { FLAG_KEYS, MODULE_ID } from "./constants.js";
+import { ATTACK_ADJUDICATION_MODES, FLAG_KEYS, MODULE_ID } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
+    getAttackAdjudication,
     getExecutionMode,
     getTurnPacingMs,
     isDiagnosticsEnabled,
@@ -68,7 +69,11 @@ export const EXECUTOR_REASONS = Object.freeze({
     rollFailed: "roll-failed",
     invalidStep: "invalid-step",
     alreadyAtEndpoint: "already-at-endpoint",
-    actionBudgetSpent: "action-budget-spent"
+    actionBudgetSpent: "action-budget-spent",
+    // Issue #37 adjudication outcomes recorded on steps/results.
+    adjudicationCancelled: "adjudication-cancelled",
+    adjudicationManual: "adjudicated-manual",
+    adjudicationSkillTest: "adjudicated-skill-test"
 });
 
 /** Step types that spend irreversible resources through the system API. */
@@ -79,6 +84,21 @@ const ROLL_API = Object.freeze({
     attack: Object.freeze({ prepare: "prepareAttack", execute: "executeAttack" }),
     test: Object.freeze({ prepare: "prepareTest", execute: "executeTest" })
 });
+
+/**
+ * GM decisions accepted by the issue #37 adjudication gate:
+ * `execute` — run the step through the system roll API;
+ * `manual` — the GM rolls it manually and the step counts as spent;
+ * `skill-test` — substitute the attack with a `test` step (legally
+ * resolves "two identical half actions"/Use Skill situations);
+ * `cancel` — stop the turn, hand it back to manual GM control.
+ */
+export const ADJUDICATION_ACTIONS = Object.freeze([
+    "execute",
+    "manual",
+    "skill-test",
+    "cancel"
+]);
 
 /** Step statuses recorded inside {@link ExecutionResult.stepsDone}. */
 export const STEP_STATUS = Object.freeze({
@@ -194,6 +214,8 @@ function _mergeDelta(ledger, delta) {
  * @param {Function} [deps.diagnostics] Diagnostics-enabled predicate.
  * @param {Function} [deps.log] Diagnostic logger.
  * @param {Function} [deps.pacing] Step/turn pacing delay getter (ms).
+ * @param {Function} [deps.getAdjudication] Attack adjudication mode
+ *   getter (`"auto"|"gm-confirm"`, issue #37).
  * @returns {object} Executor service.
  */
 export function createExecutorService({
@@ -205,10 +227,13 @@ export function createExecutorService({
     idGen = null,
     diagnostics = isDiagnosticsEnabled,
     log = (...args) => logDiagnostics(...args),
-    pacing = getTurnPacingMs
+    pacing = getTurnPacingMs,
+    getAdjudication = getAttackAdjudication
 } = {}) {
     /** Operation id → {promise, hookAdvanced}: dedup of repeated executions. */
     const executions = new Map();
+    /** Adjudication request id → pending `{resolve, request}` pair (#37). */
+    const pendingAdjudications = new Map();
     let hookSubscribed = false;
 
     const _idGen = typeof idGen === "function"
@@ -250,6 +275,25 @@ export function createExecutorService({
      * `advanceTurn: false` (e.g. config-disabled refusals) are skipped so a
      * GM keeps manual control of the turn.
      */
+    /**
+     * Resolved attack-adjudication mode for this execution
+     * (issue #37): a validated `context.adjudicationMode` injection wins,
+     * otherwise the `attackAdjudication` world setting answers.
+     * @param {object} context
+     * @returns {string} `"auto"|"gm-confirm"`.
+     */
+    function _adjudicationMode(context) {
+        const injected = context?.adjudicationMode;
+        return ATTACK_ADJUDICATION_MODES.includes(injected)
+            ? injected
+            : getAdjudication();
+    }
+
+    /**
+     * Subscribe the module hooks once: the operation-completed turn
+     * handoff, the `updateCombat` adjudication auto-cancel and the
+     * `renderChatMessage` adjudication button binding (issue #37).
+     */
     function _subscribeHook() {
         if (hookSubscribed || typeof hooks?.on !== "function") return;
         hookSubscribed = true;
@@ -263,6 +307,43 @@ export function createExecutorService({
                 _advanceForOperation(combat, operation, {});
             } catch(err) {
                 console.error(`${MODULE_ID} | operationCompleted handler failed`, err);
+            }
+        });
+        // Issue #37: a pending adjudication belongs to the claimed turn —
+        // when the combat moves on (manual advance, turn stole) the gate
+        // resolves itself instead of parking the executor promise.
+        hooks.on("updateCombat", (combat, change) => {
+            try {
+                if (!change || (change.turn === undefined && change.round === undefined)) {
+                    return;
+                }
+                for (const [requestId, pending] of pendingAdjudications) {
+                    pendingAdjudications.delete(requestId);
+                    pending.resolve({ action: "cancel", reason: "turn-stale" });
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication cancel failed`, err);
+            }
+        });
+        // Issue #37: adjudication card buttons resolve the pending gate —
+        // only the authority controller may click through, so a player
+        // reading the whispered card cannot drive the executor.
+        hooks.on("renderChatMessage", (message, html) => {
+            try {
+                const root = html instanceof HTMLElement
+                    ? html
+                    : (html?.[0] ?? null);
+                const card = root?.querySelector?.("[data-ow-ai-adjudication]");
+                if (!card) return;
+                const requestId = card.dataset.owAiAdjudication;
+                for (const button of card.querySelectorAll("[data-ow-ai-adjudicate]")) {
+                    button.addEventListener("click", () => {
+                        if (!_isController({})) return;
+                        resolveAdjudication(requestId, button.dataset.owAiAdjudicate);
+                    });
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication card binding failed`, err);
             }
         });
     }
@@ -746,6 +827,282 @@ export function createExecutorService({
     }
 
     /**
+     * Execute a `ready-weapon` step (issue #37): draws/equips the weapon
+     * the planner picked. Routed through the system actions API when it
+     * exposes one of `readyWeapon`/`ready`/`equip` — the module keeps no
+     * weapon-draw rules of its own (Quick Draw pricing lives in the
+     * system `cost` the planner already consumed). A missing endpoint is
+     * a controlled `system-api-missing`.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepReadyWeapon(step, context, run) {
+        const api = context.actionsApi
+            ?? globalThis.game?.darkHeresy?.api?.actions
+            ?? null;
+        const entry = typeof api?.readyWeapon === "function" ? api.readyWeapon
+            : (typeof api?.ready === "function" ? api.ready
+                : (typeof api?.equip === "function" ? api.equip : null));
+        if (!entry) {
+            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
+        }
+        const input = step?.input ?? {};
+        const plan = run.plan;
+        const operationId = `${run.operationId}.${step.id}`;
+        let outcome;
+        try {
+            outcome = await entry.call(api, {
+                actorUuid: plan?.snapshot?.self?.actorUuid ?? null,
+                actorId: plan?.snapshot?.self?.actorId ?? null,
+                weaponId: input.weaponId ?? input.itemUuid ?? null
+            }, { operationId });
+        } catch(err) {
+            return {
+                ok: false,
+                reason: EXECUTOR_REASONS.rollFailed,
+                error: String(err?.message ?? err)
+            };
+        }
+        if (!outcome || outcome.status === "failed" || outcome.status === "error"
+            || outcome.ok === false) {
+            return {
+                ok: false,
+                reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed,
+                stale: outcome?.reason === "stale-state"
+            };
+        }
+        return {
+            ok: true,
+            delta: outcome.resourceDelta ?? {},
+            chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
+            duplicate: outcome.duplicate === true
+        };
+    }
+
+    /**
+     * Execute a `drop-prone` step (issue #37): the free-action cover
+     * answer toggles the `prone` status on the actor. The system actions
+     * API (`api.actions.dropProne`) wins when present; otherwise the
+     * Foundry `actor.toggleStatusEffect("prone", {active: true})` channel
+     * applies the status through the standard effect pipeline.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepDropProne(step, context, run) {
+        const statusId = step?.input?.statusId ?? "prone";
+        const api = context.actionsApi
+            ?? globalThis.game?.darkHeresy?.api?.actions
+            ?? null;
+        if (typeof api?.dropProne === "function") {
+            const plan = run.plan;
+            const operationId = `${run.operationId}.${step.id}`;
+            let outcome;
+            try {
+                outcome = await api.dropProne({
+                    actorUuid: plan?.snapshot?.self?.actorUuid ?? null,
+                    actorId: plan?.snapshot?.self?.actorId ?? null
+                }, { operationId });
+            } catch(err) {
+                return {
+                    ok: false,
+                    reason: EXECUTOR_REASONS.rollFailed,
+                    error: String(err?.message ?? err)
+                };
+            }
+            if (!outcome || outcome.status === "failed" || outcome.status === "error"
+                || outcome.ok === false) {
+                return {
+                    ok: false,
+                    reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed,
+                    stale: outcome?.reason === "stale-state"
+                };
+            }
+            return {
+                ok: true,
+                delta: outcome.resourceDelta ?? {},
+                chatMessageIds: Array.isArray(outcome.chatMessageIds)
+                    ? outcome.chatMessageIds : []
+            };
+        }
+        // Status-toggle fallback: the combatant's actor applies prone
+        // through the standard effect channel.
+        const actor = run.combatant?.actor
+            ?? _tokenDoc(run.combatant?.token)?.actor
+            ?? null;
+        if (typeof actor?.toggleStatusEffect === "function") {
+            try {
+                await actor.toggleStatusEffect(statusId, { active: true });
+                return { ok: true };
+            } catch(err) {
+                return {
+                    ok: false,
+                    reason: EXECUTOR_REASONS.rollFailed,
+                    error: String(err?.message ?? err)
+                };
+            }
+        }
+        return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
+    }
+
+    /**
+     * Resolve a pending adjudication request — the single decision entry
+     * point called by the GM card buttons and integrations. Unknown
+     * request ids and unsupported actions are ignored; the resolve is
+     * idempotent (the pending entry is deleted on first resolve).
+     * @param {string} requestId Pending request id.
+     * @param {string|object} action One of {@link ADJUDICATION_ACTIONS}
+     *   or a `{action, reason?}` record.
+     * @returns {boolean} Whether a pending request was resolved.
+     */
+    function resolveAdjudication(requestId, action) {
+        const pending = pendingAdjudications.get(requestId);
+        if (!pending) return false;
+        const verdict = typeof action === "object" && action !== null
+            ? { action: action.action, reason: action.reason ?? null }
+            : { action, reason: null };
+        if (!ADJUDICATION_ACTIONS.includes(verdict.action)) return false;
+        pendingAdjudications.delete(requestId);
+        pending.resolve(verdict);
+        return true;
+    }
+
+    /**
+     * GM whisper recipients for the adjudication card.
+     * @returns {string[]} User ids.
+     */
+    function _gmWhisper() {
+        return _list(globalThis.game?.users)
+            .filter(user => user?.isGM)
+            .map(user => user.id);
+    }
+
+    /**
+     * Localize helper tolerating early init states.
+     * @param {string} key
+     * @param {object} [data] Format data.
+     * @returns {string}
+     */
+    function _localize(key, data = null) {
+        const i18n = globalThis.game?.i18n;
+        if (data && typeof i18n?.format === "function") return i18n.format(key, data);
+        return i18n?.localize?.(key) ?? key;
+    }
+
+    /**
+     * HTML content of the GM adjudication card: the step summary plus the
+     * four decision buttons (`data-ow-ai-adjudicate` marks them for the
+     * `renderChatMessage` binding).
+     * @param {object} request Pending request `{id, stepId, step, plan}`.
+     * @param {object} context Execution context.
+     * @returns {string}
+     */
+    function _adjudicationCard(request, context) {
+        const step = request.step ?? {};
+        const input = step.input ?? {};
+        const title = _localize("OWAI.Adjudication.Title");
+        const detail = _localize("OWAI.Adjudication.Detail", {
+            name: request.combatant?.name ?? "NPC",
+            action: input.name ?? input.actionId ?? step.id ?? "—"
+        });
+        const button = key =>
+            `<button type="button" data-ow-ai-adjudicate="${key}">`
+            + `${_localize(`OWAI.Adjudication.${key}`)}</button>`;
+        const buttons = ADJUDICATION_ACTIONS.map(button).join("");
+        return `<div class="ow-ai-adjudication" data-ow-ai-adjudication="${request.id}">`
+            + `<p><strong>${title}</strong> ${detail}</p>`
+            + `<div class="ow-ai-adjudication-buttons">${buttons}</div></div>`;
+    }
+
+    /**
+     * Ask the GM how to resolve an irreversible step (issue #37). An
+     * injected `context.adjudication` resolver wins (tests, integrations);
+     * otherwise a whispered `ChatMessage` card with decision buttons is
+     * posted and the gate waits for {@link resolveAdjudication} — a turn
+     * transition auto-cancels the pending gate via `updateCombat`. When
+     * the chat channel is unavailable the step executes (the documented
+     * safe default: adjudication cannot park the combat).
+     * @param {object} step Irreversible step (`attack`/`test`).
+     * @param {object} context Execution context.
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} `{action, reason?}` decision.
+     */
+    async function _adjudicate(step, context, run) {
+        const request = {
+            id: `${run.operationId}.${step.id}.adjudication`,
+            operationId: run.operationId,
+            stepId: step.id,
+            step,
+            planId: run.plan?.id ?? null,
+            combatant: run.combatant
+        };
+        if (typeof context.adjudication === "function") {
+            try {
+                const verdict = await context.adjudication(request);
+                const action = typeof verdict === "object" && verdict !== null
+                    ? verdict.action : verdict;
+                return ADJUDICATION_ACTIONS.includes(action)
+                    ? { action, reason: verdict?.reason ?? null }
+                    : { action: "execute" };
+            } catch(err) {
+                return { action: "cancel", reason: String(err?.message ?? err) };
+            }
+        }
+        if (typeof globalThis.ChatMessage?.create !== "function") {
+            // No chat channel (headless/test harness): the documented
+            // safe default keeps the turn running.
+            return { action: "execute" };
+        }
+        const requestId = request.id;
+        const pending = new Promise(resolve => {
+            pendingAdjudications.set(requestId, { resolve, request });
+        });
+        try {
+            await globalThis.ChatMessage.create({
+                content: _adjudicationCard(request, context),
+                whisper: _gmWhisper(),
+                speaker: { alias: "Only War AI" },
+                flags: { [MODULE_ID]: { adjudication: requestId } }
+            });
+        } catch(err) {
+            pendingAdjudications.delete(requestId);
+            return { action: "execute" };
+        }
+        return pending;
+    }
+
+    /**
+     * Record the weapon of a successful attack on the combatant
+     * `lastUsedWeapon` flag (issue #37): the planner's `weaponInertia`
+     * factor reads it next turn. Controller-only writes — the executor
+     * only reaches this point after the controller gate.
+     * @param {object} step Attack step.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<void>}
+     */
+    async function _recordLastUsedWeapon(step, context, run) {
+        if (typeof run.combatant?.setFlag !== "function") return;
+        const input = step?.input ?? {};
+        const record = {
+            itemUuid: input.itemUuid ?? null,
+            itemId: input.itemId ?? input.weaponId ?? null,
+            name: input.name ?? null,
+            actionId: input.actionId ?? null,
+            round: context.combat?.round ?? null
+        };
+        if (!record.itemUuid && !record.itemId && !record.name) return;
+        try {
+            await run.combatant.setFlag(MODULE_ID, FLAG_KEYS.lastUsedWeapon, record);
+        } catch(err) {
+            // Inertia bookkeeping is best-effort — the shot already landed.
+        }
+    }
+
+    /**
      * Run one plan step.
      * @param {object} step
      * @param {object} context
@@ -770,6 +1127,11 @@ export function createExecutorService({
                         // Flag cleanup is best-effort — the shot already landed.
                     }
                 }
+                // Issue #37: the taken shot also refreshes the weapon
+                // inertia marker the planner scores next turn.
+                if (outcome.ok && step.type === "attack") {
+                    await _recordLastUsedWeapon(step, context, run);
+                }
                 return outcome;
             }
             case "aim":
@@ -778,6 +1140,10 @@ export function createExecutorService({
                 return _stepReload(step, context, run);
             case "overwatch":
                 return _stepOverwatch(step, context, run);
+            case "ready-weapon":
+                return _stepReadyWeapon(step, context, run);
+            case "drop-prone":
+                return _stepDropProne(step, context, run);
             case "end-turn":
                 return { ok: true };
             default:
@@ -1199,13 +1565,50 @@ export function createExecutorService({
                     break;
                 }
 
-                const outcome = await _runStep(step, context, run);
+                // Issue #37 adjudication gate: a `gm-confirm` world pauses
+                // before every irreversible step and lets the GM decide —
+                // execute, roll manually, substitute a skill test or take
+                // the turn back. The gate only runs on `automatic`: the
+                // preview mode already carries its own confirmation point,
+                // so the GM is never asked twice for the same plan.
+                let adjudicated = null;
+                if (irreversible && getMode() === "automatic"
+                    && _adjudicationMode(context) === "gm-confirm") {
+                    const decision = await _adjudicate(step, context, run);
+                    if (decision.action === "cancel") {
+                        status = EXECUTOR_STATUS.cancelled;
+                        reason = EXECUTOR_REASONS.adjudicationCancelled;
+                        failedStep = step.id;
+                        break;
+                    }
+                    if (decision.action === "manual") {
+                        stepsDone.push({
+                            stepId: step.id,
+                            type: step.type,
+                            status: STEP_STATUS.done,
+                            reason: EXECUTOR_REASONS.adjudicationManual
+                        });
+                        irreversibleSpent = true;
+                        run.stepIndex++;
+                        if (run.stepIndex < steps.length) await _sleep(pacing());
+                        continue;
+                    }
+                    // "skill-test" substitutes the roll channel below;
+                    // "execute" falls through to the normal path.
+                    if (decision.action === "skill-test") adjudicated = "skill-test";
+                }
+
+                const outcome = adjudicated === "skill-test" && step.type === "attack"
+                    ? await _stepRoll("test", step, context, run.plan, run.operationId)
+                    : await _runStep(step, context, run);
                 if (outcome.ok) {
                     stepsDone.push({
                         stepId: step.id,
                         type: step.type,
                         status: outcome.skipped ? STEP_STATUS.skipped : STEP_STATUS.done,
-                        reason: outcome.reason ?? null,
+                        reason: adjudicated === "skill-test"
+                            ? EXECUTOR_REASONS.adjudicationSkillTest
+                            : (outcome.reason ?? null),
                         duplicate: outcome.duplicate === true
                     });
                     _mergeDelta(resourceDelta, outcome.delta);
@@ -1260,7 +1663,7 @@ export function createExecutorService({
             reason = reason ?? EXECUTOR_REASONS.actionBudgetSpent;
         }
         if (status === EXECUTOR_STATUS.cancelled) {
-            return _result({
+            const result = _result({
                 status,
                 reason,
                 operationId: run.operationId,
@@ -1272,6 +1675,14 @@ export function createExecutorService({
                 chatMessageIds,
                 diagnostics: run.report ?? run.plan?.diagnostics
             });
+            // Issue #37: an adjudication cancel hands the turn back to
+            // manual GM control — the operation closes but the turn is
+            // not advanced. Controller/module cancellations leave the
+            // operation to its real owner and stay silent.
+            if (reason === EXECUTOR_REASONS.adjudicationCancelled) {
+                await _finish(context, run, result, false);
+            }
+            return result;
         }
         const result = _result({
             status,
@@ -1464,9 +1875,19 @@ export function createExecutorService({
     return {
         executePlan,
         runPlan,
+        resolveAdjudication,
+        /**
+         * Whether an adjudication request is still pending a GM decision.
+         * @param {string} requestId
+         * @returns {boolean}
+         */
+        adjudicationPending(requestId) {
+            return pendingAdjudications.has(requestId);
+        },
         statuses: EXECUTOR_STATUS,
         reasons: EXECUTOR_REASONS,
         stepStatuses: STEP_STATUS,
+        adjudicationActions: ADJUDICATION_ACTIONS,
         /**
          * Whether an execution result already exists for an operation id.
          * @param {string} operationId

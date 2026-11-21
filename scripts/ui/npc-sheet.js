@@ -69,6 +69,10 @@ function _injectNpcSection(html, actor) {
     const resolvedTraits = resolvedPersonality.traits
         .map(id => _localize(`OWAI.Personality.${id}`))
         .join(", ");
+    // Issue #37: the GM's signature weapon for this NPC — the planner's
+    // `weaponAffinity` factor favours attack actions of that weapon.
+    const preferredWeapon = typeof config.preferredWeapon === "string"
+        ? config.preferredWeapon : "";
 
     const section = _buildElement(`
         <fieldset class="ow-ai-config" data-ow-ai-config>
@@ -86,6 +90,12 @@ function _injectNpcSection(html, actor) {
             <div class="form-group">
                 <label>${_localize("OWAI.Sheet.IncludeNeutral")}</label>
                 <input type="checkbox" data-ow-ai-field="includeNeutral" ${includeNeutral ? "checked" : ""}>
+            </div>
+            <div class="form-group">
+                <label>${_localize("OWAI.Sheet.PreferredWeapon")}</label>
+                <select data-ow-ai-field="preferredWeapon">
+                    ${_weaponOptions(actor, preferredWeapon)}
+                </select>
             </div>
             <div class="form-group">
                 <label>${_localize("OWAI.Sheet.Personality.Label")}</label>
@@ -280,8 +290,11 @@ async function _saveActorConfig(actor, section) {
     const presetValue = section.querySelector("[data-ow-ai-field=preset]")?.value ?? "";
     const preset = AI_PRESETS.includes(presetValue) ? presetValue : null;
     const includeNeutral = section.querySelector("[data-ow-ai-field=includeNeutral]")?.checked === true;
+    const preferredValue = section.querySelector("[data-ow-ai-field=preferredWeapon]")?.value ?? "";
+    const preferredWeapon = preferredValue.trim().length ? preferredValue.trim() : null;
     try {
-        await actor.setFlag(MODULE_ID, FLAG_KEYS.actorConfig, { enabled, preset, includeNeutral });
+        await actor.setFlag(MODULE_ID, FLAG_KEYS.actorConfig,
+            { enabled, preset, includeNeutral, preferredWeapon });
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to save actor AI config`, err);
     }
@@ -365,6 +378,40 @@ function _presetOptions(selected, includeEmpty) {
     for (const preset of AI_PRESETS) {
         options.push(
             `<option value="${preset}" ${preset === selected ? "selected" : ""}>${_localize(`OWAI.Preset.${preset}`)}</option>`
+        );
+    }
+    return options.join("");
+}
+
+/**
+ * Build `<option>` markup for the `preferredWeapon` select (issue #37):
+ * the actor's weapon items keyed by uuid-or-id, plus an "auto" empty
+ * entry. A stored value that no longer resolves to an inventory item
+ * survives as a custom option so the select never hides the flag.
+ * @param {object} actor
+ * @param {string} selected Stored preferredWeapon value.
+ * @returns {string}
+ */
+function _weaponOptions(actor, selected) {
+    const options = [`<option value="">${_localize("OWAI.Sheet.PreferredWeapon.None")}</option>`];
+    const items = actor?.items ?? [];
+    const weapons = Array.isArray(items)
+        ? items
+        : (typeof items.values === "function" ? [...items.values()] : []);
+    let found = false;
+    for (const item of weapons) {
+        if (item?.type !== "weapon") continue;
+        const value = item.uuid ?? item.id ?? item.name ?? "";
+        if (!value) continue;
+        if (value === selected) found = true;
+        const name = _escapeAttr(item.name ?? value);
+        options.push(
+            `<option value="${_escapeAttr(value)}" ${value === selected ? "selected" : ""}>${name}</option>`
+        );
+    }
+    if (selected && !found) {
+        options.push(
+            `<option value="${_escapeAttr(selected)}" selected>${_escapeAttr(selected)}</option>`
         );
     }
     return options.join("");

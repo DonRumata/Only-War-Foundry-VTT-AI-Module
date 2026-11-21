@@ -54,7 +54,13 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 0,
     // Issue #16: assault accepts risky lanes — danger only mildly deters.
-    danger: -0.5
+    danger: -0.5,
+    // Issue #37: signature weapons and a ready alternative are worth a
+    // real pull; lying down mid-charge is not the assault answer.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 0,
+    readyWeapon: 2
 });
 
 /**

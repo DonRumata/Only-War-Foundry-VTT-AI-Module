@@ -96,7 +96,13 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 1,
     // Issue #16: spec-ops reads the threat map like rangedCover does.
-    danger: -2
+    danger: -2,
+    // Issue #37: spec-ops takes cover under fire but keeps moving when it
+    // can; signature weapons and backup weapons score as elsewhere.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 1,
+    readyWeapon: 2
 });
 
 /**

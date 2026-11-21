@@ -79,7 +79,13 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 2,
     // Issue #16: the preset's whole doctrine is staying out of kill lanes.
-    danger: -3
+    danger: -3,
+    // Issue #37: dropping prone is this doctrine's free-action answer to
+    // suppression fire; signature weapons and readying a backup still pay.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 1.5,
+    readyWeapon: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

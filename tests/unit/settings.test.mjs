@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import {
     getAIDifficulty,
+    getAttackAdjudication,
     getExecutionMode,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
@@ -16,6 +17,7 @@ import {
     registerSettings
 } from "../../scripts/settings.js";
 import {
+    ATTACK_ADJUDICATION_MODES,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -27,7 +29,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 8);
+    assert.equal(registered.length, 9);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -173,4 +175,25 @@ test("getAIDifficulty honours a stored value and rejects damaged ones", async ()
     assert.equal(getAIDifficulty(), "hard");
     await game.settings.set(MODULE_ID, SETTING_KEYS.aiDifficulty, "nightmare");
     assert.equal(getAIDifficulty(), "normal");
+});
+
+test("attackAdjudication defaults to auto with auto/gm-confirm choices (issue #37)", () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(
+        e => e.key === SETTING_KEYS.attackAdjudication);
+    assert.ok(entry, "attackAdjudication registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, "auto");
+    assert.deepEqual(Object.keys(entry.data.choices), [...ATTACK_ADJUDICATION_MODES]);
+    assert.equal(getAttackAdjudication(), "auto");
+});
+
+test("getAttackAdjudication honours a stored value and rejects damaged ones", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.attackAdjudication, "gm-confirm");
+    assert.equal(getAttackAdjudication(), "gm-confirm");
+    await game.settings.set(MODULE_ID, SETTING_KEYS.attackAdjudication, "garbage");
+    assert.equal(getAttackAdjudication(), "auto");
 });

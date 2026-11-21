@@ -12,10 +12,16 @@
  *   planner (issue #16); personalities of issue #19 read it too.
  * - `threatMapOverlay`: boolean — persisted toggle of the GM-only danger
  *   heatmap debug overlay (issue #36); rendering stays GM-only either way.
+ * - `attackAdjudication`: "auto" | "gm-confirm" — whether irreversible
+ *   attack/test steps execute unattended or pause for a GM decision card
+ *   (issue #37). Applies to `executionMode: "automatic"` only; the preview
+ *   mode already carries its own confirmation point.
  */
 import {
     AI_DIFFICULTIES,
+    ATTACK_ADJUDICATION_MODES,
     DEFAULT_AI_DIFFICULTY,
+    DEFAULT_ATTACK_ADJUDICATION,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -96,6 +102,19 @@ export function registerSettings() {
             hard: "OWAI.Settings.AiDifficulty.Hard"
         },
         default: DEFAULT_AI_DIFFICULTY
+    });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.attackAdjudication, {
+        name: "OWAI.Settings.AttackAdjudication.Name",
+        hint: "OWAI.Settings.AttackAdjudication.Hint",
+        scope: "world",
+        config: true,
+        type: String,
+        choices: {
+            auto: "OWAI.Settings.AttackAdjudication.Auto",
+            "gm-confirm": "OWAI.Settings.AttackAdjudication.GmConfirm"
+        },
+        default: DEFAULT_ATTACK_ADJUDICATION
     });
 
     game.settings.register(MODULE_ID, SETTING_KEYS.threatMapOverlay, {
@@ -218,6 +237,23 @@ export function isDiagnosticsEnabled() {
         return game.settings.get(MODULE_ID, SETTING_KEYS.diagnosticsEnabled) === true;
     } catch(_err) {
         return false;
+    }
+}
+
+/**
+ * Attack adjudication mode ("auto" | "gm-confirm", issue #37). With
+ * `"gm-confirm"` the executor pauses before each irreversible attack/test
+ * step and asks the GM via a chat card whether to execute it, roll it
+ * manually, substitute a skill test or cancel the turn. Missing or damaged
+ * values fall back to {@link DEFAULT_ATTACK_ADJUDICATION}.
+ * @returns {string}
+ */
+export function getAttackAdjudication() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.attackAdjudication);
+        return ATTACK_ADJUDICATION_MODES.includes(value) ? value : DEFAULT_ATTACK_ADJUDICATION;
+    } catch(_err) {
+        return DEFAULT_ATTACK_ADJUDICATION;
     }
 }
 

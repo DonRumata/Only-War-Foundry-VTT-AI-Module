@@ -74,6 +74,10 @@ export function resolveEffectiveConfig(document) {
             const preset = _presetOr(override.preset, actorConfig.preset);
             const result = { enabled: true, preset, source: layer.source };
             if (_includeNeutralOf(actorConfig, override)) result.includeNeutral = true;
+            // Issue #37: a layer-level preferred weapon wins, then the
+            // actor config's, else the field stays absent.
+            const preferred = _preferredWeaponOr(override.preferredWeapon, actorConfig.preferredWeapon);
+            if (preferred) result.preferredWeapon = preferred;
             if (personality) result.personality = personality;
             return result;
         }
@@ -88,6 +92,7 @@ export function resolveEffectiveConfig(document) {
             source: "actor"
         };
         if (actorConfig.includeNeutral === true) result.includeNeutral = true;
+        if (actorConfig.preferredWeapon) result.preferredWeapon = actorConfig.preferredWeapon;
         if (personality) result.personality = personality;
         return result;
     }
@@ -148,7 +153,37 @@ function _normalizeActorConfig(actor) {
     }
     const enabled = config.enabled === true;
     const preset = AI_PRESETS.includes(config.preset) ? config.preset : null;
-    return { enabled, preset, includeNeutral: config.includeNeutral === true };
+    return {
+        enabled,
+        preset,
+        includeNeutral: config.includeNeutral === true,
+        // Issue #37: the GM's signature weapon for this NPC — any non-empty
+        // string (item id, item uuid or weapon name) is accepted.
+        preferredWeapon: _preferredWeapon(config.preferredWeapon)
+    };
+}
+
+/**
+ * Normalise a `preferredWeapon` config field to a trimmed non-empty
+ * string or null (issue #37).
+ * @param {*} value
+ * @returns {string|null}
+ */
+function _preferredWeapon(value) {
+    if (typeof value !== "string") return null;
+    const trimmed = value.trim();
+    return trimmed.length ? trimmed : null;
+}
+
+/**
+ * Resolve the preferred-weapon chain: a defined override value wins,
+ * then the actor config; null/undefined entries fall through.
+ * @param {*} overrideValue
+ * @param {*} actorValue
+ * @returns {string|null}
+ */
+function _preferredWeaponOr(overrideValue, actorValue) {
+    return _preferredWeapon(overrideValue) ?? _preferredWeapon(actorValue);
 }
 
 /**
@@ -192,7 +227,12 @@ function _normalizeOverride(doc) {
         ? override.mode
         : "inherit";
     const preset = AI_PRESETS.includes(override.preset) ? override.preset : null;
-    return { mode, preset, includeNeutral: override.includeNeutral };
+    return {
+        mode,
+        preset,
+        includeNeutral: override.includeNeutral,
+        preferredWeapon: _preferredWeapon(override.preferredWeapon)
+    };
 }
 
 /**

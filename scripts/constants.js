@@ -48,7 +48,9 @@ export const FLAG_KEYS = Object.freeze({
     fireteam: "fireteam",
     overwatch: "overwatch",
     aim: "aim",
-    personality: "personality"
+    personality: "personality",
+    reactionUsed: "reactionUsed",
+    lastUsedWeapon: "lastUsedWeapon"
 });
 
 /**
@@ -72,7 +74,8 @@ export const SETTING_KEYS = Object.freeze({
     previewTimeoutSeconds: "previewTimeoutSeconds",
     turnPacingMs: "turnPacingMs",
     aiDifficulty: "aiDifficulty",
-    threatMapOverlay: "threatMapOverlay"
+    threatMapOverlay: "threatMapOverlay",
+    attackAdjudication: "attackAdjudication"
 });
 
 /** Default pacing delay between AI execution steps in milliseconds. */
@@ -101,6 +104,20 @@ export const AI_DIFFICULTIES = Object.freeze([
 
 /** Default AI difficulty when the world setting is missing or damaged. */
 export const DEFAULT_AI_DIFFICULTY = "normal";
+
+/**
+ * Attack adjudication modes for the `attackAdjudication` world setting
+ * (issue #37): `"auto"` executes irreversible attack/test steps without a
+ * pause; `"gm-confirm"` pauses before the irreversible step and asks the
+ * GM through a chat card how to resolve it.
+ */
+export const ATTACK_ADJUDICATION_MODES = Object.freeze([
+    "auto",
+    "gm-confirm"
+]);
+
+/** Default attack-adjudication mode — the historical, hands-off one. */
+export const DEFAULT_ATTACK_ADJUDICATION = "auto";
 
 /** Required host system id. */
 export const REQUIRED_SYSTEM_ID = "only-war-local";

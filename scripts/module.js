@@ -20,6 +20,7 @@ import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
 import { createOverwatchService } from "./overwatch.js";
+import { createReactionsService } from "./reactions.js";
 import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
 import { registerAssaultPreset } from "./presets/assault.js";
@@ -96,6 +97,12 @@ Hooks.once("init", () => {
         _registerOverwatchService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register overwatch service`, err);
+    }
+
+    try {
+        _registerReactionsService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register reactions service`, err);
     }
 
     try {
@@ -187,6 +194,14 @@ Hooks.once("ready", () => {
         api?.services?.get?.("overwatch")?.start?.();
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start overwatch service`, err);
+    }
+
+    // Start the reactions service: the per-round `reactionUsed` flag
+    // refresh on turn starts only runs in a compatible world.
+    try {
+        api?.services?.get?.("reactions")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start reactions service`, err);
     }
     console.log(`${MODULE_ID} | Ready`);
 });
@@ -323,6 +338,20 @@ function _registerOverwatchService(api) {
     if (!api?.services) return;
     if (!api.services.has("overwatch")) {
         api.services.register("overwatch", createOverwatchService({ api }));
+    }
+}
+
+/**
+ * Register the `reactions` service on the module API (issue #37): the
+ * per-round `reactionUsed` flag — `markUsed`/`clear` for the system side
+ * and GM macros, the `updateCombat` refresh on turn starts. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerReactionsService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("reactions")) {
+        api.services.register("reactions", createReactionsService({ api }));
     }
 }
 

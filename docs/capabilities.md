@@ -270,7 +270,9 @@ execute: расхождение — `stale-state` (перемещение, см�
   (идемпотентно); `move-reload` допустим при half-стоимости.
 - `overwatch` — кандидат объявляет конус 45° на видимую угрозу через
   сервис из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
-  На last-known контакт конус не объявляется.
+  На last-known контакт конус не объявляется. Issue #37: бот с
+  потраченной реакцией (`flags["only-war-ai"].reactionUsed` текущего
+  раунда) конус не декларирует — rejected `reaction-used`.
 - Ориентация конусов (issue #30): spray/suppression наводятся только по
   воспринимаемым якорям — видимая цель на текущую позицию, last-known на
   запомненную точку; невидимые/неизвестные hostile на сцене шаблон не
@@ -282,6 +284,54 @@ execute: расхождение — `stale-state` (перемещение, см�
   ниже легальных атак), `reload`, `overwatch`. Направленности: assault —
   перезарядка без прицелов; rangedCover/hold — aim-ветка и конус;
   specOps — умеренно.
+
+#### Экономия действий II (issue #37)
+
+- **`ready-weapon`** — free/полу-действие «достать оружие»: явные записи
+  `actions.list` с `kind:"ready"|"draw"|"equip"` планируются с
+  собственным `cost` системы (free под Quick Draw — таланты в модуле не
+  парсятся, стоимость приходит из записи). Без явных записей — синтез из
+  инвентаря: оружие без usable-атакующей записи кандидатизируется как
+  half-cost ready, когда действующий список атак пуст или все клипы
+  `clip.value === 0` («боеприпасы кончились — смена ствола»). Шаг
+  `ready-weapon {weaponId, itemUuid}` → executor вызывает
+  `api.actions.readyWeapon`/`ready`/`equip` (без эндпоинта —
+  `system-api-missing`); превью шага — только показ.
+- **`drop-prone`** — free-действие «залечь» при `pinned` либо при
+  `danger ≥ 0.5` на собственной клетке (threat map видит перекрёстный
+  обстрел); уже лежачий/здоровый бот кандидата не получает. Шаг
+  `drop-prone {statusId:"prone"}` → `api.actions.dropProne` или
+  fallback `actor.toggleStatusEffect("prone")`.
+- **`reactionUsed`** (`flags["only-war-ai"].reactionUsed` на Combatant,
+  рекорд `{round, reason}`) — сервис `reactions` (`api.services`):
+  `markUsed`, `markUsedByToken`, `clear`, `reactionUsedOf`,
+  `handleUpdateCombat`. Пишет только контроллер; читают все —
+  planner проверяет флаг документа цели. Сбрасывается в начале хода
+  владельца (`updateCombat`-вотчер). Рекорд без `round` — консервативно
+  потрачен; рекорд прошлого раунда — уже чист.
+- **Counter-EV dodge-модель**: `dodgeChanceOf(target, action)` →
+  `{dodgeable, chance}` — TN уворота цели/100 (поле `dodge` в записи
+  цели, дефолт `DEFAULT_DODGE_TN = 30`, cap 0.95). Недоджибельные:
+  spray/cone/suppression, blast при недоказанном выходе из зоны за
+  half-move, цель с потраченной реакцией (`chance 0`). Фактор
+  `attackType` несёт `desire × (1 − chance)` — атака по уворотливой цели
+  теряет EV, по беззащитной выигрывает; цель `reactionUsed` дополнительно
+  размечается `vulnerable`. `breakdown.dodge` экспонирует вердикт.
+- **`attackAdjudication`** (world setting `auto|gm-confirm`, default
+  `auto`): в `gm-confirm` перед каждым attack/test шагом в
+  automatic-режиме GM получает whisper-чаткарту с решениями
+  `execute | manual | skill-test | cancel` (клик — только контроллер,
+  `updateCombat` авто-отменяет ожидание, таймаута нет — ход под ручным
+  управлением). `manual` — шаг исполнен без ролла; `skill-test` — подмена
+  на `prepare/executeTest`; `cancel` — отмена операции с
+  `advanceTurn:false`. Preview-режим не меняется: диалог предпросмотра —
+  единственная точка подтверждения, гейт не дублирует вопрос.
+- **Оружейные предпочтения**: `preferredWeapon` — поле конфига/листа NPC
+  (uuid/id/имя оружия; chain Combatant → Token → Actor), скорится
+  фактором `weaponAffinity` (полный вес при совпадении, половина — при
+  совпадении класса оружия со spec черты личности). Executor пишет
+  `lastUsedWeapon` на combatant после успешной атаки — фактор
+  `weaponInertia` даёт мягкое предпочтение тому же стволу.
 
 ### Executor (issue #407)
 

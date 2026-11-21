@@ -37,11 +37,21 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 Все данные модуля — в `flags["only-war-ai"]`; `actor.system` не трогаем:
 
 - Actor: `config = { enabled: boolean, preset: string|null,
-  includeNeutral?: boolean }` — `includeNeutral` разрешает атаковать
-  нейтральные токены (владение, казни заложников и т.п.).
+  includeNeutral?: boolean, preferredWeapon?: string }` — `includeNeutral`
+  разрешает атаковать нейтральные токены (владение, казни заложников и
+  т.п.); `preferredWeapon` (issue #37) — uuid/id/имя предпочтительного
+  оружия, скорится фактором `weaponAffinity`.
 - Token: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`.
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
+- Combatant: `reactionUsed = { round, reason }` (issue #37) — реакция
+  потрачена в текущем раунде; пишет только контроллер, сбрасывается
+  сервисом `reactions` в начале хода владельца. Рекорд без `round`
+  считается потраченным, рекорд прошлого раунда — уже неактивен.
+- Combatant: `lastUsedWeapon = { itemUuid, itemId, name, actionId,
+  round }` (issue #37) — последнее оружие успешной атаки; пишет
+  executor после `executeAttack`, читает planner (фактор
+  `weaponInertia`).
 - Actor/Token/Combatant: `personality = string[]` — явный список черт
   личности (issue #19, id из пула `scripts/personalities.js`); резолвится
   той же цепочкой Combatant → Token → Actor, без флага черты
@@ -59,6 +69,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   AI-хода и перед `combat.nextTurn()`, чтобы автоходы оставались
   наблюдаемыми. `threatMapOverlay` (default `false`, issue #36) —
   персистентный тумблер GM-only отладочной теплокарты угроз.
+  `attackAdjudication` (default `"auto"`, issue #37) — арбитраж атак:
+  `auto` — бросок через системный API сразу, `gm-confirm` — перед каждым
+  attack/test шагом (только `executionMode === "automatic"`) GM получает
+  whisper-чаткарту с решениями `execute | manual | skill-test | cancel`.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -212,6 +226,35 @@ actor-данных; в fingerprint цели не входят. Детермин�
 сохранением/увеличением дистанции; `prone` — бюджет движения делится
 пополам (floor, ползком; `{mode}` → `half`) и вето `charge`.
 
+Free-действия и реакция (issue #37): `ready-weapon` — явные записи
+`kind:"ready"|"draw"|"equip"` из `actions.list` планируются с `cost`
+системы (free под Quick Draw; таланты не парсятся), иначе синтез из
+инвентаря при сухом списке атак (`clip.value === 0` у всех атакующих) —
+half-cost кандидат; `drop-prone` — free-шаг `statusId:"prone"` при
+pinned или `danger ≥ 0.5` на своей клетке. Факторы `weaponAffinity`
+(`preferredWeapon` конфига — полный вес, affinity-спека черты личности —
+половина) и `weaponInertia` (флаг `lastUsedWeapon`). Counter-EV:
+`dodgeChanceOf(target, action)` → `{dodgeable, chance}` — TN уворота
+цели (поле `dodge` записи цели, дефолт 30, cap 0.95); недоджибельные —
+spray/cone/suppression, blast без доказанного выхода из зоны за
+half-move, цель `reactionUsed`. Фактор `attackType` несёт
+`desire × (1 − chance)`; цель с потраченной реакцией добавляет
+`vulnerable` (planner читает флаг документа её комбатанта); бот с
+потраченной реакцией не декларирует overwatch (`reaction-used`).
+
+## Реакции (issue #37)
+
+`scripts/reactions.js` — сервис `reactions` (`api.services`): учёт слота
+реакции через `flags["only-war-ai"].reactionUsed` на Combatant. Пишет
+только контроллер (`authority.isController()` иначе `game.user.isGM`),
+читают все клиенты — включая цели-комбатанты. `markUsed({combat,
+combatant, reason})`, `markUsedByToken(combat, tokenId)`,
+`clear(combatant)`, `reactionUsedOf(combatant, combat)` (толерантно к
+рекорду старого раунда), `handleUpdateCombat` — вотчер `updateCombat`,
+сбрасывающий флаг владельца в начале его хода. Писателями реакции
+сейчас выступают системная сторона/GM-макросы — модуль только хранит и
+читает состояние.
+
 ## Личности ботов (issue #19)
 
 `scripts/personalities.js` — data-driven пул из 24 черт (`PERSONALITIES`,
@@ -252,8 +295,19 @@ state-changing шагом `planner.validateSnapshot(plan)`; позиция то�
 из плана без пересчёта пути (fallback `update({x, y})`); `attack`/`test` —
 `game.darkHeresy.api.rolls` (`prepare*` + `execute*(prepared,
 {operationId})`, system PR #440), отсутствие API — `system-api-missing`.
-Stale → один replan через `planner.shouldReplan`; повторный stale —
-hold-and-report. operationId дедупликация: повторный вызов возвращает
+`ready-weapon` — `api.actions.readyWeapon`/`ready`/`equip` (без
+эндпоинта — `system-api-missing`); `drop-prone` — `api.actions.dropProne`
+или fallback `actor.toggleStatusEffect("prone")`. Успешная `attack`
+пишет `lastUsedWeapon` на combatant (issue #37). Adjudication
+(issue #37): `attackAdjudication === "gm-confirm"` и режим `automatic` —
+перед attack/test шагом `context.adjudication` резолвер (тесты,
+интеграции) либо GM-чаткарта (`renderChatMessage`-биндинг решений,
+`updateCombat` авто-отменяет ожидание); `manual` — шаг исполнен без
+ролла, `skill-test` — канал `prepare/executeTest`, `cancel` —
+`cancelled` + `completeTurn(advanceTurn:false)`; в preview-режиме гейт
+не срабатывает — GM уже подтвердил план в диалоге. Stale → один replan
+через `planner.shouldReplan`; повторный stale — hold-and-report.
+operationId дедупликация: повторный вызов возвращает
 прежний результат, roll-шаги проксируют step-scoped operationId, move к
 уже достигнутой точке пропускается. Темп: между шагами и перед
 `nextTurn()` вставляется пауза `turnPacingMs` (deps `pacing`, `0` — без

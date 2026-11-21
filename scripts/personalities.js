@@ -9,6 +9,12 @@
  *   resolved preset weights before scoring — the same overlay pattern
  *   the spec-ops task weights use (`{...base, ...overlay}`), except
  *   personality deltas add up instead of replacing the base value.
+ * - Weapon affinity (issue #37): a trait may carry `weaponAffinity`
+ *   `{classes?, keywords?, blast?}` — a direct, non-weight flavour hook
+ *   read by the planner's `weaponAffinity` factor: sniper → long-las/
+ *   needle weapons, heavy-handed → flame/heavy, grenadier → blast.
+ *   Matching is purely data-driven (class id or name substring); it
+ *   never changes the candidate set, only the factor value.
  * - Generation is seeded from the stable document identity
  *   (`actor.id` → `token.uuid` → `token.id` → `combatant.id`) through
  *   `fnv1a` + `mulberry32`: 1–2 traits drawn without replacement from a
@@ -166,28 +172,44 @@ export const PERSONALITIES = Object.freeze({
         deltas: Object.freeze({ attackType: 0.15, area: 3, melee: 2 }),
         jitter: 0.01,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        // Issue #37: heavy class and flame weapons ("огнемётчик" flavour).
+        weaponAffinity: Object.freeze({
+            classes: Object.freeze(["heavy"]),
+            keywords: Object.freeze(["flame", "flamer"])
+        })
     }),
     grenadier: Object.freeze({
         category: "skill",
         deltas: Object.freeze({ area: 6 }),
         jitter: 0,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        // Issue #37: blast weapons are his natural reach.
+        weaponAffinity: Object.freeze({
+            blast: true,
+            keywords: Object.freeze(["grenade", "frag", "krak"])
+        })
     }),
     duelist: Object.freeze({
         category: "skill",
         deltas: Object.freeze({ melee: 4, meleeEngage: 4, charge: 3 }),
         jitter: 0,
         weight: 6,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1.2 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1.2 }),
+        // Issue #37: melee weapon affinity mirrors the melee deltas.
+        weaponAffinity: Object.freeze({ classes: Object.freeze(["melee"]) })
     }),
     sniper: Object.freeze({
         category: "skill",
         deltas: Object.freeze({ los: 4, proximity: -3, aim: 3, aimAlone: 1 }),
         jitter: -0.02,
         weight: 6,
-        bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.5 })
+        bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.5 }),
+        // Issue #37: long-las / needle class flavour (issue's "снайпер").
+        weaponAffinity: Object.freeze({
+            keywords: Object.freeze(["long-las", "long las", "needle", "sniper", "stalker"])
+        })
     }),
     // --- Позиция / манёвр ---------------------------------------------
     flanker: Object.freeze({
@@ -528,6 +550,54 @@ export function personalityJitterFactor({ seed = 0, candidateId = "", amp = 0 } 
     const hash = parseInt(fnv1a(String(candidateId)), 16) >>> 0;
     const roll = mulberry32(((seed >>> 0) ^ PERSONALITY_JITTER_SEED_XOR ^ hash) >>> 0)();
     return 1 + (((roll * 2) - 1) * amp);
+}
+
+/**
+ * Whether one trait's `weaponAffinity` spec matches a normalized planner
+ * action. A spec matches when any declared field matches: `classes` —
+ * exact match of the lowercased weapon class; `keywords` — substring of
+ * the lowercased action/weapon name; `blast` — the action carries a
+ * blast radius.
+ * @param {object} spec `weaponAffinity` spec of a trait.
+ * @param {object|null} action Normalized action (`{class, name, itemName,
+ *   attackType, blastRadius}` fields when known).
+ * @returns {boolean}
+ */
+function _weaponAffinityMatches(spec, action) {
+    if (!spec || !action || typeof action !== "object") return false;
+    const cls = String(action.class ?? "").toLowerCase();
+    if (Array.isArray(spec.classes)
+        && spec.classes.some(entry => String(entry).toLowerCase() === cls)
+        && cls.length > 0) {
+        return true;
+    }
+    const haystack = [action.name, action.itemName, action.attackType]
+        .map(entry => String(entry ?? "").toLowerCase())
+        .join("|");
+    if (Array.isArray(spec.keywords)
+        && spec.keywords.some(entry => {
+            const keyword = String(entry).toLowerCase();
+            return keyword.length > 0 && haystack.includes(keyword);
+        })) {
+        return true;
+    }
+    return spec.blast === true && Number.isFinite(action.blastRadius) && action.blastRadius > 0;
+}
+
+/**
+ * Weapon affinity of a resolved trait list toward one action (issue #37):
+ * `true` when any trait's `weaponAffinity` spec matches — read by the
+ * planner's `weaponAffinity` factor. Pure and deterministic.
+ * @param {string[]} traits Resolved trait ids.
+ * @param {object|null} action Normalized planner action.
+ * @returns {boolean}
+ */
+export function personalityWeaponAffinity(traits, action) {
+    for (const id of traits ?? []) {
+        const spec = PERSONALITIES[id]?.weaponAffinity;
+        if (spec && _weaponAffinityMatches(spec, action)) return true;
+    }
+    return false;
 }
 
 /**

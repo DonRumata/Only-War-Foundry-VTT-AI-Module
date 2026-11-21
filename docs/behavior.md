@@ -13,7 +13,13 @@
 `attackNow, attackAfterMove, charge, melee, advance, threat, proximity,
 los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
-danger`.
+danger, weaponAffinity, weaponInertia, dropProne, readyWeapon`.
+
+Issue #37: `attackType` теперь несёт EV-срез уклонения — значение фактора
+`desire × (1 − P(dodge))` для уклоняемых атак; недоджибельные
+(spray/cone/suppression, blast вне досягаемости half-move убегания,
+цель с потраченной реакцией) сохраняют полный `desire`. `vulnerable`
+дополнительно включает цель с флагом `reactionUsed` текущего раунда.
 
 Preset-only: `rangeBand`, `aimOpportunity` (rangedCover/hold);
 `insideZone, returnToZone, moveToLos, escapeMelee, searchMove,
@@ -48,6 +54,10 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | reload | 3 | 3 | 3 | 3 |
 | overwatch | 0 | 2 | 0.5 | 1 |
 | danger | −0.5 | −3 | −2 | −2 |
+| weaponAffinity | 1 | 1 | 1 | 1 |
+| weaponInertia | 0.15 | 0.15 | 0.15 | 0.15 |
+| dropProne | 0 | 1.5 | 2 | 1 |
+| readyWeapon | 2 | 2 | 2 | 2 |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -89,8 +99,16 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    перебирает `move-attack` по конечным точкам.
 7. Action-economy кандидаты: standalone `aim` (нужен `aimFullAction`,
    не pinned, дальняя атака, `aim > carriedAim`); `reload` (+`move-reload`);
-   `overwatch` (45° дуга на ближайшую видимую угрозу; не для memory-only).
-8. `hold` кандидат: `alwaysOfferHold`, или `allowNoTarget`, или
+   `overwatch` (45° дуга на ближайшую видимую угрозу; не для memory-only;
+   вето `reaction-used`, когда реакция бота уже потрачена — issue #37).
+8. Free-action кандидаты (issue #37): `ready-weapon` — явные записи
+   `kind:"ready"|"draw"|"equip"` из `actions.list` с собственным `cost`
+   (free под Quick Draw; модуль таланты не парсит), иначе — синтез по
+   инвентарю: оружие без usable-записи при пустом/сухом списке атак
+   (клипы `clip.value === 0` у всех атакующих) → half-cost кандидат;
+   `drop-prone` — free-действие при pinned либо при `danger ≥ 0.5`
+   на собственной клетке (не для уже prone).
+9. `hold` кандидат: `alwaysOfferHold`, или `allowNoTarget`, или
    `allowNoAction`.
 9. Скоринг: `_factorsOf` → `preset.veto` (reject в диагностику) →
    `evaluate` → personality jitter (по id кандидата). Сортировка score↓.
@@ -104,12 +122,15 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
 ## 3. Сериализация шагов (`_stepsFor`)
 
 Порядок шагов плана: `aim → move → attack|test → reload → overwatch →
-end-turn` (всегда последний). Attack input: `attackType`, `mode:"charge"`,
-`aim`, `targetPoint` + `blastRadius` (blast, issue #29 — зона для
-оверлея/системного шаблона), `template.direction/angle/range` + `covered/
-suppressionFire/burstMode` (cone). Preconditions: move `["turn",
-"self-position","collision"]`, attack `["turn","target","resources"]`,
-aim/end-turn `["turn"]`.
+ready-weapon → drop-prone → end-turn` (всегда последний). Attack input:
+`attackType`, `mode:"charge"`, `aim`, `targetPoint` + `blastRadius`
+(blast, issue #29 — зона для оверлея/системного шаблона),
+`template.direction/angle/range` + `covered/suppressionFire/burstMode`
+(cone). `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
+записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`.
+Preconditions: move `["turn","self-position","collision"]`, attack
+`["turn","target","resources"]`, aim/end-turn `["turn"]`, ready-weapon
+`["turn","resources"]`, drop-prone `["turn"]`.
 
 ## 4. Blast / cone / память
 
@@ -135,7 +156,8 @@ aim/end-turn `["turn"]`.
 Причины: `not-controller, controller-changed, config-disabled,
 module-disabled, preview-mode, system-api-missing, no-planner,
 no-combatant, plan-failed, move-failed, roll-failed, invalid-step,
-already-at-endpoint, action-budget-spent`.
+already-at-endpoint, action-budget-spent, adjudication-cancelled,
+adjudicated-manual, adjudicated-skill-test`.
 
 - Preflight: `module-disabled`/`config-disabled` → cancelled без
   продвижения хода; не контроллер → `not-controller`.
@@ -147,7 +169,22 @@ already-at-endpoint, action-budget-spent`.
   `update({x,y})`; `attack`/`test` → `prepare*+execute*` системного API
   (`operationId.stepId`); `aim` → флаг на combatant'е, снимается
   атакой; `reload` → `api.actions.reload`; `overwatch` →
-  `overwatch.declare` (только декларация, реакция — за GM); `end-turn` → ok.
+  `overwatch.declare` (только декларация, реакция — за GM);
+  `ready-weapon` → `api.actions.readyWeapon`/`ready`/`equip` (без
+  endpoint — `system-api-missing`); `drop-prone` → `api.actions.dropProne`
+  или fallback `actor.toggleStatusEffect("prone")`; `end-turn` → ok.
+- Issue #37: успешная `attack` записывает `lastUsedWeapon` на combatant
+  (controller-only) — planner читает его фактором `weaponInertia`.
+- Attack adjudication (issue #37): в режиме `attackAdjudication
+  "gm-confirm"` перед каждым attack/test шагом в automatic-режиме
+  executor спрашивает GM — инъекция `context.adjudication` либо
+  whisper-чаткарта с кнопками `execute | manual | skill-test | cancel`
+  (`renderChatMessage`-биндинг только для контроллера, `updateCombat`
+  авто-отменяет ожидание). `manual` считает шаг исполненным без ролла;
+  `skill-test` подменяет канал `prepare/executeTest`; `cancel` завершает
+  ход `cancelled` + `completeTurn(advanceTurn:false)`. В preview-режиме
+  гейт не работает — диалог предпросмотра уже является единственной
+  точкой подтверждения, GM не спрашивается дважды.
 - Replan: `shouldReplan`, макс `DEFAULT_MAX_REPLANS = 1`; reset
   `stepIndex=0`; неудачный реплан → `plan-failed`.
 - Финиш: `operations.completeTurn` + продвижение хода через
@@ -168,6 +205,28 @@ already-at-endpoint, action-budget-spent`.
 - `RELEVANT_KEYS` фильтр обновлений + debounce 150ms; смена контроллера —
   abort локальных и пометка чужих операций `controller-changed`.
 - Master switch off → нет claims/execution/preview.
+
+## 6a. Реакция и counter-EV (issue #37, reactions.js)
+
+- Флаг `flags["only-war-ai"].reactionUsed` на Combatant — «реакция
+  потрачена в текущем раунде». Запись `{round, reason}`; рекорд без
+  `round` считается потраченным консервативно; рекорд прошлого раунда —
+  уже неактивен. Пишет только контроллер (`authority.isController()` иначе
+  `game.user.isGM`); читают все.
+- Сервис `reactions` (`api.services`): `markUsed({combat, combatant})`,
+  `markUsedByToken(combat, tokenId)`, `clear(combatant)`,
+  `reactionUsedOf(combatant, combat)`, `handleUpdateCombat` — авто-сброс
+  флага владельца на `updateCombat` (смена turn/round) — реакция
+  восстанавливается в начале его хода.
+- Counter-EV: `dodgeChanceOf(target, action)` → `{dodgeable, chance}` —
+  `dodgeTN/100` (дефолт `DEFAULT_DODGE_TN = 30`, cap 0.95). Недоджибельно:
+  cone/spray/suppression, blast при недоказанном выходе из зоны за
+  half-move, цель `reactionUsed` (`chance 0`). Planner читает флаг
+  `reactionUsed` с документа цели-комбатанта (не только инъекцию),
+  складывает в `vulnerable` и режет `attackType`-EV; `breakdown.dodge`
+  показывает вердикт.
+- Бот с потраченной реакцией не декларирует overwatch (`reaction-used`
+  rejected) — слот занят, конус всё равно не выстрелит.
 
 ## 7. Perception
 
@@ -249,12 +308,16 @@ Danger-оверлей (issue #36): `setDangerEnabled`/`toggleDanger` +
 · `preferredCohesion 5` · `previewTimeoutSeconds 60` · `turnPacingMs 800`
 · `aiDifficulty "normal"` (easy|normal|hard) · `threatMapOverlay false`
 (issue #36 — GM-only отладочная теплокарта угроз; переключается также
-keybinding Alt+M, `restricted`).
+keybinding Alt+M, `restricted`) · `attackAdjudication "auto"`
+(auto|gm-confirm, issue #37 — арбитраж атак: бросок через системный API
+или GM-карточка подтверждения перед каждым attack/test шагом).
 
 Override-цепочка: Combatant → Token → Actor → disabled. Флаги:
-`config/override {enabled|mode, preset, includeNeutral}`, `personality`
-(массив id черт на всех уровнях), `fireteam {teamId, leaderId, teamPreset,
-preferredCohesion, character}`.
+`config/override {enabled|mode, preset, includeNeutral, preferredWeapon}`,
+`personality` (массив id черт на всех уровнях), `fireteam {teamId,
+leaderId, teamPreset, preferredCohesion, character}`, `reactionUsed`
+(combatant, рекорд `{round, reason}`), `lastUsedWeapon` (combatant,
+рекорд `{itemUuid, itemId, name, actionId, round}` — controller-only).
 
 ## 12. Уже реализованные слои (#14/#15/#16/#19)
 
@@ -268,7 +331,16 @@ preferredCohesion, character}`.
   `MAX_GENERATED_TRAITS=2`, `DOUBLE_TRAIT_CHANCE=0.5`,
   `JITTER_MAX=0.15`, `DIFFICULTY_JITTER {easy:0.04, normal:0.02, hard:0}`,
   seeded fnv1a+mulberry32, overlay-дельты, `fireteam.character`, показ
-  в превью (`npc.traits`).
+  в превью (`npc.traits`). Issue #37: `weaponAffinity`-спеки
+  (`classes|keywords|blast`) у heavyHanded/grenadier/duelist/sniper —
+  `personalityWeaponAffinity(traits, action)` подпитывает фактор
+  `weaponAffinity` (0.5 от базового значения, preferredWeapon побеждает).
+- **#37** — free-action кандидаты `ready-weapon`/`drop-prone` + шаги;
+  `reactionUsed`-флаг и сервис `reactions` со сбросом в начале хода;
+  `attackAdjudication "auto"|"gm-confirm"` с GM-чаткартой;
+  counter-EV `attackType × (1 − P(dodge))` + `vulnerable` по
+  `reactionUsed`; `preferredWeapon` в конфиге и NPC-листе +
+  `lastUsedWeapon`-флаг (факторы `weaponAffinity`/`weaponInertia`).
 
 ## 13. Позиция перед рефактором #24
 

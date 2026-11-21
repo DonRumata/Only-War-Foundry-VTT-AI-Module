@@ -260,11 +260,18 @@ test("pinned vetoes charge and closing approaches for a melee NPC", async () => 
         ...context(),
         selfStatuses: ["pinned"]
     });
-    assert.equal(pinned.status, PLANNER_STATUS.noAction);
-    const reasons = pinned.diagnostics.rejected.map(r => r.reason);
-    assert.ok(reasons.includes("pinned"), `expected pinned vetoes, got ${JSON.stringify(pinned.diagnostics.rejected)}`);
-    assert.ok(pinned.diagnostics.rejected.some(r => r.candidate.startsWith("charge|") && r.reason === "pinned"));
-    assert.ok(pinned.diagnostics.rejected.some(r => r.candidate.startsWith("approach|") && r.reason === "pinned"));
+    // Issue #37: pinned no longer means `no-action` — the free-action
+    // drop-prone turn keeps the pinned bot legal (all movement vetoes
+    // still hold).
+    assert.equal(pinned.status, PLANNER_STATUS.ok);
+    assert.ok(pinned.plan.steps.every(step => step.type !== "move"),
+        "a pinned bot never moves");
+    assert.ok(pinned.plan.steps.some(step => step.type === "drop-prone"),
+        "the free drop-prone turn wins");
+    const reasons = pinned.plan.diagnostics.rejected.map(r => r.reason);
+    assert.ok(reasons.includes("pinned"), `expected pinned vetoes, got ${JSON.stringify(pinned.plan.diagnostics.rejected)}`);
+    assert.ok(pinned.plan.diagnostics.rejected.some(r => r.candidate.startsWith("charge|") && r.reason === "pinned"));
+    assert.ok(pinned.plan.diagnostics.rejected.some(r => r.candidate.startsWith("approach|") && r.reason === "pinned"));
 });
 
 test("pinned vetoes a closing move-attack but keeps attack-in-place", async () => {
@@ -415,7 +422,10 @@ test("attackType factor prefers full_auto for a ranged attack-in-place", async (
     assert.equal(result.status, PLANNER_STATUS.ok);
     const attack = result.plan.steps.find(step => step.type === "attack");
     assert.equal(attack.input.actionId, "w1-full");
-    assert.equal(result.plan.breakdown.factors.attackType, 0.9);
+    // Issue #37 counter-EV: the attackType factor carries the dodge cut —
+    // full_auto desire 0.9 × (1 − default dodge 0.3) = 0.63.
+    assert.equal(result.plan.breakdown.factors.attackType, 0.63);
+    assert.deepEqual(result.plan.breakdown.dodge, { dodgeable: true, chance: 0.3 });
 });
 
 test("vulnerable and engaged factors appear in the score breakdown", async () => {

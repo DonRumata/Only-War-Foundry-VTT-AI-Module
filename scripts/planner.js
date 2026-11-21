@@ -34,8 +34,10 @@ import {
     personalityIdentity,
     personalityJitter,
     personalityJitterFactor,
+    personalityWeaponAffinity,
     resolvePersonality
 } from "./personalities.js";
+import { reactionUsed } from "./reactions.js";
 import { getAIDifficulty, logDiagnostics } from "./settings.js";
 import {
     buildThreatMap,
@@ -72,7 +74,8 @@ export const STALE_REASONS = Object.freeze({
 
 /** Serializable action step types allowed inside a plan. */
 export const STEP_TYPES = Object.freeze([
-    "move", "attack", "test", "aim", "reload", "overwatch", "end-turn"
+    "move", "attack", "test", "aim", "reload", "overwatch",
+    "ready-weapon", "drop-prone", "end-turn"
 ]);
 
 /** Half-action units available to a combatant per turn (issue #15). */
@@ -138,7 +141,11 @@ export const SCORE_FACTORS = Object.freeze([
     "aimAlone",
     "reload",
     "overwatch",
-    "danger"
+    "danger",
+    "weaponAffinity",
+    "weaponInertia",
+    "dropProne",
+    "readyWeapon"
 ]);
 
 /**
@@ -187,7 +194,14 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     aimAlone: 0.5,
     reload: 3,
     overwatch: 0,
-    danger: -1
+    danger: -1,
+    // Issue #37: weapon inertia is a small hysteresis on the last-used
+    // weapon (factor × weight ≈ +0.15); preferred/trait affinity and the
+    // free-action candidates carry no default pull.
+    weaponAffinity: 0,
+    weaponInertia: 0.15,
+    dropProne: 0,
+    readyWeapon: 0
 });
 
 /**
@@ -318,6 +332,19 @@ const SUPPRESSION_CONE_DEG = 45;
 
 /** Status ids that mark a target as vulnerable to attack. */
 const VULNERABLE_STATUSES = Object.freeze(new Set(["pinned", "prone", "stunned"]));
+
+/**
+ * Default dodge TN of a target when neither its profile nor the plan
+ * context carries one (issue #37 counter-EV): a rough Only War Dodge ~30.
+ * Precision is not the goal — the model only needs target sorting.
+ */
+export const DEFAULT_DODGE_TN = 30;
+
+/** Hard cap of the dodge probability applied to attack EV. */
+const MAX_DODGE_CHANCE = 0.95;
+
+/** Minimum aggregated danger that justifies a free drop-prone turn. */
+const DROP_PRONE_DANGER = 0.5;
 
 /**
  * Deterministic 32-bit FNV-1a fingerprint, identical on every client.
@@ -1385,7 +1412,15 @@ function _normalizeTarget(raw, { source, sceneId, selfPos, grid, measure }) {
         emitters: Array.isArray(raw.emitters) ? raw.emitters : null,
         damage: raw.damage ?? null,
         range: Number.isFinite(raw.range) ? raw.range : null,
-        melee: raw.melee === true
+        melee: raw.melee === true,
+        // Issue #37: dodge/reaction data feeding the counter-EV model —
+        // `reactionUsed` marks a combatant that already spent its
+        // reaction this round, `dodge`/`dodgeTN` is a rough dodge TN
+        // (0..100), `halfMove` the target's half-move rate used to judge
+        // whether a blast target can still escape the zone.
+        reactionUsed: raw.reactionUsed === true,
+        dodge: _finiteOr(raw.dodgeTN ?? raw.dodge, null),
+        halfMove: _finiteOr(raw.halfMove, null)
     };
 }
 
@@ -1507,6 +1542,18 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
     if (!targets.length && !Array.isArray(context.targets)) {
         targets = _fallbackTargets(combat, combatant, input);
     }
+    // Issue #37: read the `reactionUsed` flag off each target's own
+    // combatant — a spent-reaction enemy cannot dodge, which raises the
+    // attack EV against it ("finish the dodged target"). Injected
+    // `reactionUsed` entries win; the flag only fills blanks.
+    const round = Number.isFinite(combat?.round) ? combat.round : null;
+    for (const target of targets) {
+        if (target.reactionUsed === true) continue;
+        const other = _findCombatantByToken(combat, target.tokenId);
+        const record = other?.getFlag?.(MODULE_ID, FLAG_KEYS.reactionUsed)
+            ?? other?.flags?.[MODULE_ID]?.[FLAG_KEYS.reactionUsed];
+        if (reactionUsed(record, round)) target.reactionUsed = true;
+    }
     const seen = new Set();
     return targets
         .filter(target => {
@@ -1534,6 +1581,11 @@ function _normalizeAction(raw, index) {
     let type;
     if (kind === "aim" || raw.aim === true) type = "aim";
     else if (kind === "reload") type = "reload";
+    // Issue #37 free actions: the system may emit explicit ready/draw
+    // entries — their `cost` passes through unchanged (e.g. free under
+    // Quick Draw) and lands in the step cost as-is.
+    else if (kind === "ready-weapon" || kind === "ready" || kind === "draw"
+        || kind === "equip" || raw.ready === true) type = "ready-weapon";
     else if (kind === "attack" || raw.attack === true || raw.itemUuid != null
         || raw.weapon != null || raw.weaponId != null || raw.attackType != null) {
         type = "attack";
@@ -1743,6 +1795,135 @@ function _overwatchAction(actions) {
 }
 
 /**
+ * Whether a normalized action belongs to a referenced weapon. The
+ * reference may be a plain string (item uuid, item id or weapon name —
+ * `config.preferredWeapon` and the sheet store whichever the GM picked)
+ * or a record carrying those fields (`flags["only-war-ai"].lastUsedWeapon`).
+ * @param {object|null} action Normalized action.
+ * @param {object|string|null} ref Weapon reference.
+ * @returns {boolean}
+ */
+function _weaponMatches(action, ref) {
+    if (!action || !ref) return false;
+    if (typeof ref === "string") {
+        const needle = ref.trim();
+        if (!needle) return false;
+        return [action.itemUuid, action.itemId, action.name]
+            .some(entry => String(entry ?? "") === needle);
+    }
+    if (typeof ref === "object") {
+        return [ref.itemUuid, ref.weaponUuid, ref.itemId, ref.weaponId, ref.name]
+            .filter(entry => entry != null)
+            .some(entry => _weaponMatches(action, entry));
+    }
+    return false;
+}
+
+/**
+ * Current clip fill of a weapon item; `null` when the item tracks no
+ * clip (melee and simple weapons — they never run dry).
+ * @param {object|null} item
+ * @returns {number|null}
+ */
+function _itemAmmo(item) {
+    const clip = item?.system?.clip;
+    if (!clip || typeof clip !== "object") return null;
+    return _finiteOr(clip.value, null);
+}
+
+/**
+ * Clip fill of the weapon backing a normalized action; `null` when the
+ * weapon item is unreadable or has no clip.
+ * @param {object|null} actor
+ * @param {object} action Normalized action.
+ * @returns {number|null}
+ */
+function _weaponClipOf(actor, action) {
+    const item = _list(actor?.items).find(entry => entry
+        && (entry.id === action?.itemId
+            || (action?.itemUuid != null && entry.uuid === action.itemUuid)));
+    return _itemAmmo(item);
+}
+
+/**
+ * Ready-weapon entries for the action economy (issue #37): explicit
+ * `kind:"ready"|"draw"|"equip"` records from the system `actions.list`
+ * pass through with their own `cost` (free under Quick Draw — the module
+ * deliberately does not parse talents, the system prices the entry).
+ * Otherwise, when the live attack list is dry — no usable attack/test
+ * actions at all, or every usable attack's weapon is out of ammo —
+ * inventory weapons backing no usable action become synthesized
+ * half-cost ready candidates. A dry or clip-less weapon is always a
+ * legal ready target; only weapons whose clip reads `0` are skipped.
+ * @param {object} input
+ * @param {object[]} input.allActions Every normalized action entry.
+ * @param {object|null} input.actor Actor document for the inventory scan.
+ * @param {object[]} input.usableActions Usable attack/test actions.
+ * @returns {object[]} Normalized `ready-weapon` entries.
+ */
+function _readyWeaponActions({ allActions, actor, usableActions }) {
+    const explicit = (allActions ?? []).filter(action => action.type === "ready-weapon");
+    if (explicit.length) return explicit;
+    const dry = !(usableActions ?? []).length
+        || usableActions.every(action => _weaponClipOf(actor, action) === 0);
+    if (!dry) return [];
+    const backing = new Set((usableActions ?? []).map(action =>
+        action.itemUuid ?? action.itemId ?? action.name ?? action.id));
+    return _list(actor?.items)
+        .filter(item => item?.type === "weapon"
+            && !backing.has(item.uuid ?? item.id ?? item.name))
+        .filter(item => {
+            const ammo = _itemAmmo(item);
+            return ammo === null || ammo > 0;
+        })
+        .map((item, index) => _normalizeAction({
+            id: `ready-${item.id ?? index}`,
+            kind: "ready-weapon",
+            name: item.name,
+            itemUuid: item.uuid ?? null,
+            itemId: item.id ?? null,
+            class: item.system?.class ?? null,
+            damage: item.system?.damage ?? 0,
+            cost: "half",
+            synthesized: true
+        }, index))
+        .filter(Boolean)
+        .sort((a, b) => (b.damage - a.damage) || String(a.id).localeCompare(String(b.id)))
+        .slice(0, DEFAULT_MAX_ACTIONS);
+}
+
+/**
+ * Dodge model of one (target, action) pair (issue #37 counter-EV):
+ * `{dodgeable, chance}` — `chance` is the rough `dodgeTN/100` of the
+ * target, capped at {@link MAX_DODGE_CHANCE}. Cone/spray/suppression
+ * attacks cannot be dodged; blast attacks only dodge when the target's
+ * half-move provably reaches outside the zone (unknown half-move counts
+ * as undodgeable — conservative); a target that already spent its
+ * reaction this round is defenseless (`chance` 0).
+ * @param {object|null} target Normalized target.
+ * @param {object|null} action Normalized action.
+ * @param {number|null} [dodgeTN] Default dodge TN override
+ *   (`context.defaultDodgeTN`).
+ * @returns {{dodgeable: boolean, chance: number}}
+ */
+export function dodgeChanceOf(target, action, dodgeTN = null) {
+    if (!action || action.type !== "attack") return { dodgeable: false, chance: 0 };
+    if (target?.reactionUsed === true) return { dodgeable: true, chance: 0 };
+    if (_coneSpecOf(action)) return { dodgeable: false, chance: 0 };
+    const blast = _actionBlastRadius(action);
+    if (blast > 0) {
+        const escape = _finiteOr(target?.halfMove ?? target?.threatProfile?.halfMove, null);
+        if (!(escape > 0 && escape >= blast)) return { dodgeable: false, chance: 0 };
+    }
+    const tn = _finiteOr(
+        target?.dodge ?? target?.threatProfile?.dodge ?? dodgeTN, DEFAULT_DODGE_TN);
+    return {
+        dodgeable: true,
+        chance: Math.max(0, Math.min(MAX_DODGE_CHANCE, tn / 100))
+    };
+}
+
+/**
  * Nearest known threat: visible attackable targets win; when nothing is
  * visible the nearest last-known contact gives the overwatch bearing.
  * @param {object[]} targets Normalized targets.
@@ -1771,6 +1952,21 @@ function _bearingTo(from, to) {
     if (!Number.isFinite(from?.x) || !Number.isFinite(from?.y)
         || !Number.isFinite(to?.x) || !Number.isFinite(to?.y)) return null;
     return (((Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI) + 360) % 360;
+}
+
+/**
+ * Danger value at the bot's own position for the drop-prone check —
+ * `dangerAt` may throw; a broken probe counts as no cover urgency.
+ * @param {Function} dangerAt Threat-map probe.
+ * @param {object} selfPos Self position `{x, y}` (pixels).
+ * @returns {number} 0..1.
+ */
+function _dangerAtSelf(dangerAt, selfPos) {
+    try {
+        return _finiteOr(dangerAt(selfPos), 0);
+    } catch(err) {
+        return 0;
+    }
 }
 
 /**
@@ -1957,10 +2153,20 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
  * @param {object|null} [input.selfPos] Self position `{x, y}` in pixels —
  *   the endpoint of stationary variants.
  * @param {number} [input.blastHits] Hostiles covered by a blast aim point.
+ * @param {object|null} [input.dodge] `{dodgeable, chance}` of the
+ *   (target, action) pair (issue #37); recomputed when absent.
+ * @param {object|string|null} [input.preferredWeapon] Resolved
+ *   `preferredWeapon` config value (issue #37).
+ * @param {object|string|null} [input.lastUsedWeapon] `lastUsedWeapon`
+ *   flag/context value feeding the `weaponInertia` factor (issue #37).
+ * @param {string[]} [input.traits] Resolved personality trait ids —
+ *   their `weaponAffinity` specs feed the `weaponAffinity` factor.
+ * @param {number|null} [input.dodgeTN] Default dodge TN override.
  * @returns {object}
  */
 function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
-    dangerAt = null, selfPos = null }) {
+    dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
+    lastUsedWeapon = null, traits = [], dodgeTN = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -1979,7 +2185,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     const cover = Math.max(0, Math.min(1, _finiteOr(move?.cover, 0)));
     const stationary = variant === "hold" || variant === "attack-in-place"
         || variant === "aim-attack" || variant === "aim"
-        || variant === "reload" || variant === "overwatch";
+        || variant === "reload" || variant === "overwatch"
+        || variant === "ready-weapon" || variant === "drop-prone";
     const holdPosition = stationary || move?.stay === true ? 1 : 0;
     const budget = Number.isFinite(moveBudget) && moveBudget > 0 ? moveBudget : null;
     const budgetOver = budget !== null && move
@@ -1991,8 +2198,29 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     // — a ranged candidate still counts as engaged in close contact.
     const meleeReach = melee ? _actionRange(action) : DEFAULT_MELEE_RANGE;
     const engaged = Number.isFinite(postDistance) && postDistance <= meleeReach + 1e-9 ? 1 : 0;
-    const vulnerable = (target?.statuses ?? [])
-        .some(status => VULNERABLE_STATUSES.has(status)) ? 1 : 0;
+    // Issue #37: an enemy that already spent its reaction is defenceless
+    // against the next shot — scored through the same `vulnerable` door
+    // as pinned/prone/stunned targets.
+    const vulnerable = target?.reactionUsed === true
+        || (target?.statuses ?? []).some(status => VULNERABLE_STATUSES.has(status)) ? 1 : 0;
+    // Issue #37 counter-EV: `EV = hitsEV × (1 − P(dodge))` folded into
+    // the attack-type desire — dodgeable attacks lose expected value
+    // against evasive targets; undodgeable ones (spray/cone, unescapable
+    // blast, reaction-spent targets) keep the full desire.
+    const dodgeInfo = dodge ?? dodgeChanceOf(target, action, dodgeTN);
+    const attackDesire = action
+        ? (ATTACK_TYPE_DESIRE[action.attackType] ?? ATTACK_TYPE_DESIRE_DEFAULT)
+        : 0;
+    // Weapon affinity and inertia (issue #37): the GM-marked signature
+    // weapon wins outright; a matching personality `weaponAffinity` spec
+    // (sniper → long-las, grenadier → blast) contributes half strength;
+    // the weapon used on the previous turn gets a small hysteresis.
+    let weaponAffinity = 0;
+    if (action && preferredWeapon && _weaponMatches(action, preferredWeapon)) {
+        weaponAffinity = 1;
+    } else if (action && personalityWeaponAffinity(traits, action)) {
+        weaponAffinity = 0.5;
+    }
     // Issue #16 threat map: aggregated danger of the candidate endpoint —
     // the move destination, the stay cell or the actor position for
     // stationary variants. It complements `cover`/`exposure`: those only
@@ -2025,9 +2253,9 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         holdPosition,
         lastKnown: target?.source === "last-known" ? 1 : 0,
         budgetOver,
-        attackType: action
-            ? (ATTACK_TYPE_DESIRE[action.attackType] ?? ATTACK_TYPE_DESIRE_DEFAULT)
-            : 0,
+        attackType: dodgeInfo.dodgeable
+            ? attackDesire * (1 - dodgeInfo.chance)
+            : attackDesire,
         vulnerable,
         engaged,
         meleeEngage: melee * engaged,
@@ -2043,7 +2271,11 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         aimAlone: variant === "aim" ? 1 : 0,
         reload: (variant === "reload" || variant === "move-reload") ? 1 : 0,
         overwatch: variant === "overwatch" ? 1 : 0,
-        danger
+        danger,
+        weaponAffinity,
+        weaponInertia: action && _weaponMatches(action, lastUsedWeapon) ? 1 : 0,
+        dropProne: variant === "drop-prone" ? 1 : 0,
+        readyWeapon: variant === "ready-weapon" ? 1 : 0
     };
 }
 
@@ -2367,6 +2599,37 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
             projectedResourceDelta: {}
         });
     }
+    // Issue #37: `ready-weapon` draws/equips the alternative weapon —
+    // free action when the system prices it so (Quick Draw), a half
+    // action otherwise. Execution goes through
+    // `api.actions.readyWeapon` when the system exposes it.
+    if (variant === "ready-weapon") {
+        steps.push({
+            id: `step-ready-weapon-${steps.length + 1}`,
+            type: "ready-weapon",
+            cost: { halves: _actionCost(action) },
+            input: {
+                actionId: action.id,
+                name: action.name,
+                weaponId: action.itemId ?? null,
+                itemUuid: action.itemUuid ?? null
+            },
+            preconditions: ["turn", "resources"],
+            projectedResourceDelta: {}
+        });
+    }
+    // Issue #37: `drop-prone` is the free-action cover answer to pinning
+    // and suppression fire — executor toggles the prone status.
+    if (variant === "drop-prone") {
+        steps.push({
+            id: `step-drop-prone-${steps.length + 1}`,
+            type: "drop-prone",
+            cost: { halves: 0 },
+            input: { statusId: "prone" },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
+        });
+    }
     steps.push({
         id: `step-end-turn-${steps.length + 1}`,
         type: "end-turn",
@@ -2660,7 +2923,13 @@ export function createPlannerService({
         const usableActions = [...actionGroups.values()]
             .slice(0, _finiteOr(context.maxActions, DEFAULT_MAX_ACTIONS))
             .flat();
-        if (!usableActions.length && !preset.allowNoAction && targets.length) {
+        // Issue #37: ready-weapon candidates rescue a bot whose attack
+        // list is dry (empty clip, unreadied weapon) — they keep it out
+        // of the `no-action` failure when the system or the inventory
+        // still offers a live weapon to draw.
+        const readyActions = _readyWeaponActions({ allActions, actor, usableActions });
+        if (!usableActions.length && !readyActions.length
+            && !preset.allowNoAction && targets.length) {
             return {
                 status: PLANNER_STATUS.noAction,
                 reason: "no-action",
@@ -2696,6 +2965,25 @@ export function createPlannerService({
             || move.cost <= remainingMove + 1e-9;
         const actionBudget = Math.max(0,
             _finiteOr(context.actionBudget, ACTION_BUDGET_HALVES) - spentHalves);
+        // Issue #37 weapon affinity/inertia inputs: `context` injections
+        // win over the resolved config `preferredWeapon` and the
+        // combatant `lastUsedWeapon` flag the executor wrote after the
+        // previous successful attack.
+        const preferredWeapon = context.preferredWeapon
+            ?? config.preferredWeapon ?? null;
+        const lastUsedWeapon = context.lastUsedWeapon
+            ?? combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.lastUsedWeapon)
+            ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.lastUsedWeapon]
+            ?? null;
+        const dodgeTN = _finiteOr(context.defaultDodgeTN, DEFAULT_DODGE_TN);
+        // Issue #37 reaction slot: a bot that already spent its reaction
+        // this round cannot bank another one — overwatch declarations
+        // drop out of the candidate set.
+        const selfReactionRecord = context.reactionUsed !== undefined
+            ? context.reactionUsed
+            : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.reactionUsed)
+                ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.reactionUsed]);
+        const selfReactionUsed = reactionUsed(selfReactionRecord, combat?.round);
         // Fallback approach points aim for the shortest usable range so a
         // melee-capable NPC keeps closing instead of stopping at gun range.
         const positiveRanges = usableActions
@@ -3169,7 +3457,14 @@ export function createPlannerService({
             const owDirection = threatTarget?.canAttack === true
                 && threatTarget.hidden !== true
                 ? _bearingTo(selfPos, threatTarget) : null;
-            if (owAction && Number.isFinite(owDirection)
+            if (owAction && selfReactionUsed) {
+                // Issue #37: the reaction slot is spent — a declaration
+                // could never fire this round, so the cone is not offered.
+                diagnostics.rejected.push({
+                    candidate: `overwatch|${owAction.id}`,
+                    reason: "reaction-used"
+                });
+            } else if (owAction && Number.isFinite(owDirection)
                 && ACTION_BUDGET_HALVES <= actionBudget) {
                 candidates.push({
                     variant: "overwatch",
@@ -3179,6 +3474,44 @@ export function createPlannerService({
                     direction: owDirection
                 });
             }
+        }
+
+        // ---- Issue #37 free-action candidates -------------------------
+
+        // `ready-weapon`: draw/equip an alternative weapon — the only
+        // meaningful turn of a bot whose attack list is dry. Costs come
+        // straight from the system entry (free under Quick Draw); the
+        // inventory fallback synthesizes a half action.
+        for (const ready of readyActions) {
+            if (_actionCost(ready) > actionBudget) {
+                diagnostics.rejected.push({
+                    candidate: `ready-weapon|${ready.id}`,
+                    reason: "over-budget"
+                });
+                continue;
+            }
+            candidates.push({
+                variant: "ready-weapon",
+                action: ready,
+                target: threatTarget,
+                move: null
+            });
+        }
+
+        // `drop-prone`: a free-action cover answer — offered under fire
+        // (pinned, or standing inside a real kill lane the threat map
+        // reads ≥ DROP_PRONE_DANGER), never when already prone. Landing
+        // prone engages the existing prone rules next turn (halved move
+        // budget, no charge) instead of bypassing them.
+        if (!isProne && threatTarget
+            && (isPinned || (dangerAt && selfPos
+                && _dangerAtSelf(dangerAt, selfPos) >= DROP_PRONE_DANGER))) {
+            candidates.push({
+                variant: "drop-prone",
+                action: null,
+                target: threatTarget,
+                move: null
+            });
         }
 
         if (preset.alwaysOfferHold === true) {
@@ -3224,7 +3557,12 @@ export function createPlannerService({
         };
         const scored = [];
         candidates.forEach((candidate, index) => {
-            const factors = _factorsOf({ ...candidate, moveBudget, dangerAt, selfPos });
+            const dodge = dodgeChanceOf(candidate.target, candidate.action, dodgeTN);
+            const factors = _factorsOf({
+                ...candidate, moveBudget, dangerAt, selfPos, dodge,
+                preferredWeapon, lastUsedWeapon,
+                traits: personality.traits, dodgeTN
+            });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed
             // entries land in `rejected` diagnostics instead of ranking.
@@ -3272,6 +3610,7 @@ export function createPlannerService({
                 ...candidate,
                 id: candidateId,
                 factors,
+                dodge,
                 score,
                 breakdown: jitterFactor !== 1
                     ? {
@@ -3356,6 +3695,11 @@ export function createPlannerService({
                 ...winner.breakdown,
                 lookahead: { ...winner.lookahead, lambda: lookahead.lambda }
             };
+        }
+        // Issue #37: the dodge verdict of the winning attack rides the
+        // breakdown so the preview/diagnostics can explain the EV cut.
+        if (winner.dodge) {
+            winner.breakdown = { ...winner.breakdown, dodge: winner.dodge };
         }
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
