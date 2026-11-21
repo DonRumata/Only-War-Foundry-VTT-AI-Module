@@ -25,34 +25,43 @@ const NAMES = {
 
 const BOTS = [
     // Assault team вЂ” hybrid loadout so melee-vs-ranged selection shows.
+    // Issue #19: `shock` team character + an explicit `fanatic` leader —
+    // the alpha wedge should visibly over-extend toward contact.
     ...[1, 2, 3, 4].map(i => ({
         name: `Alpha Trooper ${i}`, preset: 'assault',
-        team: 'alpha-smoke', leader: i === 1, cohesion: 5,
+        team: 'alpha-smoke', leader: i === 1, cohesion: 5, character: 'shock',
+        personality: i === 1 ? ['fanatic'] : null,
         weapons: [
             { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } },
             { name: 'Chainsword', cls: 'melee', damage: '1d10+4' }
         ]
     })),
-    // Ranged-cover team вЂ” keeps distance behind cover.
+    // Ranged-cover team вЂ” keeps distance behind cover. `disciplined`
+    // character + a `cowardly` rifleman: the team holds formation while
+    // the coward drifts back from the front line.
     ...[1, 2, 3].map(i => ({
         name: `Beta Rifleman ${i}`, preset: 'rangedCover',
-        team: 'beta-smoke', leader: i === 1, cohesion: 6,
+        team: 'beta-smoke', leader: i === 1, cohesion: 6, character: 'disciplined',
+        personality: i === 1 ? ['cowardly'] : null,
         weapons: [
             { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } }
         ]
     })),
-    // Spec-ops pair for coordinated tactics.
+    // Spec-ops pair for coordinated tactics — `elite` character,
+    // `flanker` on the lead operative.
     ...[1, 2].map(i => ({
         name: `Spec Operative ${i}`, preset: 'specOps',
-        team: 'spec-smoke', leader: i === 1, cohesion: 4,
+        team: 'spec-smoke', leader: i === 1, cohesion: 4, character: 'elite',
+        personality: i === 1 ? ['flanker'] : null,
         weapons: [
             { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } },
             { name: 'Combat Knife', cls: 'melee', damage: '1d5+2' }
         ]
     })),
-    // Solo hold-position NPC in the building.
+    // Solo hold-position NPC in the building — `sentinel` keeps him home.
     {
         name: 'Hold Gunner', preset: 'hold', team: null,
+        personality: ['sentinel'],
         weapons: [
             { name: 'Lasgun', cls: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, semi: 2, full: 0 } }
         ]
@@ -119,12 +128,16 @@ const botIds = await page.evaluate(async (data) => {
         await actor.createEmbeddedDocuments('Item',
             spec.weapons.map((w) => ({ name: w.name, type: 'weapon', system: w })));
         await actor.setFlag('only-war-ai', 'config', { enabled: true, preset: spec.preset });
+        if (spec.personality) {
+            await actor.setFlag('only-war-ai', 'personality', spec.personality);
+        }
         if (spec.team) {
             await actor.setFlag('only-war-ai', 'fireteam', {
                 teamId: spec.team,
                 leaderId: spec.leader ? spec.name : null,
                 teamPreset: spec.preset,
-                preferredCohesion: spec.cohesion
+                preferredCohesion: spec.cohesion,
+                character: spec.character ?? null
             });
         }
         out[spec.name] = actor.id;
@@ -220,7 +233,8 @@ const tokenIds = await page.evaluate(async (data) => {
             teamId: spec.team,
             leaderId: spec.leader ? spec.name : null,
             teamPreset: spec.preset,
-            preferredCohesion: spec.cohesion
+            preferredCohesion: spec.cohesion,
+            character: spec.character ?? null
         });
     }
     return Object.fromEntries(created.map((t) => [t.name, t.id]));

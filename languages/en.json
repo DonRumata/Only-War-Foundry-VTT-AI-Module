@@ -10,7 +10,7 @@
   "OWAI.Sheet.Fireteam.TeamPreset": "Team preset",
   "OWAI.Sheet.Fireteam.Cohesion": "Preferred cohesion (m)",
   "OWAI.Sheet.Fireteam.Character": "Team character",
-  "OWAI.Sheet.Personality": "Personality traits",
+  "OWAI.Sheet.Personality.Label": "Personality traits",
   "OWAI.Sheet.Personality.Placeholder": "trait ids, comma separated (e.g. brave, marksman)",
   "OWAI.Sheet.Personality.Resolved": "Resolved personality",
   "OWAI.Sheet.Personality.None": "(none)",

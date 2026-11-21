@@ -20,12 +20,16 @@ node smoke/close-players.mjs    # закрыть вкладки игроков
 |---|---|
 | Пользователи | Smoke Player 1–3 (роль Player) |
 | Персонажи | Acolyte One–Three (OWNER у своего игрока), lasgun |
-| Команда `alpha-smoke` | 4 Alpha Trooper — пресет `assault`, гибриды (lasgun + chainsword), cohesion 5 |
-| Команда `beta-smoke` | 3 Beta Rifleman — пресет `rangedCover`, cohesion 6 |
-| Пара `spec-smoke` | 2 Spec Operative — пресет `specOps`, cohesion 4 |
-| Одиночка | Hold Gunner — пресет `hold` в здании |
+| Команда `alpha-smoke` | 4 Alpha Trooper — пресет `assault`, гибриды (lasgun + chainsword), cohesion 5, характер `shock`, лидер с чертой `fanatic` |
+| Команда `beta-smoke` | 3 Beta Rifleman — пресет `rangedCover`, cohesion 6, характер `disciplined`, один `cowardly` |
+| Пара `spec-smoke` | 2 Spec Operative — пресет `specOps`, cohesion 4, характер `elite`, лидер с `flanker` |
+| Одиночка | Hold Gunner — пресет `hold` в здании, черта `sentinel` |
 | Сцена | Smoke Arena 40×30 клеток: открытое поле, здание с дверью в центре, укрытия, южный фланговый коридор |
 | Бой | Smoke Combat — staged, жмём «Begin Combat» |
+
+Характер (`character`) пишется во флаг fireteam каждой команды, черты
+(`personality`) — во флаг актёра. У ботов без явного флага личность
+генерируется seeded из `actor.id` — она стабильна между прогонами.
 
 Карту можно перерисовать руками — сценарий от неё не зависит, важны:
 открытое поле, хотя бы одно закрытое помещение, укрытия, фланговый обход.
@@ -35,7 +39,10 @@ node smoke/close-players.mjs    # закрыть вкладки игроков
 - `only-war-ai.executionMode = "preview"` — ГМ видит план и подтверждает;
 - `only-war-ai.diagnosticsEnabled = true` — в preview видна раскладка скора;
 - `only-war-ai.masterEnabled = true`;
-- `only-war-ai.previewTimeoutSeconds = 0` — без авто-отмены.
+- `only-war-ai.previewTimeoutSeconds = 0` — без авто-отмены;
+- `only-war-ai.aiDifficulty = "normal"` — базовый прогон; отдельные ходы
+  повторить на `"easy"` (заметны промахи выбора) и `"hard"` (включается
+  lookahead).
 
 ## Протокол
 
@@ -133,6 +140,28 @@ node smoke/close-players.mjs    # закрыть вкладки игроков
 | H3 | Время планирования хода | Субъективно: <2 с на бота; формально замерить `plan.diagnostics.ms` |
 | H4 | Память last-known | Записи забываются через ~3 раунда без повторного обнаружения |
 
+### T. Тактический уровень (issue #16)
+
+| # | Проверка | Ожидается |
+|---|---|---|
+| T1 | Preview плана с движением | В разборе скора move-кандидата виден фактор `danger` (карта угроз) |
+| T2 | `aiDifficulty = "hard"` | В `plan.diagnostics.lookahead` появляются `counterDamage`/`adjusted`; итоговый выбор может отличаться от базового argmax |
+| T3 | `aiDifficulty = "easy"` | В `diagnostics.easyPick.mistake` периодически `true` — бот берёт не-top1 кандидат (неидеальные ходы) |
+| T4 | Раненая цель в радиусе файртимы | `teamPlan.convergence` / общий `assignedTargetId` у способных членов — команда фокусирует добивание |
+| T5 | Движение через открытое поле под огнём | Бот предпочитает маршрут/конечную клетку с меньшим `danger`, не идёт веером по открытому |
+| T6 | Детерминизм | Один и тот же ход при неизменном мире → тот же `plan.id` (seed-повторяемость) |
+
+### P. Личности ботов (issue #19)
+
+| # | Проверка | Ожидается |
+|---|---|---|
+| P1 | Preview плана | В строке NPC видна личность (`fanatic`, `cowardly`, `flanker` и т.д.) и характер команды в скобках |
+| P2 | Лист NPC (вкладка AI) | Поле черт (введённые id), read-only строка resolved-личности, селект характера в fireteam-секции |
+| P3 | Явный флаг `personality` | Заданные в setup черты (`fanatic`, `cowardly`, `flanker`, `sentinel`) — именно они в `plan.personality.traits`, `source: "flag"` |
+| P4 | Бот без флага | Черты сгенерированы (`source: "generated"`), 1–2 шт, идентичны при replan/новом бое |
+| P5 | Характер команды | `plan.personality.character` совпадает с флагом команды (`shock`/`disciplined`/`elite`); заметен в поведении (shock лезет вперёд, disciplined держит строй) |
+| P6 | `aiDifficulty = "easy"` | В сгенерированных личностях новых ботов чаще `cowardly`/`rookie`/`unsteady`/`reckless`; на `hard` — `veteran`/`marksman`/`flanker`/`cunning` |
+
 ## Что фиксируем по итогам
 
 Для каждого ❌/⚠️: номер проверки, что произошло, operationId/planId из
@@ -160,6 +189,14 @@ node smoke/close-players.mjs    # закрыть вкладки игроков
 | masterEnabled — общий выключатель | e2e-зелёный | G5–G6 |
 | Нет дублей при двух GM | e2e-зелёный | G8 |
 | Ожидание без активного GM | e2e-зелёный | A1 |
+| Threat-map: фактор `danger` в скоринге движения | реализовано — проверить | T1, T5 |
+| Lookahead на hard (counter-damage re-score) | реализовано — проверить | T2 |
+| Easy: seeded промах ~30% из top-3 | реализовано — проверить | T3 |
+| Fireteam convergence по kill-EV | реализовано — проверить | T4 |
+| Личности: seeded генерация + flag override | реализовано — проверить | P3–P4 |
+| Характер файртимы (overlay) | реализовано — проверить | P5 |
+| Личность в preview и на листе NPC | реализовано — проверить | P1–P2 |
+| Difficulty-bias пула черт | реализовано — проверить | P6 |
 
 Известные ограничения (заведомо не проверяем/не умеем):
 gridless-сцены (контролируемый `gridless-unsupported`), >10 активных AI NPC,

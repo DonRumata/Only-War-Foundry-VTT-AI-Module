@@ -150,8 +150,10 @@ async function testHoldsPositionWithAttack() {
 
   assert.equal(result.status, 'ok', `expected ok plan, got ${result.status}`);
   const plan = result.plan;
-  assert.equal(plan.breakdown?.variant, 'attack-in-place',
-    'a legal attack from the position must not move');
+  // Issue #15: the aim-attack variant also holds position — it fires
+  // from the current cell with a half-action aim folded in.
+  assert.ok(['attack-in-place', 'aim-attack'].includes(plan.breakdown?.variant),
+    `a legal attack from the position must not move, got ${plan.breakdown?.variant}`);
   assert.ok(plan.steps.every((s) => s.type !== 'move'), 'no move step while holding');
   const attack = plan.steps.find((s) => s.type === 'attack');
   assert.ok(attack, 'attack step exists');

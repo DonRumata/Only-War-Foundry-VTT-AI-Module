@@ -88,7 +88,7 @@ function _injectNpcSection(html, actor) {
                 <input type="checkbox" data-ow-ai-field="includeNeutral" ${includeNeutral ? "checked" : ""}>
             </div>
             <div class="form-group">
-                <label>${_localize("OWAI.Sheet.Personality")}</label>
+                <label>${_localize("OWAI.Sheet.Personality.Label")}</label>
                 <input type="text" data-ow-ai-field="personality"
                     value="${_escapeAttr(personalityTraits.join(", "))}"
                     placeholder="${_escapeAttr(_localize("OWAI.Sheet.Personality.Placeholder"))}">

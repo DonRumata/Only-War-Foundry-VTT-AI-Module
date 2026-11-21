@@ -128,8 +128,9 @@ async function testBehindWallToFiringPosition() {
 
 async function testBlockedShotNeverFiresBlind() {
   // Still behind the tall wall but with no reachable endpoint: the only
-  // attack is vetoed, so the planner reports no-valid-plan instead of a
-  // shot through the wall.
+  // attack is vetoed. Issue #15 utility candidates (aim/overwatch) may
+  // keep the plan `ok` — the invariant is that no attack step is
+  // planned through the wall, and the blocked attack is rejected.
   const result = await page.evaluate(async (cid) => {
     const planner = game.modules.get('only-war-ai').api.services.get('planner');
     const combatant = game.combat?.combatants?.get(cid);
@@ -137,9 +138,16 @@ async function testBlockedShotNeverFiresBlind() {
     return JSON.parse(JSON.stringify(outcome));
   }, page._owaiCombatantId);
 
-  assert.equal(result.status, 'no-action', `expected no-action, got ${result.status}`);
-  assert.equal(result.plan, null);
-  assert.ok(result.diagnostics.rejected.some((e) => e.reason === 'no-line-of-sight'));
+  assert.ok(['ok', 'no-action'].includes(result.status), `unexpected status ${result.status}`);
+  const rejected = result.diagnostics?.rejected ?? result.plan?.diagnostics?.rejected ?? [];
+  assert.ok(rejected.some((e) => e.reason === 'no-line-of-sight'),
+    'blocked attack should be rejected with no-line-of-sight');
+  if (result.status === 'ok') {
+    assert.ok(result.plan.steps.every((s) => s.type !== 'attack'),
+      'vetoed shot must not produce an attack step');
+  } else {
+    assert.equal(result.plan, null);
+  }
 }
 
 async function testOpenPositionMovesToCover() {
