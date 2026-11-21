@@ -94,7 +94,9 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     aim: 2,
     aimAlone: 0.5,
     reload: 3,
-    overwatch: 1
+    overwatch: 1,
+    // Issue #16: spec-ops reads the threat map like rangedCover does.
+    danger: -2
 });
 
 /**

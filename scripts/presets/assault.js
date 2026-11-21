@@ -52,7 +52,9 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     aim: 0,
     aimAlone: 0.5,
     reload: 3,
-    overwatch: 0
+    overwatch: 0,
+    // Issue #16: assault accepts risky lanes — danger only mildly deters.
+    danger: -0.5
 });
 
 /**

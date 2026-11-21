@@ -38,12 +38,14 @@ import {
     MODULE_ID
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
+import { isHostileDisposition } from "./perception.js";
 import {
     createPlannerService,
     fnv1a,
     stableStringify
 } from "./planner.js";
 import { getPreferredCohesion, logDiagnostics } from "./settings.js";
+import { weaponEmitters } from "./threat-map.js";
 import {
     SPEC_OPS_PRESET_ID,
     specOpsTactic
@@ -81,6 +83,9 @@ export const BARRIER_FAILURE_POLICIES = Object.freeze([
 
 /** Default bound on the phases a member may stay detached from cohesion. */
 export const DEFAULT_MAX_DETACHED_PHASES = 2;
+
+/** Charge band beyond melee reach in which melee members count for kill-EV. */
+const MELEE_KILL_ALLOWANCE = 6;
 
 /**
  * How many members of one task may reserve the same target. `flank` keeps a
@@ -523,9 +528,15 @@ export function createFireteamService({
             if (!FIRETEAM_TASKS.includes(task)) task = "support";
             if (task === "flank") flankAssigned = true;
             const groupId = task === "flank" ? "flank-1" : "main";
+            // Issue #16: a convergent objective may restrict the shared
+            // target to the members that actually contribute kill-EV
+            // (`capableMembers`); without that list the objective goes to
+            // every non-flank member as before.
+            const objectiveRestricted = Array.isArray(context.objective?.capableMembers)
+                && !context.objective.capableMembers.includes(member.combatantId);
             const assignedTargetId = task === "flank"
                 ? (context.objective?.flankTargetId ?? context.objective?.targetId ?? null)
-                : (context.objective?.targetId ?? null);
+                : (objectiveRestricted ? null : (context.objective?.targetId ?? null));
             return {
                 combatantId: member.combatantId,
                 tokenId: member.tokenId ?? null,
@@ -1053,6 +1064,189 @@ export function createFireteamService({
     }
 
     /**
+     * Normalize a wounds spec: plain number or `{value}` object.
+     * @param {*} raw
+     * @returns {number|null}
+     */
+    function _woundsValue(raw) {
+        if (Number.isFinite(raw)) return raw;
+        if (Number.isFinite(raw?.value)) return raw.value;
+        return null;
+    }
+
+    /**
+     * Grid info `{size, distance}` for pixel→scene-unit conversion inside
+     * the kill-EV model; injected `context.grid`, then the combat scene.
+     * @param {object} combat
+     * @param {object} context
+     * @returns {object|null}
+     */
+    function _convergenceGrid(combat, context) {
+        const grid = context.grid ?? context.scene?.grid ?? combat?.scene?.grid ?? null;
+        const size = _finiteOr(grid?.size, 0);
+        const distance = _finiteOr(grid?.distance, 0);
+        return size > 0 && distance > 0 ? { size, distance } : null;
+    }
+
+    /**
+     * Scene-unit distance between two pixel points (1:1 without grid).
+     * @param {{x: number, y: number}} a
+     * @param {{x: number, y: number}} b
+     * @param {object|null} grid
+     * @returns {number|null}
+     */
+    function _convergenceDistance(a, b, grid) {
+        if (!Number.isFinite(a?.x) || !Number.isFinite(a?.y)
+            || !Number.isFinite(b?.x) || !Number.isFinite(b?.y)) return null;
+        const px = Math.hypot(b.x - a.x, b.y - a.y);
+        return grid ? px / grid.size * grid.distance : px;
+    }
+
+    /**
+     * Convergence target list: injected `context.targets` win (they may
+     * carry `wounds` directly); otherwise the combat scan returns every
+     * living non-hidden combatant hostile to the team's shared
+     * disposition.
+     * @param {object} input
+     * @param {object[]} input.members Team member entries.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @returns {object[]} `{tokenId, tokenUuid, x, y, wounds}` entries.
+     */
+    function _convergentTargets({ members, combat, context }) {
+        if (Array.isArray(context.targets) && context.targets.length) {
+            return context.targets.map(target => ({
+                tokenId: target?.tokenId ?? null,
+                tokenUuid: target?.tokenUuid ?? null,
+                x: _finiteOr(target?.x, null),
+                y: _finiteOr(target?.y, null),
+                wounds: _woundsValue(target?.wounds)
+            })).filter(entry => entry.tokenId || entry.tokenUuid);
+        }
+        const memberIds = new Set(members.map(m => m.combatantId));
+        const leaderDoc = _tokenDoc(members[0]?.combatant?.token);
+        const selfDisposition = _finiteOr(
+            leaderDoc?.disposition ?? members[0]?.combatant?.disposition, 0);
+        const hostileOptions = {
+            includeNeutral: context.includeNeutral === true,
+            dispositions: Array.isArray(context.dispositions) ? context.dispositions : null
+        };
+        const targets = [];
+        for (const other of _list(combat?.combatants)) {
+            if (!other || _isMissing(other) || memberIds.has(other.id)) continue;
+            const doc = _tokenDoc(other.token);
+            if (!doc || _isMissing(doc) || doc.hidden === true) continue;
+            if (other.defeated === true) continue;
+            if (!isHostileDisposition(selfDisposition,
+                _finiteOr(doc.disposition ?? other.disposition, 0), hostileOptions)) {
+                continue;
+            }
+            const pos = _tokenPosition(doc);
+            const actor = other.actor ?? doc.actor ?? null;
+            targets.push({
+                tokenId: other.tokenId ?? doc.id ?? null,
+                tokenUuid: typeof doc.uuid === "string" ? doc.uuid : null,
+                x: pos.x,
+                y: pos.y,
+                wounds: _woundsValue(actor?.system?.wounds)
+            });
+        }
+        return targets;
+    }
+
+    /**
+     * One member's kill-EV contribution against a target: the best
+     * emitter it can actually bring to bear — a ranged emitter counts
+     * when the target is inside its range, a melee emitter inside reach
+     * plus the charge band. Members with no weapon data or no usable
+     * emitter contribute 0; an unknown distance counts conservatively
+     * (the member is assumed able to engage).
+     * @param {object} member Member entry (`position`, `combatant`).
+     * @param {object[]} emitters Entries from `weaponEmitters`.
+     * @param {object} target Convergence target.
+     * @param {object|null} grid Grid info for the px→unit conversion.
+     * @returns {number}
+     */
+    function _memberKillEV(member, emitters, target, grid) {
+        const distance = _convergenceDistance(member?.position, target, grid);
+        let best = 0;
+        for (const emitter of emitters ?? []) {
+            if (!(emitter?.ev > 0)) continue;
+            if (distance !== null) {
+                const reach = emitter.melee === true
+                    ? _finiteOr(emitter.range, 2) + MELEE_KILL_ALLOWANCE
+                    : _finiteOr(emitter.range, 0);
+                if (distance > reach + 1e-9) continue;
+            }
+            best = Math.max(best, emitter.ev);
+        }
+        return best;
+    }
+
+    /**
+     * Kill-EV convergence objective (issue #16): when the summed expected
+     * damage of the members that can actually engage a target reaches its
+     * wounds total, the whole team converges on that target instead of
+     * distributing. Explicit `context.objective.targetId` orders win;
+     * `context.convergence === false`/`context.killEV === false` disable
+     * the pass. Deterministic: ties resolve on margin, then target id.
+     * @param {object} input
+     * @param {object[]} input.members Filtered team members.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @returns {object|null} Descriptor `{targetId, targetUuid, killEV,
+     *   wounds, margin, capableMembers}` or null.
+     */
+    function _convergentObjective({ members, combat, context }) {
+        if (context.convergence === false || context.killEV === false) return null;
+        if (context.objective?.targetId) return null;
+        const targets = _convergentTargets({ members, combat, context });
+        if (!targets.length) return null;
+        const grid = _convergenceGrid(combat, context);
+        const capable = (members ?? [])
+            .filter(member => member.enabled !== false && member.defeated !== true);
+        const profiles = capable.map(member => ({
+            member,
+            emitters: weaponEmitters(member.combatant?.actor
+                ?? _tokenDoc(member.combatant?.token)?.actor ?? null)
+        }));
+        let best = null;
+        for (const target of targets) {
+            // A target whose wounds cannot be read is never converged on:
+            // committing a focus-fire on an enemy of unknown toughness is
+            // exactly the premature commitment the feature avoids.
+            const wounds = _woundsValue(target.wounds);
+            if (!(wounds > 0)) continue;
+            let killEV = 0;
+            const capableMembers = [];
+            for (const { member, emitters } of profiles) {
+                const ev = _memberKillEV(member, emitters, target, grid);
+                if (ev > 0) {
+                    killEV += ev;
+                    capableMembers.push(member.combatantId);
+                }
+            }
+            killEV = Math.round(killEV * 1e4) / 1e4;
+            const margin = Math.round((killEV - wounds) * 1e4) / 1e4;
+            if (margin < 0) continue;
+            const candidate = {
+                targetId: target.tokenId ?? target.tokenUuid,
+                targetUuid: target.tokenUuid ?? null,
+                killEV,
+                wounds,
+                margin,
+                capableMembers
+            };
+            if (!best || margin > best.margin + 1e-9
+                || (Math.abs(margin - best.margin) <= 1e-9
+                    && String(candidate.targetId) < String(best.targetId))) {
+                best = candidate;
+            }
+        }
+        return best;
+    }
+
+    /**
      * Resolve the bounded team tactic for this plan (issue #412).
      * `context.tactic` may be a tactic factory `(input) => descriptor` or
      * a ready serializable descriptor `{name, reason, assignments,
@@ -1222,12 +1416,29 @@ export function createFireteamService({
             context.maxDetachedPhases ?? tactic?.maxDetachedPhases,
             DEFAULT_MAX_DETACHED_PHASES);
 
+        // Issue #16 kill-EV convergence: when the summed expected damage
+        // of the members able to engage a target reaches its wounds
+        // total, the team converges — every capable member shares the
+        // convergent objective and no flank group detaches. Explicit
+        // `context.objective`/`context.assignments`/a tactic-bound
+        // objective keep precedence; `context.convergence === false`
+        // disables the pass.
+        const convergence = _convergentObjective({ members, combat, context });
+        diagnostics.convergence = convergence ? _jsonClone(convergence) : null;
+
         const assignments = assignTasks(members, {
             leaderId: election.combatantId,
             assignments: context.assignments ?? tactic?.assignments,
-            allowFlank: context.allowFlank ?? tactic?.allowFlank,
+            allowFlank: context.allowFlank ?? tactic?.allowFlank
+                ?? (convergence ? false : undefined),
             regroup: context.regroup ?? tactic?.regroup,
             objective: context.objective ?? tactic?.objective
+                ?? (convergence
+                    ? {
+                        targetId: convergence.targetId,
+                        capableMembers: convergence.capableMembers
+                    }
+                    : undefined)
         });
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
@@ -1453,6 +1664,7 @@ export function createFireteamService({
             teamPreset: teamPreset && AI_PRESETS.includes(teamPreset)
                 ? teamPreset : null,
             tactic: diagnostics.tactic?.name ?? null,
+            convergence,
             revision,
             seed,
             members: memberEntries,

@@ -96,7 +96,9 @@ export const HOLD_WEIGHTS = Object.freeze({
     aim: 3,
     aimAlone: 0,
     reload: 3,
-    overwatch: 0.5
+    overwatch: 0.5,
+    // Issue #16: hold bots prefer cells the enemy covers least.
+    danger: -2
 });
 
 /** Candidate variants whose action produces an attack/test step. */

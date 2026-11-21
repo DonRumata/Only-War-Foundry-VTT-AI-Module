@@ -141,6 +141,50 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Suppression — только из текущей позиции (длительная зона); spray может
   идти после move-attack (прицел пересчитывается с конца маршрута).
 
+#### Тактический уровень (issue #16)
+
+- **Threat map** (`scripts/threat-map.js`, сервис `threatMap`) — агрегированное
+  поле опасности сцены: пересчитывается один раз на план (`refresh(input)`),
+  все решения читают один и тот же `dangerAt(point) → 0..1`. Источники —
+  оружейные эмиттеры известных врагов `{ev, range, melee}` из инвентаря
+  актёра (EV урона — детерминированное среднее кубов) или инъекция
+  `context.threats`. Ranged-эмиттер вносит полную силу `min(1, ev/10)`
+  внутри дальности, melee — полную в reach и линейный спад по полосе
+  чарджа (2 + 6 м). LOS-гейт — проба стен (`createGridAdapter`), без пробы
+  угроза считается открытой. `explain(point)` — разбивка по источникам.
+  Отличие от `cover`/`exposure`: те меряют укрытие относительно *выбранной*
+  цели, `danger` суммирует покрытие всех известных врагов — точка, безопасная
+  от текущей цели, может оказаться убийственной зоной второго стрелка.
+- Фактор `danger` (норм. 0..1) оценивает endpoint кандидата; веса пресетов
+  отрицательны: assault −0.5, hold −2, specOps −2, rangedCover −3,
+  default/skeleton −1.
+- **Lookahead** (2-ply, модельный, без симуляции мира): после базового
+  скоринга top-K (default 4) кандидатов для каждого endpoint'а считается
+  максимальный ожидаемый контр-урон вражеского эмиттера
+  (`expectedCounterDamage` — та же модель, что у threat map: дальность +
+  LOS + melee-полоса). Оценка: `adjusted = score − λ × EV`, λ default 0.5.
+  Выбор идёт по top-K с детерминированным tie-break; pass записывается в
+  `diagnostics.lookahead`, результат победителя — в `breakdown.lookahead`.
+  Оверрайды: `context.lookahead` (on/off), `lookaheadLambda`, `lookaheadTopK`.
+- **`aiDifficulty`** (world setting `easy|normal|hard`, default `normal`;
+  `getAIDifficulty()`; `context.difficulty` переопределяет на план):
+  `easy` — бот не читает производную карту угроз и с вероятностью ~30%
+  (`EASY_MISTAKE_CHANCE`, переопределяется `context.easyMistakeChance`)
+  выбирает не-argmax — seeded pick из следующих кандидатов, детерминирован
+  по seed (XOR-поток mulberry32); `normal` — threat map активна;
+  `hard` — дополнительно lookahead по умолчанию. `plan.difficulty` и
+  `diagnostics.difficulty/easyPick` отражают выбор. Настройка — точка
+  опоры для личностей ботов (issue #19).
+- **Fireteam kill-EV конвергенция**: `buildTeamPlan` суммирует ожидаемый
+  урон членов, чьё оружие достаёт до цели (ranged — по дальности, melee —
+  reach + полоса), и сравнивает с `wounds` цели (из snapshot/инъекции).
+  `killEV ≥ wounds` → конвергентный объект: `teamPlan.convergence
+  {targetId, targetUuid, killEV, wounds, margin, capableMembers}`,
+  общий `assignedTargetId` всем способным, flank-группа не выделяется
+  (если не задана явно). Цель без читаемых wounds не конвергентна;
+  приоритет — `context.objective`/тактика/`context.assignments`,
+  отключение — `context.convergence === false`.
+
 #### Экономия действий (issue #15)
 
 - Бюджет хода — две half-actions: `cost` из `actions.list` нормализуется
@@ -241,6 +285,9 @@ disposition-матрица).
 | LOS к aim-точке | Требуется (кроме memory-strike) |
 | Gridless | Не поддерживается (контролируемый отказ) |
 | Бот защищается | Нет авто-уворота (защищающийся — ручной) |
+| Тактический lookahead | 2-ply модельный (top-K + λ·counterEV, issue #16) — MCTS/глубокий поиск не планируется |
+| Сложность AI | `aiDifficulty` easy/normal/hard: easy ~30% намеренно не-оптимальных ходов, hard включает lookahead (issue #16) |
+| Карта угроз | danger-фактор на endpoint кандидата; цели без оружейного профиля угрозу не проецируют |
 
 ## 5. Точки расширения
 
