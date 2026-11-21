@@ -57,7 +57,8 @@ export const SETTING_KEYS = Object.freeze({
     diagnosticsEnabled: "diagnosticsEnabled",
     preferredCohesion: "preferredCohesion",
     previewTimeoutSeconds: "previewTimeoutSeconds",
-    turnPacingMs: "turnPacingMs"
+    turnPacingMs: "turnPacingMs",
+    aiDifficulty: "aiDifficulty"
 });
 
 /** Default pacing delay between AI execution steps in milliseconds. */
@@ -71,6 +72,21 @@ export const EXECUTION_MODES = Object.freeze([
     "automatic",
     "preview"
 ]);
+
+/**
+ * AI difficulty levels for the world setting (issue #16): `easy` bots
+ * deliberately pick suboptimal plans and ignore the threat map, `normal`
+ * applies the danger factor, `hard` additionally enables the 2-ply
+ * lookahead pass.
+ */
+export const AI_DIFFICULTIES = Object.freeze([
+    "easy",
+    "normal",
+    "hard"
+]);
+
+/** Default AI difficulty when the world setting is missing or damaged. */
+export const DEFAULT_AI_DIFFICULTY = "normal";
 
 /** Required host system id. */
 export const REQUIRED_SYSTEM_ID = "only-war-local";

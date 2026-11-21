@@ -8,8 +8,12 @@
  * - `diagnosticsEnabled`: boolean — GM-only diagnostic logging.
  * - `preferredCohesion`: default fireteam cohesion distance (issue #408).
  * - `previewTimeoutSeconds`: GM preview auto-cancel timeout (issue #409).
+ * - `aiDifficulty`: "easy" | "normal" | "hard" — tactical depth of the
+ *   planner (issue #16); personalities of issue #19 read it too.
  */
 import {
+    AI_DIFFICULTIES,
+    DEFAULT_AI_DIFFICULTY,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -76,6 +80,20 @@ export function registerSettings() {
         config: true,
         type: Number,
         default: DEFAULT_TURN_PACING_MS
+    });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.aiDifficulty, {
+        name: "OWAI.Settings.AiDifficulty.Name",
+        hint: "OWAI.Settings.AiDifficulty.Hint",
+        scope: "world",
+        config: true,
+        type: String,
+        choices: {
+            easy: "OWAI.Settings.AiDifficulty.Easy",
+            normal: "OWAI.Settings.AiDifficulty.Normal",
+            hard: "OWAI.Settings.AiDifficulty.Hard"
+        },
+        default: DEFAULT_AI_DIFFICULTY
     });
 }
 
@@ -151,6 +169,22 @@ export function getTurnPacingMs() {
         return Number.isFinite(value) && value >= 0 ? value : DEFAULT_TURN_PACING_MS;
     } catch(_err) {
         return DEFAULT_TURN_PACING_MS;
+    }
+}
+
+/**
+ * AI tactical difficulty ("easy" | "normal" | "hard", issue #16). Gates the
+ * planner's threat-map awareness, the lookahead pass and the deliberate
+ * sub-optimal pick of easy mode. Missing or damaged values fall back to
+ * {@link DEFAULT_AI_DIFFICULTY}.
+ * @returns {string}
+ */
+export function getAIDifficulty() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.aiDifficulty);
+        return AI_DIFFICULTIES.includes(value) ? value : DEFAULT_AI_DIFFICULTY;
+    } catch(_err) {
+        return DEFAULT_AI_DIFFICULTY;
     }
 }
 

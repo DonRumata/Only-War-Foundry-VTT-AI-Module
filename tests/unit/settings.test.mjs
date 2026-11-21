@@ -5,6 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+    getAIDifficulty,
     getExecutionMode,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
@@ -25,7 +26,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 6);
+    assert.equal(registered.length, 7);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -135,4 +136,26 @@ test("isMasterEnabled falls back to true on damaged values", async () => {
     await game.settings.set(MODULE_ID, SETTING_KEYS.masterEnabled, 0);
     // Only an explicit false disables the module.
     assert.equal(isMasterEnabled(), true);
+});
+
+test("aiDifficulty defaults to normal with easy/normal/hard choices (issue #16)", () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.aiDifficulty);
+    assert.ok(entry, "aiDifficulty registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, "normal");
+    assert.deepEqual(Object.keys(entry.data.choices), ["easy", "normal", "hard"]);
+    assert.equal(getAIDifficulty(), "normal");
+});
+
+test("getAIDifficulty honours a stored value and rejects damaged ones", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.aiDifficulty, "easy");
+    assert.equal(getAIDifficulty(), "easy");
+    await game.settings.set(MODULE_ID, SETTING_KEYS.aiDifficulty, "hard");
+    assert.equal(getAIDifficulty(), "hard");
+    await game.settings.set(MODULE_ID, SETTING_KEYS.aiDifficulty, "nightmare");
+    assert.equal(getAIDifficulty(), "normal");
 });

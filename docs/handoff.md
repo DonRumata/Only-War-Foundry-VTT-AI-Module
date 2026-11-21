@@ -23,12 +23,19 @@
   aim-attack/aim-standalone с переносом `aimedUntil` (флаг `aim` на
   combatant), `reload` через `api.actions.reload`, overwatch-кандидат,
   веса `aim`/`aimAlone`/`reload`/`overwatch` в пресетах.
+- `feature/tactical-16` — #16: тактический уровень — threat-map
+  (`scripts/threat-map.js`, сервис `threatMap`, фактор `danger`),
+  модельный 2-ply lookahead (λ=0.5, top-4, hard по умолчанию),
+  `aiDifficulty` (easy ~30% намеренных промахов; опора для #19),
+  fireteam kill-EV конвергенция цели.
 
 ## Открытые issues (эпик #363)
 
 - ~~**#14**~~ — реализовано на `feature/templates-14` (`0aa7662`).
 - ~~**#15**~~ — реализовано на `feature/action-economy-15` (поверх
   `feature/templates-14`).
+- ~~**#16**~~ — реализовано на `feature/tactical-16` (поверх
+  `feature/integration-ai`).
 - Системная сторона: `rolls.executeDamage`/`applyDamage`/`evasionTest` —
   обсуждалось, issue ещё НЕ заведено (модуль кидает только тест
   попадания — урон/уворот ручные). Авто-реакция бота (триггер
@@ -54,7 +61,7 @@ RoF очередей. Надо:
 - Модуль: `OnlyWarAIModule`, ветка `feature/integration-ai`.
 - Deploy: копирование `scripts/`+`languages/` в
   `%LOCALAPPDATA%\FoundryVTT\Data\modules\only-war-ai`.
-- Юниты: `npm run test:unit` (322/322), `npm run check` (46 файлов),
+- Юниты: `npm run test:unit` (339/339), `npm run check` (48 файлов),
   `npx eslint scripts/`.
 - Live: Playwright CDP (`tests/foundry-e2e/smoke/`): `setup-smoke.mjs`
   строит мир (Smoke Arena, 4000×3000, grid 100px=1м, стены/двери/укрытия),

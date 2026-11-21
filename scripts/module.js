@@ -20,6 +20,7 @@ import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
 import { createOverwatchService } from "./overwatch.js";
+import { createThreatMapService } from "./threat-map.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
@@ -58,6 +59,12 @@ Hooks.once("init", () => {
         _registerNavigationService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register navigation service`, err);
+    }
+
+    try {
+        _registerThreatMapService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register threat-map service`, err);
     }
 
     try {
@@ -198,6 +205,19 @@ function _registerPerceptionService(api) {
     if (!api?.services) return;
     if (!api.services.has("perception")) {
         api.services.register("perception", createPerceptionService({ api, hooks: Hooks }));
+    }
+}
+
+/**
+ * Register the `threatMap` service on the module API (issue #16). The
+ * service is pure/read-only — no hooks, no lifecycle — so it is available
+ * immediately for the planner and macros.
+ * @param {object} api Module API object.
+ */
+function _registerThreatMapService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("threatMap")) {
+        api.services.register("threatMap", createThreatMapService({ api }));
     }
 }
 

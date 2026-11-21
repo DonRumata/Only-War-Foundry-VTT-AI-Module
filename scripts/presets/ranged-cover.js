@@ -77,7 +77,9 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     aim: 0.5,
     aimAlone: 1.5,
     reload: 3,
-    overwatch: 2
+    overwatch: 2,
+    // Issue #16: the preset's whole doctrine is staying out of kill lanes.
+    danger: -3
 });
 
 /** Candidate variants whose action produces an attack/test step. */

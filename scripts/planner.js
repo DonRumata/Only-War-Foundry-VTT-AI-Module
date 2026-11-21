@@ -21,9 +21,19 @@
  *   replans per turn; after the budget is spent the AI holds and reports
  *   a diagnostic reason for the GM instead of acting on stale state.
  */
-import { FALLBACK_PRESET, FLAG_KEYS, MODULE_ID } from "./constants.js";
+import {
+    AI_DIFFICULTIES,
+    FALLBACK_PRESET,
+    FLAG_KEYS,
+    MODULE_ID
+} from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
-import { logDiagnostics } from "./settings.js";
+import { getAIDifficulty, logDiagnostics } from "./settings.js";
+import {
+    buildThreatMap,
+    expectedCounterDamage,
+    threatSourcesOf
+} from "./threat-map.js";
 
 /** Result statuses of {@link createPlannerService.planTurn}. */
 export const PLANNER_STATUS = Object.freeze({
@@ -119,8 +129,26 @@ export const SCORE_FACTORS = Object.freeze([
     "aim",
     "aimAlone",
     "reload",
-    "overwatch"
+    "overwatch",
+    "danger"
 ]);
+
+/**
+ * Tactical-layer tuning constants (issue #16): the lookahead penalty
+ * weight `λ`, how many top candidates the 2-ply counter model re-scores,
+ * the deliberate-slip probability of easy difficulty and how many
+ * next-best candidates that slip may pick from.
+ */
+export const DEFAULT_LOOKAHEAD_LAMBDA = 0.5;
+export const DEFAULT_LOOKAHEAD_TOP_K = 4;
+export const EASY_MISTAKE_CHANCE = 0.3;
+export const EASY_PICK_TOP_K = 3;
+
+/**
+ * Seed XOR mask for the easy-mode slip roll — a stream independent of
+ * the tie-break shuffle so the two never correlate.
+ */
+const EASY_PICK_SEED_XOR = 0x9e3779b9;
 
 /**
  * Default weight set вЂ” the merge base for every registered preset. Combat
@@ -150,7 +178,8 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     aim: 0,
     aimAlone: 0.5,
     reload: 3,
-    overwatch: 0
+    overwatch: 0,
+    danger: -1
 });
 
 /**
@@ -1323,7 +1352,15 @@ function _normalizeTarget(raw, { source, sceneId, selfPos, grid, measure }) {
         canAttack: source === "last-known" ? false : raw.canAttack !== false,
         hidden: raw.hidden === true,
         statuses: _statusIds(raw.statuses),
-        source
+        source,
+        // Issue #16 threat-profile passthrough: explicit weapon emitters
+        // (`emitters`/`damage`+`range`/`melee`/`threatProfile`) feeding
+        // the danger field and the lookahead counter model.
+        threatProfile: raw.threatProfile ?? null,
+        emitters: Array.isArray(raw.emitters) ? raw.emitters : null,
+        damage: raw.damage ?? null,
+        range: Number.isFinite(raw.range) ? raw.range : null,
+        melee: raw.melee === true
     };
 }
 
@@ -1847,10 +1884,15 @@ function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navi
  * @param {object|null} input.action Normalized action candidate.
  * @param {number|null} [input.moveBudget] Numeric movement budget for the
  *   `budgetOver` penalty factor (null/unknown disables it).
+ * @param {Function|null} [input.dangerAt] Threat-map probe
+ *   `(point) => 0..1` evaluated on the candidate endpoint (issue #16).
+ * @param {object|null} [input.selfPos] Self position `{x, y}` in pixels —
+ *   the endpoint of stationary variants.
  * @param {number} [input.blastHits] Hostiles covered by a blast aim point.
  * @returns {object}
  */
-function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0 }) {
+function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
+    dangerAt = null, selfPos = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -1883,6 +1925,24 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     const engaged = Number.isFinite(postDistance) && postDistance <= meleeReach + 1e-9 ? 1 : 0;
     const vulnerable = (target?.statuses ?? [])
         .some(status => VULNERABLE_STATUSES.has(status)) ? 1 : 0;
+    // Issue #16 threat map: aggregated danger of the candidate endpoint —
+    // the move destination, the stay cell or the actor position for
+    // stationary variants. It complements `cover`/`exposure`: those only
+    // measure walls against the *planned* target, `danger` sums every
+    // known enemy's effective weapon range over the cell — a spot safe
+    // from the current target may still be a kill lane for a second
+    // shooter.
+    const endpoint = move && Number.isFinite(move.x) && Number.isFinite(move.y)
+        ? { x: move.x, y: move.y }
+        : (Number.isFinite(selfPos?.x) && Number.isFinite(selfPos?.y) ? selfPos : null);
+    let danger = 0;
+    if (endpoint && typeof dangerAt === "function") {
+        try {
+            danger = Math.max(0, Math.min(1, _finiteOr(dangerAt(endpoint), 0)));
+        } catch(err) {
+            danger = 0;
+        }
+    }
     return {
         attackNow,
         attackAfterMove,
@@ -1914,7 +1974,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         aim: variant === "aim-attack" ? 1 : 0,
         aimAlone: variant === "aim" ? 1 : 0,
         reload: (variant === "reload" || variant === "move-reload") ? 1 : 0,
-        overwatch: variant === "overwatch" ? 1 : 0
+        overwatch: variant === "overwatch" ? 1 : 0,
+        danger
     };
 }
 
@@ -1956,6 +2017,139 @@ function _seededPick(tied, seed) {
         [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
     }
     return shuffled[0];
+}
+
+/**
+ * Resolved AI difficulty for one plan: validated `context.difficulty`
+ * wins, otherwise the `aiDifficulty` world setting (issue #16).
+ * @param {object} context Planning context.
+ * @returns {string} One of `easy|normal|hard`.
+ */
+function _difficultyOf(context) {
+    return AI_DIFFICULTIES.includes(context?.difficulty)
+        ? context.difficulty
+        : getAIDifficulty();
+}
+
+/**
+ * Threat sources for the plan's danger field and counter model:
+ * injected `context.threats` win; otherwise the resolved targets provide
+ * positions while `threatSourcesOf` derives weapon emitters from
+ * explicit target profiles or the enemy token's actor loadout.
+ * @param {object} input
+ * @param {object[]} input.targets Normalized targets.
+ * @param {object} input.combat Combat document.
+ * @param {object|null} input.scene Scene for token lookup.
+ * @param {object} input.context Planning context.
+ * @returns {object[]} Raw/normalized threat sources.
+ */
+function _enemyThreats({ targets, combat, scene, context }) {
+    if (Array.isArray(context?.threats)) return context.threats;
+    return threatSourcesOf(targets, {
+        combat,
+        scene,
+        findToken: tokenId => _findToken(tokenId, { combat, scene })
+    });
+}
+
+/**
+ * Resolve the threat map for one plan. `context.threatMap` may be a
+ * ready map (`dangerAt`), a threat-map service (`refresh` builds and
+ * returns it) or `false` to disable the factor; absent an injection the
+ * map is built locally from the resolved threat sources — but only on
+ * `normal`/`hard`: easy bots deliberately do not read the danger field.
+ * @param {object} input
+ * @param {string} input.difficulty Resolved AI difficulty.
+ * @param {object[]} input.threats Threat sources.
+ * @param {object} input.grid Normalized grid info.
+ * @param {Function|boolean|undefined} input.los Sight probe override.
+ * @param {object|null} input.service Registered `threatMap` service.
+ * @param {object} input.context Planning context.
+ * @returns {object|null} Map exposing `dangerAt(point)` or null.
+ */
+function _resolveThreatMap({ difficulty, threats, grid, los, service, context }) {
+    const injected = context?.threatMap;
+    if (injected === false) return null;
+    if (injected && typeof injected === "object") {
+        if (typeof injected.refresh === "function") {
+            try {
+                const map = injected.refresh({ threats, grid, los, context });
+                if (map && typeof map.dangerAt === "function") return map;
+            } catch(err) {
+                // Fall back to the local build below.
+            }
+        }
+        if (typeof injected.dangerAt === "function") return injected;
+    }
+    // Easy bots skip the derived danger field; an explicit source list
+    // still applies because caller-injected context always wins.
+    if (difficulty === "easy" && !Array.isArray(context?.threats)) return null;
+    if (!threats.length) return null;
+    if (service && typeof service.refresh === "function") {
+        try {
+            const map = service.refresh({ threats, grid, los, context });
+            if (map && typeof map.dangerAt === "function") return map;
+        } catch(err) {
+            // Fall back to the local build below.
+        }
+    }
+    try {
+        return buildThreatMap({ threats, los, grid });
+    } catch(err) {
+        return null;
+    }
+}
+
+/**
+ * Whether the 2-ply lookahead pass runs for this plan: `hard`
+ * difficulty enables it by default, `context.lookahead` force-enables
+ * or force-disables it; `context.lookaheadLambda`/`lookaheadTopK` tune
+ * the penalty weight and the top-K bound.
+ * @param {object} context Planning context.
+ * @param {string} difficulty Resolved AI difficulty.
+ * @returns {{enabled: boolean, lambda: number, topK: number}}
+ */
+function _lookaheadConfig(context, difficulty) {
+    const enabled = context?.lookahead === true
+        || (context?.lookahead !== false && difficulty === "hard");
+    if (!enabled) return { enabled: false, lambda: 0, topK: 0 };
+    const lambda = Number.isFinite(context?.lookaheadLambda)
+        ? context.lookaheadLambda : DEFAULT_LOOKAHEAD_LAMBDA;
+    const topK = Math.max(1, Math.min(8,
+        Math.floor(_finiteOr(context?.lookaheadTopK, DEFAULT_LOOKAHEAD_TOP_K))));
+    return { enabled: true, lambda, topK };
+}
+
+/**
+ * Lookahead pass over the top-K scored candidates: each candidate's
+ * endpoint is charged the expected counter damage of the strongest
+ * enemy emitter able to respond (`adjusted = score − λ × EV`). The
+ * returned pool is re-sorted by adjusted score with candidate-id
+ * tie-breaks — deterministic for identical input.
+ * @param {object[]} scored Scored candidates (score-sorted).
+ * @param {object} input
+ * @param {object[]} input.threats Threat sources of the plan.
+ * @param {object} input.grid Normalized grid info.
+ * @param {Function|boolean|undefined} input.los Sight probe override.
+ * @param {number} input.lambda Penalty weight.
+ * @param {number} input.topK Candidates re-scored.
+ * @param {object} input.selfPos Self position `{x, y}` in pixels.
+ * @returns {object[]} The adjusted top-K pool (sorted).
+ */
+function _applyLookahead(scored, { threats, grid, los, lambda, topK, selfPos }) {
+    const pool = scored.slice(0, Math.max(1, topK));
+    for (const entry of pool) {
+        const endpoint = entry.move && Number.isFinite(entry.move.x)
+            && Number.isFinite(entry.move.y)
+            ? { x: entry.move.x, y: entry.move.y }
+            : selfPos;
+        const counter = expectedCounterDamage(endpoint, threats, { grid, los });
+        const adjusted = Math.round((entry.score - (lambda * counter)) * 1e6) / 1e6;
+        entry.lookahead = { counterDamage: counter, adjusted };
+    }
+    pool.sort((a, b) => (b.lookahead.adjusted - a.lookahead.adjusted)
+        || String(a.id).localeCompare(String(b.id)));
+    return pool;
 }
 
 /** Candidate variants that produce an attack/test step. */
@@ -2187,8 +2381,13 @@ export function createPlannerService({
         const presetId = presets.has(config.preset) ? config.preset : FALLBACK_PRESET;
         const preset = presets.get(presetId) ?? presets.get(FALLBACK_PRESET);
         const seed = _seedFor(context, combat, combatant);
+        // Issue #16 difficulty: `context.difficulty` (validated) overrides
+        // the world setting; it gates threat-map reads, the lookahead
+        // pass and the deliberate slip of easy mode.
+        const difficulty = _difficultyOf(context);
         const diagnostics = {
             seed,
+            difficulty,
             weights: { ...preset.weights },
             preset: presetId,
             candidatesCount: 0,
@@ -2270,6 +2469,24 @@ export function createPlannerService({
             combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context
         });
         diagnostics.metrics.targetsEvaluated = targets.length;
+        // Issue #16 threat map: one aggregated danger field built once per
+        // plan from the resolved enemies' weapon loadouts (weapon EV +
+        // range emitters). `context.threatMap` injects a ready map or a
+        // service (`refresh` runs here), `context.threats` injects raw
+        // sources; derived sources only engage on normal+hard — easy bots
+        // never read the field.
+        const threats = _enemyThreats({ targets, combat, scene, context: planContext });
+        const losProbe = typeof planContext.los === "function" ? planContext.los : undefined;
+        const threatMap = _resolveThreatMap({
+            difficulty, threats, grid, los: losProbe,
+            service: _service("threatMap"), context: planContext
+        });
+        const dangerAt = threatMap ? point => threatMap.dangerAt(point) : null;
+        if (threatMap) {
+            diagnostics.threatMap = {
+                threats: Array.isArray(threatMap.threats) ? threatMap.threats.length : threats.length
+            };
+        }
         if (!targets.length && !preset.allowNoTarget) {
             return {
                 status: PLANNER_STATUS.noTarget,
@@ -2778,7 +2995,7 @@ export function createPlannerService({
         };
         const scored = [];
         candidates.forEach((candidate, index) => {
-            const factors = _factorsOf({ ...candidate, moveBudget });
+            const factors = _factorsOf({ ...candidate, moveBudget, dangerAt, selfPos });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed
             // entries land in `rejected` diagnostics instead of ranking.
@@ -2836,8 +3053,62 @@ export function createPlannerService({
             };
         }
 
-        const top = scored.filter(entry => entry.score === scored[0].score);
-        const winner = top.length > 1 ? _seededPick(top, seed) : top[0];
+        // Issue #16 lookahead (2-ply, model-level): the top-K candidates
+        // are re-scored by the expected counter damage of the strongest
+        // responding enemy emitter —
+        // `adjusted = score − λ × expectedCounterDamage`. No world
+        // simulation: the counter model only reads the same snapshot data
+        // (enemy emitters, distances, the sight probe) the threat map
+        // uses, so the pass stays deterministic. Enabled on hard
+        // difficulty or through `context.lookahead`.
+        const lookahead = _lookaheadConfig(planContext, difficulty);
+        let pickPool = scored;
+        let scoreOf = entry => entry.score;
+        if (lookahead.enabled) {
+            pickPool = _applyLookahead(scored, {
+                threats, grid, los: losProbe,
+                lambda: lookahead.lambda,
+                topK: lookahead.topK,
+                selfPos
+            });
+            scoreOf = entry => _finiteOr(entry.lookahead?.adjusted, entry.score);
+            diagnostics.lookahead = {
+                lambda: lookahead.lambda,
+                topK: lookahead.topK,
+                entries: pickPool.map(entry => ({
+                    candidate: entry.id,
+                    score: entry.score,
+                    counterDamage: entry.lookahead.counterDamage,
+                    adjusted: entry.lookahead.adjusted
+                }))
+            };
+        }
+
+        const topScore = scoreOf(pickPool[0]);
+        const top = pickPool.filter(entry => scoreOf(entry) === topScore);
+        let winner = top.length > 1 ? _seededPick(top, seed) : top[0];
+
+        // Issue #16 difficulty: on easy the bot deliberately slips — with
+        // `EASY_MISTAKE_CHANCE` probability the winner is a seeded pick
+        // among the next-best candidates instead of the argmax. The slip
+        // roll uses its own XOR-masked seed stream; identical seed
+        // reproduces the identical plan.
+        if (difficulty === "easy" && pickPool.length > 1) {
+            const chance = _finiteOr(planContext.easyMistakeChance, EASY_MISTAKE_CHANCE);
+            const mistake = mulberry32((seed ^ EASY_PICK_SEED_XOR) >>> 0)() < chance;
+            diagnostics.easyPick = { chance, mistake };
+            if (mistake) {
+                const rest = pickPool.filter(entry => entry !== winner)
+                    .slice(0, EASY_PICK_TOP_K);
+                if (rest.length) winner = _seededPick(rest, seed);
+            }
+        }
+        if (winner.lookahead) {
+            winner.breakdown = {
+                ...winner.breakdown,
+                lookahead: { ...winner.lookahead, lambda: lookahead.lambda }
+            };
+        }
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
         // attack step — the executor clears the flag once the shot lands.
@@ -2936,6 +3207,7 @@ export function createPlannerService({
             preset: presetId,
             seed,
             replanCount,
+            difficulty: _difficultyOf(context),
             score: winner.score,
             breakdown: winner.breakdown,
             target: snapshot.target,
