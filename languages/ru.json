@@ -10,7 +10,7 @@
   "OWAI.Sheet.Fireteam.TeamPreset": "Пресет группы",
   "OWAI.Sheet.Fireteam.Cohesion": "Предпочтительная связность (м)",
   "OWAI.Sheet.Fireteam.Character": "Характер группы",
-  "OWAI.Sheet.Personality": "Черты личности",
+  "OWAI.Sheet.Personality.Label": "Черты личности",
   "OWAI.Sheet.Personality.Placeholder": "id черт через запятую (напр. brave, marksman)",
   "OWAI.Sheet.Personality.Resolved": "Личность бота",
   "OWAI.Sheet.Personality.None": "(нет)",

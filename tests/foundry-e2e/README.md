@@ -59,6 +59,7 @@ npm run test:all      # все тесты последовательно
 | `performance.test.mjs` | Issue #410: 10 AI NPC в двух fireteam за полный боевой цикл, machine-readable счётчики (planning/execution ms, candidates, path nodes, doc updates, replans, cycle time) в `reports/performance-*.json`, человекочитаемый отчёт при падении. |
 | `master-switch.test.mjs` | `masterEnabled=false`: автоматизация не стартует, executor отвечает `module-disabled`, UI-секции скрыты. |
 | `player-view.test.mjs` | Не-контроллер/player клиент: нет записей документов и автоматизации со стороны обычного игрока. |
+| `tactical.test.mjs` | Issues #16/#19: сервис `threatMap` (`refresh`/`dangerAt`/`map`), world setting `aiDifficulty`, `api.personalities`/`api.fireteamCharacters`, `plan.difficulty`/`plan.personality`/`diagnostics.threatMap`/`weights.danger`, lookahead-диагностика, easy-гейт карты + `easyPick`, flag-override личности, `team.character` на плане, детерминизм plan.id. |
 
 ## Замечания
 

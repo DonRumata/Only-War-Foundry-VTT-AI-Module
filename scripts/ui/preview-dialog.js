@@ -294,9 +294,9 @@ export function buildPreviewViewModel(plan, context = {}) {
             name: actionInput.name ?? actionInput.actionId ?? null,
             mode: actionInput.mode ?? null,
             attackType: actionInput.attackType ?? null,
-            attackTypeLabel: actionInput.attackType
-                ? _label(i18nSource, `OWAI.AttackType.${actionInput.attackType}`, actionInput.attackType)
-                : null,
+            // Localized in localizePreviewViewModel — the base model
+            // stays free of i18n so it remains serializable.
+            attackTypeLabel: null,
             range: Number.isFinite(actionInput.range) ? actionInput.range : null,
             targetNumber: Number.isFinite(targetNumber) ? targetNumber : null,
             itemUuid: actionInput.itemUuid ?? null
@@ -451,7 +451,14 @@ export function localizePreviewViewModel(vm, i18n = null) {
                 ...vm.action,
                 typeLabel: _label(
                     i18nSource, `OWAI.Preview.Step.${vm.action.type}`, vm.action.type
-                )
+                ),
+                attackTypeLabel: vm.action.attackType
+                    ? _label(
+                        i18nSource,
+                        `OWAI.AttackType.${vm.action.attackType}`,
+                        vm.action.attackType
+                    )
+                    : null
             }
             : vm.action,
         steps: (vm.steps ?? []).map(step => ({
