@@ -170,8 +170,13 @@ test("a friendly inside the cone vetoes the template attack", async () => {
         actions: [suppressionAction()],
         moves: []
     });
-    assert.ok([PLANNER_STATUS.noAction, PLANNER_STATUS.noRoute].includes(result.status));
-    assert.ok(result.diagnostics.rejected.some(
+    // The cone candidate is vetoed; the issue-#15 economy may still
+    // rescue the turn with an aim/overwatch utility step.
+    const attack = result.plan?.steps.find(step => step.type === "attack");
+    assert.ok(!attack || attack.input.attackType !== "suppressing_fire",
+        "no suppression step when the cone covers a friendly");
+    const diagnostics = result.plan?.diagnostics ?? result.diagnostics ?? {};
+    assert.ok((diagnostics.rejected ?? []).some(
         entry => String(entry.candidate).startsWith("cone|")
             && entry.reason === "cone-no-safe-aim"
     ));
@@ -211,5 +216,12 @@ test("a lone distant hostile outside the cone range yields no template step", as
         actions: [suppressionAction()],
         moves: []
     });
-    assert.notEqual(result.status, PLANNER_STATUS.ok);
+    const attack = result.plan?.steps.find(step => step.type === "attack");
+    assert.ok(!attack || !attack.input.template?.direction,
+        "no cone template when the hostile is out of range");
+    const diagnostics = result.plan?.diagnostics ?? result.diagnostics ?? {};
+    assert.ok((diagnostics.rejected ?? []).some(
+        entry => String(entry.candidate).startsWith("cone|")
+            && entry.reason === "cone-no-safe-aim"
+    ));
 });

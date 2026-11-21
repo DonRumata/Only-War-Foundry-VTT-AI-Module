@@ -92,11 +92,17 @@ export const HOLD_WEIGHTS = Object.freeze({
     attackType: 0.05,
     vulnerable: 0.5,
     meleeEngage: 2,
-    area: 2
+    area: 2,
+    aim: 3,
+    aimAlone: 0,
+    reload: 3,
+    overwatch: 0.5
 });
 
 /** Candidate variants whose action produces an attack/test step. */
-const ATTACK_VARIANTS = new Set(["attack-in-place", "move-attack", "charge"]);
+const ATTACK_VARIANTS = new Set([
+    "attack-in-place", "move-attack", "charge", "aim-attack"
+]);
 
 /** Floating-point slack for radius comparisons. */
 const RADIUS_EPSILON = 1e-6;

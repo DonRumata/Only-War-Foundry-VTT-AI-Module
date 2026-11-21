@@ -73,11 +73,17 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     attackType: 0.1,
     vulnerable: 0.5,
     meleeEngage: 2,
-    area: 3
+    area: 3,
+    aim: 0.5,
+    aimAlone: 1.5,
+    reload: 3,
+    overwatch: 2
 });
 
 /** Candidate variants whose action produces an attack/test step. */
-const ATTACK_VARIANTS = new Set(["attack-in-place", "move-attack", "charge"]);
+const ATTACK_VARIANTS = new Set([
+    "attack-in-place", "move-attack", "charge", "aim-attack"
+]);
 
 /** Cover granted per blocking wall crossed, capped at {@link MAX_COVER}. */
 const COVER_PER_WALL = 0.5;

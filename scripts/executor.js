@@ -33,7 +33,7 @@
  * - Preview mode emits `only-war-ai.previewRequested` (issue #409) with the
  *   serialized plan so the GM preview dialog can confirm/cancel/replan.
  */
-import { MODULE_ID } from "./constants.js";
+import { FLAG_KEYS, MODULE_ID } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
@@ -589,6 +589,88 @@ export function createExecutorService({
     }
 
     /**
+     * Execute an `aim` step (issue #15): books the aim bonus on the
+     * combatant `aim` flag. For `aim-attack` plans the following attack
+     * step carries `input.aim` and consumes the flag; a standalone `aim`
+     * plan leaves the record until the next attack (aimedUntil).
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepAim(step, context, run) {
+        const input = step?.input ?? {};
+        const bonus = _finiteOr(input.aim, 10);
+        const record = {
+            bonus,
+            declaredRound: context.combat?.round ?? null
+        };
+        const combatant = run.combatant;
+        if (typeof combatant?.setFlag === "function") {
+            try {
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.aim, record);
+            } catch(err) {
+                return {
+                    ok: false,
+                    reason: "flag-write-failed",
+                    error: String(err?.message ?? err)
+                };
+            }
+        }
+        return { ok: true };
+    }
+
+    /**
+     * Execute a `reload` step (issue #15) through
+     * `game.darkHeresy.api.actions.reload` — magazine swap or clip refill,
+     * idempotent through the step-scoped operation id.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepReload(step, context, run) {
+        const api = context.actionsApi
+            ?? globalThis.game?.darkHeresy?.api?.actions
+            ?? null;
+        if (typeof api?.reload !== "function") {
+            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
+        }
+        const input = step?.input ?? {};
+        const plan = run.plan;
+        const operationId = `${run.operationId}.${step.id}`;
+        let outcome;
+        try {
+            outcome = await api.reload({
+                actorUuid: plan?.snapshot?.self?.actorUuid ?? null,
+                actorId: plan?.snapshot?.self?.actorId ?? null,
+                weaponId: input.weaponId ?? input.itemUuid ?? null,
+                magazineItemId: input.magazineItemId ?? null
+            }, { operationId });
+        } catch(err) {
+            return {
+                ok: false,
+                reason: EXECUTOR_REASONS.rollFailed,
+                error: String(err?.message ?? err)
+            };
+        }
+        if (!outcome || outcome.status === "failed" || outcome.status === "error"
+            || outcome.ok === false) {
+            return {
+                ok: false,
+                reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed,
+                stale: outcome?.reason === "stale-state"
+            };
+        }
+        return {
+            ok: true,
+            delta: outcome.resourceDelta ?? {},
+            chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
+            duplicate: outcome.duplicate === true
+        };
+    }
+
+    /**
      * Execute an `overwatch` step: declare a watch cone on the combatant
      * flag through the overwatch service (issue #14). Declare-only — the
      * reaction shot itself stays with the GM.
@@ -633,8 +715,25 @@ export function createExecutorService({
             case "move":
                 return _stepMove(step, context, run.combatant);
             case "attack":
-            case "test":
-                return _stepRoll(step.type, step, context, run.plan, run.operationId);
+            case "test": {
+                const outcome = await _stepRoll(step.type, step, context,
+                    run.plan, run.operationId);
+                // AimedUntil: a taken shot consumes the combatant `aim`
+                // flag so the bonus never applies twice (issue #15).
+                if (outcome.ok && step.type === "attack"
+                    && typeof run.combatant?.unsetFlag === "function") {
+                    try {
+                        await run.combatant.unsetFlag(MODULE_ID, FLAG_KEYS.aim);
+                    } catch(err) {
+                        // Flag cleanup is best-effort — the shot already landed.
+                    }
+                }
+                return outcome;
+            }
+            case "aim":
+                return _stepAim(step, context, run);
+            case "reload":
+                return _stepReload(step, context, run);
             case "overwatch":
                 return _stepOverwatch(step, context, run);
             case "end-turn":

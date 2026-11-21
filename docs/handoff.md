@@ -16,15 +16,23 @@
 - `8066030` — smoke-лазганы S/2/- (очереди стали доступны).
 - `a46485d` — blast-awareness: aim-точки, вето своих, memory-strike.
 - `0711716` — `docs/capabilities.md`.
+- `0aa7662` — #14 (ветка `feature/templates-14`): step-контракт
+  `targetPoint`/`template`/`suppressionFire`, spray и suppressing_fire с
+  конусным прицеливанием, заявочный overwatch + GM-only конус.
+- `feature/action-economy-15` — #15: бюджет 2×half и вето move+full,
+  aim-attack/aim-standalone с переносом `aimedUntil` (флаг `aim` на
+  combatant), `reload` через `api.actions.reload`, overwatch-кандидат,
+  веса `aim`/`aimAlone`/`reload`/`overwatch` в пресетах.
 
 ## Открытые issues (эпик #363)
 
-- **#14** — шаблоны в plan-step: spray-оружие, `suppressing_fire`,
-  GM-only overwatch-конусы.
-- **#15** — экономия действий: aim/overwatch/reload, half-actions.
+- ~~**#14**~~ — реализовано на `feature/templates-14` (`0aa7662`).
+- ~~**#15**~~ — реализовано на `feature/action-economy-15` (поверх
+  `feature/templates-14`).
 - Системная сторона: `rolls.executeDamage`/`applyDamage`/`evasionTest` —
   обсуждалось, issue ещё НЕ заведено (модуль кидает только тест
-  попадания — урон/уворот ручные).
+  попадания — урон/уворот ручные). Авто-реакция бота (триггер
+  overwatch) — следующая точка расширения.
 
 ## Не проверено вживую (риски перед main)
 
@@ -46,7 +54,7 @@ RoF очередей. Надо:
 - Модуль: `OnlyWarAIModule`, ветка `feature/integration-ai`.
 - Deploy: копирование `scripts/`+`languages/` в
   `%LOCALAPPDATA%\FoundryVTT\Data\modules\only-war-ai`.
-- Юниты: `npm run test:unit` (296/296), `npm run check` (42 файла),
+- Юниты: `npm run test:unit` (322/322), `npm run check` (46 файлов),
   `npx eslint scripts/`.
 - Live: Playwright CDP (`tests/foundry-e2e/smoke/`): `setup-smoke.mjs`
   строит мир (Smoke Arena, 4000×3000, grid 100px=1м, стены/двери/укрытия),

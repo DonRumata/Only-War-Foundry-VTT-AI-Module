@@ -90,7 +90,11 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     attackType: 0.15,
     vulnerable: 1,
     meleeEngage: 3,
-    area: 5
+    area: 5,
+    aim: 2,
+    aimAlone: 0.5,
+    reload: 3,
+    overwatch: 1
 });
 
 /**
@@ -172,7 +176,9 @@ export const SPEC_OPS_SOLO_WEIGHTS = Object.freeze({
 });
 
 /** Candidate variants whose action produces an attack/test step. */
-const ATTACK_VARIANTS = new Set(["attack-in-place", "move-attack", "charge"]);
+const ATTACK_VARIANTS = new Set([
+    "attack-in-place", "move-attack", "charge", "aim-attack"
+]);
 
 /**
  * Numeric helper: value when finite, otherwise fallback.

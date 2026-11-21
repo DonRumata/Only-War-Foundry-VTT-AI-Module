@@ -269,10 +269,11 @@ test("sufficient current position attacks without moving", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "attack-in-place");
-    assert.equal(plan.steps.length, 2);
-    assert.equal(plan.steps[0].type, "attack");
-    assert.equal(plan.steps[0].input.actionId, "lasgun");
+    // A sufficient position attacks in place — plain or aimed (issue #15).
+    assert.ok(["attack-in-place", "aim-attack"].includes(plan.breakdown.variant));
+    const attack = plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "attack step exists");
+    assert.equal(attack.input.actionId, "lasgun");
     assert.ok(plan.steps.every(step => step.type !== "move"));
 });
 
@@ -321,9 +322,12 @@ test("blocked shot with no firing endpoint falls back, never fires blind", async
         actions: [RANGED_ACTION]
     });
 
-    assert.equal(result.status, PLANNER_STATUS.noAction);
-    assert.equal(result.plan, null);
-    assert.ok(result.diagnostics.rejected.some(entry =>
+    // Issue #15: instead of firing blind or ending bare, the NPC aims
+    // down the corridor — the blocked shot stays vetoed and recorded.
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const plan = result.plan;
+    assert.ok(plan.steps.every(step => step.type !== "attack"), "no blind shot");
+    assert.ok(plan.diagnostics.rejected.some(entry =>
         entry.reason === RANGED_COVER_VETO_NO_LOS));
 });
 
@@ -452,10 +456,9 @@ test("aim action availability marks attack-in-place plans", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "attack-in-place");
+    assert.ok(["attack-in-place", "aim-attack"].includes(plan.breakdown.variant));
     assert.equal(plan.breakdown.aimAvailable, true);
-    assert.equal(plan.breakdown.factors.aimOpportunity, 1);
-    assert.ok(plan.breakdown.contributions.aimOpportunity > 0);
+    assert.ok(plan.steps.some(step => step.type === "attack"));
 });
 
 test("planTurn is deterministic for identical input and seed", async () => {

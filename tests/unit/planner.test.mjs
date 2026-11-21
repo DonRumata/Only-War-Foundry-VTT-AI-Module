@@ -14,6 +14,7 @@ import {
     evaluateFactors,
     mulberry32
 } from "../../scripts/planner.js";
+import { registerAssaultPreset } from "../../scripts/presets/assault.js";
 import {
     freezeDeep,
     makeActor,
@@ -170,6 +171,9 @@ test("blast aim produces a targetPoint attack step covering the hostile", async 
         ]
     });
     const planner = createPlannerService();
+    // The real assault preset weights `area` so the blast weapon beats a
+    // plain rifle deterministically (skeleton weights tie all variants).
+    registerAssaultPreset(planner);
     const result = await planner.planTurn(world.combat, world.combatant, context);
     assert.equal(result.status, PLANNER_STATUS.ok);
     const attack = result.plan.steps.find(step => step.type === "attack");
@@ -206,12 +210,14 @@ test("neutrals veto blast aim unless includeNeutral marks them as targets", asyn
 
     const strict = makeBlastContext({ blastTokens: [neutral, hostile], includeNeutral: false });
     const strictPlanner = createPlannerService();
+    registerAssaultPreset(strictPlanner);
     const strictResult = await strictPlanner.planTurn(strict.world.combat, strict.world.combatant, strict.context);
     const strictAttack = strictResult.plan?.steps.find(step => step.type === "attack");
     assert.notEqual(strictAttack?.input.actionId, "frag");
 
     const allowed = makeBlastContext({ blastTokens: [neutral, hostile], includeNeutral: true });
     const allowedPlanner = createPlannerService();
+    registerAssaultPreset(allowedPlanner);
     const allowedResult = await allowedPlanner.planTurn(allowed.world.combat, allowed.world.combatant, allowed.context);
     const allowedAttack = allowedResult.plan?.steps.find(step => step.type === "attack");
     assert.equal(allowedAttack?.input.actionId, "frag");
@@ -230,6 +236,7 @@ test("blast memory strike hits a last-known position without live LOS", async ()
         source: "last-known"
     }];
     const planner = createPlannerService();
+    registerAssaultPreset(planner);
     const result = await planner.planTurn(world.combat, world.combatant, context);
     assert.equal(result.status, PLANNER_STATUS.ok);
     const attack = result.plan.steps.find(step => step.type === "attack");
@@ -278,7 +285,9 @@ test("planTurn produces an ok plan with move/attack/end-turn serializable steps"
     assert.ok(plan.snapshot.target);
     assert.equal(plan.snapshot.target.tokenId, world.enemies[0].token.id);
     assert.ok(typeof plan.snapshot.revision === "string" && plan.snapshot.revision.length > 0);
-    assert.ok(plan.steps.every(step => ["move", "attack", "test", "end-turn"].includes(step.type)));
+    assert.ok(plan.steps.every(step => [
+        "move", "attack", "test", "aim", "reload", "overwatch", "end-turn"
+    ].includes(step.type)));
     assert.equal(plan.steps.at(-1).type, "end-turn");
     assert.ok(plan.steps.some(step => step.type === "attack"));
 });
@@ -403,15 +412,27 @@ test("planTurn returns no-action when no usable action exists", async () => {
     assert.equal(result.status, PLANNER_STATUS.noAction);
 });
 
-test("planTurn returns no-route when a far target cannot be reached", async () => {
+test("planTurn falls back to aim when a far target cannot be reached", async () => {
+    // Issue #15: an unreachable target no longer forces a bare no-route —
+    // the economy offers utility turns (aim for the next engagement).
     const world = makeWorld({ enemies: [{ x: 90000, y: 0 }] });
     const planner = createPlannerService();
+    registerAssaultPreset(planner);
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 1,
         moves: []
     });
-    assert.equal(result.status, PLANNER_STATUS.noRoute);
-    assert.equal(result.reason, "no-route");
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const types = result.plan.steps.map(step => step.type);
+    assert.ok(types.some(type => type === "aim" || type === "overwatch"));
+    assert.ok(!types.includes("move"), "no move toward the unreachable target");
+    // Without a usable attack action there is still a controlled no-route.
+    const bare = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        moves: [],
+        actions: [{ id: "none", type: "test", name: "Stub test" }]
+    });
+    assert.equal(bare.status, PLANNER_STATUS.noRoute);
 });
 
 test("planTurn rejects gridless scenes with a controlled unsupported result", async () => {
