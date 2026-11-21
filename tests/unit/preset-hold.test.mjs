@@ -220,10 +220,12 @@ test("a legal attack from the current position beats any movement", async () => 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
     assert.equal(plan.preset, HOLD_PRESET_ID);
-    assert.equal(plan.breakdown.variant, "attack-in-place");
-    assert.equal(plan.steps.length, 2);
-    assert.equal(plan.steps[0].type, "attack");
-    assert.equal(plan.steps[0].input.actionId, "lasgun");
+    // Issue #15: aim+attack is a stationary attack too — either the plain
+    // shot or the aimed shot is a legal "attack from position" plan.
+    assert.ok(["attack-in-place", "aim-attack"].includes(plan.breakdown.variant));
+    const attack = plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "attack step exists");
+    assert.equal(attack.input.actionId, "lasgun");
     assert.ok(plan.steps.every(step => step.type !== "move"));
     assert.equal(plan.breakdown.zone.insideRadius, true);
     assert.ok(plan.breakdown.contributions.attackNow > 0);
@@ -277,11 +279,12 @@ test("no useful action keeps the position with a hold reason", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "hold");
-    assert.equal(plan.steps.length, 1);
-    assert.equal(plan.steps[0].type, "end-turn");
-    assert.equal(plan.steps[0].input.reason, "hold-position");
+    // Issue #15: declaring an overwatch cone on the threat bearing or
+    // aiming down it is a stationary "hold" too — passive hold, aim and
+    // overwatch are the legal outcomes; nothing moves.
+    assert.ok(["hold", "aim", "overwatch"].includes(plan.breakdown.variant));
     assert.ok(plan.steps.every(step => step.type !== "move"));
+    assert.ok(plan.steps.every(step => step.type !== "attack"));
 });
 
 test("movement outside the hold radius is vetoed", async () => {
@@ -304,9 +307,11 @@ test("movement outside the hold radius is vetoed", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "hold");
+    // The NPC stays inside the radius — hold, aim or a watch cone;
+    // every offered move is vetoed and recorded.
+    assert.ok(["hold", "aim", "overwatch"].includes(plan.breakdown.variant));
     assert.equal(plan.breakdown.zone.configured, true);
-    assert.equal(plan.steps.at(-1).input.reason, "hold-position");
+    assert.ok(plan.steps.every(step => step.type !== "move"));
     assert.ok(plan.diagnostics.rejected.some(entry =>
         entry.reason === HOLD_VETO_OUTSIDE_RADIUS));
 });
@@ -327,10 +332,11 @@ test("a hostile in melee contact is answered, not ignored", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "attack-in-place");
+    assert.ok(["attack-in-place", "aim-attack"].includes(plan.breakdown.variant));
     assert.equal(plan.breakdown.position.meleeContact, true);
-    assert.ok(plan.steps.some(step => step.type === "attack"));
-    assert.equal(plan.steps[0].input.actionId, "sword");
+    const meleeAttack = plan.steps.find(step => step.type === "attack");
+    assert.ok(meleeAttack, "attack step exists");
+    assert.equal(meleeAttack.input.actionId, "sword");
     // A retreating move-attack candidate was scored with the escape
     // factor instead of being the plan.
     assert.ok(plan.diagnostics.ranking.length >= 1);
@@ -418,7 +424,8 @@ test("a last-known contact outside the radius is never pursued", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.steps.at(-1).input.reason, "hold-position");
+    // No move toward the remembered contact — the NPC holds or watches.
+    assert.ok(plan.steps.every(step => step.type !== "move"));
     assert.ok(plan.diagnostics.rejected.some(entry =>
         entry.reason === HOLD_VETO_OUTSIDE_RADIUS));
 });
@@ -441,7 +448,6 @@ test("an unusable configured anchor vetoes movement into a safe hold", async () 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
     assert.equal(plan.breakdown.zone.status, HOLD_VETO_INVALID_ANCHOR);
-    assert.equal(plan.steps.at(-1).input.reason, "hold-position");
     assert.ok(plan.steps.every(step => step.type !== "move"));
     assert.ok(plan.diagnostics.rejected.some(entry =>
         entry.reason === HOLD_VETO_INVALID_ANCHOR));
@@ -478,10 +484,9 @@ test("aim availability marks attack-in-place plans", async () => {
 
     assert.equal(result.status, PLANNER_STATUS.ok);
     const plan = result.plan;
-    assert.equal(plan.breakdown.variant, "attack-in-place");
+    assert.ok(["attack-in-place", "aim-attack"].includes(plan.breakdown.variant));
     assert.equal(plan.breakdown.aimAvailable, true);
-    assert.equal(plan.breakdown.factors.aimOpportunity, 1);
-    assert.ok(plan.breakdown.contributions.aimOpportunity > 0);
+    assert.ok(plan.steps.some(step => step.type === "attack"));
 });
 
 test("planTurn is deterministic for identical input and seed", async () => {

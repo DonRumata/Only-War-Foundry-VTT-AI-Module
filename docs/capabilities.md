@@ -141,13 +141,42 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Suppression — только из текущей позиции (длительная зона); spray может
   идти после move-attack (прицел пересчитывается с конца маршрута).
 
+#### Экономия действий (issue #15)
+
+- Бюджет хода — две half-actions: `cost` из `actions.list` нормализуется
+  в half-единицы (`"half"|1` → 1, `"full"|2`/числа → 2, без поля — 1).
+  Full-действие после движения запрещено (`full-after-move` в
+  diagnostics); half+half — легально.
+- `aim` — universal-действие: явные `kind:"aim"` записи из API берут
+  собственный бонус, иначе синтезируются `aim.half` (+10) и `aim.full`
+  (+20). `aim-attack` — half aim + half-атака за один ход; шаг `aim`
+  бронирует бонус в `input.aim` атаки. Standalone `aim` (полный ход) —
+  только при видимом контакте и ranged-оружии, пишет бонус во флаг
+  `flags["only-war-ai"].aim` (aimedUntil): он переносится на атаку
+  следующего хода и снимается executor'ом после выстрела. Переприцел на
+  равный/меньший бонус не планируется.
+- `reload` — `kind:"reload"` записи `actions.list`: шаг `reload` идёт
+  через `api.actions.reload` со step-scoped `operationId`
+  (идемпотентно); `move-reload` допустим при half-стоимости.
+- `overwatch` — кандидат объявляет конус 45° на видимую угрозу через
+  сервис из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
+  На last-known контакт конус не объявляется.
+- Статусы: pinned запрещает движение, standalone aim, overwatch и
+  move-reload — стационарные reload/attack-in-place остаются.
+- Веса пресетов: `aim` (прицельный выстрел), `aimAlone` (standalone aim —
+  ниже легальных атак), `reload`, `overwatch`. Направленности: assault —
+  перезарядка без прицелов; rangedCover/hold — aim-ветка и конус;
+  specOps — умеренно.
+
 ### Executor (issue #407)
 
 - Шаги плана последовательно: `move` — `TokenDocument#move` по
   сериализованным waypoints (fallback `update({x,y})`); `attack`/`test` —
   `prepare*`/`execute*` системного API со step-scoped `operationId`;
-  `overwatch` — заявка конуса через сервис overwatch (флаг Combatant +
-  GM-only конус на сцене, реакция — ручная у GM).
+  `aim` — флаг aimedUntil на combatant (снимается после выстрела);
+  `reload` — `api.actions.reload`; `overwatch` — заявка конуса через
+  сервис overwatch (флаг Combatant + GM-only конус на сцене, реакция —
+  ручная у GM).
 - Безопасность: перед каждым шагом `validateSnapshot`; stale → один
   replan; повторный stale — hold-and-report. Без контроллера — `not-controller`.
 - Продвижение хода: сериализовано по боевому `id`, ключи `(round,turn)`,
@@ -203,8 +232,9 @@ disposition-матрица).
 |---|---|
 | Урон/уворот/пари | Только тест попадания — урона/реакции нет (нужны `rolls.executeDamage`/`applyDamage`/`evasionTest` в системе) |
 | `suppressing_fire`, spray-оружие (огнемёты) | Поддержано: `template.direction` + вето союзников (issue #14) |
-| Overwatch-конусы | Заявка + GM-only отрисовка есть; авто-реакция и выбор в плане — **issue #15** |
-| Aim, half/full экономия, reload-шаг, реакции | Не моделируется — **issue #15** (`actions.reload` в системе уже есть) |
+| Overwatch-конусы | Заявка в плане + GM-only отрисовка есть (issues #14/#15); авто-реакция — нет |
+| Aim, half/full экономия, reload-шаг | Реализовано (issue #15): бюджет 2×half, `aim`/`aim-attack` с aimedUntil-флагом, `reload` через `api.actions.reload` |
+| Реакции бота (overwatch-триггер, авто-уворот) | Нет — реакцию объявляет конус, но исполняет её GM вручную |
 | Гранаты на союзников | Нет (`blast-friendly-fire` вето); на нейтралов — только при `includeNeutral` |
 | GM «подтвердить команду/раунд» | Нет — только per-бот preview |
 | Нейтральный бот (disp 0) | Считает враждебными всех — ставить корректную disposition |
@@ -217,9 +247,10 @@ disposition-матрица).
 - ~~Issue #14~~ — реализовано: step-контракт `targetPoint`/`template`,
   spray и `suppressing_fire` с конусным прицеливанием, заявочный
   overwatch (флаг + GM-only конус).
-- **Issue #15** — модель действий: aim/overwatch/reload, half+half,
-  перенос aim-бонуса, реакции. Системный `actions.reload` уже готов
-  (PR #440).
+- ~~Issue #15~~ — реализовано: бюджет half+half и вето move+full, aim
+  (+10/+20) с переносом `aimedUntil`-бонуса, `reload` через
+  `api.actions.reload` (PR #440), заявочный `overwatch`-кандидат.
+  Авто-реакция остаётся точкой расширения (нужны триггеры в системе).
 - **Системное расширение #398** — `rolls.executeDamage`,
   `rolls.applyDamage`, `rolls.evasionTest` — замыкает боевой цикл
   «попадание → урон → применение» и авто-реакцию AI-защитника.

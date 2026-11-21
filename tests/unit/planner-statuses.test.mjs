@@ -279,8 +279,11 @@ test("pinned vetoes a closing move-attack but keeps attack-in-place", async () =
         selfStatuses: ["pinned"]
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
-    // Attack-in-place stays legal — no move step is emitted.
-    assert.deepEqual(result.plan.steps.map(step => step.type), ["attack", "end-turn"]);
+    // Attack-in-place stays legal — no move step is emitted; the
+    // issue-#15 aim+attack pair is an equally legal pinned plan.
+    const types = result.plan.steps.map(step => step.type);
+    assert.ok(!types.includes("move"), "no move step for pinned");
+    assert.ok(types.includes("attack"), "attack step kept");
     assert.ok(result.plan.diagnostics.rejected.some(
         r => r.candidate.startsWith("move-attack|") && r.reason === "pinned"
     ));

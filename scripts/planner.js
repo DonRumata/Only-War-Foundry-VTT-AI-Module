@@ -21,7 +21,7 @@
  *   replans per turn; after the budget is spent the AI holds and reports
  *   a diagnostic reason for the GM instead of acting on stale state.
  */
-import { FALLBACK_PRESET } from "./constants.js";
+import { FALLBACK_PRESET, FLAG_KEYS, MODULE_ID } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import { logDiagnostics } from "./settings.js";
 
@@ -53,7 +53,12 @@ export const STALE_REASONS = Object.freeze({
 });
 
 /** Serializable action step types allowed inside a plan. */
-export const STEP_TYPES = Object.freeze(["move", "attack", "test", "end-turn"]);
+export const STEP_TYPES = Object.freeze([
+    "move", "attack", "test", "aim", "reload", "overwatch", "end-turn"
+]);
+
+/** Half-action units available to a combatant per turn (issue #15). */
+export const ACTION_BUDGET_HALVES = 2;
 
 /** Reasons that justify rebuilding the snapshot and replanning once. */
 export const REPLAN_REASONS = Object.freeze(new Set([
@@ -110,7 +115,11 @@ export const SCORE_FACTORS = Object.freeze([
     "vulnerable",
     "engaged",
     "meleeEngage",
-    "area"
+    "area",
+    "aim",
+    "aimAlone",
+    "reload",
+    "overwatch"
 ]);
 
 /**
@@ -137,7 +146,11 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     vulnerable: 0,
     engaged: 0,
     meleeEngage: 0,
-    area: 0
+    area: 0,
+    aim: 0,
+    aimAlone: 0.5,
+    reload: 3,
+    overwatch: 0
 });
 
 /**
@@ -157,7 +170,9 @@ export const PRESET_SKELETONS = Object.freeze({
             cover: 4,
             los: 3,
             holdPosition: 1,
-            advance: 0.5
+            advance: 0.5,
+            aim: 2,
+            overwatch: 2
         })
     }),
     hold: Object.freeze({
@@ -167,7 +182,9 @@ export const PRESET_SKELETONS = Object.freeze({
             holdPosition: 4,
             threat: 1,
             proximity: 0.5,
-            advance: -1
+            advance: -1,
+            aim: 3,
+            overwatch: 2
         }),
         allowNoTarget: true,
         allowNoAction: true,
@@ -181,7 +198,9 @@ export const PRESET_SKELETONS = Object.freeze({
             proximity: 1.5,
             los: 2,
             cover: 1,
-            lastKnown: 1
+            lastKnown: 1,
+            aim: 2,
+            overwatch: 1
         }),
         allowNoAction: true
     })
@@ -643,15 +662,22 @@ function _isChargeAction(action) {
 }
 
 /**
- * Action-economy cost of an action candidate: a bare number, an object
- * with an `actions` field, or the default single action.
+ * Action-economy cost of an action candidate in half-action units
+ * (issue #15): `"half"` → 1, `"full"` → 2, `"free"` → 0, numbers and
+ * `{halves|actions}` objects pass through, default is one half action.
  * @param {object|null} action Normalized action candidate.
  * @returns {number}
  */
 function _actionCost(action) {
     const cost = action?.cost;
+    if (cost === "half") return 1;
+    if (cost === "full") return 2;
+    if (cost === "free") return 0;
     if (Number.isFinite(cost)) return cost;
-    if (cost && typeof cost === "object") return _finiteOr(cost.actions, 1);
+    if (cost && typeof cost === "object") {
+        if (Number.isFinite(cost.halves)) return cost.halves;
+        if (Number.isFinite(cost.actions)) return cost.actions;
+    }
     return 1;
 }
 
@@ -1428,12 +1454,16 @@ function _normalizeAction(raw, index) {
     if (!raw || typeof raw !== "object") return null;
     if (raw.available === false) return null;
     const kind = raw.kind ?? raw.type ?? null;
-    const attackLike = kind === "attack" || raw.attack === true || raw.itemUuid != null
-        || raw.weapon != null || raw.weaponId != null || raw.attackType != null;
+    // Non-attack action kinds (aim/reload) are kept as auxiliary entries —
+    // they never become attack candidates (issue #15).
     let type;
-    if (attackLike) type = "attack";
-    else if (kind === "test" || kind === null || raw.test === true) type = "test";
-    else return null; // Movement/aim/etc are not attack/test candidates.
+    if (kind === "aim" || raw.aim === true) type = "aim";
+    else if (kind === "reload") type = "reload";
+    else if (kind === "attack" || raw.attack === true || raw.itemUuid != null
+        || raw.weapon != null || raw.weaponId != null || raw.attackType != null) {
+        type = "attack";
+    } else if (kind === "test" || kind === null || raw.test === true) type = "test";
+    else return null;
     const id = typeof raw.id === "string" && raw.id ? raw.id : `action-${index}`;
     const cls = raw.class ?? raw.system?.class ?? null;
     const attackType = typeof raw.attackType === "string" ? raw.attackType : null;
@@ -1457,9 +1487,11 @@ function _normalizeAction(raw, index) {
         requirements: Array.isArray(raw.requirements) ? raw.requirements.slice() : [],
         spray: raw.spray === true || raw.traits?.spray === true,
         rateOfFire: raw.rateOfFire ?? raw.system?.rateOfFire ?? null,
-        cost: typeof raw.cost === "string"
-            ? { actions: raw.cost === "free" ? 0 : 1 }
-            : (raw.cost ?? null)
+        aim: Number.isFinite(raw.aim) ? raw.aim
+            : (Number.isFinite(raw.modifier) ? raw.modifier : null),
+        reload: raw.reload ?? null,
+        spans: Number.isFinite(raw.spans) ? raw.spans : null,
+        cost: raw.cost ?? null
     };
 }
 
@@ -1596,6 +1628,74 @@ function _curateAttackTypes(group) {
         .filter((entry, position) => position < MAX_ATTACK_TYPES_PER_WEAPON
             || entry.action.attackType === "suppressing_fire")
         .map(entry => entry.action);
+}
+
+/**
+ * Aim action entries for the action economy (issue #15). When the system
+ * API or injected list exposes `kind:"aim"` records they pass through
+ * with their own modifier; otherwise the universal Only War defaults are
+ * synthesized — half aim (+10, one half action) and full aim (+20, a
+ * full action).
+ * @param {object[]} actions Normalized action entries.
+ * @returns {object[]}
+ */
+function _aimActions(actions) {
+    const found = (actions ?? []).filter(action => action.type === "aim");
+    if (found.length) return found;
+    return [
+        { id: "aim.half", type: "aim", aim: 10, name: "Aim",
+            cost: "half", synthesized: true },
+        { id: "aim.full", type: "aim", aim: 20, name: "Aim",
+            cost: "full", synthesized: true }
+    ];
+}
+
+/**
+ * Pick the overwatch weapon: the longest-range non-cone, non-blast ranged
+ * attack action. Deterministic tiebreak by action id.
+ * @param {object[]} actions Normalized attack actions.
+ * @returns {object|null}
+ */
+function _overwatchAction(actions) {
+    const ranged = (actions ?? []).filter(action => action.type === "attack"
+        && !_isMeleeAction(action)
+        && _actionBlastRadius(action) <= 0
+        && !_coneSpecOf(action)
+        && _actionRange(action) > 0);
+    if (!ranged.length) return null;
+    return [...ranged].sort((a, b) => (_actionRange(b) - _actionRange(a))
+        || String(a.id).localeCompare(String(b.id)))[0];
+}
+
+/**
+ * Nearest known threat: visible attackable targets win; when nothing is
+ * visible the nearest last-known contact gives the overwatch bearing.
+ * @param {object[]} targets Normalized targets.
+ * @param {{x: number|null, y: number|null}} selfPos
+ * @param {object} grid Normalized grid info.
+ * @returns {object|null}
+ */
+function _nearestThreat(targets, selfPos, grid) {
+    const list = (targets ?? []).filter(target => Number.isFinite(target?.x)
+        && Number.isFinite(target?.y));
+    if (!list.length) return null;
+    const key = target => Number.isFinite(target.distance) ? target.distance
+        : (_pixelDistance(selfPos, target, grid) ?? Infinity);
+    const visible = list.filter(target => target.canAttack === true);
+    const pool = visible.length ? visible : list;
+    return pool.reduce((best, target) => (key(target) < key(best) ? target : best), pool[0]);
+}
+
+/**
+ * Compass bearing (0-360, degrees) from self to a target point.
+ * @param {{x: number|null, y: number|null}} from
+ * @param {{x: number|null, y: number|null}} to
+ * @returns {number|null}
+ */
+function _bearingTo(from, to) {
+    if (!Number.isFinite(from?.x) || !Number.isFinite(from?.y)
+        || !Number.isFinite(to?.x) || !Number.isFinite(to?.y)) return null;
+    return (((Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI) + 360) % 360;
 }
 
 /**
@@ -1754,7 +1854,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
-    const attackNow = variant === "attack-in-place" && canAttack ? 1 : 0;
+    const attackNow = (variant === "attack-in-place" || variant === "aim-attack")
+        && canAttack ? 1 : 0;
     const attackAfterMove = (variant === "move-attack" || variant === "charge") && canAttack ? 1 : 0;
     let advance = 0;
     if (move && !move.stay && Number.isFinite(targetDistance) && targetDistance > 0
@@ -1766,7 +1867,10 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         : 0;
     const los = target?.source === "visible" || move?.los === true ? 1 : 0;
     const cover = Math.max(0, Math.min(1, _finiteOr(move?.cover, 0)));
-    const holdPosition = variant === "hold" || variant === "attack-in-place" || move?.stay === true ? 1 : 0;
+    const stationary = variant === "hold" || variant === "attack-in-place"
+        || variant === "aim-attack" || variant === "aim"
+        || variant === "reload" || variant === "overwatch";
+    const holdPosition = stationary || move?.stay === true ? 1 : 0;
     const budget = Number.isFinite(moveBudget) && moveBudget > 0 ? moveBudget : null;
     const budgetOver = budget !== null && move
         ? Math.max(0, (_finiteOr(move.cost, 0) - budget) / budget)
@@ -1801,7 +1905,16 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         meleeEngage: melee * engaged,
         // Blast coverage: 1+ hostiles under the template; a presumed
         // last-known strike counts 0.5 of a confirmed two-target hit.
-        area: Math.min(_finiteOr(blastHits, 0) / 2, 1)
+        area: Math.min(_finiteOr(blastHits, 0) / 2, 1),
+        // Action-economy markers (issue #15): an aimed attack spends the
+        // whole budget for a +10/+20 bonus; reload/overwatch are the
+        // utility turns of a dry clip or a held position.
+        // `aim` marks the aimed shot; `aimAlone` the standalone full-aim
+        // turn — presets weight it low so aiming never beats a legal shot.
+        aim: variant === "aim-attack" ? 1 : 0,
+        aimAlone: variant === "aim" ? 1 : 0,
+        reload: (variant === "reload" || variant === "move-reload") ? 1 : 0,
+        overwatch: variant === "overwatch" ? 1 : 0
     };
 }
 
@@ -1846,17 +1959,39 @@ function _seededPick(tied, seed) {
 }
 
 /** Candidate variants that produce an attack/test step. */
-const ATTACK_VARIANTS = Object.freeze(new Set(["attack-in-place", "move-attack", "charge"]));
+const ATTACK_VARIANTS = Object.freeze(new Set([
+    "attack-in-place", "move-attack", "charge", "aim-attack"
+]));
 
 /**
  * Serialize a plan candidate variant into executable action steps.
  * @param {object} input Step input.
  * @param {object} input.candidate Winning scored candidate.
+ * @param {number|null} [input.carriedAim] Aim bonus carried by the
+ *   combatant `aim` flag from a previous turn; attached to attack steps.
  * @returns {object[]}
  */
-function _stepsFor({ candidate }) {
+function _stepsFor({ candidate, carriedAim = null }) {
     const steps = [];
     const { target, move, action, variant } = candidate;
+    // Issue #15: an `aim` step books the aim bonus — for `aim-attack`
+    // plans it is consumed by the attack step of the same turn, for a
+    // standalone `aim` variant the executor persists it on the combatant
+    // flag until the next attack (aimedUntil).
+    if (variant === "aim-attack" || variant === "aim") {
+        steps.push({
+            id: `step-aim-${steps.length + 1}`,
+            type: "aim",
+            cost: { halves: variant === "aim" ? _actionCost(action) : 1 },
+            input: {
+                actionId: action?.id ?? null,
+                name: action?.name ?? "Aim",
+                aim: candidate.aimBonus ?? action?.aim ?? 10
+            },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
+        });
+    }
     if (move && !move.stay) {
         steps.push({
             id: `step-move-${steps.length + 1}`,
@@ -1876,7 +2011,7 @@ function _stepsFor({ candidate }) {
         steps.push({
             id: `step-${action.type === "attack" ? "attack" : "test"}-${steps.length + 1}`,
             type: action.type === "attack" ? "attack" : "test",
-            cost: { actions: 1 },
+            cost: { halves: _actionCost(action) },
             input: {
                 actionId: action.id,
                 name: action.name,
@@ -1886,6 +2021,9 @@ function _stepsFor({ candidate }) {
                 range: _actionRange(action),
                 ...(action.attackType ? { attackType: action.attackType } : {}),
                 ...(variant === "charge" ? { mode: "charge" } : {}),
+                ...(candidate.aimBonus != null
+                    ? { aim: candidate.aimBonus }
+                    : (Number.isFinite(carriedAim) ? { aim: carriedAim } : {})),
                 ...(candidate.aim
                     ? { targetPoint: { x: candidate.aim.x, y: candidate.aim.y } }
                     : {}),
@@ -1904,6 +2042,47 @@ function _stepsFor({ candidate }) {
             },
             preconditions: ["turn", "target", "resources"],
             projectedResourceDelta: action.type === "attack" ? { ammo: -1 } : {}
+        });
+    }
+    // Issue #15: `reload` executes through `api.actions.reload`; the step
+    // carries the weapon reference — the system picks the magazine swap
+    // when `magazineItemId` is left unset.
+    if (variant === "reload" || variant === "move-reload") {
+        steps.push({
+            id: `step-reload-${steps.length + 1}`,
+            type: "reload",
+            cost: { halves: _actionCost(action) },
+            input: {
+                actionId: action.id,
+                name: action.name,
+                weaponId: action.itemId ?? null,
+                itemUuid: action.itemUuid ?? null,
+                spans: action.spans ?? null
+            },
+            preconditions: ["turn", "resources"],
+            projectedResourceDelta: {}
+        });
+    }
+    // Issue #15: `overwatch` declares a GM-rendered cone through the
+    // overwatch service (issue #14); no roll is made.
+    if (variant === "overwatch") {
+        steps.push({
+            id: `step-overwatch-${steps.length + 1}`,
+            type: "overwatch",
+            cost: { halves: ACTION_BUDGET_HALVES },
+            input: {
+                actionId: action.id,
+                name: action.name,
+                weaponId: action.itemId ?? null,
+                itemUuid: action.itemUuid ?? null,
+                attackType: action.attackType ?? "standard",
+                direction: candidate.direction,
+                arc: 45,
+                range: _actionRange(action),
+                targetTokenUuid: target?.tokenUuid ?? null
+            },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
         });
     }
     steps.push({
@@ -2100,7 +2279,23 @@ export function createPlannerService({
             };
         }
 
-        const actions = await _resolveActions(actor, context);
+        const allActions = await _resolveActions(actor, context);
+        // Issue #15: aim and reload entries are auxiliary actions — they
+        // join the budget economy but never become attack candidates.
+        const aimActions = _aimActions(allActions);
+        const aimHalfAction = aimActions.find(action => _actionCost(action) === 1) ?? null;
+        const aimFullAction = aimActions.find(action => _actionCost(action) >= 2)
+            ?? aimHalfAction;
+        const reloadActions = allActions.filter(action => action.type === "reload");
+        const actions = allActions.filter(action => action.type === "attack"
+            || action.type === "test");
+        // AimedUntil: a combatant `aim` flag left by a previous full-aim
+        // turn is consumed by this turn's attack step. Re-aiming only
+        // makes sense when it raises the booked bonus.
+        const carriedAim = _finiteOr(
+            planContext.carriedAim,
+            combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.aim)?.bonus ?? null
+        );
         // `maxActions` bounds weapons, not action rows: curated attack
         // types of one weapon must not crowd other weapons out.
         const actionGroups = new Map();
@@ -2128,7 +2323,7 @@ export function createPlannerService({
         const moveBudget = Number.isFinite(planContext.moveBudget)
             ? planContext.moveBudget
             : _finiteOr(planContext.moveBudget?.budget ?? planContext.moveBudget?.limit, null);
-        const actionBudget = _finiteOr(context.actionBudget, 1);
+        const actionBudget = _finiteOr(context.actionBudget, ACTION_BUDGET_HALVES);
         // Fallback approach points aim for the shortest usable range so a
         // melee-capable NPC keeps closing instead of stopping at gun range.
         const positiveRanges = usableActions
@@ -2243,6 +2438,20 @@ export function createPlannerService({
                                 blastHits: aim.hits
                             });
                             attackFound = true;
+                            // Half aim (+10) + a half-cost blast throw
+                            // fills the turn budget exactly. Skipped when
+                            // a carried aimedUntil bonus already matches
+                            // or beats the half-aim value.
+                            if (aimHalfAction && _actionCost(action) === 1
+                                && _finiteOr(aimHalfAction.aim, 10) > _finiteOr(carriedAim, 0)) {
+                                candidates.push({
+                                    target, action, move: null,
+                                    variant: "aim-attack",
+                                    aim: aim.point,
+                                    blastHits: aim.hits,
+                                    aimBonus: aimHalfAction.aim
+                                });
+                            }
                         } else {
                             rejectOnce(`blast|${tag}`, presumed === null
                                 ? "blast-no-safe-aim" : "blast-unclear-position");
@@ -2290,6 +2499,18 @@ export function createPlannerService({
                         candidates.push({ target, action, move: null, variant: "attack-in-place" });
                         inPlace = true;
                         attackFound = true;
+                        // Issue #15: aim.half (+10) + a half-cost attack
+                        // consumes the whole two-half budget — only
+                        // half-cost attack types qualify. Skipped when a
+                        // carried aimedUntil bonus is already as good.
+                        if (aimHalfAction && _actionCost(action) === 1
+                            && _finiteOr(aimHalfAction.aim, 10) > _finiteOr(carriedAim, 0)) {
+                            candidates.push({
+                                target, action, move: null,
+                                variant: "aim-attack",
+                                aimBonus: aimHalfAction.aim
+                            });
+                        }
                     } else {
                         diagnostics.rejected.push({
                             candidate: `attack-in-place|${tag}`,
@@ -2307,6 +2528,16 @@ export function createPlannerService({
                             // Moving into melee reach is a charge; any
                             // other move inside weapon range is move+attack.
                             const variant = melee ? "charge" : "move-attack";
+                            // Issue #15 action budget: a full-cost action
+                            // cannot follow a half move — move+full_auto
+                            // or move+allOut are illegal. The `charge`
+                            // attack type is the exception: its full
+                            // action already includes the move.
+                            if (_actionCost(action) >= 2
+                                && action.attackType !== "charge") {
+                                rejectOnce(`${variant}|${tag}`, "full-after-move");
+                                continue;
+                            }
                             // Pinned/prone veto charges outright; a
                             // sibling `charge` attack type owns the
                             // variant so other types skip it (dedup, not
@@ -2417,6 +2648,93 @@ export function createPlannerService({
             }
         }
 
+        // ---- Issue #15 action-economy candidates ----------------------
+
+        // Full aim (+20 on the next attack): a full action whose bonus
+        // persists on the combatant `aim` flag until the shot is taken
+        // (aimedUntil). Worth planning when no shot is available now or
+        // the preset explicitly prefers it.
+        const threatTarget = _nearestThreat(targets, selfPos, grid);
+        // Standalone aim only makes sense for a ranged loadout facing a
+        // live contact — for last-known memories a search move or an
+        // overwatch declaration is the meaningful turn instead.
+        const hasRangedAction = usableActions.some(action => action.type === "attack"
+            && !_isMeleeAction(action) && _actionRange(action) > 0);
+        if (!isPinned && aimFullAction && threatTarget?.canAttack === true
+            && hasRangedAction
+            && _finiteOr(aimFullAction.aim, 20) > _finiteOr(carriedAim, 0)) {
+            candidates.push({
+                variant: "aim",
+                action: aimFullAction,
+                aimBonus: aimFullAction.aim ?? 20,
+                target: threatTarget,
+                move: null
+            });
+        }
+
+        // Reload candidates for clip-fed weapons (`kind:"reload"` entries
+        // from the system `actions.list`). A half-cost reload may follow
+        // a half move (half+half budget); a full-cost reload stands alone.
+        if (reloadActions.length) {
+            let auxMoves = null;
+            for (const reload of reloadActions) {
+                const halves = _actionCost(reload);
+                if (halves > actionBudget) {
+                    diagnostics.rejected.push({
+                        candidate: `reload|${reload.id}`,
+                        reason: "over-budget"
+                    });
+                    continue;
+                }
+                candidates.push({
+                    variant: "reload",
+                    action: reload,
+                    target: threatTarget,
+                    move: null
+                });
+                if (halves > 1 || isPinned) continue;
+                if (auxMoves === null) {
+                    auxMoves = threatTarget
+                        ? _resolveMoves({
+                            tokenDoc, target: threatTarget, range: approachRange,
+                            selfPos,
+                            targetPos: { x: threatTarget.x, y: threatTarget.y },
+                            grid, navigation, perception, context: planContext
+                        })
+                        : [];
+                }
+                for (const move of auxMoves) {
+                    if (move.stay) continue;
+                    candidates.push({
+                        variant: "move-reload",
+                        action: reload,
+                        target: threatTarget,
+                        move
+                    });
+                }
+            }
+        }
+
+        // Overwatch: declare a 45° watch cone toward the nearest visible
+        // threat. The step only registers the declaration — the reaction
+        // shot itself stays under manual GM control (issue #14 service,
+        // #15 candidate). For memory-only contacts a search move or a
+        // hold is the better turn — no cone is declared on a guess.
+        if (!isPinned) {
+            const owAction = _overwatchAction(usableActions);
+            const owDirection = threatTarget?.canAttack === true
+                ? _bearingTo(selfPos, threatTarget) : null;
+            if (owAction && Number.isFinite(owDirection)) {
+                candidates.push({
+                    variant: "overwatch",
+                    action: owAction,
+                    target: threatTarget,
+                    move: null,
+                    direction: owDirection
+                });
+            }
+        }
+
         if (preset.alwaysOfferHold === true) {
             candidates.push({ variant: "hold", target: targets[0] ?? null, action: null, move: null });
         }
@@ -2450,6 +2768,12 @@ export function createPlannerService({
             navigation,
             resolvedTargets: targets,
             usableActions,
+            // Issue #15: presets check `aimAvailable`/`aimActions` to
+            // decide whether an aimed attack is an option this turn.
+            // `aimAvailable` keeps its original meaning — the API lists
+            // an explicit aim action — synthesized aim stays invisible.
+            aimActions,
+            aimAvailable: aimActions.some(action => action.synthesized !== true),
             ...planContext
         };
         const scored = [];
@@ -2515,7 +2839,9 @@ export function createPlannerService({
         const top = scored.filter(entry => entry.score === scored[0].score);
         const winner = top.length > 1 ? _seededPick(top, seed) : top[0];
         diagnostics.chosenStep = null;
-        const steps = _stepsFor({ candidate: winner });
+        // AimedUntil (issue #15): the booked flag bonus rides into the
+        // attack step — the executor clears the flag once the shot lands.
+        const steps = _stepsFor({ candidate: winner, carriedAim });
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
         const plan = _assemblePlan({

@@ -290,9 +290,11 @@ test("unreachable target yields no-route with rejected diagnostics", async () =>
         seed: 5,
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([], "no-route"),
-        actions: [MELEE_ACTION, RANGED_ACTION]
+        actions: [MELEE_ACTION]
     });
 
+    // Melee-only loadout: no utility fallback applies to a ranged-less
+    // NPC (aim/overwatch need a ranged action), so no-route stands.
     assert.equal(result.status, PLANNER_STATUS.noRoute);
     assert.equal(result.reason, "no-route");
     assert.equal(result.plan, null);
@@ -355,7 +357,7 @@ test("actions over the action budget are rejected, not charged", async () => {
             { x: 200, y: 0, i: 2, j: 0, cost: 2, distance: 1.5, los: true }
         ]),
         actions: [
-            { ...MELEE_ACTION, id: "cleaver", name: "Heavy Cleaver", damage: 12, cost: 2 },
+            { ...MELEE_ACTION, id: "cleaver", name: "Heavy Cleaver", damage: 12, cost: 3 },
             MELEE_ACTION
         ]
     });
