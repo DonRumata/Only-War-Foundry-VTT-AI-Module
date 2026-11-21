@@ -110,10 +110,13 @@ async function testMovePlusRanged() {
     const pxPerUnit = size / unit;
     const target = Array.from(scene.tokens.values())
       .find((t) => t.id !== combatant.tokenId);
+    // Issue #31: a move bundled with an attack must fit the half-move
+    // rate (agility 40 → 4), so the injected route costs 4, not the old
+    // 8 that the full move used to allow.
     const landing = {
       x: target.x - 6 * pxPerUnit,
       y: target.y,
-      cost: 8,
+      cost: 4,
       distance: 6,
       los: true
     };

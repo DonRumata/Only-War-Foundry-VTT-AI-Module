@@ -15,7 +15,8 @@ const r = await page.evaluate(async () => {
         const cfg = api.config.resolveEffectiveConfig(c);
         const team = api.services.get('fireteam').resolveTeamConfig?.(c)
             ?? c.getFlag('only-war-ai', 'fireteam') ?? null;
-        return { name: c.name ?? c.token?.name, enabled: cfg?.enabled, preset: cfg?.preset,
+        return { name: c.name ?? c.token?.name, initiative: c.initiative,
+            enabled: cfg?.enabled, preset: cfg?.preset,
             team: team?.teamId ?? null, leader: team?.leaderId ?? null };
     });
     return {

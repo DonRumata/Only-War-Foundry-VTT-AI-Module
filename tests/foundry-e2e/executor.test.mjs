@@ -55,7 +55,9 @@ async function setup() {
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
   sceneId = await h.createTestScene(page, { grid: 1, size: 100 });
   npcTokenId = await h.placeToken(page, sceneId, npcId, { x: 400, y: 500 });
-  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1200, y: 500 });
+  // 12 m away — beyond pistol range (10 m): under the half-move cap the
+  // plan must move before it can shoot.
+  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1600, y: 500 });
 
   // Explicit dispositions: npc hostile (-1) vs enemy friendly (+1).
   await page.evaluate(async (data) => {

@@ -418,11 +418,13 @@ test("happy path: move + attack + end-turn executes and advances the turn", asyn
         assert.deepEqual(result.stepsDone.map(s => s.type), ["move", "attack", "end-turn"]);
 
         // Token moved through the serialized waypoints to the endpoint.
+        // Plan points are cell centres; TokenDocument#move receives
+        // document coordinates (centre − half footprint, issue #32).
         assert.equal(world.moveCalls.length, 1);
-        assert.equal(world.token.x, 200);
-        assert.equal(world.token.y, 0);
+        assert.equal(world.token.x, 150);
+        assert.equal(world.token.y, -50);
         const last = world.moveCalls[0].waypoints.at(-1);
-        assert.deepEqual({ x: last.x, y: last.y }, { x: 200, y: 0 });
+        assert.deepEqual({ x: last.x, y: last.y }, { x: 150, y: -50 });
 
         // Attack executed exactly once with a step-scoped operation id.
         assert.equal(rolls.executeCalls.length, 1);
@@ -587,7 +589,7 @@ test("a move step is skipped when the token already sits on the endpoint", async
         const plan = {
             ...planning.plan,
             steps: [
-                { id: "step-move-1", type: "move", input: { to: { x: 0, y: 0 } }, projectedResourceDelta: {} },
+                { id: "step-move-1", type: "move", input: { to: { x: 50, y: 50 } }, projectedResourceDelta: {} },
                 { id: "step-end-turn-2", type: "end-turn", input: {}, projectedResourceDelta: {} }
             ]
         };

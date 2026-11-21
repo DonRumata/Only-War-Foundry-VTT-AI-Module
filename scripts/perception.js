@@ -315,6 +315,10 @@ export function hasLineOfSight(from, to) {
  */
 function _geometricLineOfSight(origin, target) {
     const ray = { A: { x: origin.x, y: origin.y }, B: { x: target.x, y: target.y } };
+    // Nothing in the scene can block a sight ray: the collision backends
+    // keep a quadtree that does not always refresh after wall deletion,
+    // so an empty live wall list is the fresher verdict.
+    if (!_sightBlockingWalls().length) return true;
     try {
         // Foundry v13+: the sight polygon backend is the authoritative wall
         // collision API; walls.checkCollision returns opaque results there.

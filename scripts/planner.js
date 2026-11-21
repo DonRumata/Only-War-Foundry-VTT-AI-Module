@@ -1811,6 +1811,8 @@ function _approachPoint(selfPos, target, range, grid) {
  * @param {object|null} input.tokenDoc Viewer token document.
  * @param {object} input.target Normalized target entry.
  * @param {number} input.range Attack range in scene units.
+ * @param {number|null} [input.bandRange] Farthest weapon range in scene
+ *   units — drives the edge probe; falls back to `range` when unset.
  * @param {object} input.selfPos Self position `{x, y}` in pixels.
  * @param {object} input.targetPos Target position `{x, y}` in pixels.
  * @param {object} input.grid Normalized grid info.
@@ -1819,29 +1821,57 @@ function _approachPoint(selfPos, target, range, grid) {
  * @param {object} input.context Planning context overrides.
  * @returns {object[]}
  */
-function _resolveMoves({ tokenDoc, target, range, selfPos, targetPos, grid, navigation, perception, context }) {
+function _resolveMoves({ tokenDoc, target, range, bandRange = null,
+    selfPos, targetPos, grid, navigation, perception, context }) {
     const input = { selfPos, targetPos, grid };
     let raw = null;
     if (Array.isArray(context.moves)) {
         raw = context.moves;
     } else if (navigation && typeof navigation.findCandidates === "function") {
-        try {
-            const result = navigation.findCandidates(tokenDoc,
-                context.moveBudget ?? { mode: "full" },
-                {
-                    target: targetPos,
-                    count: _finiteOr(context.moveCandidateCount, DEFAULT_MOVE_CANDIDATES),
-                    includeCover: true,
-                    perception,
-                    rates: context.rates
-                });
-            if (result && result.status === "ok" && Array.isArray(result.candidates)) {
-                raw = result.candidates;
-            } else {
-                raw = [];
+        const find = options => {
+            try {
+                const result = navigation.findCandidates(tokenDoc,
+                    context.moveBudget ?? { mode: "full" },
+                    {
+                        count: _finiteOr(context.moveCandidateCount, DEFAULT_MOVE_CANDIDATES),
+                        includeCover: true,
+                        perception,
+                        rates: context.rates,
+                        ...options
+                    });
+                return result && result.status === "ok" && Array.isArray(result.candidates)
+                    ? result.candidates : [];
+            } catch(err) {
+                return [];
             }
-        } catch(err) {
-            raw = [];
+        };
+        // Copy — the navigation result is deep-frozen and the band merge
+        // below pushes extra candidates.
+        raw = [...find({ target: targetPos })];
+        // Issue #31: move-attack is capped at the half-move rate, so the
+        // candidate set also needs cheap cells at the weapon's range edge —
+        // the proximity-ranked top-N only ever holds the cells nearest the
+        // target, which all cost more than a half move on long approaches.
+        // Probe a point `0.9 × range` from the target toward the viewer:
+        // cells close to it are both reachable on a half move and already
+        // inside firing distance.
+        const band = Number.isFinite(bandRange) && bandRange > 0 ? bandRange : range;
+        if (Number.isFinite(band) && band > 0
+            && Number.isFinite(target?.distance) && target.distance > band) {
+            const edge = _approachPoint(selfPos, target, band, grid);
+            if (edge) {
+                const seen = new Set(raw.map(entry =>
+                    `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`));
+                for (const entry of find({ target: edge })) {
+                    const key = `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    // `distance` was scored against the edge probe —
+                    // `_normalizeMove` must recompute it against the real
+                    // target so the range filter sees the true value.
+                    raw.push({ ...entry, distance: null });
+                }
+            }
         }
     }
     if (raw === null) {
@@ -2171,9 +2201,11 @@ const ATTACK_VARIANTS = Object.freeze(new Set([
  * @param {object} input.candidate Winning scored candidate.
  * @param {number|null} [input.carriedAim] Aim bonus carried by the
  *   combatant `aim` flag from a previous turn; attached to attack steps.
+ * @param {number|null} [input.halfMoveLimit] Half-move rate in scene
+ *   units — standalone moves past it cost a full action (issue #31).
  * @returns {object[]}
  */
-function _stepsFor({ candidate, carriedAim = null }) {
+function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
     const steps = [];
     const { target, move, action, variant } = candidate;
     // Issue #15: an `aim` step books the aim bonus — for `aim-attack`
@@ -2195,10 +2227,17 @@ function _stepsFor({ candidate, carriedAim = null }) {
         });
     }
     if (move && !move.stay) {
+        // Issue #31: charge folds its movement into the attack's full
+        // action (0 here); a bundled move costs one half; a standalone
+        // move beyond the half-move rate costs a full action.
+        const moveHalves = variant === "charge" ? 0
+            : (candidate.action === null || candidate.action === undefined)
+                ? (halfMoveLimit !== null && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1)
+                : 1;
         steps.push({
             id: `step-move-${steps.length + 1}`,
             type: "move",
-            cost: { movement: _finiteOr(move.cost, 0) },
+            cost: { movement: _finiteOr(move.cost, 0), halves: moveHalves },
             input: {
                 to: { x: move.x, y: move.y, i: move.i, j: move.j },
                 waypoints: move.waypoints ?? [],
@@ -2503,12 +2542,23 @@ export function createPlannerService({
         // Prime the per-actor movement-rate cache: findCandidates is
         // synchronous and resolves {mode} budgets only against prefetched
         // rates (issue #398 system API or actor.system.movement).
+        let moveRates = null;
         if (navigation && context.rates == null
             && typeof navigation.getMovementRates === "function") {
-            try { await navigation.getMovementRates(tokenDoc); } catch(_err) {
+            try {
+                moveRates = (await navigation.getMovementRates(tokenDoc))?.rates ?? null;
+            } catch(_err) {
                 // Rates stay unresolved; findCandidates degrades to stay.
             }
         }
+        // Issue #31: a move bundled with a half action is a half move —
+        // only endpoints within the half-move rate may combine; anything
+        // further is a standalone full move. Prone crawls at half speed.
+        const halfMoveRate = _finiteOr(
+            context.halfMove ?? context.rates?.half ?? moveRates?.half, null);
+        const halfMoveLimit = halfMoveRate !== null && isProne
+            ? Math.floor(halfMoveRate / 2)
+            : halfMoveRate;
 
         const targets = _resolveTargets({
             combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context
@@ -2585,13 +2635,36 @@ export function createPlannerService({
         const moveBudget = Number.isFinite(planContext.moveBudget)
             ? planContext.moveBudget
             : _finiteOr(planContext.moveBudget?.budget ?? planContext.moveBudget?.limit, null);
-        const actionBudget = _finiteOr(context.actionBudget, ACTION_BUDGET_HALVES);
+        // Issue #33: `context.spent` subtracts budget already consumed
+        // this turn — GM manual actions or a partial execution before a
+        // replan. Movement endpoints past the remainder are filtered out;
+        // a spent-up action budget leaves only free actions.
+        const spentMove = _finiteOr(context.spent?.movement, 0);
+        const spentHalves = _finiteOr(context.spent?.halves, 0);
+        const totalMoveBudget = Number.isFinite(moveBudget) ? moveBudget
+            : _finiteOr(
+                moveRates?.[planContext.moveBudget?.mode ?? "full"]
+                    ?? context.rates?.[planContext.moveBudget?.mode ?? "full"],
+                null);
+        const remainingMove = spentMove > 0 && totalMoveBudget !== null
+            ? Math.max(0, totalMoveBudget - spentMove)
+            : null;
+        const _withinRemaining = move => move?.stay === true
+            || !Number.isFinite(move?.cost)
+            || remainingMove === null
+            || move.cost <= remainingMove + 1e-9;
+        const actionBudget = Math.max(0,
+            _finiteOr(context.actionBudget, ACTION_BUDGET_HALVES) - spentHalves);
         // Fallback approach points aim for the shortest usable range so a
         // melee-capable NPC keeps closing instead of stopping at gun range.
         const positiveRanges = usableActions
             .map(action => _actionRange(action))
             .filter(value => value > 0);
         const approachRange = positiveRanges.length ? Math.min(...positiveRanges) : 0;
+        // The edge band is probed at the *farthest* weapon's reach —
+        // `approachRange` is the shortest (a melee bot keeps closing), but
+        // move-attack endpoints should exist for the longest-ranged gun.
+        const bandRange = positiveRanges.length ? Math.max(...positiveRanges) : 0;
         const targetPosOf = target => ({ x: target?.x ?? null, y: target?.y ?? null });
 
         const candidates = [];
@@ -2620,10 +2693,10 @@ export function createPlannerService({
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             const moves = _resolveMoves({
-                tokenDoc, target, range: approachRange,
+                tokenDoc, target, range: approachRange, bandRange,
                 selfPos, targetPos: targetPosOf(target),
                 grid, navigation, perception, context: planContext
-            });
+            }).filter(_withinRemaining);
             diagnostics.metrics.movesEvaluated += moves.length;
 
             let approachMove = null;
@@ -2703,8 +2776,10 @@ export function createPlannerService({
                             // Half aim (+10) + a half-cost blast throw
                             // fills the turn budget exactly. Skipped when
                             // a carried aimedUntil bonus already matches
-                            // or beats the half-aim value.
+                            // or beats the half-aim value, or when the
+                            // remaining budget cannot pay both halves.
                             if (aimHalfAction && _actionCost(action) === 1
+                                && 1 + 1 <= actionBudget
                                 && _finiteOr(aimHalfAction.aim, 10) > _finiteOr(carriedAim, 0)) {
                                 candidates.push({
                                     target, action, move: null,
@@ -2721,6 +2796,14 @@ export function createPlannerService({
                         if (!presumed && !isPinned) {
                             for (const move of moves) {
                                 if (move.stay) continue;
+                                // Issue #31: blast thrown after a move is
+                                // a half move — beyond half rate it is a
+                                // standalone relocation instead. Issue #33:
+                                // the combo also needs a free half action.
+                                if (_actionCost(action) + 1 > actionBudget
+                                    || (halfMoveLimit !== null
+                                        && Number.isFinite(move.cost)
+                                        && move.cost > halfMoveLimit + 1e-9)) continue;
                                 const aimFromMove = _bestBlastAim({
                                     ...aimInput,
                                     origin: { x: move.x, y: move.y },
@@ -2764,8 +2847,10 @@ export function createPlannerService({
                         // Issue #15: aim.half (+10) + a half-cost attack
                         // consumes the whole two-half budget — only
                         // half-cost attack types qualify. Skipped when a
-                        // carried aimedUntil bonus is already as good.
+                        // carried aimedUntil bonus is already as good or
+                        // the remaining budget cannot pay both halves.
                         if (aimHalfAction && _actionCost(action) === 1
+                            && 1 + 1 <= actionBudget
                             && _finiteOr(aimHalfAction.aim, 10) > _finiteOr(carriedAim, 0)) {
                             candidates.push({
                                 target, action, move: null,
@@ -2799,6 +2884,24 @@ export function createPlannerService({
                                 && action.attackType !== "charge") {
                                 rejectOnce(`${variant}|${tag}`, "full-after-move");
                                 continue;
+                            }
+                            // Issue #31: a move bundled with a half-cost
+                            // attack is a half move — endpoints beyond
+                            // the half-move rate belong to standalone
+                            // approach/full-move candidates instead.
+                            // Issue #33: the combo also needs a free half
+                            // action on top of the attack's own cost.
+                            if (variant === "move-attack") {
+                                if (_actionCost(action) + 1 > actionBudget) {
+                                    rejectOnce(`${variant}|${tag}`, "over-budget");
+                                    continue;
+                                }
+                                if (halfMoveLimit !== null
+                                    && Number.isFinite(move.cost)
+                                    && move.cost > halfMoveLimit + 1e-9) {
+                                    rejectOnce(`${variant}|${tag}`, "beyond-half-move");
+                                    continue;
+                                }
                             }
                             // Pinned/prone veto charges outright; a
                             // sibling `charge` attack type owns the
@@ -2837,7 +2940,13 @@ export function createPlannerService({
             const approachVetoed = approachMove !== null && isPinned
                 && Number.isFinite(approachMove.distance)
                 && approachMove.distance < distance;
-            if (approachMove && !approachVetoed) {
+            // Issue #33: a standalone move still costs an action — a
+            // full move needs both halves, a ≤half move needs one.
+            const approachHalves = approachMove
+                ? (halfMoveLimit !== null
+                    && _finiteOr(approachMove.cost, 0) > halfMoveLimit ? 2 : 1)
+                : 0;
+            if (approachMove && !approachVetoed && approachHalves <= actionBudget) {
                 candidates.push({ target, action: null, move: approachMove, variant: "approach" });
             } else if (approachVetoed) {
                 diagnostics.rejected.push({
@@ -2893,10 +3002,16 @@ export function createPlannerService({
                 tokenDoc, target: coneTarget, range,
                 selfPos, targetPos: { x: coneTarget?.x ?? null, y: coneTarget?.y ?? null },
                 grid, navigation, perception, context: planContext
-            });
+            }).filter(_withinRemaining);
             diagnostics.metrics.movesEvaluated += coneMoves.length;
             for (const move of coneMoves) {
                 if (move.stay) continue;
+                // Issue #31: spray + reposition is a half move combo.
+                // Issue #33: it also needs a free half action.
+                if (_actionCost(action) + 1 > actionBudget
+                    || (halfMoveLimit !== null
+                        && Number.isFinite(move.cost)
+                        && move.cost > halfMoveLimit + 1e-9)) continue;
                 const aimFromMove = _bestConeAim({
                     ...aimInput,
                     origin: { x: move.x, y: move.y }
@@ -2924,6 +3039,7 @@ export function createPlannerService({
             && !_isMeleeAction(action) && _actionRange(action) > 0);
         if (!isPinned && aimFullAction && threatTarget?.canAttack === true
             && hasRangedAction
+            && _actionCost(aimFullAction) <= actionBudget
             && _finiteOr(aimFullAction.aim, 20) > _finiteOr(carriedAim, 0)) {
             candidates.push({
                 variant: "aim",
@@ -2962,11 +3078,17 @@ export function createPlannerService({
                             selfPos,
                             targetPos: { x: threatTarget.x, y: threatTarget.y },
                             grid, navigation, perception, context: planContext
-                        })
+                        }).filter(_withinRemaining)
                         : [];
                 }
                 for (const move of auxMoves) {
                     if (move.stay) continue;
+                    // Issue #31: reload bundled with a move is a half move.
+                    // Issue #33: it also needs a free half action.
+                    if (halves + 1 > actionBudget
+                        || (halfMoveLimit !== null
+                            && Number.isFinite(move.cost)
+                            && move.cost > halfMoveLimit + 1e-9)) continue;
                     candidates.push({
                         variant: "move-reload",
                         action: reload,
@@ -2986,7 +3108,8 @@ export function createPlannerService({
             const owAction = _overwatchAction(usableActions);
             const owDirection = threatTarget?.canAttack === true
                 ? _bearingTo(selfPos, threatTarget) : null;
-            if (owAction && Number.isFinite(owDirection)) {
+            if (owAction && Number.isFinite(owDirection)
+                && ACTION_BUDGET_HALVES <= actionBudget) {
                 candidates.push({
                     variant: "overwatch",
                     action: owAction,
@@ -3176,7 +3299,7 @@ export function createPlannerService({
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
         // attack step — the executor clears the flag once the shot lands.
-        const steps = _stepsFor({ candidate: winner, carriedAim });
+        const steps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
         const plan = _assemblePlan({

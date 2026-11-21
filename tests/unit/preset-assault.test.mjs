@@ -261,6 +261,56 @@ test("far target falls back to move + ranged attack", async () => {
     assert.equal(plan.steps.at(-1).type, "end-turn");
 });
 
+test("range-edge probe supplies half-move move-attack endpoints for far targets", async () => {
+    // Enemy at 45u — outside lasgun range. The proximity top-N only holds
+    // cells nearest the target (cost 27 — beyond the half-move cap), so a
+    // legal move+attack needs the range-edge probe: it returns the cheap
+    // cell at ~0.9×range that is reachable on a half move.
+    const world = makeWorld({ enemies: [{ x: 3000, y: 0 }] });
+    const planner = makePlanner();
+    const findCalls = [];
+    const navigation = {
+        findCandidates: (_token, _budget, options = {}) => {
+            findCalls.push(options.target);
+            // The edge probe point sits ~1800 px from the target toward
+            // the viewer — only that call gets the cheap firing cell
+            // (tolerance for float math in the probe computation).
+            if (options.target && Math.abs(options.target.x - 1200) < 1) {
+                return {
+                    status: "ok",
+                    candidates: [
+                        { x: 1200, y: 0, i: 12, j: 0, cost: 12, distance: null, los: true }
+                    ]
+                };
+            }
+            return {
+                status: "ok",
+                candidates: [
+                    { x: 2700, y: 0, i: 27, j: 0, cost: 27, distance: 13.5, los: true }
+                ]
+            };
+        }
+    };
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 5,
+        halfMove: 12,
+        rates: { half: 12, full: 24 },
+        perception: makePerception({ visible: visibleTargets(world) }),
+        navigation,
+        actions: [MELEE_ACTION, RANGED_ACTION]
+    });
+
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.equal(result.plan.breakdown.variant, "move-attack");
+    assert.equal(result.plan.steps[0].type, "move");
+    assert.equal(result.plan.steps[0].input.to.x, 1200);
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.equal(attack.input.actionId, "lasgun");
+    // The edge probe really fired: one findCandidates call targets a
+    // point between viewer and target, not the target position itself.
+    assert.ok(findCalls.some(target => target && Math.abs(target.x - 1200) < 1));
+});
+
 test("advance-only plan ends with no-attack when nothing can fire", async () => {
     // Enemy visible but far beyond every weapon and beyond charge reach:
     // the NPC closes distance and ends the turn without a forced attack.

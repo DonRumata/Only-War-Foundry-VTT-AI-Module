@@ -245,6 +245,18 @@ execute: расхождение — `stale-state` (перемещение, см�
   в half-единицы (`"half"|1` → 1, `"full"|2`/числа → 2, без поля — 1).
   Full-действие после движения запрещено (`full-after-move` в
   diagnostics); half+half — легально.
+- Движение имеет стоимость по OW (issue #31): ход в связке с другим
+  полудействием — half move, т.е. комбо-варианты (`move-attack`,
+  `move-reload`, blast/spray move-attack) генерируются только для
+  конечных точек в пределах `rates.half` — дальше `beyond-half-move`
+  в diagnostics и остаются только move-only кандидаты (full action).
+  Half rate берётся из `context.halfMove`/`context.rates.half`/кэша
+  `getMovementRates`; prone половинит его как и бюджет. Move-шаг
+  сериализует `cost.halves` (charge → 0, bundled → 1, standalone за
+  половинным порогом → 2). Чтобы у комбо была хоть одна дешёвая конечная,
+  набор точек дополняется «кромкой дальности»: второй `findCandidates`
+  нацелен на точку `0.9 × maxRange` от цели — клетки рядом с ней укладываются
+  в half move и уже в дистанции выстрела.
 - `aim` — universal-действие: явные `kind:"aim"` записи из API берут
   собственный бонус, иначе синтезируются `aim.half` (+10) и `aim.full`
   (+20). `aim-attack` — half aim + half-атака за один ход; шаг `aim`

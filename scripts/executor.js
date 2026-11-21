@@ -334,6 +334,12 @@ export function createExecutorService({
             operation: operation ?? context.operation ?? null,
             operationId: context.operationId ?? operation?.id ?? null,
             replanCount,
+            // Issue #33: the replanned turn is budgeted against what was
+            // already spent — GM manual inputs (context.spent) plus steps
+            // this run already executed.
+            ...(run?.spent && (run.spent.movement > 0 || run.spent.halves > 0)
+                ? { spent: { ...run.spent } }
+                : {}),
             includeNeutral: (run?.config ?? resolveConfig(run?.combatant ?? context.combatant))?.includeNeutral === true
         };
     }
@@ -412,26 +418,59 @@ export function createExecutorService({
     }
 
     /**
+     * Grid size in pixels used for waypoint→document conversion.
+     * @param {object} context
+     * @returns {number}
+     */
+    function _gridSizeOf(context) {
+        const size = context?.scene?.grid?.size
+            ?? globalThis.canvas?.grid?.size;
+        return Number.isFinite(size) && size > 0 ? size : 100;
+    }
+
+    /**
+     * Document-space point of a serialized waypoint. Plans carry cell
+     * *centres* (navigation `toPoint` = footprint centre), but Foundry 13
+     * `TokenMovementWaypoint` expects the document position — the top-left
+     * corner for a 1×1 token — so every point shifts by half the footprint.
+     * Without this shift each move drifts the token half a cell off-grid,
+     * the measured walk overshoots the planned budget and segments can
+     * clip walls (issue #32).
+     * @param {{x: number, y: number}} point Serialized waypoint/`to`.
+     * @param {object|null} tokenDoc
+     * @param {object} context
+     * @returns {{x: number, y: number}}
+     */
+    function _docPoint(point, tokenDoc, context) {
+        const size = _gridSizeOf(context);
+        const fw = _finiteOr(tokenDoc?.width, 1) * size;
+        const fh = _finiteOr(tokenDoc?.height, 1) * size;
+        return { x: point.x - (fw / 2), y: point.y - (fh / 2) };
+    }
+
+    /**
      * Waypoint payload for `TokenDocument#move` (Foundry 13+): the
      * serialized navigation `planRoute` waypoints stored in the plan,
-     * normalized to `{x, y, elevation?}` with the step endpoint appended.
-     * The path itself is never recomputed here.
+     * normalized to document-space `{x, y, elevation?}` with the step
+     * endpoint appended. The path itself is never recomputed here.
      * @param {object} step Move step.
-     * @param {{x: number, y: number}} to Destination.
+     * @param {{x: number, y: number}} to Destination (centre point).
+     * @param {object|null} tokenDoc
+     * @param {object} context
      * @returns {object[]}
      */
-    function _movePayload(step, to) {
+    function _movePayload(step, to, tokenDoc, context) {
         const raw = Array.isArray(step?.input?.waypoints) ? step.input.waypoints : [];
         const points = raw
             .filter(point => Number.isFinite(point?.x) && Number.isFinite(point?.y))
             .map(point => ({
-                x: point.x,
-                y: point.y,
+                ..._docPoint(point, tokenDoc, context),
                 ...(Number.isFinite(point.elevation) ? { elevation: point.elevation } : {})
             }));
+        const docTo = _docPoint(to, tokenDoc, context);
         const last = points[points.length - 1];
-        if (!last || last.x !== to.x || last.y !== to.y) {
-            points.push({ x: to.x, y: to.y });
+        if (!last || last.x !== docTo.x || last.y !== docTo.y) {
+            points.push(docTo);
         }
         return points;
     }
@@ -454,27 +493,30 @@ export function createExecutorService({
         if (!Number.isFinite(to?.x) || !Number.isFinite(to?.y)) {
             return { ok: false, reason: EXECUTOR_REASONS.invalidStep };
         }
+        // The serialized `to` is a footprint centre; document positions
+        // are top-left — compare in document space (issue #32).
+        const docTo = _docPoint(to, tokenDoc, context);
         // Hex grids snap the token to the cell — the plan's fractional `to`
         // and the stored integer position differ by <0.5px.
         const curX = tokenDoc._source?.x ?? tokenDoc.x;
         const curY = tokenDoc._source?.y ?? tokenDoc.y;
-        if (Math.abs(curX - to.x) < 0.5 && Math.abs(curY - to.y) < 0.5) {
+        if (Math.abs(curX - docTo.x) < 0.5 && Math.abs(curY - docTo.y) < 0.5) {
             return {
                 ok: true,
                 skipped: true,
                 reason: EXECUTOR_REASONS.alreadyAtEndpoint,
-                position: { x: to.x, y: to.y }
+                position: docTo
             };
         }
         try {
             if (typeof tokenDoc.move === "function") {
-                const moved = await tokenDoc.move(_movePayload(step, to), {
+                const moved = await tokenDoc.move(_movePayload(step, to, tokenDoc, context), {
                     method: "api",
                     showRuler: false
                 });
                 if (moved === false) return { ok: false, reason: EXECUTOR_REASONS.moveFailed };
             } else if (typeof tokenDoc.update === "function") {
-                await tokenDoc.update({ x: to.x, y: to.y });
+                await tokenDoc.update({ x: docTo.x, y: docTo.y });
             } else {
                 return { ok: false, reason: EXECUTOR_REASONS.moveFailed };
             }
@@ -487,7 +529,7 @@ export function createExecutorService({
         }
         return {
             ok: true,
-            position: { x: to.x, y: to.y, elevation: to.elevation },
+            position: { x: docTo.x, y: docTo.y, elevation: to.elevation },
             delta: step?.projectedResourceDelta ?? {}
         };
     }
@@ -1153,6 +1195,13 @@ export function createExecutorService({
                     _mergeDelta(resourceDelta, outcome.delta);
                     if (outcome.chatMessageIds) chatMessageIds.push(...outcome.chatMessageIds);
                     if (irreversible && !outcome.skipped) irreversibleSpent = true;
+                    // Issue #33: accumulate this turn's spent budget so a
+                    // later replan only offers the remainder.
+                    if (!outcome.skipped && run.spent) {
+                        run.spent.halves += _finiteOr(step?.cost?.halves, 0);
+                        run.spent.movement += Math.max(0,
+                            -_finiteOr(outcome.delta?.movement, 0));
+                    }
                     if (step.type === "move" && !outcome.skipped && outcome.position) {
                         run.expectedPosition = {
                             x: outcome.position.x,
@@ -1248,6 +1297,15 @@ export function createExecutorService({
             expectedPosition: _selfPosition(plan),
             replanCount: _finiteOr(plan?.replanCount, 0),
             stepIndex: 0,
+            // Issue #33: budget already consumed this turn (GM manual
+            // actions via context.spent / planContext.spent + executed
+            // steps) — feeds replan planContext.
+            spent: {
+                movement: _finiteOr(
+                    context.spent?.movement ?? context.planContext?.spent?.movement, 0),
+                halves: _finiteOr(
+                    context.spent?.halves ?? context.planContext?.spent?.halves, 0)
+            },
             report: null,
             record: null
         };
@@ -1284,6 +1342,12 @@ export function createExecutorService({
             expectedPosition: _selfPosition(context.plan),
             replanCount: _finiteOr(context.plan?.replanCount, 0),
             stepIndex: 0,
+            spent: {
+                movement: _finiteOr(
+                    context.spent?.movement ?? context.planContext?.spent?.movement, 0),
+                halves: _finiteOr(
+                    context.spent?.halves ?? context.planContext?.spent?.halves, 0)
+            },
             report: null,
             record: null
         };

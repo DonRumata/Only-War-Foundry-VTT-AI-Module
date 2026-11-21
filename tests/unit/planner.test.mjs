@@ -671,3 +671,90 @@ test("mulberry32 is deterministic per seed", () => {
         assert.ok(value >= 0 && value < 1);
     }
 });
+
+test("issue #31: move+action combos are capped at the half-move rate", async () => {
+    const world = makeWorld({ enemies: [{ x: 800, y: 0 }] });
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const context = {
+        seed: 1,
+        rates: { half: 4, full: 8, charge: 12, run: 24 },
+        actions: [{
+            id: "lasgun", type: "attack", name: "Lasgun",
+            itemUuid: "Actor.npc.Item.w1", itemId: "w1",
+            class: "ranged", range: 100, cost: 1
+        }],
+        targets: injectedTargets(world),
+        moves: [
+            {
+                key: "near", x: 300, y: 0, i: 3, j: 0, cost: 3, distance: 5,
+                waypoints: [{ x: 50, y: 0 }, { x: 300, y: 0 }]
+            },
+            {
+                key: "far", x: 600, y: 0, i: 6, j: 0, cost: 6, distance: 2,
+                waypoints: [{ x: 50, y: 0 }, { x: 600, y: 0 }]
+            }
+        ]
+    };
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, "ok");
+    // The 6 m endpoint exceeds the half-move rate (4 m): the combo is
+    // vetoed and can only appear as a standalone full-move approach.
+    const diagnostics = result.diagnostics ?? result.plan?.diagnostics ?? {};
+    assert.ok(
+        (diagnostics.rejected ?? []).some(entry => entry.reason === "beyond-half-move"),
+        "far move-attack vetoed with beyond-half-move"
+    );
+    const moveStep = result.plan.steps.find(step => step.type === "move");
+    const attackStep = result.plan.steps.find(step => step.type === "attack");
+    if (attackStep && moveStep) {
+        // Bundled move: half action and within the half-move rate.
+        assert.equal(moveStep.cost.halves, 1);
+        assert.ok(moveStep.cost.movement <= 4);
+    } else if (moveStep) {
+        // Standalone full move beyond the half rate: a full action.
+        assert.equal(moveStep.cost.halves, 2);
+        assert.ok(moveStep.cost.movement > 4);
+    } else {
+        assert.fail("expected a move step on an assault plan with reachable moves");
+    }
+});
+
+test("issue #33: context.spent reduces the remaining turn budget", async () => {
+    const world = makeWorld({ enemies: [{ x: 800, y: 0 }] });
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const context = {
+        seed: 1,
+        moveBudget: 8,
+        spent: { movement: 6, halves: 1 },
+        actions: [{
+            id: "lasgun", type: "attack", name: "Lasgun",
+            itemUuid: "Actor.npc.Item.w1", itemId: "w1",
+            class: "ranged", range: 100, cost: 1
+        }],
+        targets: injectedTargets(world),
+        moves: [
+            {
+                key: "near", x: 100, y: 0, i: 1, j: 0, cost: 1, distance: 7,
+                waypoints: [{ x: 50, y: 0 }, { x: 100, y: 0 }]
+            },
+            {
+                key: "far", x: 600, y: 0, i: 6, j: 0, cost: 6, distance: 2,
+                waypoints: [{ x: 50, y: 0 }, { x: 600, y: 0 }]
+            }
+        ]
+    };
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, "ok");
+    // movement 8 - spent 6 = 2: the 6 m endpoint is filtered out entirely.
+    const moveStep = result.plan.steps.find(step => step.type === "move");
+    if (moveStep) {
+        assert.ok(moveStep.cost.movement <= 2,
+            `remaining movement 2 m, got ${moveStep.cost.movement} m`);
+    }
+    // halves 2 - spent 1 = 1: exactly one half action remains.
+    const halves = result.plan.steps.reduce(
+        (sum, step) => sum + (step.cost?.halves ?? 0), 0);
+    assert.ok(halves <= 1, `at most one half action remains, got ${halves}`);
+});

@@ -65,7 +65,10 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
 1. Лимиты: `maxTargets 8`, `maxActions 3` **на группу оружия**
    (`itemUuid ?? itemId ?? name ?? id`), `move candidates 8`.
 2. На цель: `moves = _resolveMoves()`, `approachMove` — минимальная
-   дистанция не-stay.
+   дистанция не-stay. Когда цель дальше самого дальнего оружия,
+   `findCandidates` вызывается дважды: на позицию цели (ближайшие
+   клетки — подход/charge) и на точку `0.9 × maxRange` от неё («кромка
+   дальности» — дешёвые конечные для move-attack на half move).
 3. `memoryStrike` = last-known цель + любой non-melee blast. Цель с
    `canAttack !== true` и не memoryStrike → `target-not-attackable`.
 4. На действие: `_actionCost > actionBudget` → `over-budget`;
@@ -78,7 +81,7 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    - **Non-blast**: `distance <= range` → `attack-in-place`
      (+ `aim-attack` вариант); иначе `out-of-range`. На каждый ход в
      дистанции: `charge` (melee) / `move-attack` (ranged); full-cost после
-     move → `full-after-move`; вето `pinned`/`prone`; pinned-ход
+     move → `full-after-move`; дальше `rates.half` → `beyond-half-move` (issue #31); вето `pinned`/`prone`; pinned-ход
      к цели → `pinned`. Ничего нет → `out-of-range`/`no-route`.
 5. `approach` кандидат; ни атаки, ни approach → `no-route`.
 6. Cone/spray/suppression pass: `_bestConeAim` → `attack-in-place` с

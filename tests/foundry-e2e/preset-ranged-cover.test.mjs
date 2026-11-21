@@ -98,9 +98,11 @@ async function testBehindWallToFiringPosition() {
     const combatant = game.combat?.combatants?.get(cid);
     const outcome = await planner.planTurn(game.combat, combatant, {
       seed: 11,
+      // Issue #31: move+attack endpoints must fit the half-move rate
+      // (agility 40 → cost ≤ 4).
       moves: [
-        { x: 700, y: 800, cost: 6, distance: 5.4 },
-        { x: 700, y: 300, cost: 6, distance: 5.4 }
+        { x: 700, y: 800, cost: 4, distance: 5.4 },
+        { x: 700, y: 300, cost: 4, distance: 5.4 }
       ]
     });
     return JSON.parse(JSON.stringify(outcome));
@@ -166,7 +168,7 @@ async function testOpenPositionMovesToCover() {
     const outcome = await planner.planTurn(game.combat, combatant, {
       seed: 7,
       moves: [
-        { x: 700, y: 800, cost: 6, distance: 5.4, cover: 0.8 }
+        { x: 700, y: 800, cost: 4, distance: 5.4, cover: 0.8 }
       ]
     });
     return JSON.parse(JSON.stringify(outcome));
