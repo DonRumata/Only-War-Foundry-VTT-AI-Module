@@ -240,6 +240,7 @@ test("blocked LOS repositions to a modest endpoint with line of sight", async ()
     const planner = makePlanner();
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 5,
+        personality: false,
         hold: { anchor: { x: 0, y: 0 }, radiusMeters: 20 },
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([
@@ -515,6 +516,7 @@ test("score breakdown explains the zone constraint per candidate", async () => {
     const planner = makePlanner();
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 5,
+        personality: false,
         hold: { anchor: { x: 0, y: 0 }, radiusMeters: 9 },
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([

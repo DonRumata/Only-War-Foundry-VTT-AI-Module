@@ -258,7 +258,12 @@ export function buildPreviewViewModel(plan, context = {}) {
         name: combatant?.name ?? token?.name ?? actor?.name ?? null,
         img: actor?.img ?? token?.texture?.src ?? null,
         preset: plan?.preset ?? null,
-        replanCount: _finiteOr(plan?.replanCount, 0)
+        replanCount: _finiteOr(plan?.replanCount, 0),
+        // Issue #19: resolved bot personality shown in the preview.
+        traits: Array.isArray(plan?.personality?.traits)
+            ? [...plan.personality.traits] : [],
+        character: plan?.personality?.character ?? null,
+        personalitySource: plan?.personality?.source ?? null
     };
 
     const targetId = snapshot.target?.tokenId ?? null;
@@ -388,6 +393,26 @@ function _label(i18n, key, fallback) {
 }
 
 /**
+ * Joined personality display string for the preview summary:
+ * localized trait labels plus the fireteam character in parentheses
+ * (issue #19). Null when the plan carries no personality at all.
+ * @param {object} npc `npc` block of {@link buildPreviewViewModel}.
+ * @param {object|null} i18n `game.i18n`-compatible object.
+ * @returns {string|null}
+ */
+function _personalityLabel(npc, i18n) {
+    const traits = (npc?.traits ?? []).map(trait =>
+        _label(i18n, `OWAI.Personality.${trait}`, trait));
+    const character = npc?.character
+        ? _label(i18n, `OWAI.FireteamCharacter.${npc.character}`, npc.character)
+        : null;
+    if (!traits.length && !character) return null;
+    return character
+        ? `${traits.join(", ")} (${character})`.trim()
+        : traits.join(", ");
+}
+
+/**
  * Decorate a view-model with localized labels for the template. The raw
  * model stays untouched so it remains serializable; the returned copy is
  * what the Application renders.
@@ -405,7 +430,20 @@ export function localizePreviewViewModel(vm, i18n = null) {
                 ...vm.npc,
                 presetLabel: _label(
                     i18nSource, `OWAI.Preset.${vm.npc.preset}`, vm.npc.preset ?? "—"
-                )
+                ),
+                // Issue #19: localized trait/character labels, joined for
+                // the summary row.
+                traitLabels: (vm.npc.traits ?? []).map(trait => _label(
+                    i18nSource, `OWAI.Personality.${trait}`, trait
+                )),
+                characterLabel: vm.npc.character
+                    ? _label(
+                        i18nSource,
+                        `OWAI.FireteamCharacter.${vm.npc.character}`,
+                        vm.npc.character
+                    )
+                    : null,
+                personalityLabel: _personalityLabel(vm.npc, i18nSource)
             }
             : vm.npc,
         action: vm.action

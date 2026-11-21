@@ -9,10 +9,12 @@
 import {
     AI_PRESETS,
     EXECUTION_MODES,
+    FIRETEAM_CHARACTERS,
     MODULE_API_VERSION,
     OVERRIDE_MODES
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
+import { PERSONALITY_IDS } from "./personalities.js";
 import { createServiceRegistry } from "./services.js";
 
 /**
@@ -50,6 +52,7 @@ export function createModuleApi() {
             "perception.snapshot": true,
             "perception.memory": true,
             "perception.targets": true,
+            "planner.personalities": true,
             "planner.planTurn": true,
             "planner.presets": true,
             "planner.validateSnapshot": true,
@@ -65,6 +68,9 @@ export function createModuleApi() {
         presets: Object.freeze([...AI_PRESETS]),
         overrideModes: Object.freeze([...OVERRIDE_MODES]),
         executionModes: Object.freeze([...EXECUTION_MODES]),
+        /** Bot personality trait ids and fireteam characters (issue #19). */
+        personalities: Object.freeze([...PERSONALITY_IDS]),
+        fireteamCharacters: Object.freeze([...FIRETEAM_CHARACTERS]),
 
         /** Configuration helpers. */
         config: Object.freeze({
