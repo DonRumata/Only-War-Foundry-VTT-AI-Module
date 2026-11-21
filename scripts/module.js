@@ -21,6 +21,7 @@ import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
 import { createOverwatchService } from "./overwatch.js";
 import { createReactionsService } from "./reactions.js";
+import { createGrudgesService } from "./grudges.js";
 import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
 import { registerAssaultPreset } from "./presets/assault.js";
@@ -103,6 +104,12 @@ Hooks.once("init", () => {
         _registerReactionsService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register reactions service`, err);
+    }
+
+    try {
+        _registerGrudgesService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register grudges service`, err);
     }
 
     try {
@@ -202,6 +209,14 @@ Hooks.once("ready", () => {
         api?.services?.get?.("reactions")?.start?.();
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start reactions service`, err);
+    }
+
+    // Start the grudges service: the `updateActor` wound tracker feeding
+    // the `lastAttacker` flag only runs in a compatible world.
+    try {
+        api?.services?.get?.("grudges")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start grudges service`, err);
     }
     console.log(`${MODULE_ID} | Ready`);
 });
@@ -352,6 +367,20 @@ function _registerReactionsService(api) {
     if (!api?.services) return;
     if (!api.services.has("reactions")) {
         api.services.register("reactions", createReactionsService({ api }));
+    }
+}
+
+/**
+ * Register the `grudges` service on the module API (issue #39): the
+ * `lastAttacker` flag — `updateActor` wound tracking with conservative
+ * chat-card attribution feeding the planner's `grudge` factor. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerGrudgesService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("grudges")) {
+        api.services.register("grudges", createGrudgesService({ api }));
     }
 }
 

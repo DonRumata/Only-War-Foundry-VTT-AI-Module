@@ -60,7 +60,15 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     weaponAffinity: 1,
     weaponInertia: 0.15,
     dropProne: 0,
-    readyWeapon: 2
+    readyWeapon: 2,
+    // Issue #39: assault shrugs off shooting into a friendly melee more
+    // than other presets, but still avoids free attacks on the way out;
+    // closing into contact and avenging hits are core doctrine.
+    alliedEngagement: -2,
+    leaveMeleeEngage: -4,
+    engageDenial: 4,
+    unpin: 4,
+    grudge: 4
 });
 
 /**

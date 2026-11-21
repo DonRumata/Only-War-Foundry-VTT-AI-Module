@@ -37,6 +37,7 @@ import {
     personalityWeaponAffinity,
     resolvePersonality
 } from "./personalities.js";
+import { grudgeActive } from "./grudges.js";
 import { reactionUsed } from "./reactions.js";
 import { getAIDifficulty, logDiagnostics } from "./settings.js";
 import {
@@ -145,7 +146,12 @@ export const SCORE_FACTORS = Object.freeze([
     "weaponAffinity",
     "weaponInertia",
     "dropProne",
-    "readyWeapon"
+    "readyWeapon",
+    "alliedEngagement",
+    "leaveMeleeEngage",
+    "engageDenial",
+    "unpin",
+    "grudge"
 ]);
 
 /**
@@ -201,7 +207,15 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     weaponAffinity: 0,
     weaponInertia: 0.15,
     dropProne: 0,
-    readyWeapon: 0
+    readyWeapon: 0,
+    // Issue #39: firing into an ally's melee is a real penalty (−20 by
+    // the rules); the grudge and unpin pulls are the documented defaults,
+    // while disengage/engage awareness stays neutral for skeleton bots.
+    alliedEngagement: -2,
+    leaveMeleeEngage: 0,
+    engageDenial: 0,
+    unpin: 4,
+    grudge: 2
 });
 
 /**
@@ -1288,6 +1302,159 @@ function _hostileTo(a, b, { includeNeutral = false, dispositions = null } = {}) 
 }
 
 /**
+ * Whether a token is "on the viewer's side" for shooting-into-melee
+ * purposes (issue #39): same non-zero disposition, or a neutral token —
+ * but only when `includeNeutral` marks neutrals as tracked at all. An
+ * explicit `dispositions` allow-list treats everything outside the
+ * hostile list as a friendly the bot should not risk hitting.
+ * @param {*} viewer Viewer disposition.
+ * @param {*} disp Candidate token disposition.
+ * @param {object} [options] Same options as {@link _hostileTo}.
+ * @param {boolean} [options.includeNeutral] Track neutral tokens as allies.
+ * @param {number[]|null} [options.dispositions] Explicit hostile allow-list.
+ * @returns {boolean}
+ */
+function _isAllyDisposition(viewer, disp, { includeNeutral = false, dispositions = null } = {}) {
+    const sa = Math.sign(_finiteOr(viewer, 0));
+    const sb = Math.sign(_finiteOr(disp, 0));
+    if (sb === 0) return includeNeutral === true;
+    if (Array.isArray(dispositions)) return !dispositions.includes(sb);
+    return sa !== 0 && sb === sa;
+}
+
+/**
+ * Set of hostile token uuids currently engaged in melee with an ally
+ * (issue #39): every token hostile to the viewer that stands within
+ * `reachPx` of a same-side token. The viewer token itself and the
+ * evaluated token never count as their own ally. Only the uuid set is
+ * built — the candidate factor then checks membership per target.
+ * @param {object} input
+ * @param {object[]} input.tokens Scene token scan (`_blastTokens` shape).
+ * @param {number} input.viewerDisposition Viewer disposition.
+ * @param {string|null} input.selfTokenUuid Viewer token uuid — excluded.
+ * @param {number} input.reachPx Melee reach in pixels.
+ * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @returns {Set<string>}
+ */
+function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx, options }) {
+    const engaged = new Set();
+    for (const target of tokens ?? []) {
+        if (!target || target.tokenUuid == null) continue;
+        const disp = Math.sign(_finiteOr(target.disposition, 0));
+        if (!_hostileTo(viewerDisposition, disp, options)) continue;
+        for (const token of tokens) {
+            if (!token || token === target) continue;
+            if (selfTokenUuid != null && token.tokenUuid === selfTokenUuid) continue;
+            if (token.tokenUuid != null && token.tokenUuid === target.tokenUuid) continue;
+            if (!_isAllyDisposition(viewerDisposition, token.disposition, options)) continue;
+            if (_distPx(target, token) <= reachPx + 1e-9) {
+                engaged.add(target.tokenUuid);
+                break;
+            }
+        }
+    }
+    return engaged;
+}
+
+/**
+ * Enemy contact entries for the disengage/engage-denial factors (issue
+ * #39): every perceived enemy position plus the melee reach it
+ * threatens. The reach comes from the target's threat emitters — the
+ * longest melee emitter range — with a {@link DEFAULT_MELEE_RANGE}
+ * fallback (any combatant can swing unarmed). Pure: only snapshot data
+ * is read, so the factors stay deterministic functions of the plan
+ * inputs (issue #24).
+ * @param {object[]} targets Normalized planner targets (pixels).
+ * @param {object[]} threats Resolved threat sources with `emitters`.
+ * @param {number} pxPerUnit Pixels per scene unit (`_pxPerUnit`).
+ * @returns {object[]} `{x, y, reachPx}` entries.
+ */
+function _enemyContacts(targets, threats, pxPerUnit) {
+    const emittersOf = new Map();
+    for (const source of threats ?? []) {
+        const key = source?.tokenUuid ?? source?.id ?? null;
+        if (key != null) emittersOf.set(key, source.emitters ?? []);
+    }
+    const scale = pxPerUnit > 0 ? pxPerUnit : 1;
+    const contacts = [];
+    for (const target of targets ?? []) {
+        if (!Number.isFinite(target?.x) || !Number.isFinite(target?.y)) continue;
+        const emitters = emittersOf.get(target.tokenUuid) ?? target.emitters ?? [];
+        const meleeRanges = emitters
+            .filter(emitter => emitter && emitter.melee === true)
+            .map(emitter => _finiteOr(emitter.range, DEFAULT_MELEE_RANGE))
+            .filter(range => range > 0);
+        // A target that carries a melee reach itself (injected profile)
+        // uses it when no emitter list survives.
+        if (!meleeRanges.length && target.melee === true
+            && Number.isFinite(target.range) && target.range > 0) {
+            meleeRanges.push(target.range);
+        }
+        const reach = meleeRanges.length
+            ? Math.max(...meleeRanges)
+            : DEFAULT_MELEE_RANGE;
+        contacts.push({ x: target.x, y: target.y, reachPx: reach * scale });
+    }
+    return contacts;
+}
+
+/**
+ * Synthesized `unpin` action entry (issue #39): the DH2e full-action
+ * Willpower test that clears pinning. The candidate only exists when the
+ * actor actually has a `willpower` characteristic — `null` otherwise, so
+ * the planner can record a `unpin-unavailable` rejection instead.
+ * @param {object|null} actor Actor document.
+ * @returns {object|null}
+ */
+function _unpinAction(actor) {
+    const characteristics = actor?.system?.characteristics ?? actor?.characteristics ?? null;
+    if (!characteristics || characteristics.willpower == null) return null;
+    return {
+        id: "unpin",
+        type: "test",
+        name: "Unpin",
+        characteristic: "willpower",
+        testKind: "characteristic",
+        cost: "full",
+        synthesized: true
+    };
+}
+
+/**
+ * The `lastAttacker` record usable for scoring this turn (issue #39):
+ * the flag value filtered by the round-expiry of {@link grudgeActive}
+ * and by attacker liveness — a matching defeated combatant or destroyed
+ * token proves the attacker dead, which mutes the grudge. An attacker
+ * missing from the combat cannot disprove the record and keeps it.
+ * @param {object|null} record Raw `lastAttacker` flag/context value.
+ * @param {object|null} combat Live combat document.
+ * @returns {object|null}
+ */
+function _activeGrudge(record, combat) {
+    if (!record || typeof record !== "object") return null;
+    if (!grudgeActive(record, Number.isFinite(combat?.round) ? combat.round : null)) {
+        return null;
+    }
+    let attacker = record.tokenId != null
+        ? _findCombatantByToken(combat, record.tokenId)
+        : null;
+    if (!attacker && record.actorId != null) {
+        attacker = _list(combat?.combatants).find(other => {
+            const actor = _actorOf(other) ?? _actorOf(_tokenDoc(other?.token));
+            return actor?.id === record.actorId || other?.actorId === record.actorId;
+        }) ?? null;
+    }
+    if (attacker) {
+        const doc = _tokenDoc(attacker.token);
+        if (attacker.defeated === true || attacker.destroyed === true
+            || doc?.destroyed === true) {
+            return null;
+        }
+    }
+    return record;
+}
+
+/**
  * Build the immutable `PlanningSnapshot` for an AI combatant. Plain,
  * JSON-serializable data only вЂ” never Document references.
  * @param {object} input Builder input.
@@ -1396,6 +1563,9 @@ function _normalizeTarget(raw, { source, sceneId, selfPos, grid, measure }) {
     return {
         tokenId,
         tokenUuid,
+        // Issue #39: the target's actor id feeds the `grudge` factor —
+        // the `lastAttacker` flag identifies the attacker by actor too.
+        actorId: raw.actorId ?? null,
         x,
         y,
         elevation: _finiteOr(raw.elevation, 0),
@@ -2162,11 +2332,19 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
  * @param {string[]} [input.traits] Resolved personality trait ids —
  *   their `weaponAffinity` specs feed the `weaponAffinity` factor.
  * @param {number|null} [input.dodgeTN] Default dodge TN override.
+ * @param {Set<string>|null} [input.allyEngagedTargets] Hostile token
+ *   uuids currently engaged in melee with an ally (issue #39) — feeds
+ *   the `alliedEngagement` factor on point-target attacks.
+ * @param {object[]} [input.enemies] Enemy contacts `{x, y, reachPx}` —
+ *   feeds the `leaveMeleeEngage`/`engageDenial` free-attack factors.
+ * @param {object|null} [input.lastAttacker] Active `lastAttacker` flag
+ *   record (`{tokenUuid, actorId, ...}`) — feeds the `grudge` factor.
  * @returns {object}
  */
 function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
-    lastUsedWeapon = null, traits = [], dodgeTN = null }) {
+    lastUsedWeapon = null, traits = [], dodgeTN = null,
+    allyEngagedTargets = null, enemies = null, lastAttacker = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -2186,7 +2364,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     const stationary = variant === "hold" || variant === "attack-in-place"
         || variant === "aim-attack" || variant === "aim"
         || variant === "reload" || variant === "overwatch"
-        || variant === "ready-weapon" || variant === "drop-prone";
+        || variant === "ready-weapon" || variant === "drop-prone"
+        || variant === "unpin";
     const holdPosition = stationary || move?.stay === true ? 1 : 0;
     const budget = Number.isFinite(moveBudget) && moveBudget > 0 ? moveBudget : null;
     const budgetOver = budget !== null && move
@@ -2239,6 +2418,42 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
             danger = 0;
         }
     }
+    // Issue #39: firing at a target standing in melee with an ally draws
+    // the −20 shooting-into-melee penalty — only point-target attacks
+    // suffer it. Melee actions and blast/cone templates are exempt: the
+    // template candidates already veto any aim point covering an ally.
+    const alliedEngaged = allyEngagedTargets instanceof Set
+        && target?.tokenUuid != null
+        && allyEngagedTargets.has(target.tokenUuid)
+        && action && melee !== 1
+        && _actionBlastRadius(action) <= 0
+        && !_coneSpecOf(action) ? 1 : 0;
+    // Issue #39 free-attack awareness (DH2e Disengage): leaving an
+    // enemy's melee reach without a Disengage action provokes a free
+    // swing — compared per enemy, so walking out of A's reach into B's
+    // still counts. `engageDenial` marks the inverse transition: ending
+    // inside an enemy's reach while starting outside all of them.
+    let engagedAtStart = false;
+    let engagedAtEnd = false;
+    let leaveMeleeEngage = 0;
+    for (const enemy of enemies ?? []) {
+        if (!enemy || !Number.isFinite(enemy.reachPx)) continue;
+        const startIn = _distPx(selfPos, enemy) <= enemy.reachPx + 1e-9;
+        const endIn = _distPx(endpoint, enemy) <= enemy.reachPx + 1e-9;
+        if (startIn && !endIn) leaveMeleeEngage = 1;
+        engagedAtStart = engagedAtStart || startIn;
+        engagedAtEnd = engagedAtEnd || endIn;
+    }
+    const engageDenial = !engagedAtStart && engagedAtEnd ? 1 : 0;
+    // Issue #39: `grudge` marks candidates whose target is the recorded
+    // last attacker — the combatant remembers who hurt it.
+    const grudge = lastAttacker && target
+        && ((lastAttacker.tokenUuid != null
+                && target.tokenUuid === lastAttacker.tokenUuid)
+            || (lastAttacker.tokenId != null
+                && target.tokenId === lastAttacker.tokenId)
+            || (lastAttacker.actorId != null
+                && target.actorId === lastAttacker.actorId)) ? 1 : 0;
     return {
         attackNow,
         attackAfterMove,
@@ -2275,7 +2490,12 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         weaponAffinity,
         weaponInertia: action && _weaponMatches(action, lastUsedWeapon) ? 1 : 0,
         dropProne: variant === "drop-prone" ? 1 : 0,
-        readyWeapon: variant === "ready-weapon" ? 1 : 0
+        readyWeapon: variant === "ready-weapon" ? 1 : 0,
+        alliedEngagement: alliedEngaged,
+        leaveMeleeEngage,
+        engageDenial,
+        unpin: variant === "unpin" ? 1 : 0,
+        grudge
     };
 }
 
@@ -2615,6 +2835,27 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
                 itemUuid: action.itemUuid ?? null
             },
             preconditions: ["turn", "resources"],
+            projectedResourceDelta: {}
+        });
+    }
+    // Issue #39: `unpin` is the DH2e full-action Willpower test clearing
+    // the pinned status. The verified `prepareTest` contract takes
+    // `type` + `key`; the step also carries the descriptive
+    // `characteristic`/`testKind` pair so the plan stays readable.
+    if (variant === "unpin") {
+        steps.push({
+            id: `step-test-${steps.length + 1}`,
+            type: "test",
+            cost: { halves: _actionCost(action) },
+            input: {
+                actionId: action?.id ?? "unpin",
+                name: action?.name ?? "Unpin",
+                type: "characteristic",
+                key: "willpower",
+                characteristic: action?.characteristic ?? "willpower",
+                testKind: action?.testKind ?? "characteristic"
+            },
+            preconditions: ["turn"],
             projectedResourceDelta: {}
         });
     }
@@ -2976,6 +3217,15 @@ export function createPlannerService({
             ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.lastUsedWeapon]
             ?? null;
         const dodgeTN = _finiteOr(context.defaultDodgeTN, DEFAULT_DODGE_TN);
+        // Issue #39: the combatant `lastAttacker` flag feeds the `grudge`
+        // factor. It is deliberately kept out of the stale fingerprint —
+        // a fresh hit must not force a replan. `context.lastAttacker`
+        // injects the record in tests; `null` disables the factor.
+        const lastAttackerRecord = context.lastAttacker !== undefined
+            ? context.lastAttacker
+            : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.lastAttacker)
+                ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.lastAttacker]);
+        const lastAttacker = _activeGrudge(lastAttackerRecord, combat);
         // Issue #37 reaction slot: a bot that already spent its reaction
         // this round cannot bank another one — overwatch declarations
         // drop out of the candidate set.
@@ -3019,6 +3269,19 @@ export function createPlannerService({
         const viewerDisposition = _finiteOr(
             _tokenDoc(combatant?.token)?.disposition ?? combatant?.disposition, 0);
         const pxPerUnit = _pxPerUnit(grid);
+        // Issue #39: the same scene token scan backs two pure factor
+        // inputs — hostiles engaged in melee with an ally
+        // (`alliedEngagement`) and enemy contact reaches for the
+        // free-attack factors (`leaveMeleeEngage`/`engageDenial`).
+        const allyEngagedTargets = _allyEngagedTargets({
+            tokens: blastTokens,
+            viewerDisposition,
+            selfTokenUuid: _tokenUuid(tokenDoc, sceneId)
+                ?? tokenDoc?.uuid ?? tokenDoc?.id ?? null,
+            reachPx: DEFAULT_MELEE_RANGE * (pxPerUnit > 0 ? pxPerUnit : 1),
+            options: blastOptions
+        });
+        const enemyContacts = _enemyContacts(targets, threats, pxPerUnit);
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             const moves = _resolveMoves({
@@ -3514,6 +3777,33 @@ export function createPlannerService({
             });
         }
 
+        // Issue #39 `unpin`: a pinned combatant may spend a full action
+        // on the Willpower test that clears pinning — the recovery
+        // alternative to the drop-prone cover answer. Actors without a
+        // `willpower` characteristic never get the candidate; a pinned
+        // bot that cannot even try logs `unpin-unavailable`.
+        if (isPinned) {
+            const unpin = _unpinAction(actor);
+            if (!unpin) {
+                diagnostics.rejected.push({
+                    candidate: "unpin",
+                    reason: "unpin-unavailable"
+                });
+            } else if (_actionCost(unpin) > actionBudget) {
+                diagnostics.rejected.push({
+                    candidate: `unpin|${unpin.id}`,
+                    reason: "over-budget"
+                });
+            } else {
+                candidates.push({
+                    variant: "unpin",
+                    action: unpin,
+                    target: threatTarget,
+                    move: null
+                });
+            }
+        }
+
         if (preset.alwaysOfferHold === true) {
             candidates.push({ variant: "hold", target: targets[0] ?? null, action: null, move: null });
         }
@@ -3561,7 +3851,8 @@ export function createPlannerService({
             const factors = _factorsOf({
                 ...candidate, moveBudget, dangerAt, selfPos, dodge,
                 preferredWeapon, lastUsedWeapon,
-                traits: personality.traits, dodgeTN
+                traits: personality.traits, dodgeTN,
+                allyEngagedTargets, enemies: enemyContacts, lastAttacker
             });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed

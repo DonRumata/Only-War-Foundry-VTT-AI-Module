@@ -95,7 +95,11 @@ export const PERSONALITIES = Object.freeze({
     }),
     reckless: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ attackNow: 4, charge: 3, threat: -3, cover: -3 }),
+        // Issue #39: reckless bots worry less about hitting an ally's
+        // melee partner — a mild +1 against the engagement penalty.
+        deltas: Object.freeze({
+            attackNow: 4, charge: 3, threat: -3, cover: -3, alliedEngagement: 1
+        }),
         jitter: 0.04,
         weight: 6,
         bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 })
@@ -115,14 +119,22 @@ export const PERSONALITIES = Object.freeze({
     }),
     bloodthirsty: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ vulnerable: 6, attackNow: 2 }),
+        // Issue #39: craves contact and remembers who hurt it —
+        // `engageDenial` +3, `grudge` +4.
+        deltas: Object.freeze({
+            vulnerable: 6, attackNow: 2, engageDenial: 3, grudge: 4
+        }),
         jitter: 0.01,
         weight: 7,
         bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
     }),
     cunning: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ attackType: 0.15, los: 3, exposure: -2 }),
+        // Issue #39: cunning bots pick their shots — an extra −2 against
+        // firing into a melee their allies are winning.
+        deltas: Object.freeze({
+            attackType: 0.15, los: 3, exposure: -2, alliedEngagement: -2
+        }),
         jitter: -0.03,
         weight: 8,
         bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.8 })
@@ -138,8 +150,11 @@ export const PERSONALITIES = Object.freeze({
         category: "courage",
         // The positive `cohesionRestore` delta is the pull toward
         // regrouping with the team under pressure.
+        // Issue #39: cowards nurse no grudges — they avoid the attacker
+        // rather than avenging the hit (`grudge` −2).
         deltas: Object.freeze({
-            proximity: -3, attackNow: -3, cohesionRestore: 6, holdPosition: 2
+            proximity: -3, attackNow: -3, cohesionRestore: 6, holdPosition: 2,
+            grudge: -2
         }),
         jitter: 0.02,
         weight: 5,
@@ -193,7 +208,10 @@ export const PERSONALITIES = Object.freeze({
     }),
     duelist: Object.freeze({
         category: "skill",
-        deltas: Object.freeze({ melee: 4, meleeEngage: 4, charge: 3 }),
+        // Issue #39: the duelist seeks contact — `engageDenial` +3.
+        deltas: Object.freeze({
+            melee: 4, meleeEngage: 4, charge: 3, engageDenial: 3
+        }),
         jitter: 0,
         weight: 6,
         bias: Object.freeze({ easy: 1, normal: 1, hard: 1.2 }),

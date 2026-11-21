@@ -85,7 +85,14 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     weaponAffinity: 1,
     weaponInertia: 0.15,
     dropProne: 1.5,
-    readyWeapon: 2
+    readyWeapon: 2,
+    // Issue #39: a shooter preset — firing into a friendly melee is its
+    // worst option (−5); contact engagement neither attracts nor repels.
+    alliedEngagement: -5,
+    leaveMeleeEngage: -3,
+    engageDenial: 0,
+    unpin: 3,
+    grudge: 1
 });
 
 /** Candidate variants whose action produces an attack/test step. */

@@ -333,6 +333,41 @@ execute: расхождение — `stale-state` (перемещение, см�
   `lastUsedWeapon` на combatant после успешной атаки — фактор
   `weaponInertia` даёт мягкое предпочтение тому же стволу.
 
+#### Тактические факторы (issue #39)
+
+- **`alliedEngagement`** — штраф за точечную атаку по цели, стоящей в
+  ближнем бою с союзником (стрельба в свалку — правильный −20 DH2e).
+  «Занятость» считается по сценскому скану `_blastTokens` — та же
+  выборка, что защищает blast/cone от friendly fire: враг в
+  `DEFAULT_MELEE_RANGE` (2 м) от токена той же disposition (нейтралы —
+  только с `includeNeutral`); сам бот и сама цель не считаются. Melee,
+  blast- и cone-атаки фактор не получают — шаблоны уже ветируют
+  союзников в зоне.
+- **`leaveMeleeEngage` / `engageDenial`** — осознание свободной атаки:
+  выход кандидата из melee-reach врага (выход без Disengage) и вход в
+  reach врага снаружи оцениваются *по каждому врагу отдельно* — уйти от
+  противника A в контакт к противнику B всё равно провоцирует A. Reach —
+  melee-эмиттеры threat-профиля цели с фолбэком `DEFAULT_MELEE_RANGE`.
+- **`unpin`** — синтетическое full-cost действие для pinned-бота с
+  характеристикой `willpower`: WP-тест, снимающий pinning
+  (`test`-шаг `type:"characteristic", key:"willpower"` →
+  `api.rolls.prepareTest`/`executeTest`). Без характеристики — rejected
+  `unpin-unavailable`; альтернатива — `drop-prone` из issue #37.
+- **`grudge` / `lastAttacker`** — Combatant-флаг `{tokenUuid, tokenId,
+  actorId, round, turn, woundsLost, attribution}`, controller-only.
+  Сервис `grudges` (`api.services`): вотчер `updateActor` + кэш wounds
+  на актёра — потеря ран атрибутируется только по targeted-карточкам
+  чата (`damageOperation`-summary системы с `target` бота и
+  `source.messageId` на damage-карточку либо `rollData.damages[]` с
+  `targetActorId`/`targetTokenId` бота). Self-damage и доказуемо
+  дружественная карточка grudge не дают; без targeted-свидетельства
+  эвристикой не угадываем. Рекорд живёт `GRUDGE_MAX_AGE_ROUNDS = 2`
+  раунда и снимается доказанной смертью атакующего; в
+  stale-fingerprint не входит — свежая атака не форсирует реплан.
+  Черты: `cunning` alliedEngagement −2, `reckless` +1, `duelist`
+  engageDenial +3, `bloodthirsty` engageDenial +3 / grudge +4,
+  `cowardly` grudge −2.
+
 ### Executor (issue #407)
 
 - Шаги плана последовательно: `move` — `TokenDocument#move` по

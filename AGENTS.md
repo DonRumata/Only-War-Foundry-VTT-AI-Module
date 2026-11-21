@@ -52,6 +52,12 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   round }` (issue #37) — последнее оружие успешной атаки; пишет
   executor после `executeAttack`, читает planner (фактор
   `weaponInertia`).
+- Combatant: `lastAttacker = { tokenUuid, tokenId, actorId, round, turn,
+  woundsLost, attribution }` (issue #39) — кто последний нанёс урон
+  боту; пишет сервис `grudges` по `updateActor` + targeted-карточкам
+  чата, читает planner (фактор `grudge`). Рекорд живёт
+  `GRUDGE_MAX_AGE_ROUNDS` (2) раунда, снимается доказанной смертью
+  атакующего; в stale-fingerprint не входит.
 - Actor/Token/Combatant: `personality = string[]` — явный список черт
   личности (issue #19, id из пула `scripts/personalities.js`); резолвится
   той же цепочкой Combatant → Token → Actor, без флага черты
@@ -191,6 +197,17 @@ semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
 pinned/prone/stunned), `engaged`/`meleeEngage` (контакт ближнего боя после
 движения) — веса заданы в `scripts/presets/*.js`.
 
+Тактические факторы (issue #39): `alliedEngagement` — точечная (не
+melee/blast/cone) атака по цели, стоящей в melee-reach союзника из
+`_blastTokens` (та же disposition; нейтралы — только с `includeNeutral`;
+сам бот и цель не считаются); `leaveMeleeEngage`/`engageDenial` —
+поконтактный учёт свободной атаки: выход кандидата из melee-reach врага
+и вход в него снаружи (reach — melee-эмиттеры threat-профиля, фолбэк
+`DEFAULT_MELEE_RANGE` = 2); `unpin` — синтетический full-cost WP-тест
+для pinned-бота (`test`-шаг `type:"characteristic", key:"willpower"`,
+rejected `unpin-unavailable` без характеристики); `grudge` — цель
+совпадает с записью флага `lastAttacker` (сервис `grudges`, ниже).
+
 Blast-awareness: blast-действия (`blastRadius` из `item.system.blastRadius`
 или `traits.blast`, метры) не целятся в токен — `_bestBlastAim` перебирает
 точку центра цели + 8 оффсетов на полрадиуса и выбирает максимум покрытых
@@ -254,6 +271,22 @@ combatant, reason})`, `markUsedByToken(combat, tokenId)`,
 сбрасывающий флаг владельца в начале его хода. Писателями реакции
 сейчас выступают системная сторона/GM-макросы — модуль только хранит и
 читает состояние.
+
+## Граджи (issue #39)
+
+`scripts/grudges.js` — сервис `grudges` (`api.services`): учёт
+`flags["only-war-ai"].lastAttacker` на Combatant. Пишет только
+контроллер (тот же паттерн, что `reactions`). `handleUpdateActor` —
+вотчер `updateActor` с in-memory кэшем `wounds.value + wounds.critical`
+на actorId (старое значение в hook недоступно); потеря ран →
+консервативная атрибуция `attributeLastAttacker` по targeted-карточкам
+чата: `damageOperation`-summary системы (`target` — бот, `source
+.messageId` — damage-карточка атакующего) либо `rollData.damages[]` с
+`targetActorId`/`targetTokenId` бота. Self-damage и доказуемо
+дружественная карточка не пишутся; без targeted-свидетельства —
+нет записи вообще. `grudgeActive` — окно `GRUDGE_MAX_AGE_ROUNDS = 2`
+раунда; `grudgeOf` — читатель с проверкой экспирации и смерти
+атакующего (defeated/destroyed). `seedWounds` — тест/инспекция кэша.
 
 ## Личности ботов (issue #19)
 

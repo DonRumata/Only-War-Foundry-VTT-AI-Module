@@ -102,7 +102,14 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     weaponAffinity: 1,
     weaponInertia: 0.15,
     dropProne: 1,
-    readyWeapon: 2
+    readyWeapon: 2,
+    // Issue #39: spec-ops is disciplined fire — strong shooting-into-
+    // melee avoidance, mild engage pull and a real grudge memory.
+    alliedEngagement: -4,
+    leaveMeleeEngage: -2,
+    engageDenial: 1,
+    unpin: 4,
+    grudge: 3
 });
 
 /**

@@ -9,11 +9,12 @@
 
 ## 1. Скоринг
 
-`SCORE_FACTORS` (planner.js:118–142) — факторы считаются в 0..1:
+`SCORE_FACTORS` (planner.js) — факторы считаются в 0..1:
 `attackNow, attackAfterMove, charge, melee, advance, threat, proximity,
 los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
-danger, weaponAffinity, weaponInertia, dropProne, readyWeapon`.
+danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
+alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge`.
 
 Issue #37: `attackType` теперь несёт EV-срез уклонения — значение фактора
 `desire × (1 − P(dodge))` для уклоняемых атак; недоджибельные
@@ -58,6 +59,11 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | weaponInertia | 0.15 | 0.15 | 0.15 | 0.15 |
 | dropProne | 0 | 1.5 | 2 | 1 |
 | readyWeapon | 2 | 2 | 2 | 2 |
+| alliedEngagement | −2 | −5 | −3 | −4 |
+| leaveMeleeEngage | −4 | −3 | −5 | −2 |
+| engageDenial | 4 | 0 | 2 | 1 |
+| unpin | 4 | 3 | 3 | 4 |
+| grudge | 4 | 1 | 2 | 3 |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -67,6 +73,34 @@ cohesionWeight 10, fallbackPreset "hold"`.
 
 Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TOP_K 4`,
 `EASY_MISTAKE_CHANCE 0.3`, `EASY_PICK_TOP_K 3` (planner.js:150–159).
+
+### Тактические факторы (issue #39)
+
+- `alliedEngagement` — цель (hostile-токен из `allyEngagedTargets`, сет
+  по `_blastTokens`) стоит в ближнем бою с союзником: любой другой токен
+  той же disposition, что у viewer (`includeNeutral` учитывает
+  нейтралов, явный `dispositions`-allow-list — «всё не из списка»), в
+  радиусе `DEFAULT_MELEE_RANGE` (2 scene-единицы). Сам бот и сама цель
+  союзником не считаются. Фактор =1 только для точечных атак — melee,
+  blast-шаблон и cone-шаблон освобождены (шаблонные кандидаты уже
+  ветируют союзников в зоне). Дефолт −2.
+- `leaveMeleeEngage` — кандидат стартует в melee-reach ≥1 врага и
+  заканчивает вне reach *этого же* врага: выход из ближнего боя без
+  Disengage провоцирует свободную атаку. Сравнение идёт поконтактно
+  (`enemyContacts` из воспринятых `targets` + melee-эмиттеры threat-map,
+  фолбэк `DEFAULT_MELEE_RANGE`) — уход от врага A в контакт к врагу B
+  всё ещё считается провокацией A.
+- `engageDenial` — обратный переход: кандидат стартует вне всех reach и
+  заканчивает внутри чужого (вход в ближний бой — «блокировка» цели).
+- `unpin` — кандидат `unpin` (см. п. 8a) существует только у
+  pinned-бота с WP-характеристикой; фактор =1 у него одного.
+- `grudge` — цель кандидата совпадает с записанным `lastAttacker`
+  (`tokenUuid|tokenId|actorId`). Рекорд читается из флага Combatant
+  (`context.lastAttacker` — инъекция для тестов/макросов), фильтруется
+  `grudgeActive` (окно `GRUDGE_MAX_AGE_ROUNDS = 2` раунда) и снимается,
+  если атакующего можно доказать мёртвым (defeated/destroyed
+  комбатант). Флаг сознательно **не входит** в stale-fingerprint — свежая
+  атака по боту не должна форсировать переплан.
 
 ## 2. Генерация кандидатов (planner.js:2597–3109)
 
@@ -108,6 +142,13 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    (клипы `clip.value === 0` у всех атакующих) → half-cost кандидат;
    `drop-prone` — free-действие при pinned либо при `danger ≥ 0.5`
    на собственной клетке (не для уже prone).
+8a. `unpin` кандидат (issue #39): у pinned-комбатанта при наличии
+   характеристики `willpower` (`system.characteristics.willpower` либо
+   `actor.characteristics.willpower`) генерируется синтетическое
+   full-cost действие — WP-тест, снимающий pinning. Без характеристики —
+   rejected `unpin-unavailable`; при `cost > actionBudget` —
+   `over-budget`. Сериализуется шагом `test` по обычному контракту
+   executor'а (`prepareTest`/`executeTest`).
 9. `hold` кандидат: `alwaysOfferHold`, или `allowNoTarget`, или
    `allowNoAction`.
 9. Скоринг: `_factorsOf` → `preset.veto` (reject в диагностику) →
@@ -127,10 +168,14 @@ ready-weapon → drop-prone → end-turn` (всегда последний). Att
 (blast, issue #29 — зона для оверлея/системного шаблона),
 `template.direction/angle/range` + `covered/suppressionFire/burstMode`
 (cone). `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
-записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`.
-Preconditions: move `["turn","self-position","collision"]`, attack
+записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`; `unpin`
+(issue #39) — шаг `test` с `input {type:"characteristic",
+key:"willpower", characteristic:"willpower", testKind:"characteristic",
+actionId:"unpin"}`, `cost.halves:2` — верифицированный контракт
+`api.rolls.prepareTest`. Preconditions: move
+`["turn","self-position","collision"]`, attack
 `["turn","target","resources"]`, aim/end-turn `["turn"]`, ready-weapon
-`["turn","resources"]`, drop-prone `["turn"]`.
+`["turn","resources"]`, drop-prone/unpin `["turn"]`.
 
 ## 4. Blast / cone / память
 
@@ -228,6 +273,34 @@ adjudicated-manual, adjudicated-skill-test`.
 - Бот с потраченной реакцией не декларирует overwatch (`reaction-used`
   rejected) — слот занят, конус всё равно не выстрелит.
 
+## 6b. Grudge и lastAttacker (issue #39, grudges.js)
+
+- Флаг `flags["only-war-ai"].lastAttacker` на Combatant — «кто последний
+  ранил бота». Рекорд `{tokenUuid, tokenId, actorId, round, turn,
+  woundsLost, attribution}`; пишет только контроллер (`authority
+  .isController()` иначе `game.user.isGM`), читают все.
+- Сервис `grudges` (`api.services`): `handleUpdateActor` — вотчер
+  `updateActor`; in-memory кэш последних wounds на actorId (старое
+  значение в hook недоступно). Отслеживаемый тотал — `wounds.value +
+  wounds.critical` (в системе раны растут при уроне): потеря →
+  атрибуция, прирост/отсутствие изменений — нет.
+- Атрибуция консервативная (`attributeLastAttacker`, pure): только
+  targeted-карточки чата — (1) summary-карточка
+  `flags["only-war-local"].damageOperation`, чей `target` называет бота
+  (источник урона — карточка `source.messageId` → её `rollData`
+  атакующего: `tokenId`/`ownerId`/`speaker`); (2) damage-карточка,
+  `rollData.damages[]` которой несёт `targetActorId`/`targetTokenId`
+  бота. Без targeted-свидетельства эвристику не пишем; self-damage и
+  resolved same-side токен (дружественный огонь) не дают grudge. Если
+  токен атакующего не резолвится — запись принимается: hostile не
+  опровергнуть, а targeted-карточка уже сильное доказательство.
+- Экспирация: `GRUDGE_MAX_AGE_ROUNDS = 2` — рекорд раунда R активен на
+  R..R+2; рекорд без `round` — консервативно активен. Мёртвый атакующий
+  (defeated/destroyed комбатант в бою) снимает grudge.
+- Planner читает флаг (или `context.lastAttacker`) и помечает цель
+  атакующего фактором `grudge`; флаг в stale-fingerprint не входит —
+  свежая атака не форсирует реплан.
+
 ## 7. Perception
 
 - `MEMORY_MAX_AGE_ROUNDS = 3`; память на combatant
@@ -317,7 +390,9 @@ Override-цепочка: Combatant → Token → Actor → disabled. Флаги:
 `personality` (массив id черт на всех уровнях), `fireteam {teamId,
 leaderId, teamPreset, preferredCohesion, character}`, `reactionUsed`
 (combatant, рекорд `{round, reason}`), `lastUsedWeapon` (combatant,
-рекорд `{itemUuid, itemId, name, actionId, round}` — controller-only).
+рекорд `{itemUuid, itemId, name, actionId, round}` — controller-only),
+`lastAttacker` (combatant, рекорд `{tokenUuid, tokenId, actorId, round,
+turn, woundsLost, attribution}` — controller-only, issue #39).
 
 ## 12. Уже реализованные слои (#14/#15/#16/#19)
 
@@ -341,6 +416,14 @@ leaderId, teamPreset, preferredCohesion, character}`, `reactionUsed`
   counter-EV `attackType × (1 − P(dodge))` + `vulnerable` по
   `reactionUsed`; `preferredWeapon` в конфиге и NPC-листе +
   `lastUsedWeapon`-флаг (факторы `weaponAffinity`/`weaponInertia`).
+- **#39** — тактические факторы: `alliedEngagement` (стрельба по цели в
+  рукопашке союзника — только точечные атаки, союзники/нейтралы из
+  `_blastTokens`), `leaveMeleeEngage`/`engageDenial` (поконтактные
+  свободные атаки при выходе/входе в melee-reach врага), кандидат
+  `unpin` (WP-тест против pinning, шаг `test`), `grudge` по флагу
+  `lastAttacker` (сервис `grudges` + консервативная атрибуция по
+  targeted-карточкам урона; экспирация 2 раунда, вне
+  stale-fingerprint).
 
 ## 13. Позиция перед рефактором #24
 

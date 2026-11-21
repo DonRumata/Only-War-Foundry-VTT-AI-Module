@@ -50,7 +50,8 @@ export const FLAG_KEYS = Object.freeze({
     aim: "aim",
     personality: "personality",
     reactionUsed: "reactionUsed",
-    lastUsedWeapon: "lastUsedWeapon"
+    lastUsedWeapon: "lastUsedWeapon",
+    lastAttacker: "lastAttacker"
 });
 
 /**
