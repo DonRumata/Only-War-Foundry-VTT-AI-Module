@@ -57,7 +57,8 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `previewTimeoutSeconds` (default 60, `0` — без авто-отмены),
   `turnPacingMs` (default 800, `0` — без паузы) — пауза между шагами
   AI-хода и перед `combat.nextTurn()`, чтобы автоходы оставались
-  наблюдаемыми.
+  наблюдаемыми. `threatMapOverlay` (default `false`, issue #36) —
+  персистентный тумблер GM-only отладочной теплокарты угроз.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -168,8 +169,9 @@ mulberry32 по `plan.seed`. План сериализуем (`move`/`attack`/`t
 на оружие): недоступные (`available === false`) отбрасываются; для каждого
 оружия сохраняется до 3 типов в курируемом порядке — melee `[allOut,
 charge, standard, lightning, swift, called_shot]`, ranged `[full_auto,
-semi_auto, standard, ripper_charge, called_shot]`; `suppressing_fire`
-исключён полностью (нужен targetPoint/шаблон). Вариант `charge` использует
+semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
+`suppressing_fire` достижим — step-контракт несёт `targetPoint`/`template`
+(issue #14). Вариант `charge` использует
 действие с `attackType: "charge"` того же оружия, если оно есть. Новые
 факторы: `attackType` (привлекательность типа атаки), `vulnerable` (цель
 pinned/prone/stunned), `engaged`/`meleeEngage` (контакт ближнего боя после
@@ -184,8 +186,20 @@ hostiles при строгом запрете союзных/нейтральн�
 LOS до точки обязателен, кроме ударов по last-known позиции («зачистка
 комнаты» — запомненная точка считается одним предполагаемым hostile,
 `rangedCover` освобождает такие броски от LOS-вето). Шаг несёт
-`input.targetPoint` → `prepareAttack`. Фактор `area` = min(blastHits/2, 1);
-веса в пресетах (assault 4, specOps 5, rangedCover 3, hold 2).
+`input.targetPoint` + `input.blastRadius` (issue #29 — зона для GM-
+оверлея и системного шаблона) → `prepareAttack`. Фактор `area` =
+min(blastHits/2, 1); веса в пресетах (assault 4, specOps 5, rangedCover
+3, hold 2).
+
+Конусы (spray/`suppressing_fire`, overwatch): ориентация строго по
+воспринимаемым якорям (issue #30) — `_bestConeAim` наводит сектор только
+на записи `targets` (видимая цель — живая позиция, last-known —
+запомненная точка); hostile-токены сцены без восприятия шаблон не
+наводят, но по-прежнему срабатывают в вето союзников/нейтралов.
+`overwatch`-кандидат заявляет конус лишь на видимую угрозу
+(`canAttack === true`, не `hidden`). Шаг сериализует
+`template {direction, angle, range}` + `covered`/`suppressionFire`/
+`burstMode` — geometry хватает и системе, и GM-оверлею (#29).
 
 Статусы: `snapshot.self.statuses` — отсортированные id из `actor.statuses`
 + статусов токен-документа (+ `context.selfStatuses` для тестов); входят в
@@ -271,6 +285,27 @@ operations-сервиса) и запускает `executor.executePlan`; cancel/
 ре-валидируют открытый preview: `turn-stale`/`combat-ended` — авто-отмена,
 остальные stale — баннер + disabled Confirm. Закрытие окна без решения =
 cancel, не confirm. Сервис работает headless, если Application недоступен.
+
+## GM canvas overlays (issues #29/#30/#36)
+
+`scripts/ui/plan-overlay.js` — сервис `planOverlay` (`api.services`) и
+общий GM-only корень PIXI-контейнеров `ow-ai-overlay` на слое templates:
+именованные подслои `plan`/`overwatch`/`danger`, чистый клиентский рендер
+— без записи документов и broadcast, виден только GM (`plan` — только
+контроллеру, как и preview-диалог). Превью плана (issue #29) рисует
+route-полилинию со стрелкой на финальную клетку, конусы по сериализованным
+`template`/`overwatch` шагам, круг blast `targetPoint`+`blastRadius` и
+подсветку цели; контроллер preview вызывает `showPlan` на open/replan/
+stale и `clearPlan` на любом решении/снятии сессии. `overwatch.js`
+(#14/#30) рисует заявленные конусы в тот же корень через общий
+`coneFanPoints`. Danger-heatmap (issue #36): world setting
+`threatMapOverlay` + GM-keybinding Alt+M (`restricted`) —
+`setDangerEnabled`/`toggleDanger`/`setDangerMode` (`"plan"` — карта
+текущего бота `threatMap.map()`, `"all"` — агрегат по hostile-комбатантам);
+`dangerShade`/`dangerCells` — детерминированные pure-функции, top-8 клеток
+подписываются вкладчиком из `explain`. Сервис подписан на
+`canvasReady`/`canvasTearDown`/`updateCombat`/`deleteCombat`; `describe()`
+/`model()` — точки интроспекции для e2e.
 
 ## Права
 

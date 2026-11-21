@@ -10,6 +10,8 @@
  * - `previewTimeoutSeconds`: GM preview auto-cancel timeout (issue #409).
  * - `aiDifficulty`: "easy" | "normal" | "hard" — tactical depth of the
  *   planner (issue #16); personalities of issue #19 read it too.
+ * - `threatMapOverlay`: boolean — persisted toggle of the GM-only danger
+ *   heatmap debug overlay (issue #36); rendering stays GM-only either way.
  */
 import {
     AI_DIFFICULTIES,
@@ -94,6 +96,25 @@ export function registerSettings() {
             hard: "OWAI.Settings.AiDifficulty.Hard"
         },
         default: DEFAULT_AI_DIFFICULTY
+    });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.threatMapOverlay, {
+        name: "OWAI.Settings.ThreatMapOverlay.Name",
+        hint: "OWAI.Settings.ThreatMapOverlay.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: false,
+        onChange: value => {
+            // Sync the live toggle with the debug overlay service (issue
+            // #36); the service renders strictly on GM clients anyway.
+            try {
+                game.modules.get(MODULE_ID)?.api?.services
+                    ?.get?.("planOverlay")?.setDangerEnabled?.(value === true, { persist: false });
+            } catch(_err) {
+                // The service may be absent or mid-init — harmless.
+            }
+        }
     });
 }
 
@@ -195,6 +216,18 @@ export function getAIDifficulty() {
 export function isDiagnosticsEnabled() {
     try {
         return game.settings.get(MODULE_ID, SETTING_KEYS.diagnosticsEnabled) === true;
+    } catch(_err) {
+        return false;
+    }
+}
+
+/**
+ * Whether the GM-only danger heatmap debug overlay is enabled (issue #36).
+ * @returns {boolean}
+ */
+export function isThreatMapOverlayEnabled() {
+    try {
+        return game.settings.get(MODULE_ID, SETTING_KEYS.threatMapOverlay) === true;
     } catch(_err) {
         return false;
     }

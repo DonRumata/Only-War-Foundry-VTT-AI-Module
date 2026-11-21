@@ -20,6 +20,7 @@ import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
 import { createOverwatchService } from "./overwatch.js";
+import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
@@ -83,6 +84,12 @@ Hooks.once("init", () => {
         _registerFireteamService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register fireteam service`, err);
+    }
+
+    try {
+        _registerPlanOverlayService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register plan overlay service`, err);
     }
 
     try {
@@ -164,6 +171,14 @@ Hooks.once("ready", () => {
         api?.services?.get?.("perception")?.start?.();
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start perception service`, err);
+    }
+
+    // Start the shared GM-only overlay root before the overwatch service
+    // so its layer lifecycle exists when the cone renderer subscribes.
+    try {
+        api?.services?.get?.("planOverlay")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start plan overlay service`, err);
     }
 
     // Start the overwatch service: GM-only cone overlays and declaration
@@ -267,6 +282,34 @@ function _registerFireteamService(api) {
     if (!api?.services) return;
     if (!api.services.has("fireteam")) {
         api.services.register("fireteam", createFireteamService({ api }));
+    }
+}
+
+/**
+ * Register the `planOverlay` service on the module API (issues #29/#36):
+ * the shared GM-only canvas layer for preview plans and the danger
+ * heatmap. A GM-restricted keybinding (Alt+M) toggles the heatmap.
+ * @param {object} api Module API object.
+ */
+function _registerPlanOverlayService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("planOverlay")) {
+        api.services.register("planOverlay", createPlanOverlayService({ api, hooks: Hooks }));
+    }
+    try {
+        game.keybindings?.register?.(MODULE_ID, "threatMapOverlay", {
+            name: "OWAI.Keybinding.ThreatMapOverlay.Name",
+            hint: "OWAI.Keybinding.ThreatMapOverlay.Hint",
+            editable: [{ key: "KeyM", modifiers: ["Alt"] }],
+            restricted: true,
+            onDown: () => {
+                api.services.get("planOverlay")?.toggleDanger?.();
+            }
+        });
+    } catch(err) {
+        // Keybinding registration is optional — the world setting and the
+        // service API remain the documented toggles.
+        console.warn(`${MODULE_ID} | Threat-overlay keybinding not registered`, err);
     }
 }
 

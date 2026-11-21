@@ -183,5 +183,9 @@
   "OWAI.Notifications.PreviewTimeout": "Only War AI: предпросмотр плана для {name} истёк и был отменён. Ход остаётся под ручным управлением мастера.",
   "OWAI.Notifications.ReplanFailed": "Only War AI: перепланирование для {name} не удалось ({reason}).",
   "OWAI.Settings.MasterEnabled.Name": "Включить Only War AI",
-  "OWAI.Settings.MasterEnabled.Hint": "Общий выключатель модуля. Выкл: AI-ходы не заявляются и не исполняются, GM-превью не открывается, внедрённые элементы интерфейса скрыты. Флаги NPC сохраняются и снова заработают при включении."
+  "OWAI.Settings.MasterEnabled.Hint": "Общий выключатель модуля. Выкл: AI-ходы не заявляются и не исполняются, GM-превью не открывается, внедрённые элементы интерфейса скрыты. Флаги NPC сохраняются и снова заработают при включении.",
+  "OWAI.Settings.ThreatMapOverlay.Name": "Отладочный оверлей карты угроз",
+  "OWAI.Settings.ThreatMapOverlay.Hint": "Рисует тепловые клетки AI-карты угроз на сцене. Только для GM — игроки её не видят.",
+  "OWAI.Keybinding.ThreatMapOverlay.Name": "Переключить оверлей карты угроз AI",
+  "OWAI.Keybinding.ThreatMapOverlay.Hint": "Включает/выключает отладочный GM-only оверлей карты угроз на текущей сцене."
 }

@@ -71,7 +71,8 @@ export const SETTING_KEYS = Object.freeze({
     preferredCohesion: "preferredCohesion",
     previewTimeoutSeconds: "previewTimeoutSeconds",
     turnPacingMs: "turnPacingMs",
-    aiDifficulty: "aiDifficulty"
+    aiDifficulty: "aiDifficulty",
+    threatMapOverlay: "threatMapOverlay"
 });
 
 /** Default pacing delay between AI execution steps in milliseconds. */

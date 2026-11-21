@@ -12,6 +12,7 @@ import {
     getTurnPacingMs,
     isDiagnosticsEnabled,
     isMasterEnabled,
+    isThreatMapOverlayEnabled,
     registerSettings
 } from "../../scripts/settings.js";
 import {
@@ -26,7 +27,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 7);
+    assert.equal(registered.length, 8);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -147,6 +148,20 @@ test("aiDifficulty defaults to normal with easy/normal/hard choices (issue #16)"
     assert.equal(entry.data.default, "normal");
     assert.deepEqual(Object.keys(entry.data.choices), ["easy", "normal", "hard"]);
     assert.equal(getAIDifficulty(), "normal");
+});
+
+test("threatMapOverlay defaults to false and reads a stored value (issue #36)", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.threatMapOverlay);
+    assert.ok(entry, "threatMapOverlay registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, false);
+    assert.equal(isThreatMapOverlayEnabled(), false);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.threatMapOverlay, true);
+    assert.equal(isThreatMapOverlayEnabled(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.threatMapOverlay, "garbage");
+    assert.equal(isThreatMapOverlayEnabled(), false);
 });
 
 test("getAIDifficulty honours a stored value and rejects damaged ones", async () => {

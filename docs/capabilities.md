@@ -271,6 +271,11 @@ execute: расхождение — `stale-state` (перемещение, см�
 - `overwatch` — кандидат объявляет конус 45° на видимую угрозу через
   сервис из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
   На last-known контакт конус не объявляется.
+- Ориентация конусов (issue #30): spray/suppression наводятся только по
+  воспринимаемым якорям — видимая цель на текущую позицию, last-known на
+  запомненную точку; невидимые/неизвестные hostile на сцене шаблон не
+  наводят (вето союзников сканирует всю сцену). Overwatch — строго по
+  видимой угрозе.
 - Статусы: pinned запрещает движение, standalone aim, overwatch и
   move-reload — стационарные reload/attack-in-place остаются.
 - Веса пресетов: `aim` (прицельный выстрел), `aimAlone` (standalone aim —
@@ -314,7 +319,21 @@ execute: расхождение — `stale-state` (перемещение, см�
   (`advanceTurn:false`), Replan — в пределах `maxReplans`. Таймаут
   `previewTimeoutSeconds` (60c, `0` — бесконечно). Ход-устаревание
   авто-отменяет; stale — баннер + disabled Confirm.
+- Canvas-оверлей плана (issue #29, сервис `planOverlay`): GM-only
+  PIXI-визуализация previewed-плана — маршрутная полилиния со стрелкой,
+  конусы `template`/`overwatch`, круг blast `targetPoint`, подсветка цели.
+  Рисуется на open/replan/stale, чистится любым решением или снятием
+  сессии; документы не трогает, игрокам и не-контроллерам не виден.
 - Нет «подтвердить команду»/«подтвердить раунд» — только per-бот.
+
+### Отладка (issue #36)
+
+- `threatMapOverlay` (world setting, default `false`) + GM-keybinding
+  Alt+M → `planOverlay.setDangerEnabled/toggleDanger`: теплокарта
+  `dangerAt` поверх сетки (`dangerShade` — детерминированная раскраска),
+  режимы `plan` (карта текущего бота) и `all` (агрегат угроз команды),
+  подписи top-вкладчиков из `explain`. GM-only, чистится по disable/
+  canvasTeardown.
 
 ### Конфигурация и зоны видимости
 

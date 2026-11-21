@@ -105,7 +105,8 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
 
 Порядок шагов плана: `aim → move → attack|test → reload → overwatch →
 end-turn` (всегда последний). Attack input: `attackType`, `mode:"charge"`,
-`aim`, `targetPoint` (blast), `template.direction/covered/
+`aim`, `targetPoint` + `blastRadius` (blast, issue #29 — зона для
+оверлея/системного шаблона), `template.direction/angle/range` + `covered/
 suppressionFire/burstMode` (cone). Preconditions: move `["turn",
 "self-position","collision"]`, attack `["turn","target","resources"]`,
 aim/end-turn `["turn"]`.
@@ -116,6 +117,17 @@ aim/end-turn `["turn"]`.
 покрытия hostile; союзники ветируются всегда, нейтралы — без
 `includeNeutral`. `area = min(blastHits/2, 1)`. Удары по last-known —
 без LOS.
+
+**Ориентация конусов по восприятию (issue #30):** `_bestConeAim` берёт
+направление только по воспринимаемым якорям — `targets` планирования:
+видимая цель наводит на текущую позицию, last-known контакт — на
+запомненную точку (то же правило памяти, что у blast-«зачистки»).
+Токены `blastTokens` без восприятия (нет LOS, нет памяти, `hidden`)
+конус не наводят — они участвуют только в вето союзников/нейтралов.
+Проверка LOS — до якорей, а не до всего покрытия. Без якорей —
+`cone-no-safe-aim`, кандидата нет. `overwatch`-декларация — строго по
+видимой цели (`canAttack === true`, не `hidden`): на last-known конус
+не заявляется — память накрывает spray/blast, а не заявочный конус.
 
 ## 5. Executor (executor.js)
 
@@ -204,12 +216,40 @@ already-at-endpoint, action-budget-spent`.
 - View-model: шаги, projectedResourceDelta, npc (имя, пресет, черты,
   характер), цель, маршрут, breakdown факторов, диагностика (rejected ≤20,
   ranking ≤10), stale, timeout.
+- Canvas-оверлей плана (issue #29, `planOverlay.showPlan`): на открытии
+  preview, после replan и при stale-баннере рисуется route-полилиния со
+  стрелкой на конечную клетку, конусы `template`/`overwatch`, круг blast
+  `targetPoint` и подсветка цели; stale план рисуется приглушённо. Любое
+  решение/снятие сессии (`_drop`: confirm, cancel, timeout, внешнее
+  изменение фазы операции) очищает слой. Только controller-GM — игроки и
+  не-контроллер клиенты не видят ничего.
+
+## 10a. GM canvas overlays (plan-overlay.js, issues #29/#30/#36)
+
+`scripts/ui/plan-overlay.js` — общий GM-only корень `ow-ai-overlay` на
+слое templates с именованными подслоями (`plan`, `overwatch`, `danger`):
+чистый PIXI, без записи документов и сокетов. `overwatch.js` рисует
+заявленные конусы в тот же корень (общий `coneFanPoints`); сервис
+`planOverlay` (`api.services`) держит `start/stop`, хуки
+`canvasReady`/`canvasTearDown`/`updateCombat`/`deleteCombat` и
+`describe()`/`model()` для отладки и e2e.
+
+Danger-оверлей (issue #36): `setDangerEnabled`/`toggleDanger` +
+`setDangerMode` (`"plan"` — карта последнего плана `threatMap.map()`,
+`"all"` — агрегат по всем hostiles активного комбатанта через
+`buildMap`); `dangerCells` сканирует сетку (бюджет 2500 клеток, stride
+ростёт на больших сценах), `dangerShade` детерминированно мапит 0..1 в
+цвет/прозрачность; top-8 клеток подписываются вкладчиком из `explain`.
+Обновляется на `canvasReady`/`updateCombat`/`deleteCombat` и при redraw
+превью.
 
 ## 11. Настройки (world)
 
 `masterEnabled true` · `executionMode "preview"` · `diagnosticsEnabled false`
 · `preferredCohesion 5` · `previewTimeoutSeconds 60` · `turnPacingMs 800`
-· `aiDifficulty "normal"` (easy|normal|hard).
+· `aiDifficulty "normal"` (easy|normal|hard) · `threatMapOverlay false`
+(issue #36 — GM-only отладочная теплокарта угроз; переключается также
+keybinding Alt+M, `restricted`).
 
 Override-цепочка: Combatant → Token → Actor → disabled. Флаги:
 `config/override {enabled|mode, preset, includeNeutral}`, `personality`

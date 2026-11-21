@@ -10,12 +10,14 @@
  * combatant removal or combat end.
  */
 import { FLAG_KEYS, MODULE_ID } from "./constants.js";
+import {
+    coneFanPoints,
+    ensureOverlayLayer,
+    removeOverlayLayer
+} from "./ui/plan-overlay.js";
 
 /** Default cone arc when the declaring step does not carry one. */
 const DEFAULT_ARC_DEG = 45;
-
-/** Polygon fan step of the rendered cone sector (degrees). */
-const CONE_FAN_STEP_DEG = 5;
 
 /** Cone overlay tint and opacity. */
 const CONE_COLOR = 0xff8800;
@@ -195,38 +197,25 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     // --- GM-only canvas rendering -----------------------------------------
+    // Issue #30: declarations render into the shared GM-only overlay root
+    // (`scripts/ui/plan-overlay.js`) — same layer lifecycle as the preview
+    // plan and the danger heatmap, nothing written to documents.
 
     /**
-     * Remove the overlay container (and children) from the canvas.
+     * Remove the overlay layer (and children) from the canvas.
      * @returns {void}
      */
     function _teardownContainer() {
-        if (_container) {
-            try {
-                _container.parent?.removeChild?.(_container);
-                _container.destroy?.({ children: true });
-            } catch(err) {
-                // Best effort — a stale PIXI tree must not break the service.
-            }
-            _container = null;
-        }
+        _container = null;
+        removeOverlayLayer("overwatch");
     }
 
     /**
-     * Lazily create the overlay container on the templates layer.
+     * Lazily fetch the shared `overwatch` sub-layer of the overlay root.
      * @returns {PIXI.Container|null}
      */
     function _ensureContainer() {
-        if (_container && !_container.destroyed) return _container;
-        _container = null;
-        if (typeof PIXI === "undefined") return null;
-        const layer = globalThis.canvas?.templates ?? globalThis.canvas?.stage ?? null;
-        if (!layer || typeof layer.addChild !== "function") return null;
-        _container = new PIXI.Container();
-        _container.name = "ow-ai-overwatch";
-        _container.eventMode = "none";
-        _container.zIndex = 10;
-        layer.addChild(_container);
+        _container = ensureOverlayLayer("overwatch");
         return _container;
     }
 
@@ -270,21 +259,10 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
         if (!center || pxPerUnit <= 0) return;
         const radius = record.range * pxPerUnit;
         const arc = Number(record.arc) || DEFAULT_ARC_DEG;
-        const halfArc = arc / 2;
-        const start = record.direction - halfArc;
-        const points = [center.x, center.y];
-        const steps = Math.max(1, Math.ceil(arc / CONE_FAN_STEP_DEG));
-        for (let i = 0; i <= steps; i++) {
-            const angle = (start + (arc * i / steps)) * (Math.PI / 180);
-            points.push(
-                center.x + (Math.cos(angle) * radius),
-                center.y + (Math.sin(angle) * radius)
-            );
-        }
         const graphics = new PIXI.Graphics();
         graphics.beginFill(CONE_COLOR, CONE_FILL_ALPHA);
         graphics.lineStyle(2, CONE_COLOR, CONE_EDGE_ALPHA, 0.5);
-        graphics.drawPolygon(points);
+        graphics.drawPolygon(coneFanPoints(center, record.direction, arc, radius));
         graphics.endFill();
         container.addChild(graphics);
     }

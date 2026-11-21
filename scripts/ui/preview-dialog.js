@@ -601,6 +601,49 @@ export function createPreviewController({
     }
 
     /**
+     * Plan-overlay service: session override first, then the registry
+     * (issue #29 — the GM-only canvas visualization of the previewed
+     * plan). Absent services degrade to no-ops.
+     * @param {object} session
+     * @returns {object|null}
+     */
+    function _overlay(session) {
+        return _service("planOverlay", session?.overlay);
+    }
+
+    /**
+     * (Re)draw the GM-only plan overlay for a session — the route, the
+     * serialized templates and the target highlight (issue #29). Called
+     * on open, after a replan and when a stale banner appears, so the
+     * canvas picture always matches the dialog.
+     * @param {object} session
+     */
+    function _showOverlay(session) {
+        try {
+            _overlay(session)?.showPlan?.(session.plan, {
+                combat: session.combat,
+                combatant: session.combatant,
+                operationId: session.operationId,
+                stale: session.stale ?? null
+            });
+        } catch(err) {
+            // The overlay is decorative — never block the preview on it.
+        }
+    }
+
+    /**
+     * Clear the plan overlay of a resolved/dropped session.
+     * @param {object} session
+     */
+    function _clearOverlay(session) {
+        try {
+            _overlay(session)?.clearPlan?.(session.operationId);
+        } catch(err) {
+            // Overlay cleanup is best-effort.
+        }
+    }
+
+    /**
      * Display name of the previewed NPC for notifications.
      * @param {object} session
      * @returns {string}
@@ -729,6 +772,7 @@ export function createPreviewController({
         session.resolved = decision;
         _cancelTimeout(session);
         pending.delete(session.operationId);
+        _clearOverlay(session);
         const dialog = session.dialog;
         session.dialog = null;
         try {
@@ -877,6 +921,7 @@ export function createPreviewController({
         session.stale = null;
         _scheduleTimeout(session);
         _render(session);
+        _showOverlay(session);
         log(`preview ${session.operationId} replanned -> ${planned.plan.id}`);
         return { ok: true, decision: PREVIEW_DECISIONS.replan, plan: planned.plan };
     }
@@ -930,6 +975,7 @@ export function createPreviewController({
             planner: payload.planner,
             operations: payload.operations,
             authority: payload.authority,
+            overlay: payload.overlay,
             timeoutSeconds: Number.isFinite(timeoutSeconds) ? timeoutSeconds : 0,
             timeoutId: null,
             stale: null,
@@ -939,6 +985,7 @@ export function createPreviewController({
         pending.set(operationId, session);
         _scheduleTimeout(session);
         _present(session);
+        _showOverlay(session);
         log(`preview ${operationId}: plan ${plan.id} timeout=${session.timeoutSeconds}s`);
         return { ok: true, operationId, session };
     }
@@ -992,6 +1039,7 @@ export function createPreviewController({
             return;
         }
         _render(session);
+        _showOverlay(session);
         log(`preview ${session.operationId} stale: ${session.stale}`);
     }
 

@@ -960,6 +960,11 @@ function _coneSpecOf(action) {
  * @param {number} input.rangePx Cone length in pixels.
  * @param {number} input.angleDeg Full cone angle (degrees).
  * @param {object[]} input.tokens Coverage scan entries (blastTokens shape).
+ * @param {object[]} [input.anchors] Perceived orientation anchors (issue
+ *   #30): when provided, only these `{x, y, tokenUuid?, tokenId?}` points
+ *   steer the cone — visible targets aim their live position, last-known
+ *   contacts the remembered point; `tokens` still vetoes friendlies but
+ *   hostiles the bot cannot perceive are ignored instead of counted.
  * @param {number} input.viewerDisposition Self disposition.
  * @param {object} input.options `{includeNeutral, dispositions}`.
  * @param {object|null} input.perception Perception service (LOS probes).
@@ -968,14 +973,20 @@ function _coneSpecOf(action) {
  */
 function _bestConeAim({
     tokenDoc, origin, rangePx, angleDeg, tokens,
-    viewerDisposition, options, perception, requireLos = true
+    anchors = null, viewerDisposition, options, perception, requireLos = true
 }) {
     if (!origin || rangePx <= 0 || !(angleDeg > 0)) return null;
     const hostiles = (tokens ?? []).filter(token =>
         _hostileTo(viewerDisposition, Math.sign(_finiteOr(token.disposition, 0)), options));
-    if (!hostiles.length) return null;
-    const bearings = hostiles.map(token =>
-        ((Math.atan2(token.y - origin.y, token.x - origin.x) * 180 / Math.PI) + 360) % 360);
+    // Issue #30: without an explicit anchor list the hostile coverage
+    // scan steers the cone (legacy behaviour); with one, only perceived
+    // anchors do — a hostile the bot cannot see never aims the template.
+    const anchorList = Array.isArray(anchors)
+        ? anchors.filter(anchor => Number.isFinite(anchor?.x) && Number.isFinite(anchor?.y))
+        : hostiles;
+    if (!anchorList.length) return null;
+    const bearings = anchorList.map(anchor =>
+        ((Math.atan2(anchor.y - origin.y, anchor.x - origin.x) * 180 / Math.PI) + 360) % 360);
     const directions = new Set(bearings);
     for (let i = 0; i < bearings.length; i++) {
         for (let j = i + 1; j < bearings.length; j++) {
@@ -989,23 +1000,29 @@ function _bestConeAim({
         let hits = 0;
         let blocked = false;
         const covered = [];
+        for (const anchor of anchorList) {
+            if (!_tokenInCone(origin, direction, angleDeg, rangePx, anchor)) continue;
+            hits++;
+            covered.push({
+                tokenUuid: anchor.tokenUuid ?? null,
+                tokenId: anchor.tokenId ?? anchor.id ?? null,
+                x: anchor.x,
+                y: anchor.y,
+                elevation: anchor.elevation ?? null
+            });
+        }
+        if (hits <= 0) continue;
+        // Friendly/neutral veto still scans every scene token: the bot
+        // must not blanket allies just because it aimed by perception.
         for (const token of tokens) {
             if (!_tokenInCone(origin, direction, angleDeg, rangePx, token)) continue;
             const disp = Math.sign(_finiteOr(token.disposition, 0));
-            if (_hostileTo(viewerDisposition, disp, options)) {
-                hits++;
-                covered.push({
-                    tokenUuid: token.tokenUuid ?? null,
-                    tokenId: token.tokenId ?? token.id ?? null,
-                    x: token.x,
-                    y: token.y,
-                    elevation: token.elevation ?? null
-                });
-            } else {
+            if (!_hostileTo(viewerDisposition, disp, options)) {
                 blocked = true;
+                break;
             }
         }
-        if (blocked || hits <= 0) continue;
+        if (blocked) continue;
         if (requireLos && perception && typeof perception.hasLineOfSight === "function") {
             let anyLos = false;
             for (const entry of covered) {
@@ -2279,11 +2296,22 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
                     ? { aim: candidate.aimBonus }
                     : (Number.isFinite(carriedAim) ? { aim: carriedAim } : {})),
                 ...(candidate.aim
-                    ? { targetPoint: { x: candidate.aim.x, y: candidate.aim.y } }
+                    ? {
+                        targetPoint: { x: candidate.aim.x, y: candidate.aim.y },
+                        // Issue #29: the blast radius rides along so the
+                        // GM overlay (and the system template layer) can
+                        // draw the strike zone without re-resolving the
+                        // weapon profile.
+                        blastRadius: _actionBlastRadius(action)
+                    }
                     : {}),
                 ...(candidate.cone
                     ? {
-                        template: { direction: candidate.cone.direction },
+                        template: {
+                            direction: candidate.cone.direction,
+                            angle: candidate.cone.spec?.angle ?? null,
+                            range: _actionRange(action)
+                        },
                         covered: candidate.cone.covered.map(entry => entry.tokenUuid),
                         ...(candidate.cone.spec?.suppression
                             ? {
@@ -2981,6 +3009,22 @@ export function createPlannerService({
         // One attack-in-place candidate per template action; spray may
         // also reposition — suppression is a sustained area attack and
         // never combines with movement.
+        // Issue #30: cone orientation anchors are only perceived contacts —
+        // visible targets aim their live position, last-known contacts the
+        // remembered point. Hostiles present on the scene but unknown to
+        // the bot (no LOS, no memory) never steer the template; the
+        // friendly/neutral veto still scans every scene token for safety.
+        const coneAnchors = targets
+            .filter(target => target?.hidden !== true
+                && Number.isFinite(target?.x) && Number.isFinite(target?.y))
+            .map(target => ({
+                tokenUuid: target.tokenUuid ?? null,
+                tokenId: target.tokenId ?? null,
+                x: target.x,
+                y: target.y,
+                elevation: target.elevation ?? null,
+                source: target.source ?? null
+            }));
         for (const action of usableActions) {
             const spec = _coneSpecOf(action);
             if (!spec) continue;
@@ -2990,6 +3034,7 @@ export function createPlannerService({
                 rangePx: range * pxPerUnit,
                 angleDeg: spec.angle,
                 tokens: blastTokens,
+                anchors: coneAnchors,
                 viewerDisposition,
                 options: blastOptions,
                 perception
@@ -3115,11 +3160,14 @@ export function createPlannerService({
         // Overwatch: declare a 45° watch cone toward the nearest visible
         // threat. The step only registers the declaration — the reaction
         // shot itself stays under manual GM control (issue #14 service,
-        // #15 candidate). For memory-only contacts a search move or a
-        // hold is the better turn — no cone is declared on a guess.
+        // #15 candidate). Issue #30: only a live visible target is a
+        // valid orientation anchor — for memory-only contacts a search
+        // move or a spray/memory-strike is the documented turn, and a
+        // hidden or entirely unknown position never steers a declaration.
         if (!isPinned) {
             const owAction = _overwatchAction(usableActions);
             const owDirection = threatTarget?.canAttack === true
+                && threatTarget.hidden !== true
                 ? _bearingTo(selfPos, threatTarget) : null;
             if (owAction && Number.isFinite(owDirection)
                 && ACTION_BUDGET_HALVES <= actionBudget) {

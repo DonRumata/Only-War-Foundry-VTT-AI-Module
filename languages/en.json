@@ -183,5 +183,9 @@
   "OWAI.Notifications.PreviewTimeout": "Only War AI: plan preview for {name} timed out and was cancelled. The turn stays under manual GM control.",
   "OWAI.Notifications.ReplanFailed": "Only War AI: replan for {name} failed ({reason}).",
   "OWAI.Settings.MasterEnabled.Name": "Enable Only War AI",
-  "OWAI.Settings.MasterEnabled.Hint": "Master switch for the whole module. Off: no AI turns are claimed or executed, the GM preview never opens and injected UI is hidden. Individual NPC flags are kept for when it is turned back on."
+  "OWAI.Settings.MasterEnabled.Hint": "Master switch for the whole module. Off: no AI turns are claimed or executed, the GM preview never opens and injected UI is hidden. Individual NPC flags are kept for when it is turned back on.",
+  "OWAI.Settings.ThreatMapOverlay.Name": "Threat map debug overlay",
+  "OWAI.Settings.ThreatMapOverlay.Hint": "Draw the AI threat-map heat cells on the scene canvas. GM-only debug visualization — players never see it.",
+  "OWAI.Keybinding.ThreatMapOverlay.Name": "Toggle AI threat map overlay",
+  "OWAI.Keybinding.ThreatMapOverlay.Hint": "Toggle the GM-only threat-map debug overlay on the current scene."
 }
