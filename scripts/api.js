@@ -55,6 +55,7 @@ export function createModuleApi() {
             "perception.memory": true,
             "perception.targets": true,
             "planner.freeActions": true,
+            "planner.layers": true,
             "planner.personalities": true,
             "planner.planTurn": true,
             "planner.presets": true,

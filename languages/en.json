@@ -209,6 +209,14 @@
   "OWAI.Settings.AttackAdjudication.Hint": "Auto: the system roll API resolves AI attacks. GM confirm: before every attack/test step a GM chat card offers to execute it, roll it manually, substitute a skill test or take the turn back. Preview mode always asks the GM once for the whole plan.",
   "OWAI.Settings.AttackAdjudication.Auto": "Automatic",
   "OWAI.Settings.AttackAdjudication.GmConfirm": "GM confirm",
+  "OWAI.Settings.LayerCommitment.Name": "Behaviour layer: commitment (L1)",
+  "OWAI.Settings.LayerCommitment.Hint": "A still-valid multi-turn plan executes its next step instead of scoring from scratch. Framework only — the commitment service lands in a follow-up issue; with no recorded commitment planning is unchanged.",
+  "OWAI.Settings.LayerMorale.Name": "Behaviour layer: morale (L2)",
+  "OWAI.Settings.LayerMorale.Hint": "Lets the squad morale posture narrow the candidate space before scoring. Framework only — posture factors land in a follow-up issue; enabling today only records the resolved posture in diagnostics.",
+  "OWAI.Settings.LayerPersonality.Name": "Behaviour layer: personality (L3)",
+  "OWAI.Settings.LayerPersonality.Hint": "Applies per-bot trait weight deltas (bounded to ±30% of the base weight) and the seeded score jitter. Off = fully deterministic base scoring.",
+  "OWAI.Settings.LayerLookahead.Name": "Behaviour layer: lookahead (L4)",
+  "OWAI.Settings.LayerLookahead.Hint": "Allows the 2-ply counter-damage re-scoring pass on hard difficulty. Off = base utility only, even on hard.",
   "OWAI.Keybinding.ThreatMapOverlay.Name": "Toggle AI threat map overlay",
   "OWAI.Keybinding.ThreatMapOverlay.Hint": "Toggle the GM-only threat-map debug overlay on the current scene."
 }

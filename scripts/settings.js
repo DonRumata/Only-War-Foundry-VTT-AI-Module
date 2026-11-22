@@ -16,12 +16,17 @@
  *   attack/test steps execute unattended or pause for a GM decision card
  *   (issue #37). Applies to `executionMode: "automatic"` only; the preview
  *   mode already carries its own confirmation point.
+ * - `layersCommitment`/`layersMorale`/`layersPersonality`/
+ *   `layersLookahead`: booleans — per-layer on/off toggles of the L0–L4
+ *   planning funnel (issue #24). A disabled layer degrades to the
+ *   previous level; defaults live in {@link DEFAULT_LAYER_FLAGS}.
  */
 import {
     AI_DIFFICULTIES,
     ATTACK_ADJUDICATION_MODES,
     DEFAULT_AI_DIFFICULTY,
     DEFAULT_ATTACK_ADJUDICATION,
+    DEFAULT_LAYER_FLAGS,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -135,6 +140,23 @@ export function registerSettings() {
             }
         }
     });
+
+    // Issue #24: per-layer toggles of the L0–L4 behaviour funnel.
+    for (const [key, settingKey, suffix] of [
+        ["commitment", SETTING_KEYS.layersCommitment, "LayerCommitment"],
+        ["morale", SETTING_KEYS.layersMorale, "LayerMorale"],
+        ["personality", SETTING_KEYS.layersPersonality, "LayerPersonality"],
+        ["lookahead", SETTING_KEYS.layersLookahead, "LayerLookahead"]
+    ]) {
+        game.settings.register(MODULE_ID, settingKey, {
+            name: `OWAI.Settings.${suffix}.Name`,
+            hint: `OWAI.Settings.${suffix}.Hint`,
+            scope: "world",
+            config: true,
+            type: Boolean,
+            default: DEFAULT_LAYER_FLAGS[key]
+        });
+    }
 }
 
 /**
@@ -267,6 +289,27 @@ export function isThreatMapOverlayEnabled() {
     } catch(_err) {
         return false;
     }
+}
+
+/**
+ * Effective on/off map of the behaviour layers (issue #24):
+ * `{commitment, morale, personality, lookahead}`. Missing or damaged
+ * values fall back to {@link DEFAULT_LAYER_FLAGS}; `context.layers`
+ * overrides are merged by the planner funnel (`scripts/layers.js`).
+ * @returns {object}
+ */
+export function getLayerFlags() {
+    const read = key => {
+        try {
+            const value = game.settings.get(MODULE_ID, SETTING_KEYS[`layers${key[0].toUpperCase()}${key.slice(1)}`]);
+            return typeof value === "boolean" ? value : DEFAULT_LAYER_FLAGS[key];
+        } catch(_err) {
+            return DEFAULT_LAYER_FLAGS[key];
+        }
+    };
+    const flags = {};
+    for (const key of Object.keys(DEFAULT_LAYER_FLAGS)) flags[key] = read(key);
+    return flags;
 }
 
 /**

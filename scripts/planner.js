@@ -29,7 +29,14 @@ import {
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import {
-    applyPersonalityOverlay,
+    applyCommitmentLayer,
+    applyMoraleLayer,
+    boundedPersonalityOverlay,
+    moralePostureOf,
+    recordLayerReason,
+    resolveLayerFlags
+} from "./layers.js";
+import {
     personalityBehaviorFlags,
     personalityIdentity,
     personalityJitter,
@@ -1476,11 +1483,7 @@ function _moraleOf(combatant, context = {}) {
     const record = injected !== undefined ? injected
         : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.morale)
             ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.morale]);
-    const state = typeof record?.state === "string" ? record.state : null;
-    return {
-        pressured: record?.pressured === true || state === "pressured",
-        desperate: record?.desperate === true || state === "desperate"
-    };
+    return moralePostureOf(record);
 }
 
 /**
@@ -3183,8 +3186,16 @@ export function createPlannerService({
             rejected: [],
             ranking: [],
             chosenStep: null,
-            metrics: { targetsEvaluated: 0, movesEvaluated: 0 }
+            metrics: { targetsEvaluated: 0, movesEvaluated: 0 },
+            // Issue #24 funnel: unified `{layer, code, detail}` reason
+            // trace (#27 plumbing) plus the effective layer toggles.
+            layers: [],
+            layerFlags: null
         };
+        // `context.layers` boolean overrides win over the world settings;
+        // a disabled layer degrades to the previous funnel level.
+        const layerFlags = resolveLayerFlags(context);
+        diagnostics.layerFlags = { ...layerFlags };
 
         const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
         const actor = _actorOf(combatant) ?? _actorOf(tokenDoc);
@@ -3195,6 +3206,7 @@ export function createPlannerService({
         // candidates and route scoring need a square/hex grid (issue
         // #410). Navigation answers `gridless-unsupported` the same way.
         if (grid.type === 0) {
+            recordLayerReason(diagnostics, "L0", "gridless-unsupported");
             return {
                 status: PLANNER_STATUS.unsupported,
                 reason: "gridless-unsupported",
@@ -3203,44 +3215,71 @@ export function createPlannerService({
             };
         }
         const selfPos = _tokenPosition(tokenDoc);
-        // Issue #19 personalities: explicit `context.personality` or the
-        // resolved `flags["only-war-ai"].personality` list wins, otherwise
-        // 1–2 traits are generated seeded from the stable document
-        // identity. Additive weight deltas merge over the preset weights
-        // (same overlay pattern as the spec-ops task weights); a seeded
-        // per-candidate jitter then wobbles the final scores. The
-        // fireteam `character` arrives as `context.team.character`.
-        const personality = resolvePersonality({
-            explicit: context.personality,
-            flagged: config.personality,
-            character: context.team?.character,
-            difficulty,
-            identity: personalityIdentity({ combatant, token: tokenDoc, actor })
-        });
-        // `context.personality === false` disables the whole system —
-        // no traits and no jitter, a fully deterministic pick.
-        const personalityAmp = personality.source === "disabled"
-            ? 0
-            : personalityJitter({
-                traits: personality.traits,
-                character: personality.character,
-                difficulty
+        // Issue #19 personalities live at L3 of the funnel (issue #24):
+        // explicit `context.personality` or the resolved
+        // `flags["only-war-ai"].personality` list wins, otherwise 1–2
+        // traits are generated seeded from the stable document identity.
+        // The block is resolved lazily so the L0 stunned short-circuit
+        // below and the main scoring path share the same resolution.
+        const _runPersonalityLayer = () => {
+            const resolved = resolvePersonality({
+                // A disabled L3 layer degrades to `source:"disabled"` —
+                // same as `context.personality === false`: no traits, no
+                // jitter, a fully deterministic pick.
+                explicit: layerFlags.personality === false
+                    ? false
+                    : context.personality,
+                flagged: config.personality,
+                character: context.team?.character,
+                difficulty,
+                identity: personalityIdentity({ combatant, token: tokenDoc, actor })
             });
-        diagnostics.personality = {
-            traits: [...personality.traits],
-            character: personality.character,
-            source: personality.source,
-            jitter: personalityAmp,
-            flags: personalityBehaviorFlags(personality.traits)
+            const amp = resolved.source === "disabled"
+                ? 0
+                : personalityJitter({
+                    traits: resolved.traits,
+                    character: resolved.character,
+                    difficulty
+                });
+            diagnostics.personality = {
+                traits: [...resolved.traits],
+                character: resolved.character,
+                source: resolved.source,
+                jitter: amp,
+                flags: personalityBehaviorFlags(resolved.traits)
+            };
+            // L3 bound (issue #24): additive deltas merge over the preset
+            // weights but every applied delta is braced to ±30% of the
+            // base weight — scripts/layers.js documents the zero-base
+            // floor and reports the clamped factors.
+            const overlay = boundedPersonalityOverlay(preset.weights, {
+                traits: resolved.traits,
+                character: resolved.character
+            });
+            if (Object.keys(overlay.clamped).length) {
+                diagnostics.personality.clamped = overlay.clamped;
+            }
+            diagnostics.weights = { ...overlay.weights };
+            recordLayerReason(diagnostics, "L3",
+                layerFlags.personality === false
+                    ? "personality-layer-disabled"
+                    : "personality-overlay",
+                layerFlags.personality === false ? undefined : {
+                    traits: [...resolved.traits],
+                    character: resolved.character,
+                    clamped: Object.keys(overlay.clamped)
+                });
+            return {
+                personality: resolved,
+                personalityAmp: amp,
+                effectiveWeights: overlay.weights
+            };
         };
-        const effectiveWeights = applyPersonalityOverlay(preset.weights, {
-            traits: personality.traits,
-            character: personality.character
-        });
-        diagnostics.weights = { ...effectiveWeights };
         // Self status constraints (issue #413): deterministic rules read
         // from actor/token statuses merged with the injected
-        // `context.selfStatuses` fixture array.
+        // `context.selfStatuses` fixture array. These are L0 hard vetoes —
+        // they run ahead of every other funnel entry point so nothing
+        // below may override them.
         // - `stunned`: OW combatants take no actions — short-circuit to an
         //   ok plan whose only step is `end-turn` stamped `stunned`.
         // - `pinned`: no charge and no move that ends closer to the
@@ -3250,6 +3289,8 @@ export function createPlannerService({
         const selfStatuses = _selfStatuses(actor, tokenDoc, context.selfStatuses);
         diagnostics.selfStatuses = selfStatuses;
         if (selfStatuses.includes("stunned")) {
+            recordLayerReason(diagnostics, "L0", "stunned");
+            const l3 = _runPersonalityLayer();
             const steps = [{
                 id: "step-end-turn-1",
                 type: "end-turn",
@@ -3261,7 +3302,7 @@ export function createPlannerService({
             diagnostics.chosenStep = steps[0].id;
             const plan = _assemblePlan({
                 combat, combatant, context, authority, seed, presetId,
-                diagnostics, steps, personality,
+                diagnostics, steps, personality: l3.personality,
                 winner: { score: 0, breakdown: { reason: "stunned" }, target: null },
                 targets: [],
                 actions: []
@@ -3271,6 +3312,52 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
+        // Issue #24 L1 commitment (entry point only — issue #25 owns the
+        // record backend; the stub reads an injected `context.commitment`
+        // `{valid?, steps, source?}`). A valid record short-circuits the
+        // funnel: its serialized steps are executed verbatim and no
+        // scoring runs.
+        const commitment = applyCommitmentLayer({
+            combatant, context, flags: layerFlags, diagnostics
+        });
+        if (commitment.decision) {
+            const steps = commitment.decision.steps;
+            diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id
+                ?? steps[0]?.id ?? null;
+            const plan = _assemblePlan({
+                combat, combatant, context, authority, seed, presetId,
+                diagnostics, steps, personality: null,
+                winner: {
+                    score: 0,
+                    breakdown: {
+                        reason: "commitment",
+                        source: commitment.decision.source
+                    },
+                    target: null
+                },
+                targets: [],
+                actions: []
+            });
+            log(`plan ${plan.id} preset=${presetId} commitment hit`);
+            return { status: PLANNER_STATUS.ok, plan, reason: null };
+        }
+        // Issue #24 L2 morale — pass-through contract for #26: the layer
+        // resolves and reports the squad posture on the trace but narrows
+        // nothing yet (task assignment and posture factors are #26's own
+        // work; the legacy #38 graceful morale reads stay unconditional).
+        const moralePosture = applyMoraleLayer({
+            combatant, context, flags: layerFlags, diagnostics
+        });
+        diagnostics.morale = {
+            enabled: moralePosture.enabled,
+            state: moralePosture.state,
+            pressured: moralePosture.pressured,
+            desperate: moralePosture.desperate
+        };
+        const l3 = _runPersonalityLayer();
+        const personality = l3.personality;
+        const personalityAmp = l3.personalityAmp;
+        const effectiveWeights = l3.effectiveWeights;
         // Prone halves the numeric movement budget (floor; crawl) — both
         // the navigation findCandidates input and the `budgetOver`
         // factor see the reduced value.
@@ -3443,6 +3530,13 @@ export function createPlannerService({
 
         const candidates = [];
         let routesMissing = false;
+        // L0 hard vetoes (issue #24): every candidate rejection is
+        // absolute — no personality or morale layer may revive it, and
+        // each is mirrored into the unified layer reason trace.
+        const rejectL0 = (candidate, reason) => {
+            diagnostics.rejected.push({ candidate, reason });
+            recordLayerReason(diagnostics, "L0", reason, candidate);
+        };
         // Dedup guard so a status veto logs one diagnostics entry per
         // candidate/reason instead of one per enumerated move.
         const rejectedOnce = new Set();
@@ -3450,7 +3544,7 @@ export function createPlannerService({
             const key = `${candidate}|${reason}`;
             if (rejectedOnce.has(key)) return;
             rejectedOnce.add(key);
-            diagnostics.rejected.push({ candidate, reason });
+            rejectL0(candidate, reason);
         };
         // Blast-awareness context: aim points are searched once per
         // action/target over this coverage set; friendlies always veto a
@@ -3503,25 +3597,16 @@ export function createPlannerService({
                 && usableActions.some(action => _actionBlastRadius(action) > 0
                     && !_isMeleeAction(action));
             if (target.canAttack !== true && !memoryStrike) {
-                diagnostics.rejected.push({
-                    candidate: `attack|${target.tokenUuid}`,
-                    reason: "target-not-attackable"
-                });
+                rejectL0(`attack|${target.tokenUuid}`, "target-not-attackable");
             } else if (!usableActions.length) {
-                diagnostics.rejected.push({
-                    candidate: `attack|${target.tokenUuid}`,
-                    reason: "no-action"
-                });
+                rejectL0(`attack|${target.tokenUuid}`, "no-action");
             } else {
                 // One attack variant per legal action so presets can prefer
                 // melee charge plans over a higher-damage ranged option.
                 for (const action of usableActions) {
                     const tag = `${action.id}|${target.tokenUuid}`;
                     if (_actionCost(action) > actionBudget) {
-                        diagnostics.rejected.push({
-                            candidate: `action|${tag}`,
-                            reason: "over-budget"
-                        });
+                        rejectL0(`action|${tag}`, "over-budget");
                         continue;
                     }
                     // Cone weapons aim a direction, not a token — their
@@ -3647,10 +3732,7 @@ export function createPlannerService({
                             });
                         }
                     } else {
-                        diagnostics.rejected.push({
-                            candidate: `attack-in-place|${tag}`,
-                            reason: "out-of-range"
-                        });
+                        rejectL0(`attack-in-place|${tag}`, "out-of-range");
                     }
                     let attackMoveFound = false;
                     // A charge exists to close distance вЂ” when a melee
@@ -3714,10 +3796,8 @@ export function createPlannerService({
                         }
                     }
                     if (!inPlace && !attackMoveFound) {
-                        diagnostics.rejected.push({
-                            candidate: `${melee ? "charge" : "move-attack"}|${tag}`,
-                            reason: moves.some(move => !move.stay) ? "out-of-range" : "no-route"
-                        });
+                        rejectL0(`${melee ? "charge" : "move-attack"}|${tag}`,
+                            moves.some(move => !move.stay) ? "out-of-range" : "no-route");
                     }
                 }
             }
@@ -3737,16 +3817,10 @@ export function createPlannerService({
             if (approachMove && !approachVetoed && approachHalves <= actionBudget) {
                 candidates.push({ target, action: null, move: approachMove, variant: "approach" });
             } else if (approachVetoed) {
-                diagnostics.rejected.push({
-                    candidate: `approach|${target.tokenUuid}`,
-                    reason: "pinned"
-                });
+                rejectL0(`approach|${target.tokenUuid}`, "pinned");
             } else if (!attackFound) {
                 routesMissing = true;
-                diagnostics.rejected.push({
-                    candidate: `approach|${target.tokenUuid}`,
-                    reason: "no-route"
-                });
+                rejectL0(`approach|${target.tokenUuid}`, "no-route");
             }
         }
 
@@ -3788,10 +3862,7 @@ export function createPlannerService({
             };
             const aim = _bestConeAim({ ...aimInput, origin: selfPos });
             if (!aim) {
-                diagnostics.rejected.push({
-                    candidate: `cone|${action.id}`,
-                    reason: "cone-no-safe-aim"
-                });
+                rejectL0(`cone|${action.id}`, "cone-no-safe-aim");
                 continue;
             }
             const coneTarget = _coneTargetOf(aim, targets, selfPos, grid);
@@ -3863,10 +3934,7 @@ export function createPlannerService({
             for (const reload of reloadActions) {
                 const halves = _actionCost(reload);
                 if (halves > actionBudget) {
-                    diagnostics.rejected.push({
-                        candidate: `reload|${reload.id}`,
-                        reason: "over-budget"
-                    });
+                    rejectL0(`reload|${reload.id}`, "over-budget");
                     continue;
                 }
                 candidates.push({
@@ -3919,10 +3987,7 @@ export function createPlannerService({
             if (owAction && selfReactionUsed) {
                 // Issue #37: the reaction slot is spent — a declaration
                 // could never fire this round, so the cone is not offered.
-                diagnostics.rejected.push({
-                    candidate: `overwatch|${owAction.id}`,
-                    reason: "reaction-used"
-                });
+                rejectL0(`overwatch|${owAction.id}`, "reaction-used");
             } else if (owAction && Number.isFinite(owDirection)
                 && ACTION_BUDGET_HALVES <= actionBudget) {
                 candidates.push({
@@ -3943,10 +4008,7 @@ export function createPlannerService({
         // inventory fallback synthesizes a half action.
         for (const ready of readyActions) {
             if (_actionCost(ready) > actionBudget) {
-                diagnostics.rejected.push({
-                    candidate: `ready-weapon|${ready.id}`,
-                    reason: "over-budget"
-                });
+                rejectL0(`ready-weapon|${ready.id}`, "over-budget");
                 continue;
             }
             candidates.push({
@@ -3981,15 +4043,9 @@ export function createPlannerService({
         if (isPinned) {
             const unpin = _unpinAction(actor);
             if (!unpin) {
-                diagnostics.rejected.push({
-                    candidate: "unpin",
-                    reason: "unpin-unavailable"
-                });
+                rejectL0("unpin", "unpin-unavailable");
             } else if (_actionCost(unpin) > actionBudget) {
-                diagnostics.rejected.push({
-                    candidate: `unpin|${unpin.id}`,
-                    reason: "over-budget"
-                });
+                rejectL0(`unpin|${unpin.id}`, "over-budget");
             } else {
                 candidates.push({
                     variant: "unpin",
@@ -4009,15 +4065,9 @@ export function createPlannerService({
         if (orderCandidate) {
             const order = _orderAction(actor, orderCandidate);
             if (!order) {
-                diagnostics.rejected.push({
-                    candidate: `order|${orderCandidate.orderId ?? "unknown"}`,
-                    reason: "order-unavailable"
-                });
+                rejectL0(`order|${orderCandidate.orderId ?? "unknown"}`, "order-unavailable");
             } else if (_actionCost(order) > actionBudget) {
-                diagnostics.rejected.push({
-                    candidate: `order|${order.orderId}`,
-                    reason: "over-budget"
-                });
+                rejectL0(`order|${order.orderId}`, "over-budget");
             } else {
                 candidates.push({
                     variant: "order",
@@ -4096,10 +4146,8 @@ export function createPlannerService({
                     vetoReason = null;
                 }
                 if (vetoReason) {
-                    diagnostics.rejected.push({
-                        candidate: _candidateId(candidate, index),
-                        reason: typeof vetoReason === "string" ? vetoReason : "preset-veto"
-                    });
+                    rejectL0(_candidateId(candidate, index),
+                        typeof vetoReason === "string" ? vetoReason : "preset-veto");
                     return;
                 }
             }
@@ -4152,6 +4200,9 @@ export function createPlannerService({
             candidate: entry.id,
             score: entry.score
         }));
+        recordLayerReason(diagnostics, "L4", "scored", {
+            candidates: scored.length
+        });
 
         if (!scored.length) {
             return {
@@ -4171,9 +4222,20 @@ export function createPlannerService({
         // uses, so the pass stays deterministic. Enabled on hard
         // difficulty or through `context.lookahead`.
         const lookahead = _lookaheadConfig(planContext, difficulty);
+        // Issue #24: the L4 lookahead flag is the master gate — off
+        // degrades to plain base-utility scoring even on hard difficulty
+        // and even with a `context.lookahead` force-enable.
+        if (layerFlags.lookahead === false && lookahead.enabled) {
+            lookahead.enabled = false;
+            recordLayerReason(diagnostics, "L4", "lookahead-layer-disabled");
+        }
         let pickPool = scored;
         let scoreOf = entry => entry.score;
         if (lookahead.enabled) {
+            recordLayerReason(diagnostics, "L4", "lookahead", {
+                lambda: lookahead.lambda,
+                topK: lookahead.topK
+            });
             pickPool = _applyLookahead(scored, {
                 threats, grid, los: losProbe,
                 lambda: lookahead.lambda,
@@ -4206,6 +4268,7 @@ export function createPlannerService({
             const chance = _finiteOr(planContext.easyMistakeChance, EASY_MISTAKE_CHANCE);
             const mistake = mulberry32((seed ^ EASY_PICK_SEED_XOR) >>> 0)() < chance;
             diagnostics.easyPick = { chance, mistake };
+            recordLayerReason(diagnostics, "L4", "easy-slip", { chance, mistake });
             if (mistake) {
                 const rest = pickPool.filter(entry => entry !== winner)
                     .slice(0, EASY_PICK_TOP_K);
@@ -4223,6 +4286,10 @@ export function createPlannerService({
         if (winner.dodge) {
             winner.breakdown = { ...winner.breakdown, dodge: winner.dodge };
         }
+        recordLayerReason(diagnostics, "L4", "winner", {
+            candidate: winner.id ?? null,
+            score: winner.score
+        });
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
         // attack step — the executor clears the flag once the shot lands.

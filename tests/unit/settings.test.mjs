@@ -8,6 +8,7 @@ import {
     getAIDifficulty,
     getAttackAdjudication,
     getExecutionMode,
+    getLayerFlags,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
     getTurnPacingMs,
@@ -18,6 +19,7 @@ import {
 } from "../../scripts/settings.js";
 import {
     ATTACK_ADJUDICATION_MODES,
+    DEFAULT_LAYER_FLAGS,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -29,7 +31,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 9);
+    assert.equal(registered.length, 13);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -196,4 +198,33 @@ test("getAttackAdjudication honours a stored value and rejects damaged ones", as
     assert.equal(getAttackAdjudication(), "gm-confirm");
     await game.settings.set(MODULE_ID, SETTING_KEYS.attackAdjudication, "garbage");
     assert.equal(getAttackAdjudication(), "auto");
+});
+
+test("layer toggles register with issue #24 defaults", () => {
+    _resetMocks();
+    registerSettings();
+    for (const [key, expected] of Object.entries(DEFAULT_LAYER_FLAGS)) {
+        const settingKey = SETTING_KEYS[
+            `layers${key[0].toUpperCase()}${key.slice(1)}`];
+        const entry = game.settings._registered.find(e => e.key === settingKey);
+        assert.ok(entry, `${settingKey} registered`);
+        assert.equal(entry.data.scope, "world");
+        assert.equal(entry.data.type, Boolean);
+        assert.equal(entry.data.default, expected);
+    }
+    assert.deepEqual(getLayerFlags(), { ...DEFAULT_LAYER_FLAGS });
+});
+
+test("getLayerFlags honours stored values and rejects damaged ones", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersMorale, true);
+    assert.equal(getLayerFlags().morale, true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersPersonality, false);
+    assert.equal(getLayerFlags().personality, false);
+    // Damaged values fall back to the defaults.
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersLookahead, "garbage");
+    assert.equal(getLayerFlags().lookahead, DEFAULT_LAYER_FLAGS.lookahead);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersCommitment, 1);
+    assert.equal(getLayerFlags().commitment, DEFAULT_LAYER_FLAGS.commitment);
 });

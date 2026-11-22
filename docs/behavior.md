@@ -483,11 +483,35 @@ turn, woundsLost, attribution}` — controller-only, issue #39).
   targeted-карточкам урона; экспирация 2 раунда, вне
   stale-fingerprint).
 
-## 13. Позиция перед рефактором #24
+## 13. Воронка слоёв поведения (issue #24)
 
-Соответствие слоям: L0 = существующие вето/reason-коды; L1 commitment —
-нет (план живёт один ход); L2 morale — нет (ближайшее — fireteam
-character как статический overlay); L3 — personalities (#19, внедрено);
-L4 = текущий scoring + lookahead (#16, внедрено). Рефактор #24 —
-формализация того, что уже частично есть, + добавление L1/L2 и
-обязательного trace (#27).
+Pipeline планирования переформализован как вложенная воронка L0–L4 —
+контракт, скобы влияния, reason-формат и флаги описаны в
+`docs/layers.md`. Кратко:
+
+- **L0 hard-veto** — все отказы легальности: `diagnostics.rejected`
+  (blast/конусы по союзникам, дальность, бюджет, `canAttack`, статусы,
+  preset-veto) + входные гейты (`gridless-unsupported`, `stunned`).
+  Абсолютно: отвергнутый кандидат не достигает скоринга никогда.
+- **L1 commitment** — точка входа `applyCommitmentLayer`
+  (`scripts/layers.js`): валидная запись `context.commitment`
+  `{valid?, steps, source?}` → её шаги исполняются без генерации и
+  скоринга (`breakdown.reason: "commitment"`). Персистентность и
+  валидация записи — issue #25.
+- **L2 morale** — `applyMoraleLayer` резолвит позу из зарезервированного
+  флага `morale`/`context.morale` и пишет её в trace; сужающих эффектов
+  до #26 нет (легаси-чтения #38 — sync-delay/orderBoost — остаются
+  безусловными).
+- **L3 personalities** — дельты #19 через `boundedPersonalityOverlay`:
+  каждая дельта зажата в ±30% от базового веса (нулевая база — ±6 от
+  опорной шкалы 20); зажатые факторы репортятся
+  `diagnostics.personality.clamped`. Jitter без изменений.
+- **L4** — существующий scoring + lookahead; `layersLookahead` —
+  мастер-гейт поверх difficulty/`context.lookahead`.
+
+Каждый слой пишет `{layer, code, detail}` в `plan.diagnostics.layers`
+(хронологический trace — plumbing под #27); эффективные тумблеры —
+`diagnostics.layerFlags`, источники — world settings
+`layersCommitment`/`layersMorale`/`layersPersonality`/`layersLookahead`
+(дефолты в `DEFAULT_LAYER_FLAGS`) с оверрайдом `context.layers`.
+Выключенный слой деградирует на предыдущий уровень без ошибок.

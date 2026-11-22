@@ -173,6 +173,8 @@ execute: расхождение — `stale-state` (перемещение, см�
   Выбор идёт по top-K с детерминированным tie-break; pass записывается в
   `diagnostics.lookahead`, результат победителя — в `breakdown.lookahead`.
   Оверрайды: `context.lookahead` (on/off), `lookaheadLambda`, `lookaheadTopK`.
+  Мастер-гейт — world setting `layersLookahead` (default `true`, issue
+  #24): выкл отключает pass даже на hard и при `context.lookahead`.
 - **`aiDifficulty`** (world setting `easy|normal|hard`, default `normal`;
   `getAIDifficulty()`; `context.difficulty` переопределяет на план):
   `easy` — бот не читает производную карту угроз и с вероятностью ~30%
@@ -221,8 +223,12 @@ execute: расхождение — `stale-state` (перемещение, см�
 - **Интеграция со скорингом**: дельты черт складываются и мерджатся поверх
   `preset.weights` до scoring'а (тот же overlay-паттерн, что у
   SPEC_OPS_TASK_WEIGHTS, но аддитивный); `diagnostics.weights` несёт уже
-  эффективные веса. Поведенческие флаги (`fanatic.ignoreRegroup`)
-  работают через сильные отрицательные дельты (`cohesionRestore −12`),
+  эффективные веса. С issue #24 дельты — слой L3 воронки и ограничены
+  скобой ±30% от базового веса (фактор с нулевой базой — ±6; зажатые
+  дельты репортятся `diagnostics.personality.clamped`). Поведенческие
+  флаги (`fanatic.ignoreRegroup`)
+  работают через сильные отрицательные дельты (`cohesionRestore −12`,
+  теперь зажимаемые до −6),
   отдельных веток генерации кандидатов нет. Победитель получает
   `breakdown.jitter {amp, factor}`, план — `personality {traits,
   character, source}`, диагностика — `personality {traits, character,
@@ -450,6 +456,14 @@ execute: расхождение — `stale-state` (перемещение, см�
   `personality`; без флага черты генерируются seeded по id документа.
 - Все AI-визуалы/диагностика — GM-only (whisper на GM-пользователей);
   игрокам ничего не утекает (проверено smoke).
+- **Слои поведения L0–L4** (issue #24, `scripts/layers.js` +
+  `docs/layers.md`, capability `planner.layers`): планирование — воронка
+  вето/commitment/morale/
+  personality/scoring. World settings `layersCommitment`,
+  `layersMorale` (default `false` — каркас под #25/#26),
+  `layersPersonality`, `layersLookahead` (default `true`); план-оверрайд —
+  `context.layers`. Каждый слой пишет `{layer, code, detail}` в
+  `plan.diagnostics.layers`.
 
 ## 3. Что боты умеют — по пресетам
 

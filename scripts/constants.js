@@ -82,7 +82,28 @@ export const SETTING_KEYS = Object.freeze({
     turnPacingMs: "turnPacingMs",
     aiDifficulty: "aiDifficulty",
     threatMapOverlay: "threatMapOverlay",
-    attackAdjudication: "attackAdjudication"
+    attackAdjudication: "attackAdjudication",
+    // Issue #24 behaviour-layer toggles (the planning funnel L0–L4).
+    layersCommitment: "layersCommitment",
+    layersMorale: "layersMorale",
+    layersPersonality: "layersPersonality",
+    layersLookahead: "layersLookahead"
+});
+
+/**
+ * Default on/off state of the optional behaviour layers (issue #24).
+ * Disabled layers degrade to the previous level of the funnel — a plan is
+ * still produced, just without that layer's influence. Rollout order per
+ * the issue: commitment → morale → traits → lookahead. `commitment` (L1)
+ * and `morale` (L2) stay off until issues #25/#26 land the real logic;
+ * `personality` (L3, issue #19) and `lookahead` (L4, issue #16) already
+ * run, so they default on to keep behaviour identical.
+ */
+export const DEFAULT_LAYER_FLAGS = Object.freeze({
+    commitment: false,
+    morale: false,
+    personality: true,
+    lookahead: true
 });
 
 /** Default pacing delay between AI execution steps in milliseconds. */

@@ -91,6 +91,11 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `auto` — бросок через системный API сразу, `gm-confirm` — перед каждым
   attack/test шагом (только `executionMode === "automatic"`) GM получает
   whisper-чаткарту с решениями `execute | manual | skill-test | cancel`.
+  `layersCommitment`/`layersMorale` (default `false`) и
+  `layersPersonality`/`layersLookahead` (default `true`, issue #24) —
+  тумблеры слоёв воронки поведения L0–L4; дефолты живут в
+  `DEFAULT_LAYER_FLAGS`, план-оверрайд — `context.layers` (см.
+  `scripts/layers.js`, контракт — `docs/layers.md`).
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -313,6 +318,25 @@ combatant, reason})`, `markUsedByToken(combat, tokenId)`,
 раунда; `grudgeOf` — читатель с проверкой экспирации и смерти
 атакующего (defeated/destroyed). `seedWounds` — тест/инспекция кэша.
 
+## Слои поведения L0–L4 (issue #24)
+
+`scripts/layers.js` — pure-модуль воронки планирования; полный контракт —
+`docs/layers.md`. Порядок в `planTurn`: гейты L0 (gridless, статусы,
+права) → L1 `applyCommitmentLayer` (stub-контракт под #25: валидная
+запись `context.commitment {valid?, steps, source?}` исполняется без
+скоринга) → L2 `applyMoraleLayer` (pass-through под #26: резолвит и
+репортит позу `morale`, не сужает) → L3 `boundedPersonalityOverlay`
+(дельты #19 в скобе ±30% от базы; нулевая база — ±6 от
+`L3_DELTA_BASE_FLOOR = 20`) → генерация кандидатов (L0-вето через
+`rejectL0`) → L4 scoring + lookahead (гейт `layersLookahead` поверх
+difficulty/`context.lookahead`). Каждый слой пишет унифицированную
+запись `{layer, code, detail}` в `diagnostics.layers` (plumbing под
+#27); тумблеры плана — `diagnostics.layerFlags` (`resolveLayerFlags` =
+`context.layers` > world settings > `DEFAULT_LAYER_FLAGS`); поза —
+`diagnostics.morale`; зажатые дельты — `diagnostics.personality.clamped`.
+Выключенный слой деградирует на предыдущий уровень; поведение при
+дефолтах идентично прежнему, кроме документированной скобы L3.
+
 ## Личности ботов (issue #19)
 
 `scripts/personalities.js` — data-driven пул из 24 черт (`PERSONALITIES`,
@@ -325,8 +349,9 @@ combatant, reason})`, `markUsedByToken(combat, tokenId)`,
 `personality` (из `resolveEffectiveConfig`) → seeded генерация
 `generatePersonalityTraits` (fnv1a+mulberry32 от `actor.id`/`tokenUuid`,
 1–2 черты взвешенным пулом, bias по `aiDifficulty`; стабильна между
-клиентами и боями). `applyPersonalityOverlay` мерджит дельты поверх
-`preset.weights` до scoring'а (паттерн SPEC_OPS-оверлеев, но аддитивный);
+клиентами и боями). `boundedPersonalityOverlay` (`scripts/layers.js`, issue #24) мерджит
+дельты поверх `preset.weights` до scoring'а со скобой ±30% от базы
+(паттерн SPEC_OPS-оверлеев, но аддитивный);
 личные дельты заменяют командные при конфликте фактора. Jitter —
 `personalityJitterFactor`: seeded мультипликатор `1 ± amp` на оценку
 кандидата keyed по candidate id; `amp` = baseline сложности
