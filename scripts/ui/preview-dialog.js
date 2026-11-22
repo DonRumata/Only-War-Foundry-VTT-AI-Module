@@ -234,7 +234,16 @@ export function buildPreviewViewModel(plan, context = {}) {
     const steps = rawSteps.map(step => ({
         id: step?.id ?? null,
         type: step?.type ?? null,
-        name: step?.input?.name ?? null
+        name: step?.input?.name ?? null,
+        // Issue #38: a delay step explains its wait condition — the reason
+        // and the `until` signal it holds for. Localized in
+        // `localizePreviewViewModel` — the base model stays i18n-free.
+        detail: step?.type === "delay"
+            ? {
+                reason: step?.input?.reason ?? null,
+                until: step?.input?.until ?? null
+            }
+            : null
     }));
 
     // Merge the projected resource deltas of all steps into one summary.
@@ -463,7 +472,19 @@ export function localizePreviewViewModel(vm, i18n = null) {
             : vm.action,
         steps: (vm.steps ?? []).map(step => ({
             ...step,
-            label: _label(i18nSource, `OWAI.Preview.Step.${step.type}`, step.type ?? "?")
+            label: _label(i18nSource, `OWAI.Preview.Step.${step.type}`, step.type ?? "?"),
+            detailLabel: step.detail
+                ? (i18nSource?.format?.("OWAI.Delay.Detail", {
+                    reason: _label(
+                        i18nSource,
+                        `OWAI.Delay.Reason.${step.detail.reason}`,
+                        step.detail.reason ?? "—"),
+                    until: _label(
+                        i18nSource,
+                        `OWAI.Delay.Until.${step.detail.until}`,
+                        step.detail.until ?? "—")
+                }) ?? null)
+                : null
         })),
         resources: (vm.resources ?? []).map(entry => ({
             ...entry,

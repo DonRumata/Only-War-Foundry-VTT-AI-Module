@@ -76,7 +76,7 @@ export const STALE_REASONS = Object.freeze({
 /** Serializable action step types allowed inside a plan. */
 export const STEP_TYPES = Object.freeze([
     "move", "attack", "test", "aim", "reload", "overwatch",
-    "ready-weapon", "drop-prone", "end-turn"
+    "ready-weapon", "drop-prone", "delay", "end-turn"
 ]);
 
 /** Half-action units available to a combatant per turn (issue #15). */
@@ -151,7 +151,8 @@ export const SCORE_FACTORS = Object.freeze([
     "leaveMeleeEngage",
     "engageDenial",
     "unpin",
-    "grudge"
+    "grudge",
+    "order"
 ]);
 
 /**
@@ -215,7 +216,10 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     leaveMeleeEngage: 0,
     engageDenial: 0,
     unpin: 4,
-    grudge: 2
+    grudge: 2,
+    // Issue #38: a leader's order is the moderate utility turn — it must
+    // never outbid a ready attack, but always beats an empty hold.
+    order: 5
 });
 
 /**
@@ -1421,6 +1425,65 @@ function _unpinAction(actor) {
 }
 
 /**
+ * Synthesized order action entry (issue #38): a fireteam leader's Command
+ * skill test that delivers the order named by the team-supplied
+ * `orderCandidate` record `{orderId, name, orderType, benefit, skill?,
+ * advanced?}`. The candidate only exists when the actor actually carries
+ * the `command` skill — `null` otherwise, so the planner can record an
+ * `order-unavailable` rejection instead. Orders cost a half action; an
+ * `advanced` order (veteran-tier) is a full action.
+ * @param {object|null} actor Actor document.
+ * @param {object|null} candidate `context.team.orderCandidate`.
+ * @returns {object|null}
+ */
+function _orderAction(actor, candidate) {
+    if (!candidate || typeof candidate !== "object") return null;
+    const skills = actor?.system?.skills ?? actor?.skills ?? null;
+    if (!skills || skills.command == null) return null;
+    const orderId = candidate.orderId ?? candidate.id ?? null;
+    if (orderId == null) return null;
+    return {
+        id: `order-${orderId}`,
+        type: "test",
+        name: candidate.name ?? `Order ${orderId}`,
+        kind: "skill",
+        skill: candidate.skill ?? "command",
+        skillKey: candidate.skill ?? "command",
+        testKind: "skill",
+        key: candidate.skill ?? "command",
+        characteristic: candidate.characteristic ?? null,
+        orderId,
+        orderType: candidate.orderType ?? null,
+        benefit: candidate.benefit ?? null,
+        flags: { isOrder: true },
+        cost: candidate.advanced === true ? "full" : "half",
+        synthesized: true
+    };
+}
+
+/**
+ * Morale state of a combatant for issue #38 gating/boosts (graceful
+ * #26 integration): reads `context.morale` first (tests/integrations),
+ * then the optional module flag `flags["only-war-ai"].morale`
+ * `{state, pressured?, desperate?}`. No flag or unrecognized payload —
+ * normal state, the caller keeps planning as usual.
+ * @param {object|null} combatant Combatant document.
+ * @param {object} [context] Planning context.
+ * @returns {{pressured: boolean, desperate: boolean}}
+ */
+function _moraleOf(combatant, context = {}) {
+    const injected = context.morale;
+    const record = injected !== undefined ? injected
+        : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.morale)
+            ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.morale]);
+    const state = typeof record?.state === "string" ? record.state : null;
+    return {
+        pressured: record?.pressured === true || state === "pressured",
+        desperate: record?.desperate === true || state === "desperate"
+    };
+}
+
+/**
  * The `lastAttacker` record usable for scoring this turn (issue #39):
  * the flag value filtered by the round-expiry of {@link grudgeActive}
  * and by attacker liveness — a matching defeated combatant or destroyed
@@ -1527,6 +1590,19 @@ function _pixelDistance(from, to, grid) {
 }
 
 /**
+/**
+ * Whether a target provenance is a memory record (issue #38): the bot's
+ * own `last-known` entry or a shared `team-contact` sighting. Memory
+ * targets are never directly attackable but may steer approach moves,
+ * cones and blast memory-strikes.
+ * @param {string|null} source
+ * @returns {boolean}
+ */
+function _isMemorySource(source) {
+    return source === "last-known" || source === "team-contact";
+}
+
+/**
  * Normalize a raw target record (perception entry, combatant fallback or
  * injected fixture) to the snapshot target shape.
  * @param {object} raw
@@ -1571,10 +1647,20 @@ function _normalizeTarget(raw, { source, sceneId, selfPos, grid, measure }) {
         elevation: _finiteOr(raw.elevation, 0),
         distance,
         threat: _finiteOr(raw.threat, 0),
-        canAttack: source === "last-known" ? false : raw.canAttack !== false,
+        canAttack: _isMemorySource(source) ? false : raw.canAttack !== false,
         hidden: raw.hidden === true,
         statuses: _statusIds(raw.statuses),
         source,
+        // Issue #38: memory entries carry their sighting timestamps so a
+        // fresher shared contact may replace a stale own record inside
+        // `_resolveTargets`; `sourceCombatantId` names the teammate that
+        // shared the contact (null for own sightings).
+        lastSeenRound: _isMemorySource(source)
+            ? _finiteOr(raw.lastSeenRound, null) : null,
+        lastSeenTurn: _isMemorySource(source)
+            ? _finiteOr(raw.lastSeenTurn, null) : null,
+        sourceCombatantId: _isMemorySource(source)
+            ? (raw.sourceCombatantId ?? null) : null,
         // Issue #16 threat-profile passthrough: explicit weapon emitters
         // (`emitters`/`damage`+`range`/`melee`/`threatProfile`) feeding
         // the danger field and the lookahead counter model.
@@ -1705,12 +1791,46 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
             const visible = (snapshot.visibleTargets ?? [])
                 .map(raw => _normalizeTarget(raw, { ...input, source: "visible" }));
             const remembered = (snapshot.lastKnownTargets ?? [])
-                .map(raw => _normalizeTarget(raw, { ...input, source: "last-known" }));
+                .map(raw => _normalizeTarget(raw, {
+                    ...input,
+                    // Issue #38: the snapshot marks shared squad contacts
+                    // `team-contact`; everything else stays a last-known.
+                    source: raw?.source ?? "last-known"
+                }));
             targets = visible.concat(remembered).filter(Boolean);
         }
     }
     if (!targets.length && !Array.isArray(context.targets)) {
         targets = _fallbackTargets(combat, combatant, input);
+    }
+    // Issue #38 shared squad contacts: teammates' merged memory joins the
+    // target list marked `team-contact`. Live/injected records always win;
+    // between two memory records the fresher sighting wins, and an equal
+    // timestamp keeps the existing (own) entry.
+    for (const raw of _teamContactRaws({ combat, combatant, perception, context })) {
+        const shared = _normalizeTarget(raw, {
+            ...input,
+            source: raw?.sourceCombatantId != null || raw?.source === "team-contact"
+                ? "team-contact"
+                : "last-known"
+        });
+        if (!shared) continue;
+        const key = shared.tokenUuid ?? shared.tokenId;
+        const index = targets.findIndex(target =>
+            (target.tokenUuid ?? target.tokenId) === key);
+        if (index < 0) {
+            targets.push(shared);
+            continue;
+        }
+        const existing = targets[index];
+        if (!_isMemorySource(existing.source) || !_isMemorySource(shared.source)) {
+            continue;
+        }
+        const sharedTs = (_finiteOr(shared.lastSeenRound, 0) * 1e6)
+            + _finiteOr(shared.lastSeenTurn, 0);
+        const existingTs = (_finiteOr(existing.lastSeenRound, 0) * 1e6)
+            + _finiteOr(existing.lastSeenTurn, 0);
+        if (sharedTs > existingTs) targets[index] = shared;
     }
     // Issue #37: read the `reactionUsed` flag off each target's own
     // combatant — a spent-reaction enemy cannot dodge, which raises the
@@ -1734,6 +1854,43 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
         })
         .sort((a, b) => String(a.tokenUuid ?? a.tokenId)
             .localeCompare(String(b.tokenUuid ?? b.tokenId)));
+}
+
+/**
+ * Raw shared-contact records for `_resolveTargets` (issue #38). Injection
+ * order: `context.teamContacts` (entry array), then `context.team.contacts`
+ * — the merged map/entry list the fireteam service builds once per
+ * TeamPlan — and finally the live `perception.teamLastKnownPositions`
+ * lookup when the combatant carries a `team.teamId`. `shareContacts ===
+ * false` on `context` or `context.team` disables the merge entirely.
+ * @param {object} input
+ * @param {object} input.combat Combat document.
+ * @param {object} input.combatant Active combatant document.
+ * @param {object|null} input.perception Perception service or null.
+ * @param {object} input.context Planning context.
+ * @returns {object[]}
+ */
+function _teamContactRaws({ combat, combatant, perception, context }) {
+    if (context?.shareContacts === false || context?.team?.shareContacts === false) {
+        return [];
+    }
+    if (Array.isArray(context?.teamContacts)) return context.teamContacts;
+    const contacts = context?.team?.contacts;
+    if (Array.isArray(contacts)) return contacts;
+    if (contacts && typeof contacts === "object") {
+        return Object.entries(contacts)
+            .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }));
+    }
+    const teamId = context?.team?.teamId;
+    if (teamId && typeof perception?.teamLastKnownPositions === "function") {
+        try {
+            const shared = perception.teamLastKnownPositions(combat, combatant, teamId);
+            return Array.isArray(shared) ? shared : [];
+        } catch(err) {
+            return [];
+        }
+    }
+    return [];
 }
 
 /**
@@ -2339,12 +2496,16 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
  *   feeds the `leaveMeleeEngage`/`engageDenial` free-attack factors.
  * @param {object|null} [input.lastAttacker] Active `lastAttacker` flag
  *   record (`{tokenUuid, actorId, ...}`) — feeds the `grudge` factor.
+ * @param {object|null} [input.orderBoost] `{character, pressured}` — the
+ *   `order` factor grows +0.5 in `disciplined`/`elite` teams and +0.5
+ *   under morale pressure (issue #38, graceful #26 hook).
  * @returns {object}
  */
 function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
     lastUsedWeapon = null, traits = [], dodgeTN = null,
-    allyEngagedTargets = null, enemies = null, lastAttacker = null }) {
+    allyEngagedTargets = null, enemies = null, lastAttacker = null,
+    orderBoost = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -2365,7 +2526,7 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         || variant === "aim-attack" || variant === "aim"
         || variant === "reload" || variant === "overwatch"
         || variant === "ready-weapon" || variant === "drop-prone"
-        || variant === "unpin";
+        || variant === "unpin" || variant === "order";
     const holdPosition = stationary || move?.stay === true ? 1 : 0;
     const budget = Number.isFinite(moveBudget) && moveBudget > 0 ? moveBudget : null;
     const budgetOver = budget !== null && move
@@ -2466,7 +2627,7 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         cover,
         exposure: move && move.stay !== true ? Math.max(0, 1 - cover) : 0,
         holdPosition,
-        lastKnown: target?.source === "last-known" ? 1 : 0,
+        lastKnown: _isMemorySource(target?.source) ? 1 : 0,
         budgetOver,
         attackType: dodgeInfo.dodgeable
             ? attackDesire * (1 - dodgeInfo.chance)
@@ -2495,7 +2656,15 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         leaveMeleeEngage,
         engageDenial,
         unpin: variant === "unpin" ? 1 : 0,
-        grudge
+        grudge,
+        // Issue #38 leader order: a plain order is the moderate utility
+        // turn (1); disciplined/elite teams obey better (+0.5) and an
+        // order matters more while the squad is under pressure (+0.5,
+        // graceful #26 morale hook — absent flags read as calm).
+        order: variant === "order"
+            ? 1 + (orderBoost?.character === true ? 0.5 : 0)
+                + (orderBoost?.pressured === true ? 0.5 : 0)
+            : 0
     };
 }
 
@@ -2867,6 +3036,32 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
             type: "drop-prone",
             cost: { halves: 0 },
             input: { statusId: "prone" },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
+        });
+    }
+    // Issue #38: `order` serializes as a regular `test` step —
+    // `type:"skill"`, `key:"command"` — carrying the order identity
+    // (`orderId`/`orderType`/`orderBenefit`) so the executor can
+    // post-stamp `lastOrder` after a successful roll and `flags.isOrder`
+    // reaches the roll card.
+    if (variant === "order") {
+        steps.push({
+            id: `step-test-${steps.length + 1}`,
+            type: "test",
+            cost: { halves: _actionCost(action) },
+            input: {
+                actionId: action?.id ?? null,
+                name: action?.name ?? null,
+                type: "skill",
+                key: action?.key ?? "command",
+                skill: action?.skill ?? "command",
+                characteristic: action?.characteristic ?? null,
+                orderId: action?.orderId ?? null,
+                orderType: action?.orderType ?? null,
+                orderBenefit: action?.benefit ?? null,
+                flags: { ...(action?.flags ?? {}), isOrder: true }
+            },
             preconditions: ["turn"],
             projectedResourceDelta: {}
         });
@@ -3303,7 +3498,8 @@ export function createPlannerService({
             let attackFound = false;
             // Blast weapons may strike a last-known position (room
             // clearing) even when the remembered target is not attackable.
-            const memoryStrike = target.source === "last-known"
+            // Issue #38: shared team contacts count as memory too.
+            const memoryStrike = _isMemorySource(target.source)
                 && usableActions.some(action => _actionBlastRadius(action) > 0
                     && !_isMeleeAction(action));
             if (target.canAttack !== true && !memoryStrike) {
@@ -3339,7 +3535,7 @@ export function createPlannerService({
                     // a last-known memory position is allowed too — the
                     // LOS gate drops for remembered strikes.
                     if (_actionBlastRadius(action) > 0 && !melee) {
-                        const presumed = target.source === "last-known"
+                        const presumed = _isMemorySource(target.source)
                             ? (target.tokenUuid ?? null) : null;
                         const aimInput = {
                             tokenDoc,
@@ -3804,6 +4000,34 @@ export function createPlannerService({
             }
         }
 
+        // Issue #38 orders: a fireteam leader may spend the turn giving an
+        // order — a synthesized Command test carrying the order id/benefit
+        // so the roll card records it (`flags.isOrder`). The fireteam
+        // service supplies `context.team.orderCandidate`; a leader without
+        // the Command skill is rejected `order-unavailable` upfront.
+        const orderCandidate = context.team?.orderCandidate ?? null;
+        if (orderCandidate) {
+            const order = _orderAction(actor, orderCandidate);
+            if (!order) {
+                diagnostics.rejected.push({
+                    candidate: `order|${orderCandidate.orderId ?? "unknown"}`,
+                    reason: "order-unavailable"
+                });
+            } else if (_actionCost(order) > actionBudget) {
+                diagnostics.rejected.push({
+                    candidate: `order|${order.orderId}`,
+                    reason: "over-budget"
+                });
+            } else {
+                candidates.push({
+                    variant: "order",
+                    action: order,
+                    target: threatTarget,
+                    move: null
+                });
+            }
+        }
+
         if (preset.alwaysOfferHold === true) {
             candidates.push({ variant: "hold", target: targets[0] ?? null, action: null, move: null });
         }
@@ -3852,7 +4076,14 @@ export function createPlannerService({
                 ...candidate, moveBudget, dangerAt, selfPos, dodge,
                 preferredWeapon, lastUsedWeapon,
                 traits: personality.traits, dodgeTN,
-                allyEngagedTargets, enemies: enemyContacts, lastAttacker
+                allyEngagedTargets, enemies: enemyContacts, lastAttacker,
+                // Issue #38: disciplined/elite squads and pressured morale
+                // (graceful #26 hook) raise the leader's order utility.
+                orderBoost: {
+                    character: personality.character === "disciplined"
+                        || personality.character === "elite",
+                    pressured: _moraleOf(combatant, context).pressured
+                }
             });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed

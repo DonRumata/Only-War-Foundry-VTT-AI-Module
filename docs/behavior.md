@@ -337,6 +337,64 @@ adjudicated-manual, adjudicated-skill-test`.
   фокус-файра когда Σ EV ≥ wounds цели (#16); `specOpsTactic` hook;
   `leader-lost` инвалидирует план.
 
+## 9a. Синхронная тактика отряда (issue #38)
+
+### Общие контакты (shared squad contacts)
+
+- `mergeTeamMemory(ownMemory, teammateMemories, currentRound)` — чистая
+  функция (perception.js): свежая запись побеждает; при равном ts своя
+  запись побеждает, между тиммейтами — лексикографически меньший
+  `combatantId`. Каждая чужая запись получает `sourceCombatantId`
+  (null — своя). Дедуп после `sanitizeMemory`/`expireMemoryEntries`.
+- `teamLastKnownPositions(combat, combatant, teamId)` — мёрж памяти
+  только живых, не-disabled и стоящих на сцене тиммейтов того же
+  `teamId`; prune по сцене/tokenExists сохраняет provenance.
+- `buildPerceptionSnapshot({teamMemory})` — чужие записи попадают в
+  `lastKnownTargets` с `source:"team-contact"`; свежая запись тиммейта
+  перекрывает устаревшую свою, при равном ts — своя.
+- Планнер принимает `context.team.contacts` (список от fireteam) либо
+  вызывает `perception.teamLastKnownPositions` сам по `context.teamId`/
+  fireteam-флагу; `team.shareContacts === false` отключает мёрж.
+  Нормализованный target: `source:"team-contact"`, `canAttack:false`,
+  `lastKnown`-фактор (в `_isMemorySource` вместе с `last-known`/`memory`) —
+  движение и blast-удар по точке разрешены, прямой атаки нет.
+- Записей в отдельное хранилище нет — контакты читаются из существующей
+  памяти членов; запись остаётся controller-only на каждом combatant.
+
+### Синхронный удар (delay)
+
+- `_syncDelay` — post-pass `buildTeamPlan` после планов членов (и после
+  retry перераспределения): если есть конвергентная цель и флангер с
+  move-only планом (ETA ≥ 1 хода), main-члены, чей план атакует
+  `convergence.targetId`, получают delay-stub план `[delay, end-turn]`.
+- Флангер никогда не ждёт сам; `morale`-desperate (#26 graceful) не ждёт;
+  `delaySync.count ≥ maxSyncRounds` (default 2) снимает ожидание для
+  того же `until`; `context.syncDelay === false` отключает проход.
+- `memberEntries[].delayed = {reason:"await-sync", until:"flank-ready",
+  syncRound, awaitId}`; диагностика `diagnostics.syncDelays`.
+- Executor `delay`-шаг пишет **системный** флаг
+  `flags["only-war-local"].delayed = true` (трекер сам очищает его при
+  начале следующего хода комбатанта — `clearExpiredStates`) и модульный
+  `delaySync {round, until, count}`; повторный delay инкрементирует count.
+- `validateTeamPlan`: если ожидаемый `awaitId` погиб/недоступен —
+  `sync-broken` (TEAM_PLAN_REASONS.syncBroken) до member-unavailable.
+
+### Приказы лидера (orders)
+
+- `_orderCandidateOf`: только электнутый лидер, ≥2 живых члена, навык
+  `command`, прошло `ORDER_COOLDOWN_ROUNDS = 5` раундов с `lastOrder`.
+- Источники приказов: owned `order`-items (тип `veteran` = advanced,
+  cost 2 halves), затем speciality-перки с `activation.type ∈ {order,
+  generalOrder}` (например `sergeant_charge`), resolved через
+  `fromUuidSync` с graceful-fallback.
+- Вариант `order` — отдельный кандидат (не target-scoped): шаг `test`
+  `{type:"skill", key:"command", orderId, orderBenefit, flags:{isOrder:true}}`;
+  ниже готового выстрела, выше пустого hold (фактор `order` вес 5,
+  +0.5 для disciplined/elite, +0.5 при pressured морали).
+- Executor: успешный order-тест пишет `lastOrder {round, orderId,
+  result:"success"}` — кулдаун считается от этой метки; неуспешный
+  приказ не блокирует повтор.
+
 ## 10. Preview (preview-dialog.js)
 
 - Решения `confirm | cancel | replan`. Confirm — ревалидация snapshot →

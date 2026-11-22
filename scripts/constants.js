@@ -51,7 +51,13 @@ export const FLAG_KEYS = Object.freeze({
     personality: "personality",
     reactionUsed: "reactionUsed",
     lastUsedWeapon: "lastUsedWeapon",
-    lastAttacker: "lastAttacker"
+    lastAttacker: "lastAttacker",
+    lastOrder: "lastOrder",
+    delaySync: "delaySync",
+    // Reserved for issue #26 morale — the squad-sync/order code already
+    // reads `morale.{state|pressured|desperate}` gracefully: an absent
+    // flag simply means normal morale.
+    morale: "morale"
 });
 
 /**
@@ -119,6 +125,20 @@ export const ATTACK_ADJUDICATION_MODES = Object.freeze([
 
 /** Default attack-adjudication mode — the historical, hands-off one. */
 export const DEFAULT_ATTACK_ADJUDICATION = "auto";
+
+/**
+ * Combat rounds a leader must wait between orders (issue #38): the
+ * `lastOrder` flag record `{round, orderId, result}` blocks a new order
+ * candidate until `round - lastOrder.round` reaches this value.
+ */
+export const ORDER_COOLDOWN_ROUNDS = 3;
+
+/**
+ * Safety bound for squad-sync delays (issue #38): a member never receives
+ * more than this many consecutive `delay` assignments for the same `until`
+ * condition — the `delaySync` flag records the running count.
+ */
+export const DEFAULT_MAX_SYNC_ROUNDS = 2;
 
 /** Required host system id. */
 export const REQUIRED_SYSTEM_ID = "only-war-local";

@@ -79,6 +79,13 @@ execute: расхождение — `stale-state` (перемещение, см�
   sanitized `{sceneId, x, y, elevation, lastSeenRound, lastSeenTurn,
   dispositionAtDetection}`, истекает через 3 раунда; last-known разрешает
   поиск/движение/blast-удар, но не прямую атаку.
+- Общие контакты отряда (issue #38): `mergeTeamMemory` — чистый
+  детерминированный мёрж памяти членов (свежая запись побеждает, при
+  равном ts — своя, tie между тиммейтами — лексикографический
+  `combatantId`); `teamLastKnownPositions(combat, combatant, teamId)` —
+  мёрж только живых/enabled тиммейтов той же команды с provenance
+  `sourceCombatantId`. Отдельного хранилища контактов нет — читается
+  существующая память членов.
 
 ### Navigation (issue #402)
 
@@ -396,6 +403,19 @@ execute: расхождение — `stale-state` (перемещение, см�
 - `TeamPlan` координирует задания (`support|advance|flank|assault|regroup`)
   и мягкую связность; исполнение всё равно пер-член на своём ходу —
   превью идёт per-бот.
+- Squad tactics (issue #38): `buildTeamPlan` раздаёт каждому члену общий
+  мёрж контактов (`team.contacts`), лидеру — `orderCandidate` (приказ
+  требует навык `command`, ≥2 живых члена и кулдаун
+  `ORDER_COOLDOWN_ROUNDS` от `flags["only-war-ai"].lastOrder`), а
+  post-pass `_syncDelay` ставит main-членам delay-план ожидания
+  транзитного флангера при конвергентной цели. `memberEntries[].delayed`
+  = `{reason, until, syncRound, awaitId}`; падение ожидаемого флангера
+  инвалидирует план причиной `sync-broken`. Executor `delay`-шага пишет
+  системный `flags["only-war-local"].delayed` + модульный
+  `flags["only-war-ai"].delaySync {round, until, count}`; `maxSyncRounds`
+  (default 2) ограничивает повторные ожидания. Приказ исполняется как
+  обычный `test`-шаг (`type:"skill", key:"command", flags.isOrder`),
+  успех пишет `lastOrder {round, orderId, result}`.
 
 ### Preview (issue #409)
 

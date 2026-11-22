@@ -33,7 +33,12 @@
  * - Preview mode emits `only-war-ai.previewRequested` (issue #409) with the
  *   serialized plan so the GM preview dialog can confirm/cancel/replan.
  */
-import { ATTACK_ADJUDICATION_MODES, FLAG_KEYS, MODULE_ID } from "./constants.js";
+import {
+    ATTACK_ADJUDICATION_MODES,
+    FLAG_KEYS,
+    MODULE_ID,
+    REQUIRED_SYSTEM_ID
+} from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
@@ -744,6 +749,74 @@ export function createExecutorService({
     }
 
     /**
+     * Execute a `delay` step (issue #38): the combatant delays its turn
+     * until the synchronized strike — it writes the *system* flag
+     * `flags["only-war-local"].delayed` (the Only War tracker state that
+     * `clearExpiredStates` clears when the next turn begins), not the
+     * module namespace — plus the module bookkeeping record `delaySync`
+     * `{round, until, count}` the fireteam `maxSyncRounds` guard counts.
+     * Controller-gated exactly like `_stepAim`: the executor only reaches
+     * this point after the per-step controller check. A combatant that is
+     * already delayed is idempotent — the step still succeeds and only
+     * refreshes `delaySync`.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<object>} Step outcome.
+     */
+    async function _stepDelay(step, context, run) {
+        const input = step?.input ?? {};
+        const combatant = run.combatant;
+        if (typeof combatant?.setFlag !== "function") return { ok: true };
+        try {
+            await combatant.setFlag(REQUIRED_SYSTEM_ID, "delayed", true);
+            const prev = combatant.getFlag?.(MODULE_ID, FLAG_KEYS.delaySync)
+                ?? combatant.flags?.[MODULE_ID]?.[FLAG_KEYS.delaySync]
+                ?? null;
+            const count = prev && prev.until === (input.until ?? null)
+                && Number.isFinite(prev.count) ? prev.count + 1 : 1;
+            await combatant.setFlag(MODULE_ID, FLAG_KEYS.delaySync, {
+                round: Number.isFinite(input.round)
+                    ? input.round
+                    : (context.combat?.round ?? null),
+                until: input.until ?? null,
+                count
+            });
+        } catch(err) {
+            return {
+                ok: false,
+                reason: "flag-write-failed",
+                error: String(err?.message ?? err)
+            };
+        }
+        return { ok: true };
+    }
+
+    /**
+     * Post-stamp `flags["only-war-ai"].lastOrder` after a successful order
+     * test (issue #38): `{round, orderId, result}` — the fireteam
+     * `ORDER_COOLDOWN_ROUNDS` gate reads `round`. Flag writes fail silent:
+     * the order already landed, the cooldown record is bookkeeping.
+     * @param {object} step
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<void>}
+     */
+    async function _recordLastOrder(step, context, run) {
+        const combatant = run.combatant;
+        if (typeof combatant?.setFlag !== "function") return;
+        try {
+            await combatant.setFlag(MODULE_ID, FLAG_KEYS.lastOrder, {
+                round: context.combat?.round ?? null,
+                orderId: step?.input?.orderId ?? null,
+                result: "success"
+            });
+        } catch(err) {
+            // Cooldown bookkeeping is best-effort — the roll already landed.
+        }
+    }
+
+    /**
      * Execute a `reload` step (issue #15) through
      * `game.darkHeresy.api.actions.reload` — magazine swap or clip refill,
      * idempotent through the step-scoped operation id.
@@ -1132,6 +1205,11 @@ export function createExecutorService({
                 if (outcome.ok && step.type === "attack") {
                     await _recordLastUsedWeapon(step, context, run);
                 }
+                // Issue #38: a successful order test post-stamps
+                // `lastOrder` — the fireteam cooldown gate reads it.
+                if (outcome.ok && step.type === "test" && step?.input?.orderId) {
+                    await _recordLastOrder(step, context, run);
+                }
                 return outcome;
             }
             case "aim":
@@ -1144,6 +1222,8 @@ export function createExecutorService({
                 return _stepReadyWeapon(step, context, run);
             case "drop-prone":
                 return _stepDropProne(step, context, run);
+            case "delay":
+                return _stepDelay(step, context, run);
             case "end-turn":
                 return { ok: true };
             default:

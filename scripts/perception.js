@@ -651,6 +651,70 @@ export function pruneMemory(memory, { sceneId = null, tokenExists = null } = {})
 }
 
 /**
+ * Merge a combatant's own memory with the memory maps of living teammates
+ * (issue #38, squad shared contacts). Reads are free — the module never
+ * needs authority to look at another combatant's sanitized memory flag.
+ *
+ * Dedup rules per `tokenUuid`:
+ * - the freshest `(lastSeenRound, lastSeenTurn)` pair wins;
+ * - an equal timestamp keeps the *own* entry (own wins at equal ts);
+ * - between two teammates at equal ts the lexicographically smaller
+ *   `combatantId` wins, so every client merges identically.
+ *
+ * Entries expired against `round` are dropped before merging. Each merged
+ * entry carries `sourceCombatantId` — `null` for own sightings — so callers
+ * can mark team-sourced contacts `source: "team-contact"`.
+ * @param {object|null} own Own sanitized memory map (or null).
+ * @param {object[]} teammateMemories Entries `{combatantId, memory}` of
+ *   living, AI-enabled teammates.
+ * @param {number|null} [round] Current combat round for expiry; non-finite
+ *   values skip expiry.
+ * @returns {object} Merged memory map `{tokenUuid: entry}` — never frozen,
+ *   plain sanitized entries plus `sourceCombatantId`.
+ */
+export function mergeTeamMemory(own, teammateMemories, round = null) {
+    const expiry = Number.isFinite(round) ? round : null;
+    const ownMemory = expiry === null
+        ? sanitizeMemory(own)
+        : expireMemoryEntries(own, expiry);
+    const sources = (Array.isArray(teammateMemories) ? teammateMemories : [])
+        .map(raw => ({
+            combatantId: raw?.combatantId ?? null,
+            memory: expiry === null
+                ? sanitizeMemory(raw?.memory)
+                : expireMemoryEntries(raw?.memory, expiry)
+        }))
+        .filter(source => source.combatantId !== null && source.combatantId !== undefined);
+    const merged = {};
+    for (const [uuid, entry] of Object.entries(ownMemory)) {
+        merged[uuid] = { ...entry, sourceCombatantId: null };
+    }
+    for (const source of sources) {
+        for (const [uuid, entry] of Object.entries(source.memory)) {
+            const current = merged[uuid];
+            if (!current) {
+                merged[uuid] = { ...entry, sourceCombatantId: source.combatantId };
+                continue;
+            }
+            const ts = (entry.lastSeenRound * 1e6) + entry.lastSeenTurn;
+            const currentTs = (current.lastSeenRound * 1e6) + current.lastSeenTurn;
+            if (ts > currentTs) {
+                merged[uuid] = { ...entry, sourceCombatantId: source.combatantId };
+            } else if (ts === currentTs && current.sourceCombatantId !== null) {
+                // Equal timestamp: own entries already won (they never
+                // carry a source id); between teammates the smaller
+                // combatant id wins deterministically.
+                if (String(source.combatantId)
+                    .localeCompare(String(current.sourceCombatantId)) < 0) {
+                    merged[uuid] = { ...entry, sourceCombatantId: source.combatantId };
+                }
+            }
+        }
+    }
+    return merged;
+}
+
+/**
  * Whether a token uuid still resolves to a live token on the current scene.
  * @param {string} tokenUuid
  * @returns {boolean}
@@ -733,6 +797,11 @@ function _deepFreeze(value) {
  * @param {object} [input.token] Viewer token of the combatant.
  * @param {boolean} [input.includeNeutral] Also accept neutral targets.
  * @param {number[]|null} [input.dispositions] Explicit disposition allow-list.
+ * @param {object|object[]|null} [input.teamMemory] Shared squad contacts
+ *   (issue #38): a merged memory map (`mergeTeamMemory` output) or an entry
+ *   list `[{tokenUuid, ...entry}]`. Team records join `lastKnownTargets`
+ *   marked `source: "team-contact"` — own memory wins at equal timestamps,
+ *   a strictly fresher team sighting replaces the stale own record.
  * @returns {object} Frozen snapshot.
  */
 export function buildPerceptionSnapshot({
@@ -740,7 +809,8 @@ export function buildPerceptionSnapshot({
     combatant = null,
     token = null,
     includeNeutral = false,
-    dispositions = null
+    dispositions = null,
+    teamMemory = null
 } = {}) {
     if (!globalThis.canvas?.scene || !token) {
         return _deepFreeze({
@@ -766,9 +836,35 @@ export function buildPerceptionSnapshot({
         sceneId,
         tokenExists: _tokenExistsOnScene
     });
-    const lastKnownTargets = Object.entries(memory)
-        .filter(([uuid]) => !visibleUuids.has(uuid))
-        .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }))
+    const lastKnown = new Map();
+    for (const [tokenUuid, entry] of Object.entries(memory)) {
+        if (visibleUuids.has(tokenUuid)) continue;
+        lastKnown.set(tokenUuid, { tokenUuid, ...entry });
+    }
+    // Issue #38 squad contacts: teammates' merged memory joins the
+    // last-known list marked `team-contact`. An equal timestamp keeps the
+    // own record (own wins at equal ts); a strictly fresher team sighting
+    // replaces it, so the plan still reacts to the newest shared position.
+    if (teamMemory) {
+        const shared = pruneMemory(
+            expireMemoryEntries(sanitizeMemory(teamMemory), round),
+            { sceneId, tokenExists: _tokenExistsOnScene });
+        for (const [tokenUuid, entry] of Object.entries(shared)) {
+            if (visibleUuids.has(tokenUuid)) continue;
+            const own = lastKnown.get(tokenUuid);
+            const ts = (entry.lastSeenRound * 1e6) + entry.lastSeenTurn;
+            const ownTs = own
+                ? (own.lastSeenRound * 1e6) + own.lastSeenTurn
+                : -Infinity;
+            if (own && ownTs >= ts) continue;
+            lastKnown.set(tokenUuid, {
+                tokenUuid,
+                ...entry,
+                source: "team-contact"
+            });
+        }
+    }
+    const lastKnownTargets = [...lastKnown.values()]
         .sort((a, b) => a.tokenUuid.localeCompare(b.tokenUuid));
 
     const viewerDoc = _tokenDocument(token);
@@ -1188,11 +1284,93 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
     }
 
     /**
+     * Resolved fireteam `teamId` of a combatant (issue #38): the
+     * combatant flag wins, then the linked token, then the actor — the
+     * same field-priority chain `resolveTeamConfig` applies for `teamId`
+     * (duplicated here to keep the services cycle-free).
+     * @param {object} combatant
+     * @returns {string|null}
+     */
+    function _teamIdOf(combatant) {
+        const read = doc => {
+            if (!doc) return null;
+            try {
+                if (typeof doc.getFlag === "function") {
+                    const flag = doc.getFlag(MODULE_ID, FLAG_KEYS.fireteam);
+                    if (typeof flag?.teamId === "string" && flag.teamId) {
+                        return flag.teamId;
+                    }
+                }
+            } catch(_err) {
+                // Fall back to the raw flags object below.
+            }
+            const flag = doc?.flags?.[MODULE_ID]?.[FLAG_KEYS.fireteam];
+            return typeof flag?.teamId === "string" && flag.teamId
+                ? flag.teamId : null;
+        };
+        return read(combatant)
+            ?? read(_tokenDocument(combatant?.token))
+            ?? read(combatant?.actor ?? _tokenDocument(combatant?.token)?.actor)
+            ?? null;
+    }
+
+    /**
+     * Merged shared contacts of a combatant's fireteam (issue #38): the
+     * sanitized memory of every living, AI-enabled teammate whose token
+     * still stands on the scene, deduped with `mergeTeamMemory`. A dead,
+     * defeated, disabled or off-scene member never shares — propagation is
+     * gated on the source state at read time, no authority needed (flags
+     * are free to read).
+     * @param {object} combat Combat document.
+     * @param {object} combatant Combatant asking for team contacts.
+     * @param {string} teamId Resolved fireteam id of the combatant.
+     * @returns {object[]} Sorted `{tokenUuid, ...entry, sourceCombatantId}`
+     *   records; `sourceCombatantId === null` marks the combatant's own
+     *   sightings inside the merge.
+     */
+    function teamLastKnownPositions(combat, combatant, teamId) {
+        if (!combat || !combatant || typeof teamId !== "string" || !teamId) return [];
+        const round = Number.isFinite(combat.round) ? combat.round : 0;
+        const ownId = combatant.id ?? null;
+        const teammateMemories = [];
+        for (const other of _combatantList(combat)) {
+            if (!other || other === combatant) continue;
+            if (ownId !== null && other.id === ownId) continue;
+            // Propagation gate: only a living, AI-enabled member whose
+            // token still stands on the scene may share its memory.
+            if (other.defeated === true || other.destroyed === true) continue;
+            if (!isAiEnabled(other)) continue;
+            if (_teamIdOf(other) !== teamId) continue;
+            const doc = _tokenDocument(other.token);
+            if (!doc || doc.destroyed === true) continue;
+            const uuid = _tokenUuid(doc);
+            if (uuid && !_tokenExistsOnScene(uuid)) continue;
+            teammateMemories.push({
+                combatantId: other.id ?? null,
+                memory: _readMemory(other)
+            });
+        }
+        const merged = mergeTeamMemory(_readMemory(combatant), teammateMemories, round);
+        const sceneId = globalThis.canvas?.scene?.id ?? combat.scene?.id ?? null;
+        // Prune merged entries by hand — `pruneMemory` re-sanitizes and
+        // would drop the `sourceCombatantId` provenance marker.
+        const pruned = {};
+        for (const [uuid, entry] of Object.entries(merged)) {
+            if (sceneId && entry.sceneId !== sceneId) continue;
+            if (!_tokenExistsOnScene(uuid)) continue;
+            pruned[uuid] = entry;
+        }
+        return Object.entries(pruned)
+            .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }))
+            .sort((a, b) => a.tokenUuid.localeCompare(b.tokenUuid));
+    }
+
+    /**
      * Expire every combatant memory map at the given combat round and prune
      * entries for other scenes/deleted tokens. Returns the number of
      * removed entries.
      * @param {object} combat Combat document.
-     * @param {number} [round] Current round, defaults to `combat.round`.
+     * @param {number} [round] Current combat round, defaults to `combat.round`.
      * @returns {Promise<number>}
      */
     async function expireMemory(combat, round) {
@@ -1338,6 +1516,7 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
         rankTargets,
         rememberPositions,
         lastKnownPositions,
+        teamLastKnownPositions,
         expireMemory,
         forgetToken,
         sanitizeMemory,

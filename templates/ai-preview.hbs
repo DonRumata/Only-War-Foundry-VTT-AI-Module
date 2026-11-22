@@ -76,7 +76,7 @@
         <legend>{{localize "OWAI.Preview.Steps"}}</legend>
         <ul class="ow-ai-steps">
             {{#each steps}}
-            <li><code>{{this.id}}</code> — {{this.label}}{{#if this.name}}: {{this.name}}{{/if}}</li>
+            <li><code>{{this.id}}</code> — {{this.label}}{{#if this.name}}: {{this.name}}{{/if}}{{#if this.detailLabel}} ({{this.detailLabel}}){{/if}}</li>
             {{/each}}
         </ul>
     </fieldset>

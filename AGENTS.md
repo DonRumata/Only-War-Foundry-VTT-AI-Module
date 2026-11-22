@@ -58,6 +58,18 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   чата, читает planner (фактор `grudge`). Рекорд живёт
   `GRUDGE_MAX_AGE_ROUNDS` (2) раунда, снимается доказанной смертью
   атакующего; в stale-fingerprint не входит.
+- Combatant: `lastOrder = { round, orderId, result }` (issue #38) —
+  последний успешный приказ лидера; пишет executor только после
+  успешного order-теста, читает fireteam (кулдаун
+  `ORDER_COOLDOWN_ROUNDS = 5` раундов).
+- Combatant: `delaySync = { round, until, count }` (issue #38) —
+  буккипинг синхронного удара: счётчик повторных delay-ожиданий одного
+  `until`; пишет executor delay-шагом, читает `_syncDelay` (предел —
+  `DEFAULT_MAX_SYNC_ROUNDS = 2`).
+- Combatant: `morale = { state, pressured?, desperate? }` — зарезервировано
+  под issue #26; код синхронизации/приказов уже читает флаг graceful:
+  `desperate` снимает delay-ожидание, `pressured` усиливает фактор `order`.
+  Отсутствие флага = нормальная мораль.
 - Actor/Token/Combatant: `personality = string[]` — явный список черт
   личности (issue #19, id из пула `scripts/personalities.js`); резолвится
   той же цепочкой Combatant → Token → Actor, без флага черты
@@ -83,6 +95,12 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
   выбранный controller (issue #400).
+
+Системный namespace `flags["only-war-local"]` модуль не хозяйничает, но
+читает/пишет по контракту системы: `delay`-шаг (issue #38) ставит
+`delayed = true` — трекер `only-war-local` сам снимает его при начале
+следующего хода комбатанта (`clearExpiredStates`), модульное ожидание
+синхрона живёт отдельно в `delaySync`.
 
 Фиксированные пресеты: `assault`, `rangedCover`, `hold`, `specOps`.
 
@@ -169,6 +187,13 @@ Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
   детерминированный utility: canAttack-гейт, ожидаемая эффективность
   (damage + penetration − armour), угроза, дистанция; веса пресета через
   `context.weights`.
+- Общие контакты отряда (issue #38): `mergeTeamMemory` — pure-дедуп
+  памяти членов с provenance `sourceCombatantId`;
+  `teamLastKnownPositions(combat, combatant, teamId)` — только живые,
+  enabled и стоящие на сцене тиммейты делятся памятью;
+  `buildPerceptionSnapshot({teamMemory})` маркирует чужие записи
+  `source:"team-contact"`. Отдельного team-contact store не существует —
+  читается существующая память членов, запись остаётся controller-only.
 - Debounce ~150 мс на `updateCombat` (round/turn), `updateToken`
   (x/y/elevation/hidden/disposition/sight), `deleteToken`, `canvasReady`.
 
@@ -330,8 +355,11 @@ state-changing шагом `planner.validateSnapshot(plan)`; позиция то�
 {operationId})`, system PR #440), отсутствие API — `system-api-missing`.
 `ready-weapon` — `api.actions.readyWeapon`/`ready`/`equip` (без
 эндпоинта — `system-api-missing`); `drop-prone` — `api.actions.dropProne`
-или fallback `actor.toggleStatusEffect("prone")`. Успешная `attack`
-пишет `lastUsedWeapon` на combatant (issue #37). Adjudication
+или fallback `actor.toggleStatusEffect("prone")`. `delay` (issue #38) —
+системный флаг `flags["only-war-local"].delayed` + модульный `delaySync`
+буккипинг синхронного удара. Успешная `attack`
+пишет `lastUsedWeapon` на combatant (issue #37); успешный `test` с
+`input.orderId` пишет `lastOrder` (issue #38, кулдаун приказов). Adjudication
 (issue #37): `attackAdjudication === "gm-confirm"` и режим `automatic` —
 перед attack/test шагом `context.adjudication` резолвер (тесты,
 интеграции) либо GM-чаткарта (`renderChatMessage`-биндинг решений,

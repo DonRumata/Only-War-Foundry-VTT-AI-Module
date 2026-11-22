@@ -33,14 +33,16 @@
  */
 import {
     AI_PRESETS,
+    DEFAULT_MAX_SYNC_ROUNDS,
     DEFAULT_PREFERRED_COHESION,
     FIRETEAM_CHARACTERS,
     FIRETEAM_TASKS,
     FLAG_KEYS,
-    MODULE_ID
+    MODULE_ID,
+    ORDER_COOLDOWN_ROUNDS
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
-import { isHostileDisposition } from "./perception.js";
+import { isHostileDisposition, mergeTeamMemory } from "./perception.js";
 import {
     createPlannerService,
     fnv1a,
@@ -65,11 +67,14 @@ export const FIRETEAM_STATUS = Object.freeze({
 /**
  * Stable invalidation reason codes returned by `validateTeamPlan`.
  * `leader-lost` triggers a deterministic re-election; `member-unavailable`
- * allows one shared replan before the first state change.
+ * allows one shared replan before the first state change; `sync-broken`
+ * (issue #38) marks a synchronized-strike wait whose awaited member
+ * (usually the transit flanker) was defeated or disabled.
  */
 export const TEAM_PLAN_REASONS = Object.freeze({
     leaderLost: "leader-lost",
     memberUnavailable: "member-unavailable",
+    syncBroken: "sync-broken",
     turnStale: "turn-stale",
     combatEnded: "combat-ended",
     invalidPlan: "invalid-plan",
@@ -222,6 +227,284 @@ function _deepFreeze(value) {
  */
 function _jsonClone(value) {
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+/**
+ * Morale state of a combatant for issue #38 gating (graceful #26
+ * integration): reads `context.morale` first (tests/integrations), then
+ * the reserved module flag `flags["only-war-ai"].morale`
+ * `{state, pressured?, desperate?}`. No flag or unrecognized payload —
+ * normal morale, the caller keeps planning as usual.
+ * @param {object|null} combatant Combatant document.
+ * @param {object} [context] `buildTeamPlan` context.
+ * @returns {{pressured: boolean, desperate: boolean}}
+ */
+function _moraleOf(combatant, context = {}) {
+    const injected = context.morale;
+    const record = injected !== undefined ? injected
+        : _readFlag(combatant, FLAG_KEYS.morale);
+    const state = typeof record?.state === "string" ? record.state : null;
+    return {
+        pressured: record?.pressured === true || state === "pressured",
+        desperate: record?.desperate === true || state === "desperate"
+    };
+}
+
+/**
+ * Order options of an actor (issue #38): owned `order` items, then
+ * speciality perks whose `activation.type` is `order`/`generalOrder`
+ * (e.g. the sergeant's `sergeant_charge`). Perk documents are resolved
+ * best-effort through `fromUuidSync` — a missing compendium or resolver
+ * simply yields no perk options, never an error.
+ * @param {object} actor Actor document.
+ * @returns {object[]} `{orderId, name, orderType, benefit, advanced}`
+ *   sorted deterministically by `orderId`.
+ */
+function _orderOptionsOf(actor) {
+    const options = [];
+    for (const item of _list(actor?.items)) {
+        if (!item || item.type !== "order") continue;
+        const system = item.system ?? {};
+        options.push({
+            orderId: item.uuid ?? item.id ?? item.name,
+            name: item.name ?? null,
+            orderType: system.orderType ?? null,
+            benefit: system.benefit ?? null,
+            advanced: system.orderType === "veteran"
+        });
+    }
+    const speciality = actor?.system?.speciality;
+    if (speciality?.uuid && typeof globalThis.fromUuidSync === "function") {
+        const resolve = uuid => {
+            try {
+                return globalThis.fromUuidSync(uuid) ?? null;
+            } catch(_err) {
+                return null;
+            }
+        };
+        const specialityDoc = resolve(speciality.uuid);
+        const perkUuids = Array.isArray(specialityDoc?.system?.perks)
+            ? specialityDoc.system.perks : [];
+        const states = speciality.perks ?? {};
+        for (const uuid of perkUuids) {
+            const doc = resolve(uuid);
+            if (!doc || doc.type !== "specialityPerk") continue;
+            const activation = doc.system?.activation ?? {};
+            if (activation.type !== "order" && activation.type !== "generalOrder") {
+                continue;
+            }
+            const perkId = doc.system?.perkId ?? doc.id ?? uuid;
+            if (states[perkId]?.enabled === false) continue;
+            options.push({
+                orderId: perkId,
+                name: doc.name ?? perkId,
+                orderType: activation.type === "generalOrder"
+                    ? "general" : "speciality",
+                benefit: doc.system?.benefit ?? doc.system?.manualNote ?? null,
+                advanced: false
+            });
+        }
+    }
+    return options.sort((a, b) => String(a.orderId).localeCompare(String(b.orderId)));
+}
+
+/**
+ * The order candidate of a team leader (issue #38): a single-member squad
+ * has nobody to order, a leader without the `command` skill cannot issue
+ * orders (`prepareTest` would answer `action-unavailable` anyway — the
+ * upfront check keeps the candidate honest) and `ORDER_COOLDOWN_ROUNDS`
+ * must have elapsed since the executor's `lastOrder` post-success stamp.
+ * @param {object} input
+ * @param {object} input.member Leader member entry.
+ * @param {number} input.memberCount Living team size.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context `buildTeamPlan` context.
+ * @returns {object|null} `{orderId, name, orderType, benefit, skill, advanced}`.
+ */
+function _orderCandidateOf({ member, memberCount, combat, context }) {
+    if (!member || _finiteOr(memberCount, 0) < 2) return null;
+    const actor = member.combatant?.actor
+        ?? _tokenDoc(member.combatant?.token)?.actor ?? null;
+    if (!actor) return null;
+    const skills = actor.system?.skills ?? actor.skills ?? {};
+    if (skills.command == null) return null;
+    const record = _readFlag(member.combatant, FLAG_KEYS.lastOrder);
+    const round = _finiteOr(combat?.round, 0);
+    const cooldown = _finiteOr(context?.orderCooldownRounds, ORDER_COOLDOWN_ROUNDS);
+    if (record && Number.isFinite(record.round)
+        && round - record.round < cooldown) {
+        return null;
+    }
+    const pick = _orderOptionsOf(actor)[0] ?? null;
+    if (!pick) return null;
+    return { ...pick, skill: "command" };
+}
+
+/**
+ * Merged shared contacts of the whole team (issue #38): built once per
+ * `buildTeamPlan` — each member's `lastKnownPositions` is merged through
+ * `mergeTeamMemory`, so every member context carries the identical,
+ * deterministically deduped contact list. `context.shareContacts ===
+ * false` or a missing perception service leaves contacts unset.
+ * @param {object} input
+ * @param {object[]} input.members Living members (dead/disabled never
+ *   reach this list — `buildTeamPlan` filters them first).
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context `buildTeamPlan` context.
+ * @param {object|null} input.perception Perception service.
+ * @returns {object[]|null} Sorted `{tokenUuid, ...entry}` records.
+ */
+function _teamContacts({ members, combat, context, perception }) {
+    if (context?.shareContacts === false) return null;
+    if (typeof perception?.lastKnownPositions !== "function") return null;
+    const memories = [];
+    for (const member of members ?? []) {
+        let entries = [];
+        try {
+            entries = perception.lastKnownPositions(member.combatant) ?? [];
+        } catch(err) {
+            entries = [];
+        }
+        if (!Array.isArray(entries) || !entries.length) continue;
+        memories.push({
+            combatantId: member.combatantId,
+            memory: Object.fromEntries(
+                entries.map(entry => [entry.tokenUuid, entry]))
+        });
+    }
+    if (!memories.length) return null;
+    const merged = mergeTeamMemory(null, memories, _finiteOr(combat?.round, null));
+    const contacts = Object.entries(merged)
+        .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }))
+        .sort((a, b) => String(a.tokenUuid).localeCompare(String(b.tokenUuid)));
+    return contacts.length ? contacts : null;
+}
+
+/**
+ * Delay-stub member plan for a synchronized strike (issue #38): the
+ * member's chosen plan is replaced by a serializable `delay` step plus
+ * `end-turn`. The stub rides on the plan DTO (same id/revision) and marks
+ * `plan.delay` for executors/overlays; `memberEntries[].delayed` records
+ * the wait condition separately.
+ * @param {object} plan Original member plan.
+ * @param {object} input
+ * @param {object} input.delay `{reason, until, syncRound, awaitId}`.
+ * @param {string} input.teamId Team id.
+ * @param {number|null} input.round Current combat round.
+ * @returns {object} New plan DTO (the input is never mutated).
+ */
+function _delayStubPlan(plan, { delay, teamId, round }) {
+    const clone = _jsonClone(plan) ?? {};
+    clone.steps = [
+        {
+            id: "step-delay-1",
+            type: "delay",
+            cost: { halves: 2 },
+            input: {
+                reason: delay.reason,
+                until: delay.until,
+                teamId: teamId ?? null,
+                round: round ?? null
+            },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
+        },
+        {
+            id: "step-end-turn-2",
+            type: "end-turn",
+            cost: {},
+            input: { reason: "await-sync" },
+            preconditions: ["turn"],
+            projectedResourceDelta: {}
+        }
+    ];
+    clone.delay = { ...delay };
+    return clone;
+}
+
+/**
+ * Synchronized-strike post-pass (issue #38): when a convergence target is
+ * shared but the transit flanker still needs a round to get there — a
+ * flank-task member with a move-only plan (ETA ≥ 1 turn) — main members
+ * whose plan already strikes `convergence.targetId` hold position
+ * instead: their plan is replaced by a delay-stub, so the squad strikes
+ * together once the flank is in position. Guards: the flanker itself is
+ * never delayed, a morale-`desperate` member (graceful #26 flag, absent
+ * reads normal) keeps fighting and `maxSyncRounds` bounds consecutive
+ * delays through the `delaySync` flag record the executor's delay step
+ * writes. `context.syncDelay === false` disables the pass.
+ * @param {object} input
+ * @param {object[]} input.ordered Members in planning order.
+ * @param {Map} input.assignMap `combatantId → assignment`.
+ * @param {Map} input.plans `combatantId → planTurn result`.
+ * @param {object|null} input.convergence Shared objective descriptor.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context `buildTeamPlan` context.
+ * @param {object} input.diagnostics Diagnostics sink (`syncDelays`).
+ * @param {string} input.teamId Team id.
+ * @returns {Map} `combatantId → {reason, until, syncRound, awaitId}`.
+ */
+function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
+    diagnostics, teamId }) {
+    const result = new Map();
+    if (context?.syncDelay === false) return result;
+    if (!convergence?.targetId) return result;
+    let flanker = null;
+    for (const member of ordered ?? []) {
+        if (assignMap?.get(member.combatantId)?.task !== "flank") continue;
+        const steps = plans?.get(member.combatantId)?.plan?.steps ?? [];
+        const moves = steps.some(step => step?.type === "move");
+        const strikes = steps.some(step => step?.type === "attack" || step?.type === "test");
+        if (moves && !strikes) {
+            flanker = member;
+            break;
+        }
+    }
+    if (!flanker) return result;
+    const maxSyncRounds = _finiteOr(context?.maxSyncRounds, DEFAULT_MAX_SYNC_ROUNDS);
+    const round = Number.isFinite(combat?.round) ? combat.round : null;
+    for (const member of ordered ?? []) {
+        if (member.combatantId === flanker.combatantId) continue;
+        // Flankers are never delayed — they are the wait condition.
+        if (assignMap?.get(member.combatantId)?.task === "flank") continue;
+        const entry = plans?.get(member.combatantId);
+        const plan = entry?.plan;
+        if (!plan) continue;
+        const strikesTarget = plan.target?.tokenId === convergence.targetId
+            || (plan.steps ?? []).some(step =>
+                (step?.type === "attack" || step?.type === "test")
+                && (step?.input?.targetTokenId === convergence.targetId
+                    || step?.input?.targetTokenUuid
+                        === (convergence.targetUuid ?? convergence.targetId)));
+        if (!strikesTarget) continue;
+        // Graceful #26 hook: a morale-desperate member cannot be trusted
+        // to hold position for the synchronized strike — it fights on.
+        if (_moraleOf(member.combatant, context).desperate) continue;
+        // The `delaySync` flag counts consecutive delays for the same
+        // `until` condition — beyond `maxSyncRounds` the member stops
+        // waiting and attacks anyway.
+        const sync = _readFlag(member.combatant, FLAG_KEYS.delaySync);
+        if (sync?.until === "flank-ready" && Number.isFinite(sync.count)
+            && sync.count >= maxSyncRounds) {
+            continue;
+        }
+        const delay = {
+            reason: "await-sync",
+            until: "flank-ready",
+            syncRound: round,
+            awaitId: flanker.combatantId
+        };
+        plans.set(member.combatantId, {
+            ...entry,
+            plan: _delayStubPlan(plan, { delay, teamId, round })
+        });
+        result.set(member.combatantId, delay);
+    }
+    if (result.size && diagnostics) {
+        diagnostics.syncDelays = [...result.entries()]
+            .map(([combatantId, delay]) => ({ combatantId, ...delay }));
+    }
+    return result;
 }
 
 /**
@@ -1488,6 +1771,16 @@ export function createFireteamService({
             ...TARGET_TASK_CAPACITY,
             ...(context.taskCapacities ?? {})
         };
+
+        // Issue #38 shared squad contacts: the merged memory of every
+        // living member is collected once per TeamPlan — each member
+        // context carries the identical `team.contacts` list, so a
+        // contact one member saw propagates to the whole squad. The
+        // planner dedups freshness against the member's own last-known
+        // entries (fresher wins, own wins at equal ts).
+        const perception = _service("perception", context.perception);
+        const teamContacts = _teamContacts({ members, combat, context, perception });
+
         const reservedTargets = new Map();
         const plans = new Map();
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
@@ -1505,10 +1798,25 @@ export function createFireteamService({
                     leaderId: election.combatantId,
                     center: leaderPos,
                     character,
+                    contacts: teamContacts,
                     regroupPoint: assignment.task === "regroup"
                         ? (rejoinPoints[0] ?? null) : null
                 }
             };
+            // Issue #38 orders: the elected leader receives the team's
+            // `orderCandidate` (Command test of the best order option);
+            // absent options/cooldown simply leave the field unset.
+            if (member.combatantId === election.combatantId) {
+                const orderCandidate = _orderCandidateOf({
+                    member,
+                    memberCount: members.length,
+                    combat,
+                    context
+                });
+                if (orderCandidate) {
+                    memberContext.team.orderCandidate = orderCandidate;
+                }
+            }
             const memberTargets = _memberTargets({
                 base: baseTargets,
                 counts: reservedTargets,
@@ -1577,7 +1885,8 @@ export function createFireteamService({
                     task: assignment.task,
                     groupId: assignment.groupId,
                     leaderId: election.combatantId,
-                    character
+                    character,
+                    contacts: teamContacts
                 }
             });
             plans.set(member.combatantId, retry);
@@ -1590,6 +1899,22 @@ export function createFireteamService({
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
         }
+
+        // Issue #38 synchronized strike: when the shared convergence target
+        // is already engaged by main members but the transit flanker needs
+        // another round, main members hold position on a `delay` plan so
+        // the squad strikes together. A retry above never resurrects a
+        // delay — the pass runs after every replan.
+        const delayed = _syncDelay({
+            ordered,
+            assignMap,
+            plans,
+            convergence,
+            combat,
+            context,
+            diagnostics,
+            teamId
+        });
 
         // Cohesion evaluation: leader position is the team centre; detached
         // maneuvers need a reachable endpoint, a bounded separation and a
@@ -1655,7 +1980,10 @@ export function createFireteamService({
                 assignedRoute: Array.isArray(move?.input?.waypoints)
                     ? _jsonClone(move.input.waypoints) : null,
                 planId: plan?.id ?? null,
-                status: plans.get(member.combatantId)?.status ?? "error"
+                status: plans.get(member.combatantId)?.status ?? "error",
+                // Issue #38: `{reason, until, syncRound, awaitId}` when the
+                // member waits for the synchronized strike.
+                delayed: delayed.get(member.combatantId) ?? null
             });
         }
         score = Math.round((score - cohesionPenalty) * 1e6) / 1e6;
@@ -1765,6 +2093,19 @@ export function createFireteamService({
                 members.filter(m => m.combatantId !== teamPlan.leaderId),
                 { seed });
             return fail(TEAM_PLAN_REASONS.leaderLost, successor);
+        }
+        // Issue #38: a delayed member waits on `delayed.awaitId` — the
+        // transit flanker the synchronized strike holds for. When that
+        // awaited member is gone or defeated/disabled the wait is broken:
+        // report `sync-broken` before the generic member check so the
+        // caller sees the actual reason.
+        for (const entry of teamPlan.members ?? []) {
+            const awaitedId = entry?.delayed?.awaitId ?? null;
+            if (!awaitedId) continue;
+            const awaited = members.find(m => m.combatantId === awaitedId);
+            if (!awaited || awaited.defeated === true || awaited.enabled === false) {
+                return fail(TEAM_PLAN_REASONS.syncBroken);
+            }
         }
         for (const entry of teamPlan.members ?? []) {
             const live = members.find(m => m.combatantId === entry.combatantId);
