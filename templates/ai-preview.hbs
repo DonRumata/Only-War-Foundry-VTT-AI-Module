@@ -117,6 +117,17 @@
         </ul>
     </details>
 
+    {{#if traceLines.length}}
+    <details class="ow-ai-preview-trace">
+        <summary>{{localize "OWAI.Preview.Trace"}}</summary>
+        <ul>
+            {{#each traceLines}}
+            <li>{{this}}</li>
+            {{/each}}
+        </ul>
+    </details>
+    {{/if}}
+
     {{#if diagnostics.enabled}}
     <details class="ow-ai-preview-diagnostics">
         <summary>{{localize "OWAI.Preview.Diagnostics"}}</summary>

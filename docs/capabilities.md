@@ -502,6 +502,18 @@ execute: расхождение — `stale-state` (перемещение, см�
   `layersPersonality`, `layersLookahead` (default `true`); план-оверрайд —
   `context.layers`. Каждый слой пишет `{layer, code, detail}` в
   `plan.diagnostics.layers`.
+- **Трасс решений (issue #27, `scripts/trace.js`, capability
+  `planner.trace`)**: `plan.diagnostics.trace` — сериализуемые записи
+  `{layer, kind, ...}` по каждому слою (L0 вето по кандидатам, L1
+  вердикт обязательства, L2 поза+сдвиг весов, L3 дельты черт по
+  факторам, L4 top-3/победитель/дельта/w·f-вклады). Рендер
+  compact|full (`aiTraceVerbose`, default compact) в превью-блоке
+  «Как думал» и однострочным GM-шёпотом при отказе/отмене хода.
+  Replay-захват `aiCaptureContext` (default off): bounded (8) журнал
+  `captureJournal` на комбатанте — sanitized `planContext`+snapshot,
+  готовые фикстуры детерминированного replay `planTurn` (офлайн,
+  идентичные план и трасс). Трасс — только диагностика, на выбор
+  плана не влияет.
 
 ## 3. Что боты умеют — по пресетам
 

@@ -220,7 +220,7 @@ L4: scoring → lookahead(гейт) → easy-slip → winner → steps → пл�
 его абсолютность в том, что ни один верхний слой не может вернуть
 отвергнутого.
 
-## Reason-формат (#27 plumbing)
+## Reason-формат (issue #24/#27)
 
 Каждый слой пишет причину решения унифицированной записью:
 
@@ -249,9 +249,84 @@ L4: scoring → lookahead(гейт) → easy-slip → winner → steps → пл�
   effectiveTier, pressured, desperate, confident, shift?}`); в
   team-plan — `diagnostics.morale` (`{tier, pending, counters,
   changed, effective}`) + `diagnostics.moraleDemotions`.
-- #27 строит на этом полный trace-инструмент (выбор черт, ветки
-  сужения, per-layer timings); здесь — минимально необходимый plumbing:
-  формат зафиксирован, слои обязаны писать.
+- #27 строит на этом полный trace-инструмент (см. «Трасс решений»
+  ниже): формат зафиксирован, слои обязаны писать.
+
+## Трасс решений и replay-захват (issue #27)
+
+Задача — прозрачный для GM ответ «почему бот так решил» при наслоении
+L0–L4. Трасс — **рендер/поверхность над `diagnostics.layers`**, он
+никогда не влияет на выбор плана: записи пишутся слоями в момент
+решения, материализация и рендер — после, логика не меняется.
+
+### Материализованные записи (`scripts/trace.js`)
+
+`buildLayerTrace(diagnostics)` — pure-проекция `diagnostics.layers` в
+`plan.diagnostics.trace`: одна сериализуемая запись `{layer, kind, ...}`
+на каждую reason-запись, в хронологическом порядке. Планировщик
+штампует `diagnostics.trace` на каждом выходе с диагностикой
+(`_assemblePlan` и ранние отказы) — сериализованный план объясняет себя
+офлайн; `run.trace` executor'а зеркалит её на активный план.
+
+| Kind | Слой | Поля |
+|---|---|---|
+| `veto` | L0 | `code`, `candidate` |
+| `disabled` | L1–L4 | `code` (тумблер слоя выкл) |
+| `commitment-hit` / `commitment-miss` / `commitment-cancelled` | L1 | `source`, `steps` / `reason` / `code`+`detail` |
+| `morale` / `morale-shift` | L2 | `tier`, `effectiveTier`, `deltas` |
+| `personality` | L3 | `traits`, `character`, `deltas` (applied per-factor), `clamped` |
+| `scored` / `lookahead` / `easy-slip` / `winner` | L4 | см. ниже |
+| `record` | любой | fallback — неизвестный код не теряется |
+
+Донесения из #27: L0 уже писал veto по кандидату; L3-overlay теперь
+несёт `detail.deltas` — применённые дельты по имени фактора
+(`diagnostics.personality.deltas` дублирует); L4 `winner` —
+`{candidate, score, top: top-3 {candidate, score}, runnerUp
+{candidate, score}, margin, factors}` где `factors` — разность вкладов
+`w × f` победителя и runner-up, top-3 по |дельте| (`factorDelta`,
+`TRACE_TOP_FACTORS = 3`; easy-slip оставляет отрицательный margin
+видимым — выбран слабый ход).
+
+### Рендер
+
+`renderTrace(entries, {i18n, mode})` — локализованные строки `L<#>: …`
+(en/ru ключи `OWAI.Trace.*` — слои, причины `OWAI.Trace.Reason.<code>`,
+варианты `OWAI.Trace.Variant.<variant>`):
+
+- **`compact`** (настройка `aiTraceVerbose`, default): строка вердикта
+  на слой — L0 свёрнут в `veto <код> ×N, …`, L4 в одну scoring-строку
+  `scoring N → <winner> <score> [top-3] (+Δ vs <runner-up>: f₁ +0.10,
+  f₂ −0.03)`.
+- **`full`**: строка на каждую reason-запись — veto по кандидату,
+  `scored`/`lookahead`/`easy-slip`/`winner` раздельно.
+
+Поверхности: свёрнутый блок «Как думал» в GM-превью
+(`OWAI.Preview.Trace`, `vm.traceLines` — без гейта `diagnosticsEnabled`)
+и однострочный GM-шёпот `compactTraceLine(diagnostics)` в
+диагностическом чат-репорте executor'а при остановленном/отменённом
+ходе (`OWAI.Chat.ExecutorTrace` — «plan cancelled: gm-intervention;
+morale desperate; winner attack-in-place 0.41»).
+
+### Replay-захват
+
+`aiCaptureContext` (world setting, default `false`; разовый оверрайд —
+`context.capture === true`): executor после удачного `planTurn`
+(включая репланы) дописывает в combatant-флаг `captureJournal` запись
+`{version, at, preset, config, flags, context, snapshot, result}` —
+bounded `CAPTURE_JOURNAL_MAX = 8`, только controller, best-effort
+(ошибки флага молча пропускают захват), debug-вывод в консоль только
+при `diagnosticsEnabled`. Поля: `context` — whitelist-санитизация
+`sanitizeCaptureContext` (только JSON-данные — сервисы, проб-функции и
+документы не выживают), `flags` — AI-флаги, которые `planTurn` читает с
+комбатанта (morale/committedPlan/moveJournal/lastUsedWeapon/
+lastAttacker/reactionUsed/aim/personality/fireteam/lastOrder/delaySync/
+gmControlled), `result` — `{planId, score, winner, steps, trace}`.
+
+`tests/unit/replay-helpers.mjs` `replayPlan(capture)` — pure-хелпер:
+JSON-запись → восстановленные combat/combatant/scene/flags → тот же
+`planTurn` → идентичные `steps`/`score`/`trace`/`layers` (seeded
+детерминизм). Готовый сценарий — `tests/unit/replay.test.mjs`
+(executor → журнал → JSON → replay).
 
 ## Флаги и деградация
 

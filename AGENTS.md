@@ -80,6 +80,13 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - Combatant: `gmControlled = { round, turn, reason }` (issue #25) —
   пометка `gm-intervention` на один раунд; файртим понижает меченного
   члена со сложных заданий (flank/assault/advance → support).
+- Combatant: `captureJournal = [{version, at, preset, config, flags,
+  context, snapshot, result}]` (issue #27) — bounded (8) журнал
+  replay-захватов: санитизированный `planContext` + AI-флаги + snapshot
+  + отпечаток результата (`steps`, `winner`, `trace`); пишет executor
+  при `aiCaptureContext`/`context.capture`, только controller. Каждая
+  запись — готовая фикстура `replayPlan` (tests/unit/replay-helpers.mjs):
+  JSON → `planTurn` → идентичный план и трасс.
 - Combatant: `morale` (issue #26) — рекорд позы файртимы; evaluated
   форма `{tier, pending, counters, losses, leaderId, combatId, round,
   state, schema}` пишется только controller'ом на всех живых членов при
@@ -119,6 +126,13 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `manualOverrideGrace` (default `false`, issue #25) — ручной перенос
   токена GM: off — `gm-intervention` (отмена committed-плана + реплан),
   on — безусловный ход, план продолжается с новой позиции.
+  `aiTraceVerbose` (default `"compact"`, issue #27) — рендер трасса
+  решений: `compact` — строка вердикта на слой (сгруппированные вето,
+  объединённый скоринг), `full` — строка на каждую запись
+  `{layer, code, detail}`.
+  `aiCaptureContext` (default `false`, issue #27) — запись
+  `captureJournal` (bounded 8 захватов `planContext`+snapshot на флаге
+  комбатанта) для офлайн-реплея `planTurn`.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -358,13 +372,44 @@ tier морали + member-effective tier через исключения чер
 `L3_DELTA_BASE_FLOOR = 20`) → генерация кандидатов (L0-вето через
 `rejectL0`) → L4 scoring + lookahead (гейт `layersLookahead` поверх
 difficulty/`context.lookahead`). Каждый слой пишет унифицированную
-запись `{layer, code, detail}` в `diagnostics.layers` (plumbing под
-#27); тумблеры плана — `diagnostics.layerFlags` (`resolveLayerFlags` =
+запись `{layer, code, detail}` в `diagnostics.layers`; тумблеры плана —
+`diagnostics.layerFlags` (`resolveLayerFlags` =
 `context.layers` > world settings > `DEFAULT_LAYER_FLAGS`); поза —
 `diagnostics.morale` (`{tier, effectiveTier, shift?}`); зажатые дельты —
 `diagnostics.personality.clamped`.
 Выключенный слой деградирует на предыдущий уровень; поведение при
 дефолтах идентично прежнему, кроме документированной скобы L3.
+
+## Трасс решений (issue #27)
+
+`scripts/trace.js` — pure-рендер поверх `diagnostics.layers` +
+replay-захват; полный контракт — `docs/layers.md` (раздел трассировки).
+
+- `buildLayerTrace(diagnostics)` материализует `plan.diagnostics.trace`
+  — одна сериализуемая запись `{layer, kind, ...}` на каждую
+  reason-запись (L0-вето с кандидатом, L1 hit/miss/код инвалидатора,
+  L2 posture/shift, L3 traits+дельты по факторам, L4 scored/lookahead/
+  easy-slip/winner). `run.trace` executor'а зеркалит её.
+- `renderTrace(entries, {i18n, mode})` — локализованные строки
+  `L<#>: …`; `compact` (настройка `aiTraceVerbose`) сворачивает L0-вето в
+  одну строку по кодам и L4 в одну scoring-строку (top-3, дельта
+  победителя, top-3 |вклад| факторов), `full` — строка на запись.
+- Winner-рекорд L4 несёт `top` (top-3 `{candidate, score}`), `runnerUp`,
+  `margin` и `factors` — разность вкладов `w × f` победителя и
+  runner-up, top-3 по |дельте| (`factorDelta`); easy-slip оставляет
+  отрицательную дельту видимой.
+- `compactTraceLine(diagnostics)` — однострочный GM-шёпот остановленного/
+  отменённого хода («plan cancelled: gm-intervention; morale
+  desperate; winner …») в диагностическом чат-репорте executor'а.
+- Превью: свёрнутый блок «Как думал» (`OWAI.Preview.Trace`) рендерит
+  `traceLines` режимом настройки — без гейта `diagnosticsEnabled`.
+- Replay: `buildCaptureEntry`/`appendCaptureEntry`/`sanitizeCaptureContext`
+  — санитизированный bounded (8) журнал `captureJournal` на комбатанте
+  (записываемые AI-флаги + planContext + snapshot + отпечаток плана);
+  `tests/unit/replay-helpers.mjs` `replayPlan(capture)` перепрогоняет
+  `planTurn` детерминированно (JSON → идентичные steps/score/trace).
+  Трасс никогда не влияет на выбор плана: это только диагностическая
+  поверхность.
 
 ## Личности ботов (issue #19)
 

@@ -60,6 +60,7 @@ export function createModuleApi() {
             "planner.personalities": true,
             "planner.planTurn": true,
             "planner.presets": true,
+            "planner.trace": true,
             "planner.validateSnapshot": true,
             "reactions.flags": true,
             "services.register": true,

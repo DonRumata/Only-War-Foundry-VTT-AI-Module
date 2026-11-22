@@ -65,7 +65,12 @@ export const FLAG_KEYS = Object.freeze({
     // Reserved for issue #26 morale — the squad-sync/order code already
     // reads `morale.{state|pressured|desperate}` gracefully: an absent
     // flag simply means normal morale.
-    morale: "morale"
+    morale: "morale",
+    // Issue #27 replay capture: the bounded journal of captured
+    // `planContext`+snapshot entries the executor writes when
+    // `aiCaptureContext` is on — each entry is a ready-made unit fixture
+    // (`replayPlan` re-runs `planTurn` deterministically from it).
+    captureJournal: "captureJournal"
 });
 
 /**
@@ -107,7 +112,13 @@ export const SETTING_KEYS = Object.freeze({
     // multi-turn plan. GM-only whispers by default; `barksToPlayers`
     // widens the audience to the whole table.
     aiBarks: "aiBarks",
-    barksToPlayers: "barksToPlayers"
+    barksToPlayers: "barksToPlayers",
+    // Issue #27 reason trace: `compact` renders the final per-layer
+    // verdicts, `full` every recorded layer record. `aiCaptureContext`
+    // keeps a bounded replay journal of `planContext`+snapshot captures
+    // on the combatant `captureJournal` flag.
+    aiTraceVerbose: "aiTraceVerbose",
+    aiCaptureContext: "aiCaptureContext"
 });
 
 /**
@@ -245,6 +256,35 @@ export const MORALE_LOSS_LOG_MAX = 16;
 
 /** Default pacing delay between AI execution steps in milliseconds. */
 export const DEFAULT_TURN_PACING_MS = 800;
+
+/**
+ * Reason-trace render modes for the `aiTraceVerbose` world setting
+ * (issue #27): `compact` collapses every layer to its final verdict
+ * (grouped vetoes, merged scoring line), `full` renders each recorded
+ * `{layer, code, detail}` reason record as its own trace line.
+ */
+export const TRACE_MODES = Object.freeze([
+    "compact",
+    "full"
+]);
+
+/** Default reason-trace mode — the compact per-layer verdict view. */
+export const DEFAULT_TRACE_MODE = "compact";
+
+/**
+ * Bound on the executor replay-capture journal (issue #27): the
+ * combatant `captureJournal` flag keeps the most recent
+ * `planContext`+snapshot captures — each is a ready-made offline replay
+ * fixture for `planTurn`.
+ */
+export const CAPTURE_JOURNAL_MAX = 8;
+
+/**
+ * How many top-|contribution| factors the L4 winner record explains
+ * (issue #27): the per-factor `w × f` deltas between the winner and the
+ * runner-up, cut to the most decisive entries.
+ */
+export const TRACE_TOP_FACTORS = 3;
 
 /** Default GM preview timeout in seconds (issue #409); 0 disables it. */
 export const DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60;

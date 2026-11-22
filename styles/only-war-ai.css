@@ -94,6 +94,7 @@
 .ow-ai-preview .ow-ai-resources,
 .ow-ai-preview .ow-ai-ranking,
 .ow-ai-preview .ow-ai-preview-breakdown ul,
+.ow-ai-preview .ow-ai-preview-trace ul,
 .ow-ai-preview .ow-ai-preview-diagnostics ul {
     list-style: none;
     margin: 4px 0;
@@ -107,6 +108,7 @@
 }
 
 .ow-ai-preview .ow-ai-preview-breakdown summary,
+.ow-ai-preview .ow-ai-preview-trace summary,
 .ow-ai-preview .ow-ai-preview-diagnostics summary {
     cursor: pointer;
     font-weight: 600;

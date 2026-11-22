@@ -26,6 +26,12 @@
  * - `aiBarks`/`barksToPlayers`: booleans (issue #26) — short chat barks
  *   telegraphing AI intent on morale-tier changes and committed-plan
  *   starts. GM whispers by default; `barksToPlayers` makes them public.
+ * - `aiTraceVerbose`: "compact" | "full" (issue #27) — whether the
+ *   reason trace renders the final per-layer verdicts or every recorded
+ *   `{layer, code, detail}` reason record.
+ * - `aiCaptureContext`: boolean (issue #27) — executor keeps a bounded
+ *   journal of `planContext`+snapshot captures on the combatant
+ *   `captureJournal` flag (offline `planTurn` replay fixtures).
  */
 import {
     AI_DIFFICULTIES,
@@ -35,10 +41,12 @@ import {
     DEFAULT_LAYER_FLAGS,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
+    DEFAULT_TRACE_MODE,
     DEFAULT_TURN_PACING_MS,
     EXECUTION_MODES,
     MODULE_ID,
-    SETTING_KEYS
+    SETTING_KEYS,
+    TRACE_MODES
 } from "./constants.js";
 
 /** Register the module's world settings. Called on `init`. */
@@ -191,6 +199,33 @@ export function registerSettings() {
     game.settings.register(MODULE_ID, SETTING_KEYS.barksToPlayers, {
         name: "OWAI.Settings.BarksToPlayers.Name",
         hint: "OWAI.Settings.BarksToPlayers.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: false
+    });
+
+    // Issue #27: the reason-trace render mode — compact collapses every
+    // layer to its verdict line, full shows each recorded reason record.
+    game.settings.register(MODULE_ID, SETTING_KEYS.aiTraceVerbose, {
+        name: "OWAI.Settings.TraceVerbose.Name",
+        hint: "OWAI.Settings.TraceVerbose.Hint",
+        scope: "world",
+        config: true,
+        type: String,
+        choices: {
+            compact: "OWAI.Settings.TraceVerbose.Compact",
+            full: "OWAI.Settings.TraceVerbose.Full"
+        },
+        default: DEFAULT_TRACE_MODE
+    });
+
+    // Issue #27: replay capture — the executor keeps a bounded journal
+    // of `planContext`+snapshot captures on the combatant flag so a GM
+    // can replay `planTurn` offline (debugging/bug reports).
+    game.settings.register(MODULE_ID, SETTING_KEYS.aiCaptureContext, {
+        name: "OWAI.Settings.CaptureContext.Name",
+        hint: "OWAI.Settings.CaptureContext.Hint",
         scope: "world",
         config: true,
         type: Boolean,
@@ -374,6 +409,36 @@ export function barksToPlayers() {
     try {
         const value = game.settings.get(MODULE_ID, SETTING_KEYS.barksToPlayers);
         return value === true;
+    } catch(_err) {
+        return false;
+    }
+}
+
+/**
+ * Reason-trace render mode ("compact" | "full", issue #27). `compact`
+ * collapses each layer to its verdict line; `full` renders every
+ * recorded `{layer, code, detail}` reason record. Missing or damaged
+ * values fall back to {@link DEFAULT_TRACE_MODE}.
+ * @returns {string}
+ */
+export function getTraceMode() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.aiTraceVerbose);
+        return TRACE_MODES.includes(value) ? value : DEFAULT_TRACE_MODE;
+    } catch(_err) {
+        return DEFAULT_TRACE_MODE;
+    }
+}
+
+/**
+ * Whether the executor keeps the replay-capture journal (issue #27):
+ * a bounded `captureJournal` combatant flag of `planContext`+snapshot
+ * entries — each a ready-made offline `planTurn` fixture.
+ * @returns {boolean}
+ */
+export function isCaptureContextEnabled() {
+    try {
+        return game.settings.get(MODULE_ID, SETTING_KEYS.aiCaptureContext) === true;
     } catch(_err) {
         return false;
     }

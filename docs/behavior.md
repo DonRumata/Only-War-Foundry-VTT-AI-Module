@@ -444,7 +444,10 @@ keybinding Alt+M, `restricted`) · `attackAdjudication "auto"`
 или GM-карточка подтверждения перед каждым attack/test шагом) ·
 `manualOverrideGrace false` (issue #25 — вкл: ручной перенос токена
 безусловен и не отменяет committed-план; выкл: необъяснённый перенос —
-`gm-intervention`).
+`gm-intervention`) · `aiTraceVerbose "compact"` (issue #27 —
+compact|full рендер трасса решений в блоке «Как думал») ·
+`aiCaptureContext false` (issue #27 — bounded-журнал replay-захватов
+`captureJournal` на комбатанте).
 
 Override-цепочка: Combatant → Token → Actor → disabled. Флаги:
 `config/override {enabled|mode, preset, includeNeutral, preferredWeapon}`,
@@ -460,7 +463,10 @@ cancelledReason?}` — controller-only, issue #25), `moveJournal`
 (combatant, bounded 32 записи `{round, turn, x, y, elevation,
 operationId}` собственных ходов — controller-only, issue #25),
 `gmControlled` (combatant, рекорд `{round, turn, reason}` на один
-раунд — пометка GM-вмешательства, issue #25).
+раунд — пометка GM-вмешательства, issue #25), `captureJournal`
+(combatant, bounded 8 записей `{version, at, preset, config, flags,
+context, snapshot, result}` — replay-захваты `planContext`+snapshot,
+issue #27, controller-only).
 
 ## 12. Уже реализованные слои (#14/#15/#16/#19)
 
@@ -591,3 +597,31 @@ Pipeline планирования переформализован как вло
   важнее собственного плана. `_syncDelay` заменяет план члена
   delay-заглушкой независимо от commitment-hit; сама запись `committedPlan`
   не отменяется и, если остаётся валидной, продолжается следующим ходом.
+
+## 15. Трасс решений и replay (issue #27)
+
+GM-прозрачность при наслоении L0–L4: трасс — рендер-поверхность над
+`plan.diagnostics.layers` (`{layer, code, detail}`, контракт #24), на
+выбор плана не влияет. `scripts/trace.js` — pure-модуль:
+
+- **`diagnostics.trace`** — материализуется планировщиком на каждом
+  выходе с диагностикой: одна сериализуемая запись `{layer, kind, ...}`
+  на reason-запись (`buildLayerTrace`); `run.trace` executor'а
+  зеркалит её.
+- **Донесённые поля**: L3 `personality-overlay` — `detail.deltas`
+  (применённые дельты по фактору); L4 `winner` — `top` (top-3
+  `{candidate, score}`), `runnerUp`, `margin` и `factors` (разность
+  `w × f`-вкладов победителя и runner-up, top-3 по |дельте|).
+- **Рендер** `renderTrace(entries, {i18n, mode})` — `compact`
+  (`aiTraceVerbose`): строка вердикта на слой (`L0: veto out-of-range
+  ×3`, единая L4 scoring-строка с top-3 и дельтой); `full`: строка на
+  запись. en/ru — `OWAI.Trace.*` (слои, причины, варианты кандидатов).
+- **Поверхности**: свёрнутый блок «Как думал» в GM-превью
+  (`vm.traceLines`, шаблон `ai-preview.hbs`); однострочный GM-шёпот
+  `compactTraceLine` в диагностическом чат-репорте остановленного/
+  отменённого хода.
+- **Replay**: `aiCaptureContext` (default off; `context.capture`) —
+  executor журналит bounded (8) sanitized-запись `planContext`+флаги+
+  snapshot+отпечаток в `captureJournal` комбатанта (controller-only);
+  `tests/unit/replay-helpers.mjs` `replayPlan` перепрогоняет `planTurn`
+  из JSON-записи к идентичному плану и трассу.

@@ -35,6 +35,7 @@
  */
 import {
     ATTACK_ADJUDICATION_MODES,
+    CAPTURE_JOURNAL_MAX,
     FLAG_KEYS,
     MODULE_ID,
     REQUIRED_SYSTEM_ID
@@ -47,13 +48,19 @@ import {
     readMoveJournal,
     COMMITMENT_REASONS
 } from "./layers.js";
-import { barkText, emitBarkOnce } from "./barks.js";
+import { barkText, emitBarkOnce, gmWhisper } from "./barks.js";
+import {
+    appendCaptureEntry,
+    buildCaptureEntry,
+    compactTraceLine
+} from "./trace.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
     getAttackAdjudication,
     getExecutionMode,
     getTurnPacingMs,
+    isCaptureContextEnabled,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "./settings.js";
@@ -1278,11 +1285,12 @@ export function createExecutorService({
                 if (drift > 0.5) run.spent.movement += drift;
             }
             let replanned = null;
+            const replanContext = _planContext(context, context.operation, run.replanCount, run);
             try {
                 replanned = await planner.planTurn(
                     context.combat,
                     run.combatant,
-                    _planContext(context, context.operation, run.replanCount, run)
+                    replanContext
                 );
             } catch(err) {
                 replanned = null;
@@ -1291,6 +1299,9 @@ export function createExecutorService({
                 run.plan = replanned.plan;
                 run.stepIndex = 0;
                 run.expectedPosition = _selfPosition(run.plan) ?? run.expectedPosition;
+                // Issue #27: the swapped plan carries its own trace.
+                run.trace = run.plan?.diagnostics?.trace ?? [];
+                _capturePlanContext(context, run, replanContext);
                 log(`replan ${run.replanCount}: ${failReason} -> ${replanned.plan.id}`);
                 return { action: "replan" };
             }
@@ -1429,6 +1440,48 @@ export function createExecutorService({
         } catch(err) {
             // The journal is bookkeeping — never fatal.
         }
+    }
+
+    /**
+     * Replay capture (issue #27), controller-only and best-effort: when
+     * `aiCaptureContext` is on (or a caller injects `context.capture`),
+     * the sanitized `planContext`, the AI flag reads and the finalized
+     * snapshot land on the combatant `captureJournal` flag — a bounded
+     * journal of ready-made `planTurn` replay fixtures
+     * ({@link CAPTURE_JOURNAL_MAX}). Diagnostics additionally echo the
+     * JSON to the console. Never fatal: a flag failure degrades to no
+     * capture.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @param {object} plannedContext The exact context handed to
+     *   `planTurn`.
+     */
+    function _capturePlanContext(context, run, plannedContext) {
+        const combatant = run.combatant;
+        if (!combatant || typeof combatant.setFlag !== "function") return;
+        if (context?.capture !== true && !isCaptureContextEnabled()) return;
+        if (!_isController(context)) return;
+        (async () => {
+            try {
+                const entry = buildCaptureEntry({
+                    combat: context.combat ?? null,
+                    combatant,
+                    context: plannedContext ?? {},
+                    plan: run.plan ?? null,
+                    config: run.config ?? null,
+                    operationId: run.operationId ?? null
+                });
+                const journal = appendCaptureEntry(
+                    combatant.getFlag?.(MODULE_ID, FLAG_KEYS.captureJournal)
+                        ?? combatant.flags?.[MODULE_ID]?.[FLAG_KEYS.captureJournal],
+                    entry,
+                    CAPTURE_JOURNAL_MAX);
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.captureJournal, journal);
+                log(`capture ${run.operationId}:`, JSON.stringify(entry));
+            } catch(err) {
+                // The capture journal is debug plumbing — never fatal.
+            }
+        })();
     }
 
     /**
@@ -1651,12 +1704,20 @@ export function createExecutorService({
                 plan: result.planId ?? "—",
                 detail
             }) ?? message;
-            const whisper = _list(globalThis.game?.users)
-                .filter(user => user?.isGM)
-                .map(user => user.id);
+            // Issue #27: the stopped/cancelled turn whispers its compact
+            // reason trace — "commitment cancelled: gm-intervention;
+            // morale desperate; winner attack-in-place 0.41" — so the GM
+            // reads *why* without opening diagnostics.
+            const traceLine = compactTraceLine(
+                run.report ?? run.plan?.diagnostics, i18n);
+            const trace = traceLine
+                ? (barkText("OWAI.Chat.ExecutorTrace", { line: traceLine })
+                    ?? ` — trace: ${traceLine}`)
+                : "";
+            const whisper = gmWhisper();
             try {
                 Promise.resolve(globalThis.ChatMessage.create({
-                    content: `<p>${content}</p>`,
+                    content: `<p>${content}${trace}</p>`,
                     whisper,
                     speaker: { alias: "Only War AI" }
                 })).catch(() => {});
@@ -1991,7 +2052,9 @@ export function createExecutorService({
                     context.spent?.halves ?? context.planContext?.spent?.halves, 0)
             },
             report: null,
-            record: null
+            record: null,
+            // Issue #27: the per-layer reason trace of the active plan.
+            trace: plan?.diagnostics?.trace ?? []
         };
         const record = { promise: null, hookAdvanced: false };
         run.record = record;
@@ -2033,7 +2096,9 @@ export function createExecutorService({
                     context.spent?.halves ?? context.planContext?.spent?.halves, 0)
             },
             report: null,
-            record: null
+            record: null,
+            // Issue #27: the per-layer reason trace of the active plan.
+            trace: context.plan?.diagnostics?.trace ?? []
         };
         const record = { promise: null, hookAdvanced: false };
         run.record = record;
@@ -2053,11 +2118,12 @@ export function createExecutorService({
                     return result;
                 }
                 let planned = null;
+                const plannedContext = _planContext(context, context.operation, 0, run);
                 try {
                     planned = await planner.planTurn(
                         context.combat,
                         run.combatant,
-                        _planContext(context, context.operation, 0, run)
+                        plannedContext
                     );
                 } catch(err) {
                     planned = null;
@@ -2075,6 +2141,11 @@ export function createExecutorService({
                 }
                 run.plan = planned.plan;
                 run.expectedPosition = _selfPosition(run.plan);
+                run.trace = run.plan?.diagnostics?.trace ?? [];
+                // Issue #27: the replay capture rides the plan journal
+                // when `aiCaptureContext` is on — fire-and-forget, the
+                // flag write never delays the turn.
+                _capturePlanContext(context, run, plannedContext);
             }
 
             // Preview mode: preflight only — the operation stays in

@@ -31,9 +31,11 @@ import { MODULE_ID, MORALE_TIERS } from "../constants.js";
 import { planIntentOf } from "../layers.js";
 import { isModuleEnabled } from "../module-state.js";
 import { STALE_REASONS } from "../planner.js";
+import { buildLayerTrace, renderTrace } from "../trace.js";
 import {
     getExecutionMode,
     getPreviewTimeoutSeconds,
+    getTraceMode,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "../settings.js";
@@ -371,6 +373,14 @@ export function buildPreviewViewModel(plan, context = {}) {
         candidatesCount: _finiteOr(rawDiagnostics.candidatesCount, 0),
         chosenStep: rawDiagnostics.chosenStep ?? null
     };
+    // Issue #27: the "How it decided" trace block — the materialized
+    // per-layer entries (or the on-the-fly derivation for pre-#27
+    // plans); `aiTraceVerbose` picks the compact/full render mode at
+    // display time. Entries stay raw here; `localizePreviewViewModel`
+    // renders them into display lines.
+    const trace = Array.isArray(rawDiagnostics.trace)
+        ? rawDiagnostics.trace
+        : buildLayerTrace(rawDiagnostics);
 
     const maxReplans = Number.isFinite(context.maxReplans) ? context.maxReplans : 1;
     const replanCount = _finiteOr(plan?.replanCount, 0);
@@ -392,6 +402,8 @@ export function buildPreviewViewModel(plan, context = {}) {
         intent,
         morale,
         diagnostics,
+        trace,
+        traceMode: context.traceMode ?? getTraceMode(),
         replan: {
             allowed: replanCount < maxReplans,
             count: replanCount,
@@ -538,7 +550,13 @@ export function localizePreviewViewModel(vm, i18n = null) {
             : null,
         timeoutLabel: vm.timeoutSeconds
             ? (i18nSource?.format?.("OWAI.Preview.Timeout", { seconds: vm.timeoutSeconds }) ?? null)
-            : null
+            : null,
+        // Issue #27: rendered per-layer trace lines for the "How it
+        // decided" collapsible block (compact/full per traceMode).
+        traceLines: renderTrace(vm.trace ?? [], {
+            i18n: i18nSource,
+            mode: vm.traceMode
+        })
     };
 }
 

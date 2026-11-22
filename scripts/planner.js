@@ -50,6 +50,7 @@ import {
 } from "./personalities.js";
 import { grudgeActive } from "./grudges.js";
 import { reactionUsed } from "./reactions.js";
+import { buildLayerTrace, factorDelta } from "./trace.js";
 import { getAIDifficulty, logDiagnostics } from "./settings.js";
 import {
     buildThreatMap,
@@ -3211,6 +3212,7 @@ export function createPlannerService({
         // #410). Navigation answers `gridless-unsupported` the same way.
         if (grid.type === 0) {
             recordLayerReason(diagnostics, "L0", "gridless-unsupported");
+            diagnostics.trace = buildLayerTrace(diagnostics);
             return {
                 status: PLANNER_STATUS.unsupported,
                 reason: "gridless-unsupported",
@@ -3267,6 +3269,20 @@ export function createPlannerService({
                 diagnostics.personality.clamped = overlay.clamped;
             }
             diagnostics.weights = { ...overlay.weights };
+            // Issue #27 explainability: the applied per-factor deltas of
+            // the trait overlay ride the L3 reason record (and the
+            // diagnostics personality block) so the trace can name the
+            // factors the personality bent ("−proximity, −attackNow").
+            const appliedDeltas = {};
+            for (const [factor, weight] of Object.entries(overlay.weights)) {
+                const base = Number.isFinite(preset.weights[factor])
+                    ? preset.weights[factor] : 0;
+                const delta = Math.round((weight - base) * 1e6) / 1e6;
+                if (delta !== 0) appliedDeltas[factor] = delta + 0;
+            }
+            if (Object.keys(appliedDeltas).length) {
+                diagnostics.personality.deltas = appliedDeltas;
+            }
             recordLayerReason(diagnostics, "L3",
                 layerFlags.personality === false
                     ? "personality-layer-disabled"
@@ -3274,6 +3290,7 @@ export function createPlannerService({
                 layerFlags.personality === false ? undefined : {
                     traits: [...resolved.traits],
                     character: resolved.character,
+                    deltas: appliedDeltas,
                     clamped: Object.keys(overlay.clamped)
                 });
             return {
@@ -3458,6 +3475,7 @@ export function createPlannerService({
             };
         }
         if (!targets.length && !preset.allowNoTarget) {
+            diagnostics.trace = buildLayerTrace(diagnostics);
             return {
                 status: PLANNER_STATUS.noTarget,
                 reason: "no-target",
@@ -3501,6 +3519,7 @@ export function createPlannerService({
         const readyActions = _readyWeaponActions({ allActions, actor, usableActions });
         if (!usableActions.length && !readyActions.length
             && !preset.allowNoAction && targets.length) {
+            diagnostics.trace = buildLayerTrace(diagnostics);
             return {
                 status: PLANNER_STATUS.noAction,
                 reason: "no-action",
@@ -4137,6 +4156,7 @@ export function createPlannerService({
         }
 
         if (!candidates.length) {
+            diagnostics.trace = buildLayerTrace(diagnostics);
             return {
                 status: routesMissing ? PLANNER_STATUS.noRoute : PLANNER_STATUS.noAction,
                 reason: routesMissing ? "no-route" : "no-valid-plan",
@@ -4253,6 +4273,7 @@ export function createPlannerService({
         });
 
         if (!scored.length) {
+            diagnostics.trace = buildLayerTrace(diagnostics);
             return {
                 status: PLANNER_STATUS.noAction,
                 reason: "no-valid-plan",
@@ -4334,9 +4355,31 @@ export function createPlannerService({
         if (winner.dodge) {
             winner.breakdown = { ...winner.breakdown, dodge: winner.dodge };
         }
+        // Issue #27 explainability: the winner record carries the top-3
+        // ranking, the runner-up score delta and the per-factor
+        // contribution differences that decided the pick — the trace
+        // renders "attack-in-place beats hold by +0.09 (attackNow +0.10,
+        // exposure −0.03)" straight from this record. An easy-slip
+        // winner may score below its runner-up — the margin stays
+        // signed and shows it.
+        const runnerUp = pickPool.find(entry => entry !== winner) ?? null;
         recordLayerReason(diagnostics, "L4", "winner", {
             candidate: winner.id ?? null,
-            score: winner.score
+            score: winner.score,
+            top: pickPool.slice(0, 3).map(entry => ({
+                candidate: entry.id ?? null,
+                score: Math.round(scoreOf(entry) * 1e6) / 1e6
+            })),
+            runnerUp: runnerUp
+                ? {
+                    candidate: runnerUp.id ?? null,
+                    score: Math.round(scoreOf(runnerUp) * 1e6) / 1e6
+                }
+                : null,
+            margin: runnerUp
+                ? Math.round((scoreOf(winner) - scoreOf(runnerUp)) * 1e6) / 1e6
+                : null,
+            factors: factorDelta(winner, runnerUp, effectiveWeights)
         });
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
@@ -4466,6 +4509,11 @@ export function createPlannerService({
 
         const replanCount = _finiteOr(context.replanCount, 0);
         const planId = `plan-${fnv1a(`${snapshot.revision}|${presetId}|${seed}|${replanCount}`)}`;
+        // Issue #27: materialize the per-layer trace entries — one
+        // serializable `{layer, kind, ...}` entry per reason record —
+        // so a serialized plan explains itself offline (preview block,
+        // GM whisper, replay fixtures).
+        diagnostics.trace = buildLayerTrace(diagnostics);
         return _deepFreeze({
             id: planId,
             operationId: context.operation?.id ?? context.operationId ?? null,
