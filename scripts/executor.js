@@ -40,6 +40,12 @@ import {
     REQUIRED_SYSTEM_ID
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
+import {
+    appendJournalEntry,
+    readCommittedPlan,
+    readMoveJournal,
+    COMMITMENT_REASONS
+} from "./layers.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
@@ -1390,6 +1396,129 @@ export function createExecutorService({
     }
 
     /**
+     * Append the executed move to the combatant `moveJournal` flag
+     * (issue #25): the bounded (32) own-move journal the L1 layer diffs
+     * against `expectedState.self` — a position change with no matching
+     * journal entry is a manual intervention. Best-effort, controller
+     * only; failures never fail the step.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @param {{x: number, y: number, elevation?: number}} position
+     *   Document-space endpoint of the executed move.
+     * @returns {Promise<void>}
+     */
+    async function _noteMove(context, run, position) {
+        const combatant = run.combatant;
+        if (!combatant || typeof combatant.setFlag !== "function") return;
+        if (!_isController(context)) return;
+        if (!Number.isFinite(position?.x) || !Number.isFinite(position?.y)) return;
+        try {
+            const journal = appendJournalEntry(readMoveJournal(combatant), {
+                round: _finiteOr(context.combat?.round, 0),
+                turn: _finiteOr(context.combat?.turn, 0),
+                x: position.x,
+                y: position.y,
+                elevation: Number.isFinite(position.elevation) ? position.elevation : null,
+                operationId: run.operationId ?? null
+            });
+            await combatant.setFlag(MODULE_ID, FLAG_KEYS.moveJournal, journal);
+        } catch(err) {
+            // The journal is bookkeeping — never fatal.
+        }
+    }
+
+    /**
+     * End-of-turn commitment bookkeeping (issue #25), controller-only:
+     *
+     * - an `L1/gm-intervention` trace entry marks the combatant
+     *   `gmControlled` for the round (the fireteam replans marked
+     *   members at `support`, interventions feed reactive mode);
+     * - an invalidated flag record is stamped `cancelled` with the
+     *   invalidator code so the next turn does not re-validate a dead
+     *   plan;
+     * - a commitment hit refreshes the stored `expectedState.self` to
+     *   the actual end-of-turn position (steps and ttl are untouched);
+     * - a scored plan carrying `plan.commitment` is written as the new
+     *   active `committedPlan` record.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @param {object} result Public result summary.
+     * @returns {Promise<void>}
+     */
+    async function _syncCommitment(context, run, result) {
+        const combatant = run.combatant;
+        if (!combatant || typeof combatant.setFlag !== "function") return;
+        if (!_isController(context)) return;
+        const diagnostics = run.plan?.diagnostics;
+        const layers = Array.isArray(diagnostics?.layers) ? diagnostics.layers : [];
+        const intervened = layers.some(entry => entry?.layer === "L1"
+            && entry?.code === COMMITMENT_REASONS.gmIntervention);
+        if (intervened) {
+            try {
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.gmControlled, {
+                    round: _finiteOr(context.combat?.round, 0),
+                    turn: _finiteOr(context.combat?.turn, 0),
+                    reason: COMMITMENT_REASONS.gmIntervention
+                });
+            } catch(err) {
+                // Best-effort flag bookkeeping.
+            }
+        }
+        const record = readCommittedPlan(combatant);
+        const invalidated = diagnostics?.commitment?.invalidated ?? null;
+        const hit = run.plan?.breakdown?.reason === "commitment";
+        try {
+            if (hit && record?.status === "active") {
+                // Commitment hit: refresh the expected self position to
+                // where the turn actually ended; steps, ttl and the
+                // recorded threats stay as committed.
+                const position = run.expectedPosition ?? record.expectedState?.self;
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
+                    ...record,
+                    expectedState: {
+                        ...record.expectedState,
+                        self: {
+                            x: position?.x ?? record.expectedState?.self?.x ?? null,
+                            y: position?.y ?? record.expectedState?.self?.y ?? null,
+                            elevation: Number.isFinite(position?.elevation)
+                                ? position.elevation
+                                : _finiteOr(record.expectedState?.self?.elevation, 0)
+                        }
+                    }
+                });
+            } else if (invalidated && invalidated !== COMMITMENT_REASONS.noCommitment
+                && record?.status === "active") {
+                // Dead plan: stamp the cancellation so the next turn
+                // does not re-validate a known-invalid record.
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
+                    ...record,
+                    status: "cancelled",
+                    cancelledReason: invalidated,
+                    cancelledRound: _finiteOr(context.combat?.round, 0)
+                });
+            } else if (!hit && run.plan?.commitment
+                && (result.status === EXECUTOR_STATUS.completed
+                    || result.status === EXECUTOR_STATUS.partial)) {
+                // Fresh scored plan → persist it as the next active
+                // commitment (`plan.commitment` carries steps, ttl and
+                // expectedState).
+                await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
+                    id: `c-${run.plan.id ?? run.operationId ?? "plan"}`,
+                    status: "active",
+                    combatId: context.combat?.id ?? null,
+                    combatantId: combatant.id ?? null,
+                    createdRound: _finiteOr(context.combat?.round, 0),
+                    createdTurn: _finiteOr(context.combat?.turn, 0),
+                    ...run.plan.commitment
+                });
+            }
+        } catch(err) {
+            // Commitment persistence is best-effort — a lost record
+            // degrades to ordinary per-turn planning.
+        }
+    }
+
+    /**
      * Close the authority operation for a terminal execution and advance
      * the combat turn. Best-effort: flag failures never crash the result.
      * @param {object} context
@@ -1423,6 +1552,10 @@ export function createExecutorService({
                 console.error(`${MODULE_ID} | completeTurn failed`, err);
             }
         }
+        // Issue #25: persist commitment bookkeeping before the turn
+        // moves on — the record/journal must reflect this turn's moves
+        // when the next combatant plans.
+        await _syncCommitment(context, run, result);
         if (advanceTurn) await _advanceTurn(context, run);
     }
 
@@ -1706,6 +1839,13 @@ export function createExecutorService({
                             x: outcome.position.x,
                             y: outcome.position.y
                         };
+                    }
+                    // Issue #25: every own move lands in the bounded
+                    // `moveJournal` flag — the source of truth the L1
+                    // layer uses to tell the bot's own motion apart from
+                    // a GM drag when validating `expectedState.self`.
+                    if (step.type === "move" && outcome.position) {
+                        _noteMove(context, run, outcome.position);
                     }
                     run.stepIndex++;
                     // Pacing: let the move animation/roll card breathe so

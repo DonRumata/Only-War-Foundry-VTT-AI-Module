@@ -20,6 +20,9 @@
  *   `layersLookahead`: booleans — per-layer on/off toggles of the L0–L4
  *   planning funnel (issue #24). A disabled layer degrades to the
  *   previous level; defaults live in {@link DEFAULT_LAYER_FLAGS}.
+ * - `manualOverrideGrace`: boolean (issue #25) — on: a manual GM move of
+ *   an AI token is absolute law and never cancels a committed plan;
+ *   off (default): unexplained drift is `gm-intervention`.
  */
 import {
     AI_DIFFICULTIES,
@@ -157,6 +160,18 @@ export function registerSettings() {
             default: DEFAULT_LAYER_FLAGS[key]
         });
     }
+
+    // Issue #25: manual GM moves vs committed plans — off (default) a
+    // bot replans around the GM's move (gm-intervention), on a manual
+    // move is absolute law that never cancels a commitment.
+    game.settings.register(MODULE_ID, SETTING_KEYS.manualOverrideGrace, {
+        name: "OWAI.Settings.ManualOverrideGrace.Name",
+        hint: "OWAI.Settings.ManualOverrideGrace.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: false
+    });
 }
 
 /**
@@ -286,6 +301,24 @@ export function getAttackAdjudication() {
 export function isThreatMapOverlayEnabled() {
     try {
         return game.settings.get(MODULE_ID, SETTING_KEYS.threatMapOverlay) === true;
+    } catch(_err) {
+        return false;
+    }
+}
+
+/**
+ * Manual-override grace (issue #25): when `true` a GM move of an AI
+ * token is absolute law — the committed plan is not cancelled and the
+ * bot is not marked `gm-controlled`; the commitment simply accepts the
+ * new position. When `false` (default) an unexplained drift cancels the
+ * commitment as `gm-intervention` so the bot replans — the readable
+ * drama of a cowardly bot crawling back on its own turn. Missing or
+ * damaged values fall back to `false`.
+ * @returns {boolean}
+ */
+export function isManualOverrideGrace() {
+    try {
+        return game.settings.get(MODULE_ID, SETTING_KEYS.manualOverrideGrace) === true;
     } catch(_err) {
         return false;
     }

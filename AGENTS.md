@@ -66,6 +66,20 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   буккипинг синхронного удара: счётчик повторных delay-ожиданий одного
   `until`; пишет executor delay-шагом, читает `_syncDelay` (предел —
   `DEFAULT_MAX_SYNC_ROUNDS = 2`).
+- Combatant: `committedPlan = { id, status, combatId, combatantId,
+  createdRound, createdTurn, ttl, source, steps, expectedState,
+  cancelledReason? }` (issue #25) — действующий многоходовый план L1;
+  пишет только controller через executor (hit — обновление
+  `expectedState.self`, скореный план — новая запись, инвалидация —
+  штамп `cancelled`). `expectedState` — компактный отпечаток
+  `{self, target, morale, threats}`.
+- Combatant: `moveJournal = [{round, turn, x, y, elevation,
+  operationId}]` (issue #25) — bounded (32) журнал собственных
+  перемещений executor'а; источник истины «свой ход vs GM-перенос»
+  при валидации `expectedState.self`.
+- Combatant: `gmControlled = { round, turn, reason }` (issue #25) —
+  пометка `gm-intervention` на один раунд; файртим понижает меченного
+  члена со сложных заданий (flank/assault/advance → support).
 - Combatant: `morale = { state, pressured?, desperate? }` — зарезервировано
   под issue #26; код синхронизации/приказов уже читает флаг graceful:
   `desperate` снимает delay-ожидание, `pressured` усиливает фактор `order`.
@@ -91,11 +105,15 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `auto` — бросок через системный API сразу, `gm-confirm` — перед каждым
   attack/test шагом (только `executionMode === "automatic"`) GM получает
   whisper-чаткарту с решениями `execute | manual | skill-test | cancel`.
-  `layersCommitment`/`layersMorale` (default `false`) и
+  `layersCommitment` (default `true` — L1 реализован, issue #25),
+  `layersMorale` (default `false`) и
   `layersPersonality`/`layersLookahead` (default `true`, issue #24) —
   тумблеры слоёв воронки поведения L0–L4; дефолты живут в
   `DEFAULT_LAYER_FLAGS`, план-оверрайд — `context.layers` (см.
   `scripts/layers.js`, контракт — `docs/layers.md`).
+  `manualOverrideGrace` (default `false`, issue #25) — ручной перенос
+  токена GM: off — `gm-intervention` (отмена committed-плана + реплан),
+  on — безусловный ход, план продолжается с новой позиции.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только
@@ -322,9 +340,12 @@ combatant, reason})`, `markUsedByToken(combat, tokenId)`,
 
 `scripts/layers.js` — pure-модуль воронки планирования; полный контракт —
 `docs/layers.md`. Порядок в `planTurn`: гейты L0 (gridless, статусы,
-права) → L1 `applyCommitmentLayer` (stub-контракт под #25: валидная
-запись `context.commitment {valid?, steps, source?}` исполняется без
-скоринга) → L2 `applyMoraleLayer` (pass-through под #26: резолвит и
+права) → L1 `applyCommitmentLayer` (issue #25: флаг `committedPlan` или
+инъекция `context.commitment` — валидная запись исполняется без
+скоринга; `expectedState`-валидация с кодами `ttl-expired`,
+`gm-intervention`, `target-gone`, `morale-changed`, `threat-drift`,
+`combat-ended`, `l0-veto`) → L2 `applyMoraleLayer` (pass-through под
+#26: резолвит и
 репортит позу `morale`, не сужает) → L3 `boundedPersonalityOverlay`
 (дельты #19 в скобе ±30% от базы; нулевая база — ±6 от
 `L3_DELTA_BASE_FLOOR = 20`) → генерация кандидатов (L0-вето через

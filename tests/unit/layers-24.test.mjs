@@ -149,11 +149,13 @@ function traceOf(plan) {
 /* Layer flags and reason records                                      */
 /* ------------------------------------------------------------------ */
 
-test("resolveLayerFlags returns the issue #24 defaults", () => {
+test("resolveLayerFlags returns the rollout defaults", () => {
     _resetMocks();
     const flags = resolveLayerFlags({});
     assert.deepEqual(flags, { ...DEFAULT_LAYER_FLAGS });
-    assert.equal(flags.commitment, false);
+    // Issue #25: L1 is implemented and defaults on (one-toggle
+    // rollback); L2 stays off until #26.
+    assert.equal(flags.commitment, true);
     assert.equal(flags.morale, false);
     assert.equal(flags.personality, true);
     assert.equal(flags.lookahead, true);

@@ -42,6 +42,7 @@ import {
     ORDER_COOLDOWN_ROUNDS
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
+import { isGmControlled } from "./layers.js";
 import { isHostileDisposition, mergeTeamMemory } from "./perception.js";
 import {
     createPlannerService,
@@ -109,6 +110,13 @@ export const TARGET_TASK_CAPACITY = Object.freeze({
 
 /** Tasks eligible for a detached maneuver beyond preferred cohesion. */
 const DETACHED_TASKS = Object.freeze(new Set(["flank", "assault"]));
+
+/**
+ * Tasks a `gm-controlled` member is demoted from (issue #25): the manual
+ * move voids complex maneuvers — the member replans as `support` while
+ * the rest of the team plan degrades instead of collapsing.
+ */
+const GM_DEMOTABLE_TASKS = Object.freeze(new Set(["flank", "assault", "advance"]));
 
 /**
  * Normalize a Foundry collection/Map/array/iterable into a plain array.
@@ -1654,8 +1662,20 @@ export function createFireteamService({
             cohesion: [],
             reservations: { targets: [], endpoints: [], conflicts: [] },
             memberStatuses: {},
+            // Issue #25: members marked `gmControlled` this round (and
+            // demotions applied) — the team degrades, it does not break.
+            gmControlled: [],
+            gmDemotions: [],
             rejected: []
         };
+        // Issue #25: combatants the GM moved this round without an
+        // executor journal entry are flagged `gmControlled`; flagged
+        // members cannot be trusted with detached/complex tasks — they
+        // are demoted to `support` before planning.
+        const round = _finiteOr(combat.round, 0);
+        const gmControlledIds = new Set(
+            members.filter(member => isGmControlled(member.combatant, round))
+                .map(member => member.combatantId));
         if (!members.length) {
             return {
                 status: FIRETEAM_STATUS.noMembers,
@@ -1747,6 +1767,27 @@ export function createFireteamService({
                     }
                     : undefined)
         });
+        // Issue #25 gm-controlled degradation: members the GM moved this
+        // round are demoted from detached/complex tasks to `support`
+        // before planning — the flanker the GM grabbed does not try to
+        // finish its maneuver; the team plan degrades, it does not
+        // break. Explicit `context.assignments` demotes the same way.
+        const gmDemotions = [];
+        for (const assignment of assignments) {
+            if (gmControlledIds.has(assignment.combatantId)
+                && GM_DEMOTABLE_TASKS.has(assignment.task)) {
+                gmDemotions.push({
+                    combatantId: assignment.combatantId,
+                    from: assignment.task,
+                    to: "support",
+                    reason: "gm-controlled"
+                });
+                assignment.task = "support";
+                assignment.groupId = "main";
+            }
+        }
+        diagnostics.gmControlled = [...gmControlledIds];
+        diagnostics.gmDemotions = gmDemotions;
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
 
@@ -1831,8 +1872,63 @@ export function createFireteamService({
             } catch(err) {
                 result = { status: "error", plan: null, reason: "plan-error" };
             }
+            // Issue #25: a fresh `gm-intervention` in the member's L1
+            // trace means the GM moved the token since its last turn —
+            // mark the combatant `gmControlled` for the round (feeds
+            // reactive mode) and replan once as `support` when the
+            // demoted task allowed a complex maneuver.
+            const layerTrace = result?.plan?.diagnostics?.layers
+                ?? result?.diagnostics?.layers ?? [];
+            const intervened = layerTrace.some(entry =>
+                entry?.layer === "L1" && entry?.code === "gm-intervention");
+            if (intervened && !gmControlledIds.has(member.combatantId)) {
+                gmControlledIds.add(member.combatantId);
+                diagnostics.gmControlled = [...gmControlledIds];
+                try {
+                    await member.combatant?.setFlag?.(MODULE_ID, FLAG_KEYS.gmControlled, {
+                        round,
+                        turn: _finiteOr(combat.turn, 0),
+                        reason: "gm-intervention"
+                    });
+                } catch(err) {
+                    // Flag bookkeeping is best-effort.
+                }
+                const assignment = assignMap.get(member.combatantId);
+                if (assignment && GM_DEMOTABLE_TASKS.has(assignment.task)) {
+                    gmDemotions.push({
+                        combatantId: member.combatantId,
+                        from: assignment.task,
+                        to: "support",
+                        reason: "gm-intervention"
+                    });
+                    diagnostics.gmDemotions = gmDemotions;
+                    assignment.task = "support";
+                    assignment.groupId = "main";
+                    try {
+                        const retry = await memberPlanner.planTurn(combat,
+                            member.combatant, {
+                                ...memberContext,
+                                replanCount: _finiteOr(context.replanCount, 0) + 1,
+                                team: {
+                                    ...memberContext.team,
+                                    task: "support",
+                                    groupId: "main"
+                                }
+                            });
+                        const previous = diagnostics.memberStatuses[member.combatantId]
+                            ?? result?.status ?? "error";
+                        result = retry;
+                        diagnostics.memberStatuses[member.combatantId] =
+                            `${previous}->${retry?.status ?? "error"}`;
+                    } catch(err) {
+                        // The first plan stands — demotion is best-effort.
+                    }
+                }
+            }
             plans.set(member.combatantId, result);
-            diagnostics.memberStatuses[member.combatantId] = result?.status ?? "error";
+            if (diagnostics.memberStatuses[member.combatantId] === undefined) {
+                diagnostics.memberStatuses[member.combatantId] = result?.status ?? "error";
+            }
             // Reserve the chosen target immediately so later members cannot
             // double-book the same target for the same task type.
             const targetId = result?.plan?.target?.tokenId

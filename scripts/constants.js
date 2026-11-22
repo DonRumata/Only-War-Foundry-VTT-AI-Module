@@ -54,6 +54,14 @@ export const FLAG_KEYS = Object.freeze({
     lastAttacker: "lastAttacker",
     lastOrder: "lastOrder",
     delaySync: "delaySync",
+    // Issue #25 L1 commitment: the persisted multi-turn plan record
+    // (`{status, steps, expectedState, ttl, ...}`), the bounded journal of
+    // the bot's own executed moves (source of truth for "own move vs GM
+    // move") and the one-turn `gm-controlled` mark left by a detected
+    // GM intervention.
+    committedPlan: "committedPlan",
+    moveJournal: "moveJournal",
+    gmControlled: "gmControlled",
     // Reserved for issue #26 morale — the squad-sync/order code already
     // reads `morale.{state|pressured|desperate}` gracefully: an absent
     // flag simply means normal morale.
@@ -87,7 +95,13 @@ export const SETTING_KEYS = Object.freeze({
     layersCommitment: "layersCommitment",
     layersMorale: "layersMorale",
     layersPersonality: "layersPersonality",
-    layersLookahead: "layersLookahead"
+    layersLookahead: "layersLookahead",
+    // Issue #25: whether a manual GM move is absolute law (`true` —
+    // drift never cancels a commitment and never marks the bot
+    // `gm-controlled`) or ordinary interference (`false`, default — a
+    // committed bot treats an unexplained move as `gm-intervention`,
+    // cancels the plan and replans on its next turn).
+    manualOverrideGrace: "manualOverrideGrace"
 });
 
 /**
@@ -95,16 +109,64 @@ export const SETTING_KEYS = Object.freeze({
  * Disabled layers degrade to the previous level of the funnel — a plan is
  * still produced, just without that layer's influence. Rollout order per
  * the issue: commitment → morale → traits → lookahead. `commitment` (L1)
- * and `morale` (L2) stay off until issues #25/#26 land the real logic;
- * `personality` (L3, issue #19) and `lookahead` (L4, issue #16) already
- * run, so they default on to keep behaviour identical.
+ * and `personality` (L3, issue #19) / `lookahead` (L4, issue #16) run as
+ * the historical behaviour, so they default on. `commitment` (L1) is
+ * implemented since issue #25 and defaults on — the first rollout stage
+ * of the funnel; `morale` (L2) stays off until issue #26 lands the
+ * posture factors. Any layer remains a one-toggle rollback.
  */
 export const DEFAULT_LAYER_FLAGS = Object.freeze({
-    commitment: false,
+    commitment: true,
     morale: false,
     personality: true,
     lookahead: true
 });
+
+/**
+ * Default TTL of a committed multi-turn plan in combat rounds (issue
+ * #25): a record written in round R stays valid while
+ * `round - createdRound < ttl`. One bot activation happens per round, so
+ * a round TTL is also a bot-turn TTL. Reactive mode squeezes the
+ * effective TTL to `1` — only the round the record was written in.
+ */
+export const COMMITMENT_TTL_ROUNDS = 2;
+
+/**
+ * Bound on the executor move journal (issue #25): the combatant
+ * `moveJournal` flag keeps the most recent own moves
+ * `{round, turn, x, y, elevation, operationId}` — the source of truth
+ * telling the bot's own motion apart from a GM drag.
+ */
+export const COMMITMENT_JOURNAL_MAX = 32;
+
+/**
+ * How many committed `expectedState.threats` tokens may drift (moved
+ * more than one grid cell, died or disappeared) before the plan is
+ * cancelled with `threat-drift` (issue #25).
+ */
+export const COMMITMENT_THREAT_TOLERANCE = 1;
+
+/**
+ * Bound on `expectedState.threats` entries of a committed plan
+ * (issue #25).
+ */
+export const COMMITMENT_THREAT_MAX = 16;
+
+/**
+ * Reactive-mode threshold (issue #25): when more same-team combatants
+ * than this count were marked `gmControlled` this round, the world is in
+ * "manual chaos" — effective commitment TTL squeezes to 1 round (the
+ * per-turn baseline) until the interventions stop.
+ */
+export const COMMITMENT_REACTIVE_THRESHOLD = 1;
+
+/**
+ * Sub-cell noise tolerance (pixels) for self-position drift checks
+ * (issue #25): hex grids snap the stored position off the fractional
+ * plan endpoint, so sub-pixel drift is ignored; anything larger is a
+ * real move to be attributed via the move journal.
+ */
+export const COMMITMENT_POSITION_TOLERANCE_PX = 0.5;
 
 /** Default pacing delay between AI execution steps in milliseconds. */
 export const DEFAULT_TURN_PACING_MS = 800;

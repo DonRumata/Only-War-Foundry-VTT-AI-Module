@@ -54,6 +54,7 @@ export function createModuleApi() {
             "perception.snapshot": true,
             "perception.memory": true,
             "perception.targets": true,
+            "planner.commitment": true,
             "planner.freeActions": true,
             "planner.layers": true,
             "planner.personalities": true,

@@ -441,7 +441,10 @@ Danger-оверлей (issue #36): `setDangerEnabled`/`toggleDanger` +
 (issue #36 — GM-only отладочная теплокарта угроз; переключается также
 keybinding Alt+M, `restricted`) · `attackAdjudication "auto"`
 (auto|gm-confirm, issue #37 — арбитраж атак: бросок через системный API
-или GM-карточка подтверждения перед каждым attack/test шагом).
+или GM-карточка подтверждения перед каждым attack/test шагом) ·
+`manualOverrideGrace false` (issue #25 — вкл: ручной перенос токена
+безусловен и не отменяет committed-план; выкл: необъяснённый перенос —
+`gm-intervention`).
 
 Override-цепочка: Combatant → Token → Actor → disabled. Флаги:
 `config/override {enabled|mode, preset, includeNeutral, preferredWeapon}`,
@@ -450,7 +453,14 @@ leaderId, teamPreset, preferredCohesion, character}`, `reactionUsed`
 (combatant, рекорд `{round, reason}`), `lastUsedWeapon` (combatant,
 рекорд `{itemUuid, itemId, name, actionId, round}` — controller-only),
 `lastAttacker` (combatant, рекорд `{tokenUuid, tokenId, actorId, round,
-turn, woundsLost, attribution}` — controller-only, issue #39).
+turn, woundsLost, attribution}` — controller-only, issue #39),
+`committedPlan` (combatant, рекорд `{id, status, combatId, combatantId,
+createdRound, createdTurn, ttl, source, steps, expectedState,
+cancelledReason?}` — controller-only, issue #25), `moveJournal`
+(combatant, bounded 32 записи `{round, turn, x, y, elevation,
+operationId}` собственных ходов — controller-only, issue #25),
+`gmControlled` (combatant, рекорд `{round, turn, reason}` на один
+раунд — пометка GM-вмешательства, issue #25).
 
 ## 12. Уже реализованные слои (#14/#15/#16/#19)
 
@@ -493,11 +503,15 @@ Pipeline планирования переформализован как вло
   (blast/конусы по союзникам, дальность, бюджет, `canAttack`, статусы,
   preset-veto) + входные гейты (`gridless-unsupported`, `stunned`).
   Абсолютно: отвергнутый кандидат не достигает скоринга никогда.
-- **L1 commitment** — точка входа `applyCommitmentLayer`
-  (`scripts/layers.js`): валидная запись `context.commitment`
-  `{valid?, steps, source?}` → её шаги исполняются без генерации и
-  скоринга (`breakdown.reason: "commitment"`). Персистентность и
-  валидация записи — issue #25.
+- **L1 commitment** — `applyCommitmentLayer` (`scripts/layers.js`,
+  issue #25): валидная committed-запись (флаг `committedPlan`
+  комбатанта либо инъекция `context.commitment`) → её сериализованные
+  шаги исполняются без генерации и скоринга (`breakdown.reason:
+  "commitment"`). Запись валидируется каждый ход по `expectedState`;
+  инвалидация — стабильные коды (`ttl-expired`, `gm-intervention`,
+  `target-gone`, `morale-changed`, `threat-drift`, `combat-ended`,
+  `l0-veto`) → отмена + обычный реплан. Подробности — ниже, «L1
+  commitment (issue #25)».
 - **L2 morale** — `applyMoraleLayer` резолвит позу из зарезервированного
   флага `morale`/`context.morale` и пишет её в trace; сужающих эффектов
   до #26 нет (легаси-чтения #38 — sync-delay/orderBoost — остаются
@@ -515,3 +529,58 @@ Pipeline планирования переформализован как вло
 `layersCommitment`/`layersMorale`/`layersPersonality`/`layersLookahead`
 (дефолты в `DEFAULT_LAYER_FLAGS`) с оверрайдом `context.layers`.
 Выключенный слой деградирует на предыдущий уровень без ошибок.
+
+## 14. L1 commitment (issue #25)
+
+Слой обязательств: многоходовый план бота переживает ходы и исполняется
+без перескоринга, пока мир совпадает с ожиданиями. Компоненты:
+
+- **`committedPlan`-флаг** (combatant, controller-only через executor):
+  `{id, status, combatId, combatantId, createdRound, createdTurn, ttl,
+  source, steps, expectedState, cancelledReason?}`. `steps` — тот же
+  сериализованный формат, что `plan.steps`. Пишется после выполненного
+  (completed/partial) скореного хода из `plan.commitment`-payload'а
+  планировщика; при commitment-hit — обновляется только
+  `expectedState.self`; при инвалидации — штамп `cancelled` +
+  `cancelledReason`.
+- **`expectedState`** — компактный отпечаток условий (не snapshot):
+  `self` (документная позиция конца хода: центр footprint минус половина
+  размера клетки), `target` (`{tokenId, tokenUuid, x, y}`), `morale`
+  (tier `"pressured"|"desperate"|null` — graceful под #26: без флага
+  `morale` tier нейтральный), `threats` (`{tokenId, x, y}` ≤ 16 —
+  snapshot целей + выбранная цель).
+- **`moveJournal`-флаг** — bounded (32) журнал собственных move-шагов
+  executor'а `{round, turn, x, y, elevation, operationId}`. Источник
+  истины «свой ход vs чужой»: дрейф позиции с журнальной записью в
+  окне жизни плана — свой (`accepted.selfMoved`), без неё —
+  `gm-intervention` либо, при `manualOverrideGrace`, молчаливое
+  принятие (`accepted.gmMoved`).
+- **`ttl`** — раунды жизни записи (`round - createdRound >= ttl` →
+  `ttl-expired`); дефолт `COMMITMENT_TTL_ROUNDS = 2`
+  (оверрайд `context.commitmentTtl`), reactive-режим — 1.
+- **Инвалидаторы** (первый сработавший, стабильные коды в trace L1):
+  `combat-ended` → `ttl-expired` → `gm-intervention` → `target-gone`
+  (цель мертва/скрыта/нерезолвима) → `morale-changed` → `threat-drift`
+  (>1 записанной угрозы сдвинулось дальше клетки/умерла/пропала) →
+  `l0-veto` (pinned/prone + committed charge-шаг). L0 не обходится:
+  `stunned` опережает L1, каждый committed-шаг ревалидируется
+  executor'ом перед исполнением.
+- **`gmControlled`-флаг** `{round, turn, reason}` на один раунд —
+  помечает бота при `gm-intervention`: `buildTeamPlan` понижает его со
+  сложных заданий (flank/assault/advance → support, диагностика
+  `gmControlled`/`gmDemotions`), свежая детекция помечает флаг и
+  перепланирует члена один раз — команда деградирует, не ломаясь.
+- **Reactive mode** — при `> COMMITMENT_REACTIVE_THRESHOLD (1)`
+  одинакомандных пометок `gmControlled` за раунд эффективный ttl
+  сворачивается до одного раунда: ручной хаос → возврат к per-turn
+  планированию (baseline) до конца хаоса. Счётчик/признак идут в
+  `diagnostics.commitment` (`{recordId, invalidated, reactive,
+  interventions}`).
+- **`manualOverrideGrace`** (world setting, default off) — off: ручной
+  перенос без журнальной записи = `gm-intervention` (отмена + реплан +
+  пометка). on: GM-ход безусловен — commitment принимает новую позицию
+  как ожидание и продолжается; пометка не ставится.
+- **Delay × commitment**: синхронное ожидание (#38) побеждает — команда
+  важнее собственного плана. `_syncDelay` заменяет план члена
+  delay-заглушкой независимо от commitment-hit; сама запись `committedPlan`
+  не отменяется и, если остаётся валидной, продолжается следующим ходом.

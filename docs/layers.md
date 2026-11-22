@@ -7,16 +7,16 @@
 семантика слоёв, скобы влияния, порядок вызова, формат reason-записей,
 флаги и порядок rollout.
 
-Это каркасный issue: полные реализации L1 commitment (#25), L2 morale
-(#26) и инструмент полного reason trace (#27) — отдельные PR. Здесь
-заложены контракты, точки входа, флаги и plumbing.
+Каркас заложен в issue #24; L1 commitment реализован в issue #25 —
+этот документ описывает оба. L2 morale (#26) и инструмент полного
+reason trace (#27) — отдельные PR.
 
 ## Слои
 
 | Слой | Имя | Что делает | Статус |
 |---|---|---|---|
 | L0 | hard-veto | Абсолютные вето легальности | внедрено (формализовано) |
-| L1 | commitment | Валидный многоходовый план → следующий шаг без скоринга | точка входа + контракт (#25) |
+| L1 | commitment | Валидный многоходовый план → следующий шаг без скоринга | внедрено (#25) |
 | L2 | morale | Поза файртимы сужает назначение задач/факторы | pass-through (#26) |
 | L3 | personalities | Дельты весов в скобе ±30% + jitter | внедрено (#19 + скоба) |
 | L4 | base utility + lookahead | Детерминированный скоринг с нуля | внедрено (#16) |
@@ -40,28 +40,69 @@ blast-шаблоном и конусом (`blast-no-safe-aim`, `cone-no-safe-aim
 конфиг, сетка, `stunned`) и при генерации кандидатов (все коды
 `diagnostics.rejected`).
 
-### L1 — commitment (точка входа, реализация — #25)
+### L1 — commitment (issue #25)
 
 Если у бота есть **действующий многоходовый план** и он валиден —
 исполняется следующий шаг, скоринг не вызывается вообще (ни генерация
-кандидатов, ни веса). Контракт записи:
+кандидатов, ни веса). Реализовано в issue #25; записи приходят из двух
+источников:
 
-```js
-context.commitment = {
-    valid: true|false,          // отсутствие = валидна
-    steps: [ /* сериализованные шаги плана (формат _stepsFor) */ ],
-    source: "commitment"        // произвольная строка-провенанс
-}
-```
+1. `context.commitment` — инъекция для тестов/интеграций. Голая запись
+   `{valid?, steps, source?}` доверена напрямую (контракт #24); запись
+   с персистентной формой (`expectedState`/`combatId`/`status`/
+   `createdRound`) проходит ту же валидацию, что и флаг.
+2. Флаг комбатанта `flags["only-war-ai"].committedPlan` — запись вида
+   `{id, status, combatId, combatantId, createdRound, createdTurn, ttl,
+   source, steps, expectedState, cancelledReason?}`. Пишет только
+   controller через executor в конце хода (hit — обновление
+   `expectedState.self`; свежий скореный план — новая активная запись;
+   инвалидированная — штамп `cancelled` + `cancelledReason`).
 
-Пока запись приходит только через `context.commitment` — инъекционная
-точка под #25, который добавит флаг-персистентность, валидацию и
-регенерацию шагов. Решение L1 — `{decision: {steps, source}}`; план
-собирается стандартным `_assemblePlan` с `breakdown.reason:
-"commitment"`, `candidatesCount: 0`. Пустая/невалидная запись — miss,
-воронка продолжается. Обязанность committed-шагов быть L0-легальными —
-на писателе записи (исполнение всё равно проходит пошаговую
-валидацию executor'а); `stunned` (L0) опережает проверку commitment.
+**`expectedState`** — компактный отпечаток условий (не полный snapshot):
+`{self: {x, y, elevation}, target: {tokenId, tokenUuid, x, y} | null,
+morale: "pressured" | "desperate" | null, threats: [{tokenId, x, y}]}`
+(`threats` ограничены `COMMITMENT_THREAT_MAX = 16`).
+
+**Валидация каждый ход** (`validateCommitment`, чистая; первый провал
+выигрывает): `combat-ended` → `ttl-expired` → `gm-intervention` →
+`target-gone` → `morale-changed` → `threat-drift` → `l0-veto`.
+
+- `ttl-expired` — `round - createdRound >= ttl` (запись —
+  `COMMITMENT_TTL_ROUNDS = 2`, reactive-режим жмёт эффективный ttl до 1).
+- `gm-intervention` — токен не там, где его оставил план, и bounded
+  журнал собственных ходов (`moveJournal`, до `COMMITMENT_JOURNAL_MAX =
+  32` записей — пишет executor на каждом move-шаге) не объясняет дрейф.
+  `manualOverrideGrace = true` принимает дрейф молча
+  (`accepted.gmMoved`), журнальная запись — как собственный ход
+  (`accepted.selfMoved`).
+- `target-gone` — записанная цель умерла/скрыта/уничтожена или не
+  резолвится по `tokenId`/`tokenUuid`.
+- `morale-changed` — tier позы морали изменился; отсутствие флага
+  `morale` читается как нейтральный tier (graceful под #26).
+- `threat-drift` — более `COMMITMENT_THREAT_TOLERANCE = 1` записанных
+  угроз сдвинулись дальше клетки, умерли или пропали.
+- `l0-veto` — дешёвая проверка L0 поверх committed шагов: `pinned`/
+  `prone` не исполняет `charge`-шаг. Commitment **не обходит L0**:
+  `stunned` опережает проверку, а каждый committed-шаг проходит
+  пошаговую ревалидацию executor'а.
+
+**Reactive mode:** при `interventions > COMMITMENT_REACTIVE_THRESHOLD
+(=1)` одинакомандных пометок `gmControlled` за раунд эффективный ttl
+сворачивается до одного раунда — в ручном хаосе бот возвращается к
+baseline-планированию по ходу.
+
+**gm-controlled маркировка:** `gm-intervention` в trace → executor
+ставит `flags["only-war-ai"].gmControlled = {round, turn, reason}` на
+один раунд; `buildTeamPlan` понижает меченного члена со сложных заданий
+(flank/assault/advance → support) — команда деградирует, не ломаясь.
+
+Решение L1 — `{decision: {steps, source}}`; план собирается стандартным
+`_assemblePlan` с `breakdown.reason: "commitment"`, `candidatesCount:
+0`. Отсутствие/повреждение записи — `commitment-miss {reason:
+"no-commitment" | "invalid-commitment"}`, воронка продолжается.
+Метаданные результата (`record`, `invalidated`, `reactive`,
+`interventions`) идут в `diagnostics.commitment` плана — plumbing под
+#27 и бухгалтерию executor'а.
 
 ### L2 — morale (pass-through, реализация — #26)
 
@@ -146,7 +187,10 @@ L4: scoring → lookahead(гейт) → easy-slip → winner → steps → пл�
 - Действующие коды: L0 — все коды `diagnostics.rejected` +
   `gridless-unsupported`, `stunned`; L1 — `commitment-layer-disabled`,
   `commitment-miss` (`no-commitment`|`invalid-commitment`),
-  `commitment-hit`; L2 — `morale-layer-disabled`, `morale-posture`;
+  `commitment-hit` и прямые коды инвалидаторов `combat-ended`,
+  `ttl-expired`, `gm-intervention`, `target-gone`, `morale-changed`,
+  `threat-drift`, `l0-veto` (issue #25, набор —
+  `COMMITMENT_REASONS`); L2 — `morale-layer-disabled`, `morale-posture`;
   L3 — `personality-layer-disabled`, `personality-overlay`
   (`detail.clamped` — список зажатых факторов); L4 — `scored`,
   `lookahead`, `lookahead-layer-disabled`, `easy-slip`, `winner`.
@@ -163,15 +207,16 @@ World settings (`scope: world`, GM-only) + оверрайд `context.layers`
 
 | Настройка | Слой | Default | Выкл = деградация на |
 |---|---|---|---|
-| `layersCommitment` | L1 | `false` | нет короткого замыкания — всегда план с нуля (сейчас всегда miss) |
+| `layersCommitment` | L1 | `true` (#25 — слой реализован; выкл = откат одним тумблером) | нет короткого замыкания — всегда план с нуля |
 | `layersMorale` | L2 | `false` | нейтральная поза; posture-факторов пока нет — видимой разницы нет |
 | `layersPersonality` | L3 | `true` | `source:"disabled"` — нет черт/джиттера, чистый пресет |
 | `layersLookahead` | L4-lookahead | `true` | только базовая полезность даже на `hard` |
 
 Дефолты отражают rollout-порядок из issue (commitment → morale → черты →
-lookahead): L1/L2 ещё не реализованы — выключены до #25/#26; L3/L4 уже
-работают — включены, поведение по умолчанию идентично старому коду
-(кроме документированной скобы ±30% на L3-дельты). Повреждённые значения
+lookahead): L1 реализован и включён (#25 — первый шаг rollout'а, откат
+одним тумблером), L2 выключен до #26; L3/L4 уже работают — включены,
+поведение по умолчанию идентично старому коду (кроме документированной
+скобы ±30% на L3-дельты). Повреждённые значения
 настройки → дефолт (`getLayerFlags`); неизвестные ключи
 `context.layers` игнорируются (`resolveLayerFlags`).
 

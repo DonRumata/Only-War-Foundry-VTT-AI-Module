@@ -23,6 +23,8 @@
  */
 import {
     AI_DIFFICULTIES,
+    COMMITMENT_THREAT_MAX,
+    COMMITMENT_TTL_ROUNDS,
     FALLBACK_PRESET,
     FLAG_KEYS,
     MODULE_ID
@@ -33,6 +35,7 @@ import {
     applyMoraleLayer,
     boundedPersonalityOverlay,
     moralePostureOf,
+    moraleTierOf,
     recordLayerReason,
     resolveLayerFlags
 } from "./layers.js";
@@ -3312,14 +3315,27 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
-        // Issue #24 L1 commitment (entry point only — issue #25 owns the
-        // record backend; the stub reads an injected `context.commitment`
-        // `{valid?, steps, source?}`). A valid record short-circuits the
-        // funnel: its serialized steps are executed verbatim and no
-        // scoring runs.
+        // Issue #24/#25 L1 commitment: a valid committed plan (flag
+        // record or injected `context.commitment`) short-circuits the
+        // funnel — its serialized steps execute verbatim and no scoring
+        // runs. The layer validates the record's `expectedState` against
+        // live state (ttl, own-move journal, gm-intervention, target,
+        // morale tier, threat drift, cheap L0) and reports the stable
+        // invalidator codes on the trace.
         const commitment = applyCommitmentLayer({
-            combatant, context, flags: layerFlags, diagnostics
+            combat, combatant, context, flags: layerFlags, diagnostics,
+            selfStatuses
         });
+        // Bookkeeping for the executor and the #27 trace: which record
+        // was evaluated, why it was dropped and whether the world is in
+        // reactive mode (>threshold same-team gm-interventions squeeze
+        // every new commitment's ttl to one round).
+        diagnostics.commitment = {
+            recordId: commitment.record?.id ?? null,
+            invalidated: commitment.invalidated ?? null,
+            reactive: commitment.reactive === true,
+            interventions: _finiteOr(commitment.interventions, 0)
+        };
         if (commitment.decision) {
             const steps = commitment.decision.steps;
             diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id
@@ -4296,10 +4312,41 @@ export function createPlannerService({
         const steps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
+        // Issue #25 L1: when the commitment layer is on, the scored plan
+        // carries a serializable `commitment` payload — the same steps
+        // plus the `expectedState` fingerprint (self endpoint, committed
+        // target, morale tier, threat list). The executor persists it on
+        // the combatant `committedPlan` flag after the turn; the next
+        // planTurn then short-circuits while the expectation holds.
+        // Reactive mode (interventions above the threshold) writes the
+        // squeezed ttl=1 — the per-turn baseline during manual chaos.
+        const commitmentPayload = layerFlags.commitment === true && steps.length
+            ? {
+                source: "planner",
+                ttl: commitment.reactive === true
+                    ? 1
+                    : _finiteOr(context.commitmentTtl, COMMITMENT_TTL_ROUNDS),
+                steps: _jsonClone(steps),
+                expectedState: {
+                    self: _committedSelfPosition(steps, selfPos, tokenDoc, scene),
+                    target: winner.target
+                        ? {
+                            tokenId: winner.target.tokenId ?? null,
+                            tokenUuid: winner.target.tokenUuid ?? null,
+                            x: _finiteOr(winner.target.x, null),
+                            y: _finiteOr(winner.target.y, null)
+                        }
+                        : null,
+                    morale: moraleTierOf(moralePosture),
+                    threats: _commitmentThreats(targets, winner.target)
+                }
+            }
+            : null;
+
         const plan = _assemblePlan({
             combat, combatant, context, authority, seed, presetId,
             diagnostics, steps, winner, targets, personality,
-            actions: usableActions
+            actions: usableActions, commitment: commitmentPayload
         });
         log(`plan ${plan.id} preset=${presetId} score=${winner.score} steps=${steps.length}`);
         return { status: PLANNER_STATUS.ok, plan, reason: null };
@@ -4324,10 +4371,14 @@ export function createPlannerService({
      * @param {object[]} input.actions Usable actions for the snapshot.
      * @param {object|null} [input.personality] Issue #19 profile
      *   `{traits, character, source}` recorded on the plan.
+     * @param {object|null} [input.commitment] Issue #25 persistence
+     *   payload `{source, ttl, steps, expectedState}` the executor writes
+     *   on the combatant `committedPlan` flag after the turn.
      * @returns {object} Frozen plan.
      */
     function _assemblePlan({ combat, combatant, context, authority, seed,
-        presetId, diagnostics, steps, winner, targets, actions, personality = null }) {
+        presetId, diagnostics, steps, winner, targets, actions, personality = null,
+        commitment = null }) {
         const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
         const actor = _actorOf(combatant) ?? _actorOf(tokenDoc);
         const scene = _sceneOf(context, combat);
@@ -4406,9 +4457,81 @@ export function createPlannerService({
             target: snapshot.target,
             snapshot: _deepFreeze(snapshot),
             steps,
+            // Issue #25: the L1 persistence payload the executor writes
+            // on the `committedPlan` flag — null for commitment hits
+            // (the existing record is refreshed, not rewritten) and
+            // when the layer is off.
+            commitment: commitment ? _jsonClone(commitment) : null,
             diagnostics,
             debug: { seed }
         });
+    }
+
+    /**
+     * Projected end-of-turn self position for a committed plan
+     * (issue #25): the document-space endpoint of the last move step
+     * (the serialized `to` is a footprint centre — the token document
+     * stores top-left, mirroring the executor's `_docPoint`), or the
+     * live position when the plan keeps the bot in place.
+     * @param {object[]} steps Serialized plan steps.
+     * @param {{x: number|null, y: number|null}} selfPos Live position.
+     * @param {object|null} tokenDoc Self token document.
+     * @param {object|null} scene Scene for the grid size.
+     * @returns {{x: number|null, y: number|null, elevation: number}}
+     */
+    function _committedSelfPosition(steps, selfPos, tokenDoc, scene) {
+        const size = Number.isFinite(scene?.grid?.size) && scene.grid.size > 0
+            ? scene.grid.size : 100;
+        let last = null;
+        for (const step of steps ?? []) {
+            const to = step?.input?.to;
+            if (step?.type === "move" && Number.isFinite(to?.x) && Number.isFinite(to?.y)) {
+                last = to;
+            }
+        }
+        if (!last) {
+            return {
+                x: selfPos?.x ?? null,
+                y: selfPos?.y ?? null,
+                elevation: _finiteOr(tokenDoc?.elevation, 0)
+            };
+        }
+        const fw = _finiteOr(tokenDoc?.width, 1) * size;
+        const fh = _finiteOr(tokenDoc?.height, 1) * size;
+        return {
+            x: last.x - (fw / 2),
+            y: last.y - (fh / 2),
+            elevation: Number.isFinite(last.elevation)
+                ? last.elevation : _finiteOr(tokenDoc?.elevation, 0)
+        };
+    }
+
+    /**
+     * Compact threat fingerprint of a committed plan's expectedState
+     * (issue #25): `{tokenId, x, y}` of every evaluated target, the
+     * committed target deduped in, bounded at
+     * {@link COMMITMENT_THREAT_MAX}. Validation re-resolves the same ids
+     * and counts drifts beyond one grid cell.
+     * @param {object[]} targets Normalized snapshot targets.
+     * @param {object|null} winnerTarget Chosen target.
+     * @returns {object[]}
+     */
+    function _commitmentThreats(targets, winnerTarget) {
+        const seen = new Set();
+        const list = [];
+        const push = entry => {
+            const id = entry?.tokenId ?? entry?.tokenUuid ?? null;
+            if (!id || seen.has(id)) return;
+            if (!Number.isFinite(entry.x) || !Number.isFinite(entry.y)) return;
+            seen.add(id);
+            list.push({ tokenId: id, x: entry.x, y: entry.y });
+        };
+        push(winnerTarget);
+        for (const target of targets ?? []) {
+            if (list.length >= COMMITMENT_THREAT_MAX) break;
+            push(target);
+        }
+        return list;
     }
 
     /**

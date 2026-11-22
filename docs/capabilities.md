@@ -456,11 +456,14 @@ execute: расхождение — `stale-state` (перемещение, см�
   `personality`; без флага черты генерируются seeded по id документа.
 - Все AI-визуалы/диагностика — GM-only (whisper на GM-пользователей);
   игрокам ничего не утекает (проверено smoke).
-- **Слои поведения L0–L4** (issue #24, `scripts/layers.js` +
+- **Слои поведения L0–L4** (issues #24/#25, `scripts/layers.js` +
   `docs/layers.md`, capability `planner.layers`): планирование — воронка
   вето/commitment/morale/
-  personality/scoring. World settings `layersCommitment`,
-  `layersMorale` (default `false` — каркас под #25/#26),
+  personality/scoring. World settings `layersCommitment` (default
+  `true` — L1 реализован: флаг `committedPlan` + `expectedState`,
+  TTL, own-move `moveJournal`, `gm-intervention`/`gmControlled`,
+  `manualOverrideGrace`, reactive-режим), `layersMorale` (default
+  `false` — каркас под #26),
   `layersPersonality`, `layersLookahead` (default `true`); план-оверрайд —
   `context.layers`. Каждый слой пишет `{layer, code, detail}` в
   `plan.diagnostics.layers`.
