@@ -634,7 +634,10 @@ test("sync delay: a different until condition resets the patience budget", async
 
 test("sync delay: a desperate member never holds", async () => {
     const { result, support } = await syncWorld({
-        morale: { state: "desperate" }
+        morale: { state: "desperate" },
+        // Deterministic effective tier: a generated `fanatic` trait
+        // would legitimately cancel the desperate posture (#26).
+        extraContext: { personality: false }
     });
     const plan = result.teamPlan;
     const supportEntry = plan.members

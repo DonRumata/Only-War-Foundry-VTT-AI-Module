@@ -7,9 +7,9 @@
 семантика слоёв, скобы влияния, порядок вызова, формат reason-записей,
 флаги и порядок rollout.
 
-Каркас заложен в issue #24; L1 commitment реализован в issue #25 —
-этот документ описывает оба. L2 morale (#26) и инструмент полного
-reason trace (#27) — отдельные PR.
+Каркас заложен в issue #24; L1 commitment реализован в issue #25, L2
+morale — в issue #26. Инструмент полного reason trace (#27) — отдельный
+PR.
 
 ## Слои
 
@@ -17,7 +17,7 @@ reason trace (#27) — отдельные PR.
 |---|---|---|---|
 | L0 | hard-veto | Абсолютные вето легальности | внедрено (формализовано) |
 | L1 | commitment | Валидный многоходовый план → следующий шаг без скоринга | внедрено (#25) |
-| L2 | morale | Поза файртимы сужает назначение задач/факторы | pass-through (#26) |
+| L2 | morale | Поза файртимы сужает назначение задач/факторы | внедрено (#26) |
 | L3 | personalities | Дельты весов в скобе ±30% + jitter | внедрено (#19 + скоба) |
 | L4 | base utility + lookahead | Детерминированный скоринг с нуля | внедрено (#16) |
 
@@ -104,20 +104,69 @@ baseline-планированию по ходу.
 `interventions`) идут в `diagnostics.commitment` плана — plumbing под
 #27 и бухгалтерию executor'а.
 
-### L2 — morale (pass-through, реализация — #26)
+### L2 — morale (issue #26)
 
-Троичная поза файртимы (defensive/neutral/aggressive) должна влиять на
-task-assignment и posture-факторы. Сейчас слой *резолвит и репортит*
-позу, но ничего не сужает: `applyMoraleLayer` читает зарезервированный
-флаг `flags["only-war-ai"].morale` (`{state, pressured?, desperate?}`) /
-`context.morale` и пишет `morale-posture` в trace +
-`diagnostics.morale`. Когда слой выключен — нейтральная поза и запись
-`morale-layer-disabled`.
+**Поза морали — одна на всю файртиму**, три тира: `confident` (численное/
+позиционное превосходство), `pressured` (паритет — baseline) и
+`desperate` (превосходство врага или потери). `buildTeamPlan` раз в ход
+считает командные счётчики (`evaluateMoraleRecord`):
 
-Легаси-чтения флага `morale` батча #38 (`_syncDelay` — desperate не ждёт,
-`orderBoost` — pressured усиливает приказ) остаются **безусловными** —
-это контракт #38, а не эффект слоя; флаг `layersMorale` начнёт
-управлять поведением с появлением posture-факторов в #26.
+- `members`/`enemies` — живые члены против враждебных боевых единиц;
+- `casualties` (суммарно, от `initialStrength`) и `casualtiesRecent` —
+  журнал потерь `losses: [{round}]` за `MORALE_RECENT_LOSS_ROUNDS = 3`
+  раунда;
+- `pinned` — все члены прижаты ⇒ desperate;
+- `spaceControl` — доля безопасных опорных точек команды (выборка ходов +
+  `dangerAt` threat-map): `< MORALE_SPACE_DESPERATE` ⇒ desperate,
+  `< MORALE_SPACE_CONFIDENT` блокирует confident;
+- `leaderDead` — флагged-лидер погиб ⇒ **форсированный переход без
+  гистерезиса** (и тир никогда не выйдет в confident).
+
+Пороги tier'а — `proposeMoraleTier`: outnumbered / `casualtiesRecent ≥
+MORALE_RECENT_LOSS_DESPERATE` / половина стартового состава потеряна /
+все прижаты / провал пространства ⇒ `desperate`; `members > enemies` без
+свежих потерь и удержанным пространством ⇒ `confident`; иначе
+`pressured`.
+
+**Гистерезис** `MORALE_HYSTERESIS_ROUNDS = 2`: смена предложенного тира
+зажигает `pending = {tier, count}` — один ход нового расклада тир не
+двигает, два подряд — коммитит. Запись пишется на флаг
+`flags["only-war-ai"].morale` каждого живого члена
+(`{tier, pending, counters, losses, leaderId, combatId, round, state}`
++ `schema` для грейсфул-рида) **только controller'ом**; инъекция
+`context.morale` пропускает оценку и записи, ручные stub-записи без
+`counters` считаются членскими оверрайдами и не перезатираются.
+
+**Member-effective tier** (`effectiveMoraleTier`) — личные исключения
+только при скоринге/назначении, командный тир не меняется: `fanatic`
+игнорирует `desperate` (ведёт себя как pressured), `cowardly` читает
+`pressured` как `desperate`.
+
+**Сужение слоя:** `applyMoraleLayer` резолвит рекорд → `{tier,
+effectiveTier, pressured, desperate, confident}` + reason
+`morale-posture {tier, effectiveTier, pressured, desperate, confident}`;
+planner применяет bounded-дельты `MORALE_POSTURE_DELTAS`
+(`applyMoraleWeightShift`) — `morale-weight-shift` в trace —
+desperate тянет к укрытию/hold/cohesion и давит charge/melee,
+confident подталкивает charge/assault. В `buildTeamPlan` тир меняет
+назначения: confident поднимает квоты `assault`/`flank`
+(`MORALE_CONFIDENT_ASSAULT_CAP = 2`, `MORALE_CONFIDENT_FLANK_CAP = 2`),
+`desperate`-member ремаппится `assault→support`, `flank`/`advance→regroup`
+(`diagnostics.moraleDemotions`); `desperate`-member не ждёт
+синхро-удар (effective-тир, не командный). Смена тира инвалидирует
+commitment через `expectedState.morale` → `morale-changed` (#25).
+
+**Телеграфирование:** коммитнутый переход тира — GM-whisper bark
+`OWAI.Bark.Morale.<tier>` (настройки `aiBarks`/`barksToPlayers`,
+дедуп `combat|team|round|tier`); старт свежего многоходового
+commitment — `OWAI.Bark.Plan.Start` (дедуп на боевую единицу/раунд,
+executor). Preview показывает цепочку шагов (`planIntentOf` →
+`OWAI.Preview.Intent`) и тир морали; GM-оверлей рисует маркер
+`шаг/total` над токеном, тонированный тиром.
+
+Легаси-чтения флага `morale` батча #38 (`orderBoost` — pressured
+усиливает приказ) остаются **безусловными** — это контракт #38, а не
+эффект слоя.
 
 ### L3 — personalities (скоба ±30%)
 
@@ -158,7 +207,8 @@ gate-вето L0: not-controller / combat-ended / config-disabled
 L0: gridless-unsupported
 L0: statuses → stunned short-circuit
 L1: applyCommitmentLayer      → hit: план из записи, return
-L2: applyMoraleLayer          → поза в trace (пока без сужения)
+L2: applyMoraleLayer          → tier + effective tier (traits) в trace,
+                                дельты позы на веса
 L3: _runPersonalityLayer      → веса с дельтами в скобе + jitter
 генерация кандидатов          → L0-вето при материализации (rejectL0)
 L4: scoring → lookahead(гейт) → easy-slip → winner → steps → план
@@ -190,12 +240,15 @@ L4: scoring → lookahead(гейт) → easy-slip → winner → steps → пл�
   `commitment-hit` и прямые коды инвалидаторов `combat-ended`,
   `ttl-expired`, `gm-intervention`, `target-gone`, `morale-changed`,
   `threat-drift`, `l0-veto` (issue #25, набор —
-  `COMMITMENT_REASONS`); L2 — `morale-layer-disabled`, `morale-posture`;
-  L3 — `personality-layer-disabled`, `personality-overlay`
+  `COMMITMENT_REASONS`); L2 — `morale-layer-disabled`, `morale-posture`,
+  `morale-weight-shift`; L3 — `personality-layer-disabled`, `personality-overlay`
   (`detail.clamped` — список зажатых факторов); L4 — `scored`,
   `lookahead`, `lookahead-layer-disabled`, `easy-slip`, `winner`.
 - `diagnostics.layerFlags` — эффективные тумблеры плана;
-  `diagnostics.morale` — резолвленная поза L2.
+  `diagnostics.morale` — резолвленная поза L2 (`{enabled, state, tier,
+  effectiveTier, pressured, desperate, confident, shift?}`); в
+  team-plan — `diagnostics.morale` (`{tier, pending, counters,
+  changed, effective}`) + `diagnostics.moraleDemotions`.
 - #27 строит на этом полный trace-инструмент (выбор черт, ветки
   сужения, per-layer timings); здесь — минимально необходимый plumbing:
   формат зафиксирован, слои обязаны писать.
@@ -208,15 +261,16 @@ World settings (`scope: world`, GM-only) + оверрайд `context.layers`
 | Настройка | Слой | Default | Выкл = деградация на |
 |---|---|---|---|
 | `layersCommitment` | L1 | `true` (#25 — слой реализован; выкл = откат одним тумблером) | нет короткого замыкания — всегда план с нуля |
-| `layersMorale` | L2 | `false` | нейтральная поза; posture-факторов пока нет — видимой разницы нет |
+| `layersMorale` | L2 | `true` (#26 — слой реализован; выкл = откат одним тумблером) | нет оценки/записей/ремапа/дельт — нейтральная baseline-поза везде |
 | `layersPersonality` | L3 | `true` | `source:"disabled"` — нет черт/джиттера, чистый пресет |
 | `layersLookahead` | L4-lookahead | `true` | только базовая полезность даже на `hard` |
 
 Дефолты отражают rollout-порядок из issue (commitment → morale → черты →
 lookahead): L1 реализован и включён (#25 — первый шаг rollout'а, откат
-одним тумблером), L2 выключен до #26; L3/L4 уже работают — включены,
+одним тумблером), L2 реализован и включён (#26 — откат одним
+тумблером); L3/L4 уже работают — включены,
 поведение по умолчанию идентично старому коду (кроме документированной
-скобы ±30% на L3-дельты). Повреждённые значения
+скобы ±30% на L3-дельты и дельт позы L2). Повреждённые значения
 настройки → дефолт (`getLayerFlags`); неизвестные ключи
 `context.layers` игнорируются (`resolveLayerFlags`).
 

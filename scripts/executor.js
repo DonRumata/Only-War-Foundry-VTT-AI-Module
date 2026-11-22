@@ -42,10 +42,12 @@ import {
 import { resolveEffectiveConfig } from "./config-resolver.js";
 import {
     appendJournalEntry,
+    planIntentOf,
     readCommittedPlan,
     readMoveJournal,
     COMMITMENT_REASONS
 } from "./layers.js";
+import { barkText, emitBarkOnce } from "./barks.js";
 import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
@@ -245,6 +247,8 @@ export function createExecutorService({
     const executions = new Map();
     /** Adjudication request id → pending `{resolve, request}` pair (#37). */
     const pendingAdjudications = new Map();
+    /** Dedup keys of emitted plan-start barks (issue #26). */
+    const _barkSeen = new Set();
     let hookSubscribed = false;
 
     const _idGen = typeof idGen === "function"
@@ -1511,11 +1515,44 @@ export function createExecutorService({
                     createdTurn: _finiteOr(context.combat?.turn, 0),
                     ...run.plan.commitment
                 });
+                // Issue #26: a fresh multi-turn commitment is the plan
+                // start the table should hear — the bark dedups to one
+                // per combatant per round.
+                await _barkPlanStart(context, run);
             }
         } catch(err) {
             // Commitment persistence is best-effort — a lost record
             // degrades to ordinary per-turn planning.
         }
+    }
+
+    /**
+     * Committed-plan start bark (issue #26): a short localized phrase
+     * telegraphing the fresh multi-turn plan ("Move → Attack") — at
+     * most one per combatant per round so a same-round replan never
+     * repeats it. Single-step commitments do not telegraph (nothing to
+     * anticipate). GM whisper by default; `barksToPlayers` opens it.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<boolean>}
+     */
+    async function _barkPlanStart(context, run) {
+        const steps = planIntentOf(run.plan).steps;
+        if (steps.length < 2) return false;
+        const name = run.combatant?.name
+            ?? run.combatant?.token?.name ?? "NPC";
+        const intent = steps
+            .map(type => barkText(`OWAI.Preview.Step.${type}`))
+            .join(" → ");
+        const round = _finiteOr(context.combat?.round, 0);
+        return emitBarkOnce(_barkSeen,
+            `${context.combat?.id ?? "combat"}|${run.combatant?.id ?? "bot"}|${round}`, {
+                key: "OWAI.Bark.Plan.Start",
+                data: { name, intent },
+                speaker: name,
+                context,
+                flags: { planStart: { planId: run.plan?.id ?? null, steps: steps.length } }
+            });
     }
 
     /**

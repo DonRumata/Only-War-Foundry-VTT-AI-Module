@@ -27,7 +27,8 @@
  *   the GM replans or cancels. Closing the window without a decision
  *   cancels — never confirms.
  */
-import { MODULE_ID } from "../constants.js";
+import { MODULE_ID, MORALE_TIERS } from "../constants.js";
+import { planIntentOf } from "../layers.js";
 import { isModuleEnabled } from "../module-state.js";
 import { STALE_REASONS } from "../planner.js";
 import {
@@ -343,6 +344,19 @@ export function buildPreviewViewModel(plan, context = {}) {
             || a.factor.localeCompare(b.factor));
 
     const rawDiagnostics = plan?.diagnostics ?? {};
+    // Issue #26 intent telegraphing: the compact step-type chain of the
+    // plan (`move → attack`) plus the morale tiers the L2 layer stamped
+    // on the diagnostics — `localizePreviewViewModel` turns both into
+    // display strings.
+    const intent = planIntentOf(plan);
+    const rawMorale = rawDiagnostics.morale;
+    const morale = rawMorale?.enabled === true && rawMorale?.tier != null
+        ? {
+            tier: MORALE_TIERS.includes(rawMorale.tier) ? rawMorale.tier : null,
+            effectiveTier: MORALE_TIERS.includes(rawMorale.effectiveTier)
+                ? rawMorale.effectiveTier : null
+        }
+        : null;
     const diagnostics = {
         enabled: context.diagnosticsEnabled === true,
         rejected: (Array.isArray(rawDiagnostics.rejected) ? rawDiagnostics.rejected : [])
@@ -375,6 +389,8 @@ export function buildPreviewViewModel(plan, context = {}) {
         steps,
         resources,
         breakdown,
+        intent,
+        morale,
         diagnostics,
         replan: {
             allowed: replanCount < maxReplans,
@@ -494,6 +510,27 @@ export function localizePreviewViewModel(vm, i18n = null) {
             ...entry,
             label: _label(i18nSource, `OWAI.Preview.Factor.${entry.factor}`, entry.factor)
         })),
+        // Issue #26: localized intent chain + morale tier labels.
+        intentLabel: (vm.intent?.steps ?? []).length
+            ? vm.intent.steps
+                .map(type => _label(i18nSource, `OWAI.Preview.Step.${type}`, type))
+                .join(" → ")
+            : null,
+        morale: vm.morale
+            ? {
+                ...vm.morale,
+                tierLabel: vm.morale.tier
+                    ? _label(i18nSource, `OWAI.Morale.${vm.morale.tier}`, vm.morale.tier)
+                    : null,
+                effectiveTierLabel: vm.morale.effectiveTier
+                        && vm.morale.effectiveTier !== vm.morale.tier
+                    ? _label(
+                        i18nSource,
+                        `OWAI.Morale.${vm.morale.effectiveTier}`,
+                        vm.morale.effectiveTier)
+                    : null
+            }
+            : vm.morale,
         staleLabel: vm.stale
             ? (i18nSource?.format?.("OWAI.Preview.Stale", {
                 reason: _label(i18nSource, STALE_REASON_LABEL_KEYS[vm.stale] ?? "", vm.stale)

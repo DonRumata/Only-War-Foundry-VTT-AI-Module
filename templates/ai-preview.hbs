@@ -24,6 +24,20 @@
             <span class="ow-ai-value">{{npc.personalityLabel}}</span>
         </div>
         {{/if}}
+        {{#if intentLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Intent"}}</label>
+            <span class="ow-ai-value">{{intentLabel}}</span>
+        </div>
+        {{/if}}
+        {{#if morale.tierLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Morale"}}</label>
+            <span class="ow-ai-value">
+                {{morale.tierLabel}}{{#if morale.effectiveTierLabel}} ({{morale.effectiveTierLabel}}){{/if}}
+            </span>
+        </div>
+        {{/if}}
         <div class="form-group">
             <label>{{localize "OWAI.Preview.Target.Label"}}</label>
             <span class="ow-ai-value">

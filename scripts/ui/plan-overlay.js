@@ -303,8 +303,10 @@ export function dangerShade(danger) {
  * @param {string|null} [context.operationId] Operation owning the plan.
  * @param {string|boolean|null} [context.stale] Stale marker — the
  *   renderer dims the overlay while a stale banner is up.
+ * @param {number|null} [context.stepIndex] 1-based plan cursor for the
+ *   issue #26 intent badge (defaults to the chosen step / step 1).
  * @returns {object} `{operationId, planId, stale, self, route, cones,
- *   blasts, target}`.
+ *   blasts, target, intent}`.
  */
 export function buildPlanOverlayModel(plan, context = {}) {
     const steps = Array.isArray(plan?.steps) ? plan.steps : [];
@@ -418,6 +420,33 @@ export function buildPlanOverlayModel(plan, context = {}) {
         }
     }
 
+    // Issue #26 intent marker: a small "current/total" badge above the
+    // previewed token telegraphing where inside the multi-step plan the
+    // bot stands. `context.stepIndex` carries an explicit progress (the
+    // executor's cursor); without it the marker shows step 1 — the plan
+    // the GM is looking at is about to start.
+    const intentTotal = steps.filter(step => step?.type !== "end-turn").length
+        || steps.length;
+    let intent = null;
+    if (selfCenter && intentTotal > 0) {
+        const explicit = _finiteOr(context.stepIndex, null);
+        const chosenIdx = steps.findIndex(
+            step => step?.id === plan?.diagnostics?.chosenStep);
+        const stepIndex = Number.isFinite(explicit) && explicit > 0
+            ? Math.min(Math.trunc(explicit), intentTotal)
+            : (chosenIdx >= 0 ? Math.min(chosenIdx + 1, intentTotal) : 1);
+        intent = {
+            x: selfCenter.x,
+            y: (self?.y ?? selfCenter.y) - 14,
+            stepIndex,
+            total: intentTotal,
+            moraleTier: typeof plan?.diagnostics?.morale?.effectiveTier === "string"
+                ? plan.diagnostics.morale.effectiveTier
+                : (typeof plan?.diagnostics?.morale?.tier === "string"
+                    ? plan.diagnostics.morale.tier : null)
+        };
+    }
+
     return {
         operationId: context.operationId ?? plan?.operationId ?? null,
         planId: plan?.id ?? null,
@@ -427,7 +456,8 @@ export function buildPlanOverlayModel(plan, context = {}) {
         route,
         cones,
         blasts,
-        target
+        target,
+        intent
     };
 }
 
@@ -725,6 +755,36 @@ export function createPlanOverlayService({
     }
 
     /**
+     * Draw the intent badge (issue #26): a small "i/total" label above
+     * the previewed token — the morale tier tints it (confident green,
+     * pressured amber, desperate red). PIXI.Text is optional
+     * decoration; the model keeps the data either way.
+     * @param {PIXI.Container} layer
+     * @param {object} intent `{x, y, stepIndex, total, moraleTier}`.
+     * @param {number} dim Alpha multiplier for stale plans.
+     */
+    function _drawIntent(layer, intent, dim) {
+        if (!intent || typeof PIXI?.Text !== "function") return;
+        const color = intent.moraleTier === "confident" ? 0x66ff66
+            : (intent.moraleTier === "desperate" ? 0xff5533 : 0xffaa33);
+        try {
+            const text = new PIXI.Text(`${intent.stepIndex}/${intent.total}`, {
+                fontSize: 14,
+                fill: color,
+                stroke: 0x000000,
+                strokeThickness: 3,
+                fontWeight: "bold"
+            });
+            text.anchor?.set?.(0.5, 1);
+            text.position?.set?.(intent.x, intent.y);
+            if (Number.isFinite(text.alpha)) text.alpha = dim;
+            layer.addChild(text);
+        } catch(err) {
+            // The badge is decorative — never block the overlay on it.
+        }
+    }
+
+    /**
      * Rebuild the plan layer from the current model. No-op for non-GM
      * clients and without PIXI/canvas.
      * @returns {void}
@@ -739,6 +799,7 @@ export function createPlanOverlayService({
         for (const blast of _planModel.blasts) _drawBlast(layer, blast, dim);
         _drawRoute(layer, _planModel.route, dim);
         _drawTarget(layer, _planModel.target, dim);
+        _drawIntent(layer, _planModel.intent, dim);
     }
 
     /**
@@ -773,7 +834,8 @@ export function createPlanOverlayService({
             target: _tokenBounds(targetDoc),
             pxPerUnit: _pxPerUnit(),
             operationId: context.operationId ?? null,
-            stale: context.stale ?? null
+            stale: context.stale ?? null,
+            stepIndex: context.stepIndex ?? null
         });
         _renderPlan();
         log(`plan overlay: plan=${_planModel.planId} cones=${_planModel.cones.length} `

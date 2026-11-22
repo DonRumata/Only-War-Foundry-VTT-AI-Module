@@ -23,6 +23,9 @@
  * - `manualOverrideGrace`: boolean (issue #25) — on: a manual GM move of
  *   an AI token is absolute law and never cancels a committed plan;
  *   off (default): unexplained drift is `gm-intervention`.
+ * - `aiBarks`/`barksToPlayers`: booleans (issue #26) — short chat barks
+ *   telegraphing AI intent on morale-tier changes and committed-plan
+ *   starts. GM whispers by default; `barksToPlayers` makes them public.
  */
 import {
     AI_DIFFICULTIES,
@@ -167,6 +170,27 @@ export function registerSettings() {
     game.settings.register(MODULE_ID, SETTING_KEYS.manualOverrideGrace, {
         name: "OWAI.Settings.ManualOverrideGrace.Name",
         hint: "OWAI.Settings.ManualOverrideGrace.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: false
+    });
+
+    // Issue #26: AI intent telegraphing through short chat barks —
+    // GM-only whispers by default (`barksToPlayers` opens them to the
+    // table for drama).
+    game.settings.register(MODULE_ID, SETTING_KEYS.aiBarks, {
+        name: "OWAI.Settings.AiBarks.Name",
+        hint: "OWAI.Settings.AiBarks.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: true
+    });
+
+    game.settings.register(MODULE_ID, SETTING_KEYS.barksToPlayers, {
+        name: "OWAI.Settings.BarksToPlayers.Name",
+        hint: "OWAI.Settings.BarksToPlayers.Hint",
         scope: "world",
         config: true,
         type: Boolean,
@@ -319,6 +343,37 @@ export function isThreatMapOverlayEnabled() {
 export function isManualOverrideGrace() {
     try {
         return game.settings.get(MODULE_ID, SETTING_KEYS.manualOverrideGrace) === true;
+    } catch(_err) {
+        return false;
+    }
+}
+
+/**
+ * Whether AI chat barks are emitted (issue #26): short localized
+ * phrases on morale-tier changes and committed-plan starts. Default
+ * `true` — the audience is GM-only whispers anyway, so the telegraphing
+ * costs the table nothing; `barksToPlayers` decides who else sees it.
+ * @returns {boolean}
+ */
+export function isBarksEnabled() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.aiBarks);
+        return value !== false;
+    } catch(_err) {
+        return true;
+    }
+}
+
+/**
+ * Whether AI barks go to the whole table instead of GM whispers
+ * (issue #26). Default `false` — the GM hears the intent telegraphing;
+ * turning it on makes the drama public.
+ * @returns {boolean}
+ */
+export function barksToPlayers() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.barksToPlayers);
+        return value === true;
     } catch(_err) {
         return false;
     }

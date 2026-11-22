@@ -158,7 +158,11 @@ export const PERSONALITIES = Object.freeze({
         }),
         jitter: 0.02,
         weight: 5,
-        bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 })
+        bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 }),
+        // Issue #26 L2 morale: mere `pressured` reads as `desperate` to a
+        // coward — it regroups and pulls toward cover while the rest of
+        // the team still holds the baseline posture.
+        flags: Object.freeze({ fragileMorale: true })
     }),
     // --- Навык / опыт --------------------------------------------------
     veteran: Object.freeze({

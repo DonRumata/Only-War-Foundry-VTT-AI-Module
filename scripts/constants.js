@@ -101,7 +101,13 @@ export const SETTING_KEYS = Object.freeze({
     // `gm-controlled`) or ordinary interference (`false`, default — a
     // committed bot treats an unexplained move as `gm-intervention`,
     // cancels the plan and replans on its next turn).
-    manualOverrideGrace: "manualOverrideGrace"
+    manualOverrideGrace: "manualOverrideGrace",
+    // Issue #26: short chat barks telegraphing the AI's intentions —
+    // emitted on a morale-tier change and at the start of a committed
+    // multi-turn plan. GM-only whispers by default; `barksToPlayers`
+    // widens the audience to the whole table.
+    aiBarks: "aiBarks",
+    barksToPlayers: "barksToPlayers"
 });
 
 /**
@@ -110,14 +116,14 @@ export const SETTING_KEYS = Object.freeze({
  * still produced, just without that layer's influence. Rollout order per
  * the issue: commitment → morale → traits → lookahead. `commitment` (L1)
  * and `personality` (L3, issue #19) / `lookahead` (L4, issue #16) run as
- * the historical behaviour, so they default on. `commitment` (L1) is
- * implemented since issue #25 and defaults on — the first rollout stage
- * of the funnel; `morale` (L2) stays off until issue #26 lands the
- * posture factors. Any layer remains a one-toggle rollback.
+ * the historical behaviour, so they default on. `commitment` (L1) and
+ * `morale` (L2) are implemented since issues #25/#26 and default on —
+ * the first rollout stages of the funnel. Any layer remains a
+ * one-toggle rollback.
  */
 export const DEFAULT_LAYER_FLAGS = Object.freeze({
     commitment: true,
-    morale: false,
+    morale: true,
     personality: true,
     lookahead: true
 });
@@ -167,6 +173,75 @@ export const COMMITMENT_REACTIVE_THRESHOLD = 1;
  * real move to be attributed via the move journal.
  */
 export const COMMITMENT_POSITION_TOLERANCE_PX = 0.5;
+
+/**
+ * L2 morale tiers of a fireteam (issue #26): `confident` — the team
+ * holds a numeric/positional edge, `pressured` — parity (the baseline
+ * posture), `desperate` — enemy advantage/losses force regrouping.
+ */
+export const MORALE_TIERS = Object.freeze([
+    "confident",
+    "pressured",
+    "desperate"
+]);
+
+/**
+ * Baseline morale tier: an absent or damaged record reads as
+ * `pressured` — the parity posture with no task/weight shifts.
+ */
+export const MORALE_DEFAULT_TIER = "pressured";
+
+/**
+ * Morale hysteresis (issue #26): a tier transition commits only after
+ * the proposing conditions held for this many consecutive team
+ * evaluations (one per round) — the posture never flaps on a single
+ * bad turn. A leader loss forces the transition immediately.
+ */
+export const MORALE_HYSTERESIS_ROUNDS = 2;
+
+/**
+ * Sliding window (combat rounds) for "recent" team losses in the
+ * morale counters (issue #26): the `losses` log keeps the rounds when
+ * members fell and `casualtiesRecent` counts the entries inside this
+ * window.
+ */
+export const MORALE_RECENT_LOSS_ROUNDS = 3;
+
+/**
+ * Recent losses inside the window that push the proposal to
+ * `desperate` (issue #26).
+ */
+export const MORALE_DESPERATE_RECENT_LOSSES = 2;
+
+/**
+ * Fraction of the starting strength the team must lose before the
+ * proposal turns `desperate` regardless of the headcount (issue #26).
+ */
+export const MORALE_DESPERATE_LOSS_RATIO = 0.5;
+
+/**
+ * Space-control floor for the `desperate` proposal: when the share of
+ * sampled member cells outside the enemy threat coverage drops to or
+ * below this value the team has lost the ground (issue #26).
+ */
+export const MORALE_DESPERATE_SPACE_CONTROL = 0.25;
+
+/**
+ * Confidence floor for the `confident` proposal: the team must hold a
+ * headcount edge AND control at least this share of its own cells
+ * (when space control is measurable at all) without fresh losses
+ * (issue #26).
+ */
+export const MORALE_CONFIDENT_SPACE_CONTROL = 0.5;
+
+/**
+ * Danger level below which a sampled cell counts as "ours" for the
+ * space-control counter (issue #26, threat map #16).
+ */
+export const MORALE_SAFE_DANGER = 0.5;
+
+/** Bound on the morale `losses` log kept on the fireteam record. */
+export const MORALE_LOSS_LOG_MAX = 16;
 
 /** Default pacing delay between AI execution steps in milliseconds. */
 export const DEFAULT_TURN_PACING_MS = 800;

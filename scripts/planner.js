@@ -33,6 +33,7 @@ import { resolveEffectiveConfig } from "./config-resolver.js";
 import {
     applyCommitmentLayer,
     applyMoraleLayer,
+    applyMoraleWeightShift,
     boundedPersonalityOverlay,
     moralePostureOf,
     moraleTierOf,
@@ -3222,21 +3223,24 @@ export function createPlannerService({
         // explicit `context.personality` or the resolved
         // `flags["only-war-ai"].personality` list wins, otherwise 1–2
         // traits are generated seeded from the stable document identity.
-        // The block is resolved lazily so the L0 stunned short-circuit
-        // below and the main scoring path share the same resolution.
-        const _runPersonalityLayer = () => {
-            const resolved = resolvePersonality({
-                // A disabled L3 layer degrades to `source:"disabled"` —
-                // same as `context.personality === false`: no traits, no
-                // jitter, a fully deterministic pick.
-                explicit: layerFlags.personality === false
-                    ? false
-                    : context.personality,
-                flagged: config.personality,
-                character: context.team?.character,
-                difficulty,
-                identity: personalityIdentity({ combatant, token: tokenDoc, actor })
-            });
+        // The profile is resolved lazily so the L0 stunned short-circuit
+        // below and the main scoring path share the same resolution —
+        // and issue #26 hoists the pure resolution above the funnel so
+        // L2 morale reads the trait exceptions (`fanatic`/`cowardly`)
+        // without reordering the L3 trace entry.
+        const _resolvePersonality = () => resolvePersonality({
+            // A disabled L3 layer degrades to `source:"disabled"` —
+            // same as `context.personality === false`: no traits, no
+            // jitter, a fully deterministic pick.
+            explicit: layerFlags.personality === false
+                ? false
+                : context.personality,
+            flagged: config.personality,
+            character: context.team?.character,
+            difficulty,
+            identity: personalityIdentity({ combatant, token: tokenDoc, actor })
+        });
+        const _runPersonalityLayer = (resolved = _resolvePersonality()) => {
             const amp = resolved.source === "disabled"
                 ? 0
                 : personalityJitter({
@@ -3357,23 +3361,51 @@ export function createPlannerService({
             log(`plan ${plan.id} preset=${presetId} commitment hit`);
             return { status: PLANNER_STATUS.ok, plan, reason: null };
         }
-        // Issue #24 L2 morale — pass-through contract for #26: the layer
-        // resolves and reports the squad posture on the trace but narrows
-        // nothing yet (task assignment and posture factors are #26's own
-        // work; the legacy #38 graceful morale reads stay unconditional).
+        // Issue #26 L2 morale: the layer resolves the team tier from the
+        // combatant's `morale` record, derives the member-effective tier
+        // through the trait exceptions (`fanatic`/`cowardly`) and
+        // reports both on the trace. The bounded posture weight deltas
+        // below narrow the scoring pass; the fireteam remaps the task
+        // assignments. The team tier alone feeds `expectedState.morale`
+        // (a tier change invalidates the commitment); the legacy #38
+        // graceful morale reads stay unconditional.
+        const personalityProfile = _resolvePersonality();
         const moralePosture = applyMoraleLayer({
-            combatant, context, flags: layerFlags, diagnostics
+            combatant, context, flags: layerFlags, diagnostics,
+            traits: personalityProfile.traits
         });
         diagnostics.morale = {
             enabled: moralePosture.enabled,
             state: moralePosture.state,
+            tier: moralePosture.tier,
+            effectiveTier: moralePosture.effectiveTier,
             pressured: moralePosture.pressured,
-            desperate: moralePosture.desperate
+            desperate: moralePosture.desperate,
+            confident: moralePosture.confident
         };
-        const l3 = _runPersonalityLayer();
+        const l3 = _runPersonalityLayer(personalityProfile);
         const personality = l3.personality;
         const personalityAmp = l3.personalityAmp;
-        const effectiveWeights = l3.effectiveWeights;
+        let effectiveWeights = l3.effectiveWeights;
+        // L2 narrowing (issue #26): the member-effective tier shifts the
+        // scoring weights inside a bounded delta map — desperate
+        // postpones charges and pulls toward cover/regroup, confident
+        // pushes the assault. The baseline `pressured` tier shifts
+        // nothing.
+        if (moralePosture.enabled === true && moralePosture.effectiveTier) {
+            const shifted = applyMoraleWeightShift(
+                effectiveWeights, moralePosture.effectiveTier);
+            if (Object.keys(shifted.deltas).length) {
+                effectiveWeights = shifted.weights;
+                diagnostics.weights = { ...effectiveWeights };
+                diagnostics.morale.shift = { ...shifted.deltas };
+                recordLayerReason(diagnostics, "L2", "morale-weight-shift", {
+                    tier: moralePosture.tier,
+                    effectiveTier: moralePosture.effectiveTier,
+                    deltas: shifted.deltas
+                });
+            }
+        }
         // Prone halves the numeric movement budget (floor; crawl) — both
         // the navigation findCandidates input and the `budgetOver`
         // factor see the reduced value.

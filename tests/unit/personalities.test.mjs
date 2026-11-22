@@ -473,6 +473,10 @@ test("buildTeamPlan applies the character overlay to every member", async () => 
         seed: 11,
         targets: planContext(world).targets,
         actions: planContext(world).actions,
+        // L2 off: the morale layer would escalate `pressured` to
+        // `desperate` for the coward below (#26) and shift
+        // cohesionRestore — this test measures the L3 overlay alone.
+        layers: { morale: false },
         // Pin the personal trait so the overlay math is exact: cowardly
         // (+6 cohesionRestore) overrides the rabble (-4) team delta.
         personality: ["cowardly"]

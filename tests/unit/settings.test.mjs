@@ -31,7 +31,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 14);
+    assert.equal(registered.length, 16);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");

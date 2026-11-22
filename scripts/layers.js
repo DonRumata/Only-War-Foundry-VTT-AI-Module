@@ -22,12 +22,16 @@
  *   a full persisted-shape record runs the same validation as a flag
  *   read — so tests and integrations can exercise both paths.
  * - **L2 morale** — the fireteam's ternary posture
- *   (defensive/neutral/aggressive, today expressed through the reserved
- *   `morale` flag's `pressured`/`desperate` readings). Pass-through stub
- *   for issue #26: the layer resolves and reports the posture but narrows
- *   nothing yet — task assignment and posture factors land with #26.
- *   The legacy graceful reads of the `morale` flag (issue #38 sync/order
- *   hooks) stay unconditional by contract.
+ *   (confident/pressured/desperate, issue #26). The controller-side
+ *   team evaluation counts living members, losses, pinned members,
+ *   enemies and threat-map space control into a hysteresis-gated
+ *   record persisted on each member's `morale` flag; the layer reads
+ *   that record, derives the member's *effective* tier through the
+ *   trait exceptions (fanatic ignores `desperate`, cowardly escalates
+ *   `pressured` to `desperate`) and narrows scoring through the bounded
+ *   posture weight deltas while the fireteam remaps task assignments.
+ *   The legacy graceful reads of the `morale` flag (issue #38
+ *   sync/order hooks) stay unconditional by contract.
  * - **L3 personalities** — additive weight deltas inside the narrowed
  *   set, braced to ±30% of the base weight
  *   ({@link boundedPersonalityOverlay}) plus the seeded per-candidate
@@ -56,9 +60,23 @@ import {
     COMMITMENT_TTL_ROUNDS,
     DEFAULT_LAYER_FLAGS,
     FLAG_KEYS,
-    MODULE_ID
+    MODULE_ID,
+    MORALE_CONFIDENT_SPACE_CONTROL,
+    MORALE_DEFAULT_TIER,
+    MORALE_DESPERATE_LOSS_RATIO,
+    MORALE_DESPERATE_RECENT_LOSSES,
+    MORALE_DESPERATE_SPACE_CONTROL,
+    MORALE_HYSTERESIS_ROUNDS,
+    MORALE_LOSS_LOG_MAX,
+    MORALE_RECENT_LOSS_ROUNDS,
+    MORALE_SAFE_DANGER,
+    MORALE_TIERS
 } from "./constants.js";
-import { personalityWeightDelta } from "./personalities.js";
+import {
+    PERSONALITIES,
+    personalityBehaviorFlags,
+    personalityWeightDelta
+} from "./personalities.js";
 import { getLayerFlags, isManualOverrideGrace } from "./settings.js";
 
 /** Ordered ids of the planning funnel. */
@@ -135,13 +153,17 @@ export function resolveLayerFlags(context = {}) {
 }
 
 /**
- * Normalize a raw `morale` record (issue #26 reserved flag) into the
- * ternary posture view. Absent or damaged records mean normal morale.
- * @param {*} record Raw `{state, pressured?, desperate?}` payload.
+ * Normalize a raw `morale` record into the ternary posture view (issue
+ * #26). Accepts both the legacy stub `{state, pressured?, desperate?}`
+ * and the evaluated team record `{tier, state, counters, pending, ...}`
+ * — `state` leads, `tier` is the fallback. Absent or damaged records
+ * mean normal morale.
+ * @param {*} record Raw morale payload.
  * @returns {{state: string|null, pressured: boolean, desperate: boolean}}
  */
 export function moralePostureOf(record) {
-    const state = typeof record?.state === "string" ? record.state : null;
+    const state = typeof record?.state === "string" ? record.state
+        : (typeof record?.tier === "string" ? record.tier : null);
     return {
         state,
         pressured: record?.pressured === true || state === "pressured",
@@ -151,8 +173,9 @@ export function moralePostureOf(record) {
 
 /**
  * Read the raw morale record for one combatant: `context.morale`
- * injection wins (tests/integrations), then the reserved module flag
- * `flags["only-war-ai"].morale`.
+ * injection wins (tests/integrations), then the module flag
+ * `flags["only-war-ai"].morale` — either a manual posture stub or the
+ * evaluated team record the fireteam writes every round (issue #26).
  * @param {object|null} combatant
  * @param {object} [context] Planning context.
  * @returns {object|null}
@@ -165,28 +188,423 @@ export function readMoraleRecord(combatant, context = {}) {
 }
 
 /**
- * L2 morale — funnel entry point (stub for issue #26). When the layer is
- * enabled the resolved posture is reported on the trace and returned to
- * the caller; when disabled the layer degrades to a neutral posture and
- * reports `morale-layer-disabled`. Narrowing effects (task assignment,
- * posture factors) are #26's own work.
+ * Sanitize a persisted morale record into the evaluated shape (issue
+ * #26): `{version, teamId, combatId, round, tier, state, pressured,
+ * desperate, pending, leaderId, losses, initialStrength, counters}`.
+ * A manual stub `{state, pressured?, desperate?}` keeps working — it
+ * sanitizes to the matching bare record — and `null` is returned for
+ * anything unusable.
+ * @param {*} raw Raw flag/context payload.
+ * @returns {object|null}
+ */
+export function sanitizeMoraleRecord(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const tier = MORALE_TIERS.includes(raw.tier) ? raw.tier
+        : (MORALE_TIERS.includes(raw.state) ? raw.state
+            : (raw.desperate === true ? "desperate"
+                : (raw.pressured === true ? "pressured" : null)));
+    if (tier === null) return null;
+    const pending = raw.pending && MORALE_TIERS.includes(raw.pending.tier)
+        ? {
+            tier: raw.pending.tier,
+            count: Math.max(1, Number.isFinite(raw.pending.count)
+                ? Math.trunc(raw.pending.count) : 1)
+        }
+        : null;
+    const counters = raw.counters && typeof raw.counters === "object"
+        ? {
+            members: Number.isFinite(raw.counters.members) ? raw.counters.members : 0,
+            defeated: Number.isFinite(raw.counters.defeated) ? raw.counters.defeated : 0,
+            casualties: Number.isFinite(raw.counters.casualties) ? raw.counters.casualties : 0,
+            casualtiesRecent: Number.isFinite(raw.counters.casualtiesRecent)
+                ? raw.counters.casualtiesRecent : 0,
+            pinned: Number.isFinite(raw.counters.pinned) ? raw.counters.pinned : 0,
+            enemies: Number.isFinite(raw.counters.enemies) ? raw.counters.enemies : 0,
+            spaceControl: Number.isFinite(raw.counters.spaceControl)
+                ? raw.counters.spaceControl : null,
+            leaderDead: raw.counters.leaderDead === true
+        }
+        : null;
+    return {
+        version: Number.isFinite(raw.version) ? raw.version : 1,
+        teamId: typeof raw.teamId === "string" ? raw.teamId : null,
+        combatId: raw.combatId ?? null,
+        round: Number.isFinite(raw.round) ? raw.round : 0,
+        tier,
+        state: tier,
+        pressured: tier === "pressured",
+        desperate: tier === "desperate",
+        pending,
+        leaderId: raw.leaderId ?? null,
+        losses: (Array.isArray(raw.losses) ? raw.losses : [])
+            .filter(entry => Number.isFinite(entry))
+            .slice(-MORALE_LOSS_LOG_MAX),
+        initialStrength: Number.isFinite(raw.initialStrength) && raw.initialStrength > 0
+            ? raw.initialStrength : null,
+        counters
+    };
+}
+
+/**
+ * Whether a morale record is an evaluated team record (written by the
+ * fireteam evaluation of issue #26) rather than a manual posture stub —
+ * manual stubs are member-level overrides the team evaluation never
+ * overwrites.
+ * @param {*} record Raw morale payload.
+ * @returns {boolean}
+ */
+export function isEvaluatedMoraleRecord(record) {
+    return record !== null && typeof record === "object"
+        && Number.isFinite(record.version) && record.version >= 1
+        && typeof record.combatId !== "undefined"
+        && record.counters !== undefined;
+}
+
+/**
+ * Propose the morale tier from the counted battlefield picture (issue
+ * #26). Pure — the counters are gathered by the caller:
+ *
+ * - `desperate` — the enemy outnumbers the team, at least half of the
+ *   starting strength fell, `MORALE_DESPERATE_RECENT_LOSSES` members
+ *   died inside the recent window, every living member is pinned or the
+ *   space-control share collapsed to
+ *   `MORALE_DESPERATE_SPACE_CONTROL` or below;
+ * - `confident` — the team holds a headcount edge, nobody fell recently
+ *   and its own cells are mostly free of enemy threat coverage;
+ * - `pressured` — parity (the baseline, every other case).
+ *
+ * `counters.leaderDead` is read by {@link evaluateMoraleRecord}, which
+ * caps the proposal at `pressured` and forces the transition — a leader
+ * loss never leaves the team `confident`.
+ * @param {object} counters `{members, defeated, casualties,
+ *   casualtiesRecent, pinned, enemies, spaceControl, leaderDead,
+ *   initialStrength}`.
+ * @returns {string} One of `MORALE_TIERS`.
+ */
+export function proposeMoraleTier(counters = {}) {
+    const members = Number.isFinite(counters.members) ? counters.members : 0;
+    const enemies = Number.isFinite(counters.enemies) ? counters.enemies : 0;
+    const pinned = Number.isFinite(counters.pinned) ? counters.pinned : 0;
+    const casualties = Number.isFinite(counters.casualties) ? counters.casualties : 0;
+    const recent = Number.isFinite(counters.casualtiesRecent)
+        ? counters.casualtiesRecent : 0;
+    const initial = Number.isFinite(counters.initialStrength)
+        && counters.initialStrength > 0
+        ? counters.initialStrength
+        : members + casualties;
+    const space = Number.isFinite(counters.spaceControl)
+        ? counters.spaceControl : null;
+    if ((enemies > 0 && enemies > members)
+        || (initial > 0 && casualties >= initial * MORALE_DESPERATE_LOSS_RATIO)
+        || recent >= MORALE_DESPERATE_RECENT_LOSSES
+        || (members > 0 && pinned >= members)
+        || (space !== null && space <= MORALE_DESPERATE_SPACE_CONTROL)) {
+        return "desperate";
+    }
+    if (members > 0 && members > enemies && recent === 0
+        && !(members > 0 && pinned >= members)
+        && (space === null || space >= MORALE_CONFIDENT_SPACE_CONTROL)) {
+        return "confident";
+    }
+    return MORALE_DEFAULT_TIER;
+}
+
+/**
+ * Space-control share for the morale counters (issue #26, threat map
+ * #16): the fraction of sampled points whose aggregated enemy danger
+ * stays under {@link MORALE_SAFE_DANGER} — "the share of our cells that
+ * is ours". `null` when nothing is measurable (no points, no probe).
+ * @param {object[]} points Sampled positions `{x, y}` (member cells).
+ * @param {Function|null} dangerAt Threat-map probe `({x,y}) => 0..1`.
+ * @param {number} [safeDanger] Danger ceiling of an "our" cell.
+ * @returns {number|null} Share `0..1` or null.
+ */
+export function moraleSpaceControl(points, dangerAt, safeDanger = MORALE_SAFE_DANGER) {
+    const list = (Array.isArray(points) ? points : [])
+        .filter(p => Number.isFinite(p?.x) && Number.isFinite(p?.y));
+    if (!list.length || typeof dangerAt !== "function") return null;
+    const ceiling = Number.isFinite(safeDanger) ? safeDanger : MORALE_SAFE_DANGER;
+    let safe = 0;
+    for (const point of list) {
+        let danger = 0;
+        try {
+            danger = Number(dangerAt(point));
+        } catch(_err) {
+            danger = 0;
+        }
+        if (!(danger >= ceiling)) safe++;
+    }
+    return Math.round((safe / list.length) * 1e4) / 1e4;
+}
+
+/**
+ * Advance the evaluated morale record one round (issue #26): the
+ * counted picture proposes a tier, the hysteresis gate
+ * ({@link MORALE_HYSTERESIS_ROUNDS} consecutive rounds of the same
+ * proposal) commits it, and a leader loss forces the transition
+ * immediately (the proposal is capped at `pressured` — never
+ * `confident`). The loss log grows by every member lost since the
+ * previous evaluation; `casualtiesRecent` counts the entries inside
+ * {@link MORALE_RECENT_LOSS_ROUNDS}.
+ * @param {object|null} previous Sanitized previous record.
+ * @param {object} counters Fresh counters (see {@link proposeMoraleTier}).
+ * @param {object} meta
+ * @param {number} meta.round Combat round of this evaluation.
+ * @param {*} [meta.combatId] Owning combat id.
+ * @param {string|null} [meta.teamId] Owning team id.
+ * @param {string|null} [meta.leaderId] Elected leader this round.
+ * @param {number} [meta.hysteresis] Required consecutive proposals.
+ * @returns {object} New sanitized record.
+ */
+export function evaluateMoraleRecord(previous, counters = {}, meta = {}) {
+    const prev = sanitizeMoraleRecord(previous);
+    const round = Number.isFinite(meta.round) ? meta.round : 0;
+    const count = Math.max(1, Number.isFinite(meta.hysteresis)
+        ? Math.trunc(meta.hysteresis) : MORALE_HYSTERESIS_ROUNDS);
+    const members = Number.isFinite(counters.members) ? counters.members : 0;
+    const defeated = Number.isFinite(counters.defeated) ? counters.defeated : 0;
+    const initialStrength = prev?.initialStrength
+        ?? Math.max(1, members + defeated);
+    // The loss log appends every member that fell since the last
+    // evaluation — `casualties` is cumulative, `casualtiesRecent` is
+    // the sliding-window view.
+    const losses = [...(prev?.losses ?? [])];
+    const previouslyCounted = prev?.counters?.defeated ?? 0;
+    const freshLosses = Math.max(0, defeated - previouslyCounted);
+    for (let i = 0; i < freshLosses && losses.length < MORALE_LOSS_LOG_MAX; i++) {
+        losses.push(round);
+    }
+    const casualtiesRecent = losses
+        .filter(at => round - at < MORALE_RECENT_LOSS_ROUNDS).length;
+    const leaderId = meta.leaderId ?? null;
+    const leaderDead = counters.leaderDead === true
+        || (prev?.leaderId != null && leaderId != null
+            && prev.leaderId !== leaderId);
+    const next = {
+        members,
+        defeated,
+        casualties: defeated,
+        casualtiesRecent,
+        pinned: Number.isFinite(counters.pinned) ? counters.pinned : 0,
+        enemies: Number.isFinite(counters.enemies) ? counters.enemies : 0,
+        spaceControl: Number.isFinite(counters.spaceControl)
+            ? counters.spaceControl : null,
+        leaderDead,
+        initialStrength
+    };
+    let proposal = proposeMoraleTier(next);
+    let tier = prev?.tier ?? MORALE_DEFAULT_TIER;
+    let pending = prev?.pending ?? null;
+    const leaderChanged = leaderDead === true
+        && (prev?.leaderId == null || prev.leaderId !== leaderId);
+    if (leaderChanged && proposal === "confident") {
+        proposal = MORALE_DEFAULT_TIER;
+    }
+    if (proposal === tier) {
+        pending = null;
+    } else if (leaderChanged) {
+        // Forced transition: a leader loss commits the (capped) proposal
+        // immediately — the team reels, it does not wait for hysteresis.
+        tier = proposal;
+        pending = null;
+    } else {
+        pending = pending?.tier === proposal
+            ? { tier: proposal, count: pending.count + 1 }
+            : { tier: proposal, count: 1 };
+        if (pending.count >= count) {
+            tier = proposal;
+            pending = null;
+        }
+    }
+    return sanitizeMoraleRecord({
+        version: 1,
+        teamId: meta.teamId ?? prev?.teamId ?? null,
+        combatId: meta.combatId ?? prev?.combatId ?? null,
+        round,
+        tier,
+        pending,
+        leaderId: leaderId ?? prev?.leaderId ?? null,
+        losses,
+        initialStrength,
+        counters: next
+    });
+}
+
+/**
+ * Member-effective morale tier (issue #26): the team tier is one, but
+ * trait exceptions re-interpret it for a single bot — a `fanatic`
+ * (`flags.ignoreRegroup`) never acknowledges `desperate` and keeps its
+ * posture at `pressured`, a `cowardly` (`flags.fragileMorale`) reads
+ * mere `pressured` as `desperate`. The fanatic exception wins ties.
+ * @param {string|null} tier Team tier (`MORALE_TIERS` or null).
+ * @param {string[]} [traits] Resolved trait ids of the member.
+ * @returns {string|null}
+ */
+export function effectiveMoraleTier(tier, traits = []) {
+    if (!MORALE_TIERS.includes(tier)) return null;
+    const flags = personalityBehaviorFlags(traits);
+    if (tier === "desperate" && flags.ignoreRegroup === true) {
+        return MORALE_DEFAULT_TIER;
+    }
+    if (tier === "pressured"
+        && (traits ?? []).some(id => PERSONALITIES[id]?.flags?.fragileMorale === true)) {
+        return "desperate";
+    }
+    return tier;
+}
+
+/**
+ * Ternary booleans of a tier — the effective-posture view used by the
+ * member-facing narrowing (task remap, weight shifts, delay gate).
+ * @param {string|null} tier
+ * @returns {{pressured: boolean, desperate: boolean, confident: boolean}}
+ */
+export function moralePostureOfTier(tier) {
+    return {
+        pressured: tier === "pressured",
+        desperate: tier === "desperate",
+        confident: tier === "confident"
+    };
+}
+
+/**
+ * Bounded posture weight deltas of L2 (issue #26): the morale layer is
+ * a dramatic axis, not a second scorer — each effective tier nudges a
+ * handful of factor weights inside a small bound.
+ *
+ * - `confident` — pushes assault/charge/advance and accepts exposure;
+ * - `desperate` — postpones charges, pulls toward cover/regroup/hold;
+ * - `pressured` — the baseline, no shift.
+ */
+export const MORALE_TIER_WEIGHT_DELTAS = Object.freeze({
+    confident: Object.freeze({
+        charge: 6,
+        advance: 3,
+        attackAfterMove: 2,
+        meleeEngage: 3,
+        holdPosition: -3,
+        cover: -3,
+        overwatch: -1
+    }),
+    desperate: Object.freeze({
+        charge: -8,
+        advance: -4,
+        meleeEngage: -4,
+        attackNow: -2,
+        proximity: -3,
+        cover: 4,
+        holdPosition: 3,
+        cohesionRestore: 8,
+        overwatch: 2
+    }),
+    pressured: Object.freeze({})
+});
+
+/**
+ * Apply the L2 posture weight shift (issue #26): additive deltas of the
+ * effective tier over the scoring weights. Pure — returns the input map
+ * unchanged for the baseline tier or an unknown tier.
+ * @param {object} weights Base weight map (never mutated).
+ * @param {string|null} effectiveTier Member-effective tier.
+ * @returns {{weights: object, deltas: object}} Effective weights and
+ *   the applied delta map (empty at baseline).
+ */
+export function applyMoraleWeightShift(weights, effectiveTier) {
+    const deltas = MORALE_TIER_WEIGHT_DELTAS[effectiveTier] ?? {};
+    const next = { ...(weights ?? {}) };
+    const applied = {};
+    for (const [key, delta] of Object.entries(deltas)) {
+        if (!Number.isFinite(delta) || delta === 0) continue;
+        applied[key] = delta;
+        next[key] = (Number.isFinite(next[key]) ? next[key] : 0) + delta;
+    }
+    return { weights: next, deltas: applied };
+}
+
+/**
+ * Compact plan-intent summary for telegraphing (issue #26): the
+ * step-type chain of a serialized plan without the trailing
+ * `end-turn` — e.g. `["move", "attack"]` rendered downstream as
+ * "Move → Attack".
+ * @param {object|null} plan Serialized plan.
+ * @returns {{steps: string[], total: number}}
+ */
+export function planIntentOf(plan) {
+    const steps = (Array.isArray(plan?.steps) ? plan.steps : [])
+        .map(step => step?.type)
+        .filter(type => typeof type === "string" && type !== "end-turn");
+    return {
+        steps,
+        total: Math.max(steps.length, Array.isArray(plan?.steps) ? plan.steps.length : 0)
+    };
+}
+
+/**
+ * L2 morale — funnel entry point (issue #26). The layer resolves the
+ * team tier from the combatant's `morale` record (evaluated flag or
+ * injected `context.morale`), derives the member's *effective* tier
+ * through the trait exceptions (`input.traits` — resolved personality
+ * ids, defaulting to the combatant's flag list) and reports both on the
+ * trace. The team tier alone feeds `expectedState.morale` — a tier
+ * change is a commitment invalidator; the effective tier drives the
+ * member-facing narrowing (task remap in the fireteam, posture weight
+ * deltas in the scoring pass). When disabled the layer degrades to a
+ * neutral posture and reports `morale-layer-disabled`.
  * @param {object} input
  * @param {object|null} input.combatant Active combatant document.
  * @param {object} [input.context] Planning context.
  * @param {object} [input.flags] Resolved layer flags.
  * @param {object|null} [input.diagnostics] Plan diagnostics record.
- * @returns {{enabled: boolean, state: string|null, pressured: boolean,
- *   desperate: boolean}}
+ * @param {string[]} [input.traits] Resolved member trait ids — wins
+ *   over the `flags["only-war-ai"].personality` list.
+ * @returns {{enabled: boolean, state: string|null, tier: string|null,
+ *   effectiveTier: string|null, pressured: boolean, desperate: boolean,
+ *   confident: boolean, effective: {pressured: boolean,
+ *   desperate: boolean, confident: boolean}}}
  */
 export function applyMoraleLayer({ combatant = null, context = {},
-    flags = {}, diagnostics = null } = {}) {
+    flags = {}, diagnostics = null, traits = null } = {}) {
     if (flags.morale !== true) {
         recordLayerReason(diagnostics, "L2", "morale-layer-disabled");
-        return { enabled: false, state: null, pressured: false, desperate: false };
+        return {
+            enabled: false,
+            state: null,
+            tier: null,
+            effectiveTier: null,
+            pressured: false,
+            desperate: false,
+            confident: false,
+            effective: { pressured: false, desperate: false, confident: false }
+        };
     }
-    const posture = moralePostureOf(readMoraleRecord(combatant, context));
-    recordLayerReason(diagnostics, "L2", "morale-posture", posture);
-    return { enabled: true, ...posture };
+    const record = readMoraleRecord(combatant, context);
+    const posture = moralePostureOf(record);
+    const tier = moraleTierOf(posture);
+    const memberTraits = Array.isArray(traits) ? traits
+        : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.personality)
+            ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.personality]);
+    const effectiveTier = effectiveMoraleTier(tier, memberTraits);
+    const effective = moralePostureOfTier(effectiveTier);
+    recordLayerReason(diagnostics, "L2", "morale-posture", {
+        tier,
+        effectiveTier,
+        pressured: posture.pressured,
+        desperate: posture.desperate,
+        confident: posture.state === "confident"
+    });
+    return {
+        enabled: true,
+        state: posture.state,
+        // The team tier — `moraleTierOf` consumes `pressured`/`desperate`/
+        // `tier`/`state`, so `expectedState.morale` and the live
+        // validation view stay on the team level.
+        tier,
+        effectiveTier,
+        pressured: posture.pressured,
+        desperate: posture.desperate,
+        confident: posture.state === "confident",
+        effective
+    };
 }
 
 /* ------------------------------------------------------------------ */
@@ -270,8 +688,10 @@ export function sanitizeCommittedPlan(raw) {
         expectedState: {
             self,
             target,
-            morale: expected.morale === "pressured"
-                || expected.morale === "desperate" ? expected.morale : null,
+            // Issue #26: every real tier travels — a posture change of
+            // any kind invalidates the commitment.
+            morale: MORALE_TIERS.includes(expected.morale)
+                ? expected.morale : null,
             threats
         },
         cancelledReason: typeof raw.cancelledReason === "string"
@@ -416,15 +836,22 @@ export function isGmControlled(combatant, round) {
 }
 
 /**
- * Compact morale tier stored in `expectedState.morale` (issue #25):
- * `"desperate" | "pressured" | null`. Graceful #26 integration — an
- * absent morale flag means the neutral (null) tier.
- * @param {{pressured?: boolean, desperate?: boolean}|null} posture
+ * Compact morale tier stored in `expectedState.morale` (issues
+ * #25/#26): `"confident" | "desperate" | "pressured" | null`. Reads the
+ * posture view (`{state, pressured, desperate}`), a raw record
+ * (`{tier, state}`) or an {@link applyMoraleLayer} result — an absent
+ * morale flag means the neutral (null) tier.
+ * @param {{pressured?: boolean, desperate?: boolean, confident?:
+ *   boolean, state?: string|null, tier?: string|null}|null} posture
  * @returns {string|null}
  */
 export function moraleTierOf(posture) {
-    if (posture?.desperate === true) return "desperate";
-    if (posture?.pressured === true) return "pressured";
+    if (posture?.desperate === true || posture?.tier === "desperate"
+        || posture?.state === "desperate") return "desperate";
+    if (posture?.pressured === true || posture?.tier === "pressured"
+        || posture?.state === "pressured") return "pressured";
+    if (posture?.confident === true || posture?.tier === "confident"
+        || posture?.state === "confident") return "confident";
     return null;
 }
 

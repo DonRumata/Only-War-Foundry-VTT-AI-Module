@@ -512,10 +512,17 @@ Pipeline планирования переформализован как вло
   `target-gone`, `morale-changed`, `threat-drift`, `combat-ended`,
   `l0-veto`) → отмена + обычный реплан. Подробности — ниже, «L1
   commitment (issue #25)».
-- **L2 morale** — `applyMoraleLayer` резолвит позу из зарезервированного
-  флага `morale`/`context.morale` и пишет её в trace; сужающих эффектов
-  до #26 нет (легаси-чтения #38 — sync-delay/orderBoost — остаются
-  безусловными).
+- **L2 morale** — `applyMoraleLayer` (issue #26): общий тир позы
+  файртимы (`confident`/`pressured`/`desperate`) из evaluated-рекорда
+  флага `morale` (счётчики команды, гистерезис 2 раунда, форс при гибели
+  лидера — пишет `buildTeamPlan` на всех членов, только controller) →
+  member-effective tier через исключения черт (`fanatic` игнорирует
+  `desperate`, `cowardly` эскалирует `pressured`) → bounded-дельты
+  `MORALE_POSTURE_DELTAS` на веса (`morale-weight-shift`) + remap задач
+  в `buildTeamPlan` (confident — шире assault/flank, desperate-member —
+  assault→support, flank/advance→regroup; `moraleDemotions`) и снятие
+  sync-delay для desperate-members. Смена тира инвалидирует commitment
+  (`morale-changed`). Легаси-чтение `orderBoost` остаётся безусловным.
 - **L3 personalities** — дельты #19 через `boundedPersonalityOverlay`:
   каждая дельта зажата в ±30% от базового веса (нулевая база — ±6 от
   опорной шкалы 20); зажатые факторы репортятся

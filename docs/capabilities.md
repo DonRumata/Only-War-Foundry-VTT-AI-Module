@@ -422,6 +422,35 @@ execute: расхождение — `stale-state` (перемещение, см�
   (default 2) ограничивает повторные ожидания. Приказ исполняется как
   обычный `test`-шаг (`type:"skill", key:"command", flags.isOrder`),
   успех пишет `lastOrder {round, orderId, result}`.
+- **Мораль отряда (issue #26, слой L2)**: `buildTeamPlan` раз в ход
+  оценивает командную позу `confident | pressured | desperate` по
+  счётчикам — численность членов/врагов, суммарные и свежие потери
+  (журнал `losses` за 3 раунда), все-прижаты, доля безопасных опорных
+  точек (`spaceControl` через threat-map), гибель лидера. Смена тира —
+  гистерезис 2 раунда (`pending` в записи); гибель флагged-лидера
+  форсирует переход мгновенно и никогда в confident. Evaluated-рекорд
+  `{tier, pending, counters, losses, leaderId, combatId, round, state}`
+  пишется controller'ом на флаг `morale` всех живых членов; ручные
+  stub-записи `{state}` — членские оверрайды, не перезатираются.
+  `context.morale` — чистая инъекция без оценки/записей.
+- **Эффекты позы**: `confident` — до двух assault + до двух flank;
+  `desperate`-member ремаппится assault→support, flank/advance→regroup
+  (`diagnostics.moraleDemotions`), не ждёт синхро-удара и сдвигает свой
+  скоринг bounded-дельтами `MORALE_POSTURE_DELTAS` (тяга к укрытию/
+  удержанию/связности, давление charge/melee); `pressured` — baseline.
+  Личные исключения читают только member-effective tier: `fanatic`
+  игнорирует `desperate`, `cowardly` читает `pressured` как `desperate` —
+  командная поза одна и не меняется. Смена тира инвалидирует
+  committed-план (`morale-changed`, issue #25). Тумблер —
+  `layersMorale` (default `true`): выкл — ни оценки, ни записей, ни
+  ремапа/дельт.
+- **Barks (issue #26)**: короткие чат-фразы телеграфируют намерения —
+  коммитнутый переход тира (`OWAI.Bark.Morale.<tier>`, дедуп на
+  бой/команду/раунд/тир) и старт свежего многоходового commitment
+  (`OWAI.Bark.Plan.Start` с цепочкой шагов, дедуп на боевую единицу/
+  раунд). Настройки: `aiBarks` (default `true` — мастер-тумблер),
+  `barksToPlayers` (default `false` — GM-шёпот, `true` — видит весь
+  стол). `context.barks === false` гасит план-разово.
 
 ### Preview (issue #409)
 
@@ -432,9 +461,15 @@ execute: расхождение — `stale-state` (перемещение, см�
   авто-отменяет; stale — баннер + disabled Confirm.
 - Canvas-оверлей плана (issue #29, сервис `planOverlay`): GM-only
   PIXI-визуализация previewed-плана — маршрутная полилиния со стрелкой,
-  конусы `template`/`overwatch`, круг blast `targetPoint`, подсветка цели.
-  Рисуется на open/replan/stale, чистится любым решением или снятием
-  сессии; документы не трогает, игрокам и не-контроллерам не виден.
+  конусы `template`/`overwatch`, круг blast `targetPoint`, подсветка цели,
+  маркер замысла `шаг/total` над токеном, тонированный тиром морали
+  (issue #26). Рисуется на open/replan/stale, чистится любым решением или
+  снятием сессии; документы не трогает, игрокам и не-контроллерам не
+  виден.
+- Телеграфирование в диалоге (issue #26): строка «Замысел» — цепочка
+  типов шагов плана (`planIntentOf`, без `end-turn`), строка «Мораль
+  отряда» — командный тир (+ effective-тир, когда черты члена его
+  смещают).
 - Нет «подтвердить команду»/«подтвердить раунд» — только per-бот.
 
 ### Отладка (issue #36)

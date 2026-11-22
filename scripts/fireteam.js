@@ -32,6 +32,7 @@
  *   so the service works before/without the other stacked branches.
  */
 import {
+    AI_DIFFICULTIES,
     AI_PRESETS,
     DEFAULT_MAX_SYNC_ROUNDS,
     DEFAULT_PREFERRED_COHESION,
@@ -39,17 +40,32 @@ import {
     FIRETEAM_TASKS,
     FLAG_KEYS,
     MODULE_ID,
+    MORALE_DEFAULT_TIER,
     ORDER_COOLDOWN_ROUNDS
 } from "./constants.js";
 import { resolveEffectiveConfig } from "./config-resolver.js";
-import { isGmControlled } from "./layers.js";
+import {
+    effectiveMoraleTier,
+    evaluateMoraleRecord,
+    isEvaluatedMoraleRecord,
+    isGmControlled,
+    moraleSpaceControl,
+    resolveLayerFlags,
+    sanitizeMoraleRecord
+} from "./layers.js";
+import { personalityIdentity, resolvePersonality } from "./personalities.js";
 import { isHostileDisposition, mergeTeamMemory } from "./perception.js";
 import {
     createPlannerService,
     fnv1a,
     stableStringify
 } from "./planner.js";
-import { getPreferredCohesion, logDiagnostics } from "./settings.js";
+import { emitBarkOnce } from "./barks.js";
+import {
+    getAIDifficulty,
+    getPreferredCohesion,
+    logDiagnostics
+} from "./settings.js";
 import { weaponEmitters } from "./threat-map.js";
 import {
     SPEC_OPS_PRESET_ID,
@@ -117,6 +133,30 @@ const DETACHED_TASKS = Object.freeze(new Set(["flank", "assault"]));
  * the rest of the team plan degrades instead of collapsing.
  */
 const GM_DEMOTABLE_TASKS = Object.freeze(new Set(["flank", "assault", "advance"]));
+
+/**
+ * Issue #26 L2 morale: the task remap each member-effective tier applies
+ * after the default assignment — a `desperate` bot pulls out of the
+ * assault column into covering `support` and turns `flank`/`advance`
+ * orders into a `regroup` back to the fallback point, while
+ * `confident`/`pressured` keep their assignments (`confident` widens
+ * the assault/flank caps inside `assignTasks` instead). Same precedence
+ * as the `gm-controlled` demotion: the remap also rewrites explicit
+ * `context.assignments`.
+ */
+const MORALE_TASK_REMAP = Object.freeze({
+    desperate: Object.freeze({ assault: "support", advance: "regroup", flank: "regroup" }),
+    pressured: Object.freeze({}),
+    confident: Object.freeze({})
+});
+
+/**
+ * Issue #26: assignment caps a `confident` team gets — a second assault
+ * column and a wider flank group (the `pressured`/`desperate` default
+ * is the historical one-assault-leader plus at most one flanker).
+ */
+const MORALE_CONFIDENT_ASSAULT_CAP = 2;
+const MORALE_CONFIDENT_FLANK_CAP = 2;
 
 /**
  * Normalize a Foundry collection/Map/array/iterable into a plain array.
@@ -437,8 +477,10 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
  * whose plan already strikes `convergence.targetId` hold position
  * instead: their plan is replaced by a delay-stub, so the squad strikes
  * together once the flank is in position. Guards: the flanker itself is
- * never delayed, a morale-`desperate` member (graceful #26 flag, absent
- * reads normal) keeps fighting and `maxSyncRounds` bounds consecutive
+ * never delayed, a morale-`desperate` member (issue #26 effective tier —
+ * a `fanatic` in a desperate team still waits, a `coward` in a merely
+ * pressured one does not; the legacy flag read is the fallback) keeps
+ * fighting and `maxSyncRounds` bounds consecutive
  * delays through the `delaySync` flag record the executor's delay step
  * writes. `context.syncDelay === false` disables the pass.
  * @param {object} input
@@ -450,10 +492,12 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
  * @param {object} input.context `buildTeamPlan` context.
  * @param {object} input.diagnostics Diagnostics sink (`syncDelays`).
  * @param {string} input.teamId Team id.
+ * @param {Map<string,string>} [input.memberMorale]
+ *   `combatantId → effective tier` from the team evaluation.
  * @returns {Map} `combatantId → {reason, until, syncRound, awaitId}`.
  */
 function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
-    diagnostics, teamId }) {
+    diagnostics, teamId, memberMorale = null }) {
     const result = new Map();
     if (context?.syncDelay === false) return result;
     if (!convergence?.targetId) return result;
@@ -485,9 +529,15 @@ function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
                     || step?.input?.targetTokenUuid
                         === (convergence.targetUuid ?? convergence.targetId)));
         if (!strikesTarget) continue;
-        // Graceful #26 hook: a morale-desperate member cannot be trusted
-        // to hold position for the synchronized strike — it fights on.
-        if (_moraleOf(member.combatant, context).desperate) continue;
+        // Issue #26: a member whose *effective* morale tier is `desperate`
+        // cannot be trusted to hold position for the synchronized
+        // strike — it fights on. The effective map carries the team
+        // evaluation; the legacy flag read is the fallback.
+        const effectiveTier = memberMorale?.get?.(member.combatantId);
+        const desperate = effectiveTier != null
+            ? effectiveTier === "desperate"
+            : _moraleOf(member.combatant, context).desperate;
+        if (desperate) continue;
         // The `delaySync` flag counts consecutive delays for the same
         // `until` condition — beyond `maxSyncRounds` the member stops
         // waiting and attacks anyway.
@@ -812,21 +862,34 @@ export function createFireteamService({
         const explicit = context.assignments && typeof context.assignments === "object"
             ? context.assignments : null;
         const allowFlank = context.allowFlank !== false && sorted.length >= 2;
-        let flankAssigned = false;
+        const assaultCap = Math.max(1, _finiteOr(context.assaultCap, 1));
+        const flankCap = Math.max(0, _finiteOr(context.flankCap, 1));
+        // `assaultCap` counts the leader's own assault slot: the
+        // non-leader quota is what remains once the leader is placed
+        // (a leaderless call lets the first member lead the push).
+        const leaderPresent = sorted.some(
+            member => member.combatantId === context.leaderId);
+        const assaultQuota = Math.max(0, assaultCap - (leaderPresent ? 1 : 0));
+        let assaultAssigned = 0;
+        let flankAssigned = 0;
         return sorted.map(member => {
             let task = null;
             const forced = explicit?.[member.combatantId];
             if (typeof forced === "string") task = forced;
             else if (context.regroup === true) task = "regroup";
             else if (member.combatantId === context.leaderId) task = "assault";
-            else if (allowFlank && !flankAssigned) {
-                task = "flank";
-                flankAssigned = true;
-            } else {
+            else if (assaultAssigned < assaultQuota) task = "assault";
+            else if (allowFlank && flankAssigned < flankCap) task = "flank";
+            else {
                 task = "support";
             }
             if (!FIRETEAM_TASKS.includes(task)) task = "support";
-            if (task === "flank") flankAssigned = true;
+            // The quota counts non-leader assaults only — the leader's
+            // own slot is separate (`assaultQuota` already excludes it).
+            if (task === "assault" && member.combatantId !== context.leaderId) {
+                assaultAssigned++;
+            }
+            if (task === "flank") flankAssigned++;
             const groupId = task === "flank" ? "flank-1" : "main";
             // Issue #16: a convergent objective may restrict the shared
             // target to the members that actually contribute kill-EV
@@ -1599,6 +1662,285 @@ export function createFireteamService({
         return typeof source === "object" ? source : null;
     }
 
+    // --- L2 morale (issue #26) ------------------------------------------------
+
+    /** Dedup keys of already-emitted morale barks (`combat|team|round|tier`). */
+    const _barkSeen = new Set();
+
+    /**
+     * Status ids of one member for the morale counters: merged
+     * `actor.statuses`/`token.statuses` views, mirroring the planner's
+     * `_selfStatuses` sources (Set/array/{id: truthy} map).
+     * @param {object} member Member entry of {@link collectMembers}.
+     * @returns {string[]}
+     */
+    function _memberStatusIds(member) {
+        const ids = new Set();
+        const push = source => {
+            if (!source) return;
+            if (typeof source[Symbol.iterator] === "function") {
+                for (const id of source) ids.add(String(id));
+            } else if (typeof source === "object") {
+                for (const key of Object.keys(source)) {
+                    if (source[key]) ids.add(String(key));
+                }
+            }
+        };
+        const doc = _tokenDoc(member.combatant?.token)
+            ?? _tokenDoc(member.token);
+        push(member.combatant?.actor?.statuses);
+        push(doc?.statuses);
+        push(doc?.actor?.statuses);
+        push(member.statuses);
+        return [...ids];
+    }
+
+    /**
+     * Resolved personality trait ids of one member — the same inputs the
+     * member's own `planTurn` will see (explicit context override,
+     * flagged list, team character, difficulty, seeded generation), so
+     * the effective-tier map here matches the L2 view inside every
+     * member plan.
+     * @param {object} member Member entry of {@link collectMembers}.
+     * @param {string|null} character Team character.
+     * @param {object} context `buildTeamPlan` context.
+     * @returns {string[]}
+     */
+    function _memberTraits(member, character, context = {}) {
+        try {
+            const config = resolveConfig(member.combatant);
+            const difficulty = AI_DIFFICULTIES.includes(context.difficulty)
+                ? context.difficulty : getAIDifficulty();
+            return resolvePersonality({
+                explicit: context.personality,
+                flagged: config?.personality,
+                character,
+                difficulty,
+                identity: personalityIdentity({
+                    combatant: member.combatant,
+                    token: _tokenDoc(member.combatant?.token)
+                        ?? _tokenDoc(member.token),
+                    actor: member.combatant?.actor
+                })
+            }).traits;
+        } catch(err) {
+            return [];
+        }
+    }
+
+    /**
+     * Space-control counter (issue #26): `context.spaceControl`
+     * injection wins; otherwise the share of member cells whose
+     * aggregated enemy danger stays under the safe ceiling — measured
+     * on the threat-map service's current map, or a fresh map built
+     * over the visible hostiles. `null` when nothing is measurable.
+     * @param {object} input
+     * @param {object[]} input.members Living member entries.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @param {object|null} input.scene Scene for token/grid lookup.
+     * @returns {number|null}
+     */
+    function _spaceControlOf({ members, combat, context, scene }) {
+        if (Number.isFinite(context?.spaceControl)) {
+            return Math.max(0, Math.min(1, context.spaceControl));
+        }
+        const points = members
+            .map(member => member.position)
+            .filter(p => p && Number.isFinite(p.x) && Number.isFinite(p.y));
+        if (!points.length) return null;
+        const service = _service("threatMap", context?.threatMap);
+        if (!service) return null;
+        const current = typeof service.map === "function" ? service.map() : null;
+        if (current && typeof current.dangerAt === "function") {
+            return moraleSpaceControl(points, point => current.dangerAt(point));
+        }
+        if (typeof service.buildMap === "function") {
+            try {
+                const targets = _convergentTargets({ members, combat, context });
+                const map = service.buildMap({
+                    targets,
+                    combat,
+                    scene: scene ?? combat?.scene ?? null,
+                    grid: context?.grid ?? combat?.scene?.grid ?? null
+                });
+                if (map && typeof map.dangerAt === "function") {
+                    return moraleSpaceControl(points, point => map.dangerAt(point));
+                }
+            } catch(err) {
+                // Space control is one counter — never block the plan on it.
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Persist the evaluated morale record on every living member's
+     * `morale` flag (controller-only — `buildTeamPlan` already passed
+     * the authority gate). Members carrying a *manual* posture stub
+     * (a record without the evaluated shape) keep it as their
+     * member-level override; identical rewrites are skipped.
+     * @param {object[]} members Living member entries.
+     * @param {object} record Sanitized evaluated record.
+     * @returns {Promise<boolean>} Whether any flag was written.
+     */
+    async function _writeMoraleRecords(members, record) {
+        let wrote = false;
+        const wanted = stableStringify(record);
+        for (const member of members) {
+            const existing = _readFlag(member.combatant, FLAG_KEYS.morale);
+            if (existing != null && !isEvaluatedMoraleRecord(existing)) continue;
+            if (existing != null && stableStringify(existing) === wanted) continue;
+            try {
+                await member.combatant?.setFlag?.(
+                    MODULE_ID, FLAG_KEYS.morale, record);
+                wrote = true;
+            } catch(err) {
+                // Flag bookkeeping is best-effort — the context-side
+                // record still drives this plan.
+            }
+        }
+        return wrote;
+    }
+
+    /**
+     * Chat bark for a committed morale-tier transition (issue #26): the
+     * phrase is emitted at most once per `combat|team|round|tier` so a
+     * same-round rebuild never repeats it. GM whisper by default —
+     * `barksToPlayers` opens it to the table.
+     * @param {object|null} previous Previous sanitized record.
+     * @param {object} record Committed record.
+     * @param {object} input
+     * @param {object|null} input.combat Combat document (round + id).
+     * @param {string} input.teamId Team id for the localized phrase.
+     * @param {object} input.context Build context (bark kill switches).
+     * @returns {Promise<boolean>}
+     */
+    async function _barkMoraleChange(previous, record, { combat, teamId, context }) {
+        const from = previous?.tier ?? null;
+        const to = record?.tier ?? null;
+        if (!to || from === to) return false;
+        // The very first evaluation writing the baseline record is not
+        // news — only an actual posture change telegraphs.
+        if (from === null && to === MORALE_DEFAULT_TIER) return false;
+        const round = _finiteOr(combat?.round, 0);
+        return emitBarkOnce(_barkSeen,
+            `${combat?.id ?? "combat"}|${teamId}|${round}|${to}`, {
+                key: `OWAI.Bark.Morale.${to}`,
+                data: { team: teamId, from, to },
+                speaker: `AI ${teamId}`,
+                context,
+                flags: { morale: { teamId, from, to, round } }
+            });
+    }
+
+    /**
+     * Evaluate the team's L2 morale for this round (issue #26): read the
+     * previous evaluated record (first member carrying one), count the
+     * battlefield picture, run the hysteresis gate, persist the record
+     * on the members and bark a committed transition. An injected
+     * `context.morale` skips evaluation/writes entirely (the caller
+     * owns the posture) and `layers.morale === false` disables the
+     * whole pass — legacy manual flags keep working through the
+     * unconditional reads either way.
+     * @param {object} input
+     * @param {object} input.combat Combat document.
+     * @param {string} input.teamId Team id.
+     * @param {object[]} input.members Living enabled members.
+     * @param {object[]} input.allMembers Every team combatant
+     *   (defeated included — the casualty counters).
+     * @param {object} input.context `buildTeamPlan` context.
+     * @param {object} input.teamRef Normalized team reference.
+     * @param {string} input.leaderId Elected leader this round.
+     * @param {object|null} input.scene Scene for the space probe.
+     * @param {string|null} input.character Team character.
+     * @returns {Promise<{record: object|null, tier: string|null,
+     *   effective: Map<string,string|null>, wrote: boolean,
+     *   barked: boolean, diagnostics: object}>}
+     */
+    async function _teamMorale({ combat, teamId, members, allMembers,
+        context, teamRef, leaderId, scene, character }) {
+        const result = {
+            record: null,
+            tier: null,
+            effective: new Map(),
+            wrote: false,
+            barked: false,
+            diagnostics: { enabled: false, tier: null }
+        };
+        if (resolveLayerFlags(context).morale !== true) return result;
+        result.diagnostics = { enabled: true, tier: null };
+        const round = _finiteOr(combat?.round, 0);
+        const combatId = combat?.id ?? null;
+        let record = null;
+        if (context?.morale !== undefined) {
+            record = sanitizeMoraleRecord(context.morale);
+        } else {
+            const previous = sanitizeMoraleRecord(
+                members.map(member => _readFlag(member.combatant, FLAG_KEYS.morale))
+                    .find(raw => isEvaluatedMoraleRecord(raw)));
+            if (previous && previous.combatId === combatId
+                && previous.round === round) {
+                // Already evaluated this round — a rebuild replays the
+                // committed posture, it does not re-run the hysteresis.
+                record = previous;
+            } else {
+                const wantedLeader = context.leaderId ?? teamRef.leaderId;
+                const flaggedLeader = wantedLeader != null
+                    ? (allMembers ?? members).find(member =>
+                        (member.ids ?? []).includes(wantedLeader))
+                    : null;
+                const counters = {
+                    members: members.length,
+                    defeated: (allMembers ?? members)
+                        .filter(member => member.defeated === true).length,
+                    pinned: members.filter(member =>
+                        _memberStatusIds(member).includes("pinned")).length,
+                    enemies: _convergentTargets({ members, combat, context }).length,
+                    spaceControl: _spaceControlOf({ members, combat, context, scene }),
+                    // A pinned/flagged leader whose combatant is defeated
+                    // or gone counts as a leader loss even before the
+                    // previous-record comparison catches the swap.
+                    leaderDead: wantedLeader != null
+                        && (!flaggedLeader || flaggedLeader.defeated === true)
+                };
+                record = evaluateMoraleRecord(previous, counters, {
+                    round,
+                    combatId,
+                    teamId,
+                    leaderId,
+                    hysteresis: context.moraleHysteresis
+                });
+                result.wrote = await _writeMoraleRecords(members, record);
+                result.barked = await _barkMoraleChange(previous, record, {
+                    combat, teamId, context });
+            }
+        }
+        result.record = record;
+        result.tier = record?.tier ?? null;
+        // Member-effective tiers: a manual stub on a member's own flag is
+        // that member's base posture; everyone else shares the team tier.
+        for (const member of members) {
+            const own = _readFlag(member.combatant, FLAG_KEYS.morale);
+            const base = context?.morale !== undefined || own == null
+                || isEvaluatedMoraleRecord(own)
+                ? result.tier
+                : (sanitizeMoraleRecord(own)?.tier ?? result.tier);
+            result.effective.set(member.combatantId, effectiveMoraleTier(
+                base, _memberTraits(member, character, context)));
+        }
+        result.diagnostics = {
+            enabled: true,
+            tier: result.tier,
+            pending: record?.pending ?? null,
+            counters: record?.counters ?? null,
+            wrote: result.wrote,
+            barked: result.barked,
+            effective: Object.fromEntries(result.effective)
+        };
+        return result;
+    }
+
     /**
      * Build the serializable TeamPlan for one team of a combat. Only
      * AI-enabled combatants with a matching fireteam `teamId` participate;
@@ -1646,7 +1988,10 @@ export function createFireteamService({
             };
         }
         const seed = _seedFor(context, combat, teamId);
-        let members = collectMembers(combat, teamId)
+        // Issue #26: the unfiltered list feeds the morale casualty
+        // counters — defeated members still count for the team record.
+        const allMembers = collectMembers(combat, teamId);
+        let members = allMembers
             .filter(member => member.enabled && !member.defeated);
         if (Array.isArray(teamRef.members)) {
             const allowed = new Set(teamRef.members);
@@ -1720,6 +2065,25 @@ export function createFireteamService({
         const memberPlanner = _memberPlanner(teamPreset, context.planner);
         const preferredCohesion = diagnostics.preferredCohesion;
 
+        // Issue #26 L2 morale: evaluate the team posture (counters →
+        // tier proposal → hysteresis-gated record persisted on the
+        // members' `morale` flags), compute the member-effective tiers
+        // used by the task remap/delay gate and bark the committed
+        // transition to the GM. Disabled layers leave `tier: null` —
+        // the historical assignment policy stands.
+        const moraleInfo = await _teamMorale({
+            combat,
+            teamId,
+            members,
+            allMembers,
+            context,
+            teamRef,
+            leaderId: election.combatantId,
+            scene: context.scene ?? combat?.scene ?? null,
+            character
+        });
+        diagnostics.morale = moraleInfo.diagnostics;
+
         // Team tactic (issue #412): a preset tactic factory may bind the
         // maneuver — assignments, flank policy, regroup and the shared
         // objective. Explicit caller context fields always win.
@@ -1759,6 +2123,12 @@ export function createFireteamService({
             allowFlank: context.allowFlank ?? tactic?.allowFlank
                 ?? (convergence ? false : undefined),
             regroup: context.regroup ?? tactic?.regroup,
+            // Issue #26: a confident team pushes a second assault column
+            // and a wider flank group.
+            assaultCap: moraleInfo.tier === "confident"
+                ? MORALE_CONFIDENT_ASSAULT_CAP : undefined,
+            flankCap: moraleInfo.tier === "confident"
+                ? MORALE_CONFIDENT_FLANK_CAP : undefined,
             objective: context.objective ?? tactic?.objective
                 ?? (convergence
                     ? {
@@ -1788,6 +2158,31 @@ export function createFireteamService({
         }
         diagnostics.gmControlled = [...gmControlledIds];
         diagnostics.gmDemotions = gmDemotions;
+        // Issue #26 L2: member-effective tier remap — a `desperate`
+        // member pulls out of detached/complex tasks into `support`/
+        // `regroup` while the rest of the team keeps its assignments
+        // (the team tier stays one; the remap reads the member's
+        // *effective* tier after the trait exceptions). Explicit
+        // assignments demote the same way, mirroring the gm-controlled
+        // pass.
+        const moraleDemotions = [];
+        for (const assignment of assignments) {
+            const effectiveTier = moraleInfo.effective.get(assignment.combatantId)
+                ?? moraleInfo.tier;
+            const to = MORALE_TASK_REMAP[effectiveTier]?.[assignment.task];
+            if (to && to !== assignment.task) {
+                moraleDemotions.push({
+                    combatantId: assignment.combatantId,
+                    from: assignment.task,
+                    to,
+                    reason: `morale-${effectiveTier}`,
+                    effectiveTier: effectiveTier ?? null
+                });
+                assignment.task = to;
+                assignment.groupId = "main";
+            }
+        }
+        diagnostics.moraleDemotions = moraleDemotions;
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
 
@@ -2009,7 +2404,8 @@ export function createFireteamService({
             combat,
             context,
             diagnostics,
-            teamId
+            teamId,
+            memberMorale: moraleInfo.effective
         });
 
         // Cohesion evaluation: leader position is the team centre; detached

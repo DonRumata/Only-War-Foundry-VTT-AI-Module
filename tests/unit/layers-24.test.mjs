@@ -153,10 +153,10 @@ test("resolveLayerFlags returns the rollout defaults", () => {
     _resetMocks();
     const flags = resolveLayerFlags({});
     assert.deepEqual(flags, { ...DEFAULT_LAYER_FLAGS });
-    // Issue #25: L1 is implemented and defaults on (one-toggle
-    // rollback); L2 stays off until #26.
+    // Issues #25/#26: L1 and L2 are implemented and default on
+    // (one-toggle rollback each).
     assert.equal(flags.commitment, true);
-    assert.equal(flags.morale, false);
+    assert.equal(flags.morale, true);
     assert.equal(flags.personality, true);
     assert.equal(flags.lookahead, true);
 });
@@ -277,7 +277,7 @@ test("planTurn: commitment enabled with no record degrades to normal planning", 
 });
 
 /* ------------------------------------------------------------------ */
-/* L2 morale (pass-through stub for #26)                               */
+/* L2 morale (issue #26)                                               */
 /* ------------------------------------------------------------------ */
 
 test("moralePostureOf normalizes the reserved morale record", () => {
@@ -286,6 +286,9 @@ test("moralePostureOf normalizes the reserved morale record", () => {
         { state: "desperate", pressured: false, desperate: true });
     assert.deepEqual(moralePostureOf({ pressured: true }),
         { state: null, pressured: true, desperate: false });
+    // Issue #26: the evaluated record's `tier` is the state fallback.
+    assert.deepEqual(moralePostureOf({ tier: "confident" }),
+        { state: "confident", pressured: false, desperate: false });
 });
 
 test("applyMoraleLayer: disabled → neutral posture, enabled → reported posture", () => {
@@ -312,13 +315,26 @@ test("planTurn: the L2 entry reports the posture when the layer is enabled", asy
     const result = await planner.planTurn(world.combat, world.combatant, {
         ...planContext(world),
         layers: { morale: true },
-        morale: { state: "desperate" }
+        morale: { state: "desperate" },
+        // Trait exceptions are covered in morale-26 tests — keep this
+        // bot trait-free so the effective tier equals the team tier.
+        personality: false
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
     const posture = result.plan.diagnostics.layers.find(r => r.layer === "L2");
     assert.equal(posture.code, "morale-posture");
     assert.equal(posture.detail.desperate, true);
+    assert.equal(posture.detail.tier, "desperate");
+    assert.equal(posture.detail.effectiveTier, "desperate");
     assert.equal(result.plan.diagnostics.morale.desperate, true);
+    assert.equal(result.plan.diagnostics.morale.tier, "desperate");
+    // Issue #26: the desperate posture narrows scoring — the weight
+    // shift rides a second L2 trace entry and the diagnostics.
+    const shift = result.plan.diagnostics.layers.find(
+        r => r.layer === "L2" && r.code === "morale-weight-shift");
+    assert.ok(shift, "desperate posture shifts the scoring weights");
+    assert.equal(shift.detail.deltas.charge, -8);
+    assert.equal(result.plan.diagnostics.morale.shift.charge, -8);
 });
 
 /* ------------------------------------------------------------------ */
