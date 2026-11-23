@@ -72,6 +72,26 @@ export async function replayPlan(capture, { planner = null } = {}) {
     // The captured effective config restores as the actor-level config —
     // the same resolution layer the planner read at capture time.
     const config = entry.config ?? {};
+    // Item summaries captured on the snapshot restore as the actor's
+    // items — the action normalization enriches class/range/damage/
+    // blast/spray/clip from `actor.items`, so a replay needs the same
+    // weapon data or the `ev`/template factors diverge (issue #54).
+    const items = (Array.isArray(self.items) ? self.items : [])
+        .map(item => ({
+            id: item.id ?? null,
+            uuid: item.uuid ?? null,
+            name: item.name ?? null,
+            type: item.type ?? null,
+            system: {
+                class: item.class ?? null,
+                range: item.range ?? null,
+                clip: item.ammo != null ? { value: item.ammo } : undefined,
+                damage: item.damage ?? null,
+                blastRadius: item.blastRadius ?? null,
+                special: item.special ?? null,
+                rateOfFire: item.rateOfFire ?? null
+            }
+        }));
     const actor = _doc("Actor", {
         id: self.actorId ?? `replay-actor-${++_replayId}`,
         flags: {
@@ -85,7 +105,7 @@ export async function replayPlan(capture, { planner = null } = {}) {
                 }
             }
         },
-        extra: { type: "npc", system: {}, items: [] }
+        extra: { type: "npc", system: {}, items }
     });
 
     const token = _doc("Token", {

@@ -622,6 +622,7 @@ function _itemSummaries(actor) {
         .map(item => {
             const system = item.system ?? {};
             const clip = system.clip?.value ?? system.ammo?.value;
+            const blast = system.blastRadius ?? system.traits?.blast;
             return {
                 id: item.id ?? null,
                 uuid: typeof item.uuid === "string" ? item.uuid : null,
@@ -630,7 +631,15 @@ function _itemSummaries(actor) {
                 class: system.class ?? null,
                 range: Number.isFinite(system.range) ? system.range
                     : (Number.isFinite(system.range?.value) ? system.range.value : null),
-                ammo: Number.isFinite(clip) ? clip : null
+                ammo: Number.isFinite(clip) ? clip : null,
+                // Weapon stats the action normalization reads back when a
+                // replay rebuilds the actor items — without them the
+                // `ev`/spray/blast factors evaluate to 0 on a replay.
+                damage: typeof system.damage === "string" ? system.damage
+                    : (Number.isFinite(system.damage) ? system.damage : null),
+                blastRadius: Number.isFinite(blast) ? blast : null,
+                special: typeof system.special === "string" ? system.special : null,
+                rateOfFire: system.rateOfFire ?? null
             };
         })
         .sort((a, b) => String(a.id).localeCompare(String(b.id)))
