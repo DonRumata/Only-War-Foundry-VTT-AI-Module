@@ -223,6 +223,8 @@
   "OWAI.Settings.AiBarks.Hint": "Short chat phrases telegraphing AI intent: emitted when a fireteam's morale tier changes and when a bot commits to a multi-turn plan. Whispered to the GM by default.",
   "OWAI.Settings.BarksToPlayers.Name": "Barks visible to players",
   "OWAI.Settings.BarksToPlayers.Hint": "Off (default): AI barks are whispered to the GM only. On: the whole table sees the AI's intent telegraphing.",
+  "OWAI.Settings.MoraleDesperateRatio.Name": "Desperate when outnumbered",
+  "OWAI.Settings.MoraleDesperateRatio.Hint": "The enemy-headcount ratio that alone proposes the desperate morale tier: enemies >= members x ratio. Default 2 - a 2:1 deficit is the squad's normal war; parity and small disadvantages stay pressured.",
   "OWAI.Morale.confident": "Confident",
   "OWAI.Morale.pressured": "Pressured",
   "OWAI.Morale.desperate": "Desperate",

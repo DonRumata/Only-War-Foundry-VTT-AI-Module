@@ -115,7 +115,13 @@ baseline-планированию по ходу. Счёт идёт по `firetea
 `desperate` (превосходство врага или потери). `buildTeamPlan` раз в ход
 считает командные счётчики (`evaluateMoraleRecord`):
 
-- `members`/`enemies` — живые члены против враждебных боевых единиц;
+- `members`/`enemies` — живые члены против **увиденных** враждебных
+  боевых единиц: headcount считает только противника, которого отряд
+  знает — `seenEnemies` рекорда (накопительный, переживает экспирацию
+  памяти) + ключи `memory`-флагов членов + live-LOS-проба по
+  perception-сервису (первый контакт в этом же раунде). Невиданный враг
+  не паникует команду — слепая удача до первого обнаружения. Инъекция
+  `context.targets` считается контакт-листом (всё воспринято);
 - `casualties` (суммарно, от `initialStrength`) и `casualtiesRecent` —
   журнал потерь `losses: [{round}]` за `MORALE_RECENT_LOSS_ROUNDS = 3`
   раунда;
@@ -126,11 +132,14 @@ baseline-планированию по ходу. Счёт идёт по `firetea
 - `leaderDead` — флагged-лидер погиб ⇒ **форсированный переход без
   гистерезиса** (и тир никогда не выйдет в confident).
 
-Пороги tier'а — `proposeMoraleTier`: outnumbered / `casualtiesRecent ≥
-MORALE_RECENT_LOSS_DESPERATE` / половина стартового состава потеряна /
-все прижаты / провал пространства ⇒ `desperate`; `members > enemies` без
-свежих потерь и удержанным пространством ⇒ `confident`; иначе
-`pressured`.
+Пороги tier'а — `proposeMoraleTier`: `enemies ≥ members ×
+moraleDesperateRatio` (world setting, default
+`MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — бой 5 на 10 обычная война
+отряда; `context.moraleOutnumberRatio` перебивает на план) /
+`casualtiesRecent ≥ MORALE_RECENT_LOSS_DESPERATE` / половина стартового
+состава потеряна / все прижаты / провал пространства ⇒ `desperate`;
+`members > enemies` без свежих потерь и удержанным пространством ⇒
+`confident`; иначе `pressured`.
 
 **Гистерезис** `MORALE_HYSTERESIS_ROUNDS = 2`: смена предложенного тира
 зажигает `pending = {tier, count}` — один ход нового расклада тир не

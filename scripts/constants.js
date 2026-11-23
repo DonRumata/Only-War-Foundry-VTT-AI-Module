@@ -118,7 +118,11 @@ export const SETTING_KEYS = Object.freeze({
     // keeps a bounded replay journal of `planContext`+snapshot captures
     // on the combatant `captureJournal` flag.
     aiTraceVerbose: "aiTraceVerbose",
-    aiCaptureContext: "aiCaptureContext"
+    aiCaptureContext: "aiCaptureContext",
+    // Issue #26: outnumber ratio at which the enemy headcount alone
+    // turns the morale proposal `desperate` (default
+    // `MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — a 2:1 deficit).
+    moraleDesperateRatio: "moraleDesperateRatio"
 });
 
 /**
@@ -225,6 +229,15 @@ export const MORALE_RECENT_LOSS_ROUNDS = 3;
 export const MORALE_DESPERATE_RECENT_LOSSES = 2;
 
 /**
+ * Outnumber ratio for the `desperate` proposal (issue #26): the enemy
+ * headcount must reach `members × ratio` — default 2 (a 5v10 fight is
+ * the team's normal war, not despair; parity and small deficits stay
+ * `pressured`). GM-tunable via the `moraleDesperateRatio` world
+ * setting / `context.moraleOutnumberRatio`.
+ */
+export const MORALE_DESPERATE_OUTNUMBER_RATIO = 2;
+
+/**
  * Fraction of the starting strength the team must lose before the
  * proposal turns `desperate` regardless of the headcount (issue #26).
  */
@@ -253,6 +266,14 @@ export const MORALE_SAFE_DANGER = 0.5;
 
 /** Bound on the morale `losses` log kept on the fireteam record. */
 export const MORALE_LOSS_LOG_MAX = 16;
+
+/**
+ * Bound on the `seenEnemies` list persisted on the evaluated morale
+ * record (issue #26 review): the squad's "ever seen" hostile set —
+ * a tokenUuid is remembered once a member spots it (or once it enters
+ * a member's memory) and stays counted while the enemy lives.
+ */
+export const MORALE_SEEN_ENEMIES_MAX = 128;
 
 /** Default pacing delay between AI execution steps in milliseconds. */
 export const DEFAULT_TURN_PACING_MS = 800;

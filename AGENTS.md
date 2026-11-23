@@ -88,14 +88,16 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   запись — готовая фикстура `replayPlan` (tests/unit/replay-helpers.mjs):
   JSON → `planTurn` → идентичный план и трасс.
 - Combatant: `morale` (issue #26) — рекорд позы файртимы; evaluated
-  форма `{tier, pending, counters, losses, leaderId, combatId, round,
-  state, schema}` пишется только controller'ом на всех живых членов при
-  `buildTeamPlan`; короткая форма `{state|tier: "confident"|"pressured"|
-  "desperate", pressured?, desperate?}` — ручной членский оверрайд
-  (не перезатирается оценкой). Гистерезис 2 раунда; гибель лидера
-  форсирует переход. Легаси-чтения: `desperate` снимает delay-ожидание
-  (member-effective tier), `pressured` усиливает фактор `order`.
-  Отсутствие флага = нормальная мораль.
+  форма `{tier, pending, counters, losses, seenEnemies, leaderId,
+  combatId, round, state, schema}` пишется только controller'ом на всех
+  живых членов при `buildTeamPlan`; короткая форма `{state|tier:
+  "confident"|"pressured"|"desperate", pressured?, desperate?}` —
+  ручной членский оверрайд (не перезатирается оценкой). Гистерезис 2
+  раунда; гибель лидера форсирует переход. Headcount `enemies` — только
+  увиденный противник (`seenEnemies` + членские `memory` + live-LOS).
+  Легаси-чтения: `desperate` снимает delay-ожидание (member-effective
+  tier), `pressured` усиливает фактор `order`. Отсутствие флага =
+  нормальная мораль.
 - Combatant: `overwatch` (issues #14/#54) — декларация зоны овервотча;
   пишет только controller через сервис `overwatch`, живёт до хода
   владельца/перемещения токена. Конусная форма `{shape:"cone", direction,
@@ -140,6 +142,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `aiCaptureContext` (default `false`, issue #27) — запись
   `captureJournal` (bounded 8 захватов `planContext`+snapshot на флаге
   комбатанта) для офлайн-реплея `planTurn`.
+  `moraleDesperateRatio` (default `2`, issue #26) — кратность перевеса
+  врагов, при которой численность одна предлагает `desperate`
+  (`enemies >= members × ratio`; 5 на 10 — грань, малый недобор —
+  pressured). План-оверрайд — `context.moraleOutnumberRatio`.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только

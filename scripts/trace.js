@@ -777,6 +777,7 @@ export const CAPTURE_CONTEXT_KEYS = Object.freeze([
     "positionTolerance",
     "moveTolerancePx",
     "manualOverrideGrace",
+    "moraleOutnumberRatio",
     "orderBoost",
     "barks",
     "capture"

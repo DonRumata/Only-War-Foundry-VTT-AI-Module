@@ -63,6 +63,7 @@ import {
 import { emitBarkOnce } from "./barks.js";
 import {
     getAIDifficulty,
+    getMoraleDesperateRatio,
     getPreferredCohesion,
     logDiagnostics
 } from "./settings.js";
@@ -1775,6 +1776,94 @@ export function createFireteamService({
     }
 
     /**
+     * TokenDocument lookup of a convergent target inside the combat
+     * (issue #26 review): matches `tokenId` against both the combatant's
+     * `tokenId` and the doc id, `tokenUuid` against the doc uuid.
+     * @param {object} combat Combat document.
+     * @param {object} target Convergent target `{tokenId, tokenUuid}`.
+     * @returns {object|null}
+     */
+    function _combatTokenDoc(combat, target) {
+        for (const other of _list(combat?.combatants)) {
+            const doc = _tokenDoc(other?.token);
+            if (!doc) continue;
+            if (target?.tokenId && (other.tokenId === target.tokenId
+                || doc.id === target.tokenId)) {
+                return doc;
+            }
+            if (target?.tokenUuid && doc.uuid === target.tokenUuid) return doc;
+        }
+        return null;
+    }
+
+    /**
+     * Whether any living member currently has LOS to the target —
+     * the live probe of {@link _seenEnemyIds}: a first-contact hostile
+     * counts this round even though its memory write lags one
+     * activation. Without a perception service every unchecked target
+     * stays unseen.
+     * @param {object[]} members Living member entries.
+     * @param {object} target Convergent target.
+     * @param {object|null} perception Perception service.
+     * @param {object} combat Combat document.
+     * @returns {boolean}
+     */
+    function _memberSees(members, target, perception, combat) {
+        if (typeof perception?.hasLineOfSight !== "function") return false;
+        const targetDoc = _combatTokenDoc(combat, target);
+        if (!targetDoc) return false;
+        for (const member of members) {
+            const doc = _tokenDoc(member.combatant?.token)
+                ?? _tokenDoc(member.token);
+            if (!doc) continue;
+            try {
+                if (perception.hasLineOfSight(doc, targetDoc)) return true;
+            } catch(_err) {
+                // No usable vision probe — treated as unseen.
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The squad's "ever seen" hostile set for the morale headcount
+     * (issue #26 review): `previous.seenEnemies` persists across rounds,
+     * every member's `memory` flag keys merge in (a last-known record is
+     * proof the member once had LOS), and a live LOS probe adds a
+     * first-contact hostile immediately. Injected `context.targets` are
+     * the caller's contact list — every offered contact is perceived by
+     * definition.
+     * @param {object} input
+     * @param {object[]} input.members Living member entries.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context Build context.
+     * @param {object|null} input.previous Sanitized previous record.
+     * @param {object[]} input.targets Convergent hostile targets.
+     * @returns {Set<string>} tokenUuid (or tokenId fallback) ids.
+     */
+    function _seenEnemyIds({ members, combat, context, previous, targets }) {
+        const seen = new Set(previous?.seenEnemies ?? []);
+        for (const member of members) {
+            const memory = _readFlag(member.combatant, FLAG_KEYS.memory);
+            if (memory && typeof memory === "object") {
+                for (const key of Object.keys(memory)) seen.add(key);
+            }
+        }
+        const injected = Array.isArray(context?.targets)
+            && context.targets.length;
+        const perception = injected ? null
+            : _service("perception", context?.perception);
+        for (const target of targets ?? []) {
+            const key = target?.tokenUuid ?? target?.tokenId;
+            if (!key || seen.has(key)) continue;
+            if (injected || _memberSees(members, target, perception, combat)) {
+                seen.add(key);
+            }
+        }
+        return seen;
+    }
+
+    /**
      * Persist the evaluated morale record on every living member's
      * `morale` flag (controller-only — `buildTeamPlan` already passed
      * the authority gate). Members carrying a *manual* posture stub
@@ -1890,13 +1979,23 @@ export function createFireteamService({
                     ? (allMembers ?? members).find(member =>
                         (member.ids ?? []).includes(wantedLeader))
                     : null;
+                // Issue #26 review: the headcount reads only enemies the
+                // squad has *seen* — `previous.seenEnemies` persists,
+                // every member's memory keys merge in, and a live LOS
+                // probe reveals a first-contact hostile this round.
+                // An unseen enemy never panics the team.
+                const targets = _convergentTargets({ members, combat, context });
+                const seen = _seenEnemyIds({
+                    members, combat, context, previous, targets });
                 const counters = {
                     members: members.length,
                     defeated: (allMembers ?? members)
                         .filter(member => member.defeated === true).length,
                     pinned: members.filter(member =>
                         _memberStatusIds(member).includes("pinned")).length,
-                    enemies: _convergentTargets({ members, combat, context }).length,
+                    enemies: targets.filter(target =>
+                        seen.has(target.tokenUuid ?? target.tokenId)).length,
+                    seenEnemies: [...seen].sort(),
                     spaceControl: _spaceControlOf({ members, combat, context, scene }),
                     // A pinned/flagged leader whose combatant is defeated
                     // or gone counts as a leader loss even before the
@@ -1909,7 +2008,14 @@ export function createFireteamService({
                     combatId,
                     teamId,
                     leaderId,
-                    hysteresis: context.moraleHysteresis
+                    hysteresis: context.moraleHysteresis,
+                    // Issue #26 review: GM-tunable desperation threshold
+                    // (world setting `moraleDesperateRatio`, default 2 —
+                    // a 2:1 deficit; `context.moraleOutnumberRatio`
+                    // overrides per plan).
+                    outnumberRatio: Number.isFinite(context.moraleOutnumberRatio)
+                        ? context.moraleOutnumberRatio
+                        : getMoraleDesperateRatio()
                 });
                 result.wrote = await _writeMoraleRecords(members, record);
                 result.barked = await _barkMoraleChange(previous, record, {
