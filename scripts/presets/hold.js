@@ -112,7 +112,7 @@ export const HOLD_WEIGHTS = Object.freeze({
     leaveMeleeEngage: -5,
     engageDenial: 2,
     unpin: 3,
-    grudge: 2
+    grudge: 2,
     ev: 1
 
 });

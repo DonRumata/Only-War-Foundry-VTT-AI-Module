@@ -92,7 +92,7 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     leaveMeleeEngage: -3,
     engageDenial: 0,
     unpin: 3,
-    grudge: 1
+    grudge: 1,
     ev: 1
 
 });
