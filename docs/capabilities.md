@@ -281,16 +281,24 @@ execute: расхождение — `stale-state` (перемещение, см�
 - `reload` — `kind:"reload"` записи `actions.list`: шаг `reload` идёт
   через `api.actions.reload` со step-scoped `operationId`
   (идемпотентно); `move-reload` допустим при half-стоимости.
-- `overwatch` — кандидат объявляет конус 45° на видимую угрозу через
-  сервис из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
-  На last-known контакт конус не объявляется. Issue #37: бот с
-  потраченной реакцией (`flags["only-war-ai"].reactionUsed` текущего
-  раунда) конус не декларирует — rejected `reaction-used`.
+- `overwatch` — кандидат объявляет зону на видимую угрозу через сервис
+  из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
+  На last-known контакт зона не объявляется. Issue #54: зона наводится
+  на предсказанные позиции — nav-waypoint `planRoute(threat → self)`
+  ближайшей угрозы (~половина её полухода по маршруту — «в проход»),
+  lead-точки `min(halfMove, distToSelf)` видимых угроз («на
+  опережение»), позиции memory-контактов (валидный якорь зоны, #45);
+  все якоря в `_bestConeAim`, fallback — bearing. Оружейная геометрия:
+  cone 45°, spray — собственный конус `_coneSpecOf`, blast — круг
+  `{shape:"blast", targetPoint, blastRadius}`; melee-зона пропущена.
+  Issue #37: бот с потраченной реакцией
+  (`flags["only-war-ai"].reactionUsed` текущего раунда) зону не
+  декларирует — rejected `reaction-used`.
 - Ориентация конусов (issue #30): spray/suppression наводятся только по
   воспринимаемым якорям — видимая цель на текущую позицию, last-known на
   запомненную точку; невидимые/неизвестные hostile на сцене шаблон не
   наводят (вето союзников сканирует всю сцену). Overwatch — строго по
-  видимой угрозе.
+  видимой угрозе, но по её предсказанным позициям (issue #54).
 - Статусы: pinned запрещает движение, standalone aim, overwatch и
   move-reload — стационарные reload/attack-in-place остаются.
 - Веса пресетов: `aim` (прицельный выстрел), `aimAlone` (standalone aim —
@@ -535,7 +543,7 @@ disposition-матрица).
 |---|---|
 | Урон/уворот/пари | Только тест попадания — урона/реакции нет (нужны `rolls.executeDamage`/`applyDamage`/`evasionTest` в системе) |
 | `suppressing_fire`, spray-оружие (огнемёты) | Поддержано: `template.direction` + вето союзников (issue #14) |
-| Overwatch-конусы | Заявка в плане + GM-only отрисовка есть (issues #14/#15); авто-реакция — нет |
+| Overwatch-зоны | Заявка в плане + GM-only отрисовка есть (issues #14/#15); предсказанные якоря + spray/blast геометрия (issue #54); авто-реакция — нет |
 | Aim, half/full экономия, reload-шаг | Реализовано (issue #15): бюджет 2×half, `aim`/`aim-attack` с aimedUntil-флагом, `reload` через `api.actions.reload` |
 | Реакции бота (overwatch-триггер, авто-уворот) | Нет — реакцию объявляет конус, но исполняет её GM вручную |
 | Гранаты на союзников | Нет (`blast-friendly-fire` вето); на нейтралов — только при `includeNeutral` |
@@ -553,7 +561,8 @@ disposition-матрица).
 
 - ~~Issue #14~~ — реализовано: step-контракт `targetPoint`/`template`,
   spray и `suppressing_fire` с конусным прицеливанием, заявочный
-  overwatch (флаг + GM-only конус).
+  overwatch (флаг + GM-only зона; issue #54 — конус, spray-шаблон и
+  blast-круг по предсказанным якорям).
 - ~~Issue #15~~ — реализовано: бюджет half+half и вето move+full, aim
   (+10/+20) с переносом `aimedUntil`-бонуса, `reload` через
   `api.actions.reload` (PR #440), заявочный `overwatch`-кандидат.

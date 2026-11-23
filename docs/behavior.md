@@ -133,8 +133,19 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    перебирает `move-attack` по конечным точкам.
 7. Action-economy кандидаты: standalone `aim` (нужен `aimFullAction`,
    не pinned, дальняя атака, `aim > carriedAim`); `reload` (+`move-reload`);
-   `overwatch` (45° дуга на ближайшую видимую угрозу; не для memory-only;
-   вето `reaction-used`, когда реакция бота уже потрачена — issue #37).
+   `overwatch` (issue #54: зона по **предсказанным якорям**, а не по пеленгу
+   на стоящего врага — nav-waypoint ближайшей угрозы ~на половину полухода
+   по её `planRoute(threat → self)` (единственный pathfind на план),
+   lead-точка `threatPos + dir × min(halfMove, dist)` каждой видимой
+   угрозы, позиции memory-контактов `last-known`/`team-contact` как
+   готовые предсказания; невидимые для бота якоря отсекаются LOS-пробой.
+   По одному кандидату на геометрию зоны: cone — 45° сектор по
+   `_bestConeAim` от всех якорей, spray — собственный конус
+   `_coneSpecOf` (arc/range оружия), blast — круг-триггер
+   `{targetPoint, blastRadius}` на якоре с максимальным покрытием;
+   fallback — bearing на угрозу. Декларация по-прежнему строго по
+   видимой цели — не для memory-only; вето `reaction-used`, когда
+   реакция бота уже потрачена — issue #37).
 8. Free-action кандидаты (issue #37): `ready-weapon` — явные записи
    `kind:"ready"|"draw"|"equip"` из `actions.list` с собственным `cost`
    (free под Quick Draw; модуль таланты не парсит), иначе — синтез по
@@ -167,7 +178,11 @@ ready-weapon → drop-prone → end-turn` (всегда последний). Att
 `attackType`, `mode:"charge"`, `aim`, `targetPoint` + `blastRadius`
 (blast, issue #29 — зона для оверлея/системного шаблона),
 `template.direction/angle/range` + `covered/suppressionFire/burstMode`
-(cone). `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
+(cone). `overwatch` несёт `direction`/`arc`/`range` (конусная зона; для
+spray — дуга собственного конуса оружия, issue #54) либо
+`shape:"blast"` + `targetPoint`/`blastRadius` (круг-триггер — тот же
+контракт, что у blast-атаки, оверлей рисует круг без нового читателя).
+`ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
 записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`; `unpin`
 (issue #39) — шаг `test` с `input {type:"characteristic",
 key:"willpower", characteristic:"willpower", testKind:"characteristic",
@@ -192,8 +207,13 @@ actionId:"unpin"}`, `cost.halves:2` — верифицированный кон�
 конус не наводят — они участвуют только в вето союзников/нейтралов.
 Проверка LOS — до якорей, а не до всего покрытия. Без якорей —
 `cone-no-safe-aim`, кандидата нет. `overwatch`-декларация — строго по
-видимой цели (`canAttack === true`, не `hidden`): на last-known конус
-не заявляется — память накрывает spray/blast, а не заявочный конус.
+видимой цели (`canAttack === true`, не `hidden`): на last-known зона не
+заявляется — память накрывает spray/blast, а не заявочный конус. Issue
+#54 меняет наведение внутри видимой угрозы, не источник цели: конус
+смотрит на предсказанные позиции (route-waypoint / lead-точки / точки
+memory-контактов — последние валидны как якоря зоны по ревью #45), а
+blast-оружие заявляет круг `{shape:"blast", targetPoint, blastRadius}`
+вместо сектора; melee-зона досягаемости сознательно пропущена.
 
 ## 5. Executor (executor.js)
 
@@ -419,7 +439,8 @@ adjudicated-manual, adjudicated-skill-test`.
 `scripts/ui/plan-overlay.js` — общий GM-only корень `ow-ai-overlay` на
 слое templates с именованными подслоями (`plan`, `overwatch`, `danger`):
 чистый PIXI, без записи документов и сокетов. `overwatch.js` рисует
-заявленные конусы в тот же корень (общий `coneFanPoints`); сервис
+заявленные зоны в тот же корень (конусы — общий `coneFanPoints`,
+blast-декларации — круг по `targetPoint`/`blastRadius`, issue #54); сервис
 `planOverlay` (`api.services`) держит `start/stop`, хуки
 `canvasReady`/`canvasTearDown`/`updateCombat`/`deleteCombat` и
 `describe()`/`model()` для отладки и e2e.

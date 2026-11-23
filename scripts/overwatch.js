@@ -101,29 +101,53 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
 
     /**
      * Sanitized flag payload of a declaration: no Document references, no
-     * arbitrary caller data beyond the cone spec.
-     * @param {object} spec Step input `{direction, arc, range, weaponId, ...}`.
+     * arbitrary caller data beyond the zone spec. Two zone shapes exist
+     * (issue #54): the default watch `cone` (`direction`/`arc`/`range`)
+     * and the `blast` trigger circle (`targetPoint` in canvas pixels +
+     * `blastRadius` in scene units — "enemy entered the circle → the
+     * grenade lands there").
+     * @param {object} spec Step input `{direction|shape, arc, range,
+     *   targetPoint?, blastRadius?, weaponId, ...}`.
      * @param {object|null} combat Active combat.
      * @param {object|null} combatant Declaring combatant.
      * @returns {object|null}
      */
     function _sanitize(spec, combat, combatant) {
-        const direction = Number(spec?.direction);
-        if (!Number.isFinite(direction)) return null;
-        const range = Number(spec?.range ?? spec?.reach);
-        if (!Number.isFinite(range) || range <= 0) return null;
         const tokenDoc = _tokenDoc(combatant?.token);
-        return {
+        const base = {
             combatantId: combatant?.id ?? null,
             tokenId: combatant?.tokenId ?? tokenDoc?.id ?? null,
             sceneId: tokenDoc?.parent?.id ?? tokenDoc?.scene?.id ?? null,
-            direction: ((direction % 360) + 360) % 360,
-            arc: Number.isFinite(spec?.arc) && spec.arc > 0 ? spec.arc : DEFAULT_ARC_DEG,
-            range,
             weaponId: spec?.weaponId ?? spec?.itemUuid ?? null,
             weaponName: spec?.weaponName ?? spec?.name ?? null,
             attackType: spec?.attackType ?? null,
             round: combat?.round ?? null
+        };
+        if (spec?.shape === "blast" || spec?.zone?.shape === "blast") {
+            const point = spec?.zone?.targetPoint ?? spec?.targetPoint;
+            const radius = Number(spec?.zone?.blastRadius ?? spec?.blastRadius);
+            if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+                || !Number.isFinite(radius) || radius <= 0) return null;
+            const range = Number(spec?.zone?.range ?? spec?.range);
+            return {
+                ...base,
+                shape: "blast",
+                targetPoint: { x: point.x, y: point.y },
+                blastRadius: radius,
+                range: Number.isFinite(range) && range > 0 ? range : null
+            };
+        }
+        const direction = Number(spec?.zone?.direction ?? spec?.direction);
+        if (!Number.isFinite(direction)) return null;
+        const range = Number(spec?.zone?.range ?? spec?.range ?? spec?.reach);
+        if (!Number.isFinite(range) || range <= 0) return null;
+        const arc = Number(spec?.zone?.arc ?? spec?.arc);
+        return {
+            ...base,
+            shape: "cone",
+            direction: ((direction % 360) + 360) % 360,
+            arc: Number.isFinite(arc) && arc > 0 ? arc : DEFAULT_ARC_DEG,
+            range
         };
     }
 
@@ -133,7 +157,8 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
      * @param {object} input `{combat, combatant, spec}`.
      * @param {object|null} input.combat Active combat.
      * @param {object|null} input.combatant Declaring combatant.
-     * @param {object} input.spec Step input `{direction, arc, range, ...}`.
+     * @param {object} input.spec Step input: cone `{direction, arc,
+     *   range, ...}` or blast `{shape:"blast", targetPoint, blastRadius}`.
      * @returns {Promise<object>} `{ok, record?|reason}`
      */
     async function declare({ combat = null, combatant = null, spec = {} } = {}) {
@@ -247,16 +272,33 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     /**
-     * Draw one cone sector into the overlay container.
+     * Draw one watch zone into the overlay container: the cone sector of
+     * a plain/spray declaration, the trigger circle of a blast one
+     * (issue #54 — `targetPoint` is stored in canvas pixels,
+     * `blastRadius` in scene units).
      * @param {PIXI.Container} container
      * @param {object} combatant Declaring combatant.
      * @param {object} record Sanitized overwatch record.
      * @returns {void}
      */
-    function _drawCone(container, combatant, record) {
-        const center = _tokenCenter(combatant?.token);
+    function _drawZone(container, combatant, record) {
         const pxPerUnit = _pxPerUnit();
-        if (!center || pxPerUnit <= 0) return;
+        if (pxPerUnit <= 0) return;
+        if (record?.shape === "blast") {
+            const point = record.targetPoint;
+            const radius = Number(record.blastRadius) * pxPerUnit;
+            if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+                || !(radius > 0)) return;
+            const graphics = new PIXI.Graphics();
+            graphics.beginFill(CONE_COLOR, CONE_FILL_ALPHA);
+            graphics.lineStyle(2, CONE_COLOR, CONE_EDGE_ALPHA, 0.5);
+            graphics.drawCircle(point.x, point.y, radius);
+            graphics.endFill();
+            container.addChild(graphics);
+            return;
+        }
+        const center = _tokenCenter(combatant?.token);
+        if (!center) return;
         const radius = record.range * pxPerUnit;
         const arc = Number(record.arc) || DEFAULT_ARC_DEG;
         const graphics = new PIXI.Graphics();
@@ -280,7 +322,7 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
         }
         const combat = globalThis.game?.combat ?? null;
         for (const { combatant, record } of activeOverwatches(combat)) {
-            _drawCone(container, combatant, record);
+            _drawZone(container, combatant, record);
         }
     }
 

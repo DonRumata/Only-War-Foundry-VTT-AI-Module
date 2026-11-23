@@ -96,6 +96,13 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   форсирует переход. Легаси-чтения: `desperate` снимает delay-ожидание
   (member-effective tier), `pressured` усиливает фактор `order`.
   Отсутствие флага = нормальная мораль.
+- Combatant: `overwatch` (issues #14/#54) — декларация зоны овервотча;
+  пишет только controller через сервис `overwatch`, живёт до хода
+  владельца/перемещения токена. Конусная форма `{shape:"cone", direction,
+  arc, range, combatantId, tokenId, sceneId, weaponId, weaponName,
+  attackType, round}`; blast-форма `{shape:"blast", targetPoint:{x,y}
+  (пиксели), blastRadius (ед. сцены), range, ...}` — круг-триггер
+  «враг вошёл → граната туда».
 - Actor/Token/Combatant: `personality = string[]` — явный список черт
   личности (issue #19, id из пула `scripts/personalities.js`); резолвится
   той же цепочкой Combatant → Token → Actor, без флага черты
@@ -294,8 +301,15 @@ min(blastHits/2, 1); веса в пресетах (assault 4, specOps 5, rangedC
 на записи `targets` (видимая цель — живая позиция, last-known —
 запомненная точка); hostile-токены сцены без восприятия шаблон не
 наводят, но по-прежнему срабатывают в вето союзников/нейтралов.
-`overwatch`-кандидат заявляет конус лишь на видимую угрозу
-(`canAttack === true`, не `hidden`). Шаг сериализует
+`overwatch`-кандидат заявляет зону лишь на видимую угрозу
+(`canAttack === true`, не `hidden`), но наводит её на предсказанные
+позиции (issue #54): nav-waypoint кратчайшего маршрута ближайшей угрозы
+(`planRoute(threat → self)`, точка ~на половину её полухода), lead-точки
+`min(halfMove, dist)` всех видимых угроз и позиции memory-контактов;
+все якоря идут в `_bestConeAim`, bearing — fallback. Геометрия зоны по
+оружию: cone 45°, spray — собственный конус `_coneSpecOf`, blast —
+круг `{shape:"blast", targetPoint, blastRadius}` (второй тип зоны в
+`overwatch.declare`; melee пропущен). Шаг сериализует
 `template {direction, angle, range}` + `covered`/`suppressionFire`/
 `burstMode` — geometry хватает и системе, и GM-оверлею (#29).
 
@@ -511,8 +525,8 @@ route-полилинию со стрелкой на финальную клет�
 `template`/`overwatch` шагам, круг blast `targetPoint`+`blastRadius` и
 подсветку цели; контроллер preview вызывает `showPlan` на open/replan/
 stale и `clearPlan` на любом решении/снятии сессии. `overwatch.js`
-(#14/#30) рисует заявленные конусы в тот же корень через общий
-`coneFanPoints`. Danger-heatmap (issue #36): world setting
+(#14/#30/#54) рисует заявленные зоны в тот же корень: конусы через общий
+`coneFanPoints`, blast-декларации — круг по `targetPoint`/`blastRadius`. Danger-heatmap (issue #36): world setting
 `threatMapOverlay` + GM-keybinding Alt+M (`restricted`) —
 `setDangerEnabled`/`toggleDanger`/`setDangerMode` (`"plan"` — карта
 текущего бота `threatMap.map()`, `"all"` — агрегат по hostile-комбатантам);

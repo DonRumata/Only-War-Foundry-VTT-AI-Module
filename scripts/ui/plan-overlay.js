@@ -375,6 +375,9 @@ export function buildPlanOverlayModel(plan, context = {}) {
         if (targetPoint) {
             const radiusUnits = _finiteOr(input.blastRadius, null);
             blasts.push({
+                // Issue #54: a blast overwatch step shares the circle
+                // renderer but keeps its own zone identity.
+                kind: step?.type === "overwatch" ? "overwatch" : "blast",
                 point: { x: targetPoint.x + half.x, y: targetPoint.y + half.y },
                 radiusUnits,
                 radiusPx: radiusUnits !== null && pxPerUnit > 0
@@ -727,9 +730,10 @@ export function createPlanOverlayService({
      */
     function _drawBlast(layer, blast, dim) {
         if (!blast?.point || !(blast.radiusPx > 0)) return;
+        const color = blast.kind === "overwatch" ? OVERWATCH_COLOR : BLAST_COLOR;
         const graphics = new PIXI.Graphics();
-        graphics.beginFill(BLAST_COLOR, BLAST_FILL_ALPHA * dim);
-        graphics.lineStyle(2, BLAST_COLOR, BLAST_EDGE_ALPHA * dim, 0.5);
+        graphics.beginFill(color, BLAST_FILL_ALPHA * dim);
+        graphics.lineStyle(2, color, BLAST_EDGE_ALPHA * dim, 0.5);
         graphics.drawCircle(blast.point.x, blast.point.y, blast.radiusPx);
         graphics.endFill();
         layer.addChild(graphics);

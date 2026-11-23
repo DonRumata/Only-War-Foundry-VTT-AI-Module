@@ -360,6 +360,13 @@ const SPRAY_CONE_DEG = 30;
 /** Cone angle (degrees) the system places for suppressing fire. */
 const SUPPRESSION_CONE_DEG = 45;
 
+/**
+ * Watch-cone angle (degrees) of a plain ranged overwatch declaration
+ * (issue #54): spray weapons declare their own template arc instead,
+ * blast weapons a trigger circle — neither reads this default.
+ */
+const OVERWATCH_CONE_DEG = 45;
+
 /** Status ids that mark a target as vulnerable to attack. */
 const VULNERABLE_STATUSES = Object.freeze(new Set(["pinned", "prone", "stunned"]));
 
@@ -924,6 +931,9 @@ function _bestBlastAim({
         let blocked = false;
         for (const token of tokens) {
             if (presumedUuid && token.tokenUuid === presumedUuid) continue;
+            // Issue #54: the firing token itself is never a friendly-fire
+            // veto — a template always covers its own origin.
+            if ((token.tokenId ?? token.id) === tokenDoc?.id) continue;
             if (_distPx(point, token) > radiusPx + 1e-9) continue;
             const disp = Math.sign(_finiteOr(token.disposition, 0));
             if (_hostileTo(viewerDisposition, disp, options)) hits++;
@@ -1072,6 +1082,9 @@ function _bestConeAim({
         // Friendly/neutral veto still scans every scene token: the bot
         // must not blanket allies just because it aimed by perception.
         for (const token of tokens) {
+            // Issue #54: the firing token itself always sits at the cone
+            // origin — it is not a friendly-fire veto.
+            if ((token.tokenId ?? token.id) === tokenDoc?.id) continue;
             if (!_tokenInCone(origin, direction, angleDeg, rangePx, token)) continue;
             const disp = Math.sign(_finiteOr(token.disposition, 0));
             if (!_hostileTo(viewerDisposition, disp, options)) {
@@ -2113,20 +2126,36 @@ function _aimActions(actions) {
 }
 
 /**
- * Pick the overwatch weapon: the longest-range non-cone, non-blast ranged
- * attack action. Deterministic tiebreak by action id.
+ * Overwatch weapons of the action list (issue #54): at most one pick per
+ * zone geometry — the longest-range plain ranged attack (a 45° watch
+ * cone), the longest-range spray weapon (its own template cone) and the
+ * longest-range blast weapon (a trigger circle). `suppressing_fire`
+ * entries are a firing mode of the same gun, not a watch weapon; melee
+ * reach circles stay a niche and are deliberately skipped. Deterministic
+ * tiebreak by action id inside each geometry pool.
  * @param {object[]} actions Normalized attack actions.
- * @returns {object|null}
+ * @returns {{action: object, kind: "cone"|"spray"|"blast"}[]}
  */
-function _overwatchAction(actions) {
-    const ranged = (actions ?? []).filter(action => action.type === "attack"
-        && !_isMeleeAction(action)
-        && _actionBlastRadius(action) <= 0
-        && !_coneSpecOf(action)
-        && _actionRange(action) > 0);
-    if (!ranged.length) return null;
-    return [...ranged].sort((a, b) => (_actionRange(b) - _actionRange(a))
-        || String(a.id).localeCompare(String(b.id)))[0];
+function _overwatchWeapons(actions) {
+    const pools = { cone: [], spray: [], blast: [] };
+    for (const action of actions ?? []) {
+        if (action.type !== "attack" || _isMeleeAction(action)
+            || _actionRange(action) <= 0) continue;
+        const spec = _coneSpecOf(action);
+        if (spec?.suppression === true) continue;
+        if (spec?.spray === true) {
+            pools.spray.push(action);
+        } else if (_actionBlastRadius(action) > 0) {
+            pools.blast.push(action);
+        } else {
+            pools.cone.push(action);
+        }
+    }
+    const pick = pool => [...pool].sort((a, b) => (_actionRange(b) - _actionRange(a))
+        || String(a.id).localeCompare(String(b.id)))[0] ?? null;
+    return ["cone", "spray", "blast"]
+        .map(kind => (pools[kind].length ? { action: pick(pools[kind]), kind } : null))
+        .filter(Boolean);
 }
 
 /**
@@ -2287,6 +2316,275 @@ function _bearingTo(from, to) {
     if (!Number.isFinite(from?.x) || !Number.isFinite(from?.y)
         || !Number.isFinite(to?.x) || !Number.isFinite(to?.y)) return null;
     return (((Math.atan2(to.y - from.y, to.x - from.x) * 180) / Math.PI) + 360) % 360;
+}
+
+/**
+ * Half-move rate of a target in scene units: the normalized `halfMove`
+ * field wins, the threat-profile copy is the fallback (same precedence
+ * as the dodge-escape model in {@link dodgeChanceOf}).
+ * @param {object|null} target Normalized target.
+ * @returns {number|null}
+ */
+function _targetHalfMove(target) {
+    return _finiteOr(target?.halfMove ?? target?.threatProfile?.halfMove, null);
+}
+
+/**
+ * Lead point of a target ("на опережение", issue #54): where the enemy
+ * arrives next turn walking its shortest straight line toward the bot —
+ * `threatPos + dir(threat → self) × min(halfMove, distToSelf)`.
+ * @param {object} target Normalized target `{x, y}` (pixels).
+ * @param {object} selfPos Self position `{x, y}` (pixels).
+ * @param {number} pxPerUnit Pixels per scene unit.
+ * @returns {{x: number, y: number}|null}
+ */
+function _leadPointOf(target, selfPos, pxPerUnit) {
+    const halfMove = _targetHalfMove(target);
+    if (!(halfMove > 0)) return null;
+    const dist = _distPx(target, selfPos);
+    if (!Number.isFinite(dist) || dist < 1e-9) return null;
+    const step = Math.min(halfMove * pxPerUnit, dist);
+    return {
+        x: target.x + (((selfPos.x - target.x) / dist) * step),
+        y: target.y + (((selfPos.y - target.y) / dist) * step)
+    };
+}
+
+/**
+ * Route waypoint of the nearest threat ("в проход", issue #54): the
+ * enemy's own `planRoute(threat → self)` — the same deterministic
+ * pathfind the planner uses for its own moves — walked to the point
+ * ~half a half-move along it. The shortest approach route threads the
+ * doors and corridors itself, so a cone steered at this anchor covers
+ * the real chokepoint instead of open ground. Without a rate the route
+ * midpoint is taken; a missing service/token/route yields `null` and the
+ * caller falls back to lead points. Partial routes are accepted — the
+ * anchor sits close to the threat end either way.
+ * @param {object} input
+ * @param {object} input.threat Normalized nearest threat.
+ * @param {object} input.selfPos Self position `{x, y}` (pixels).
+ * @param {number} input.pxPerUnit Pixels per scene unit.
+ * @param {object|null} input.navigation Navigation service.
+ * @param {object|null} input.combat Active combat (token lookup).
+ * @param {object|null} input.scene Active scene (token lookup).
+ * @returns {{x: number, y: number}|null}
+ */
+function _overwatchRoutePoint({ threat, selfPos, pxPerUnit,
+    navigation, combat, scene }) {
+    if (!navigation || typeof navigation.planRoute !== "function") return null;
+    const threatDoc = _findToken(threat?.tokenId, { combat, scene });
+    if (!threatDoc || !Number.isFinite(selfPos?.x)) return null;
+    const distUnits = _finiteOr(threat?.distance, null);
+    // A generous numeric budget keeps the search deterministic while
+    // still bounding it — a route winding past the straight distance is
+    // truncated to a partial path, whose first leg anchors just as well.
+    const budget = Number.isFinite(distUnits) && distUnits > 0
+        ? Math.max(distUnits * 4, 1) : 64;
+    let route = null;
+    try {
+        route = navigation.planRoute(threatDoc, { x: selfPos.x, y: selfPos.y }, budget);
+    } catch(err) {
+        route = null;
+    }
+    const waypoints = (route?.waypoints ?? route?.path ?? [])
+        .filter(point => Number.isFinite(point?.x) && Number.isFinite(point?.y));
+    if (waypoints.length < 2) return null;
+    const px = pxPerUnit > 0 ? pxPerUnit : 1;
+    const halfMove = _targetHalfMove(threat);
+    const total = waypoints.slice(1).reduce(
+        (sum, point, index) => sum + _distPx(waypoints[index], point), 0);
+    if (!(total > 0)) return null;
+    const wanted = halfMove > 0
+        ? Math.min(halfMove * px / 2, total)
+        : total / 2;
+    let walked = 0;
+    for (let index = 1; index < waypoints.length; index++) {
+        walked += _distPx(waypoints[index - 1], waypoints[index]);
+        if (walked + 1e-9 >= wanted) {
+            return { x: waypoints[index].x, y: waypoints[index].y };
+        }
+    }
+    const last = waypoints[waypoints.length - 1];
+    return { x: last.x, y: last.y };
+}
+
+/**
+ * Predicted orientation anchors of an overwatch declaration (issue #54).
+ * The zone controls ground the enemy is about to cross, not the square
+ * it already stands on: the route waypoint of the nearest threat first
+ * (one bounded pathfind per plan, only while an overwatch candidate is
+ * being built), a lead point per live threat, and the remembered
+ * positions of memory contacts (`last-known`/`team-contact` — their
+ * recorded point IS the prediction, issue #45 anchor). Anchors the bot
+ * cannot see are dropped — a watch zone behind a wall can never fire.
+ * @param {object} input
+ * @param {object[]} input.targets Normalized targets.
+ * @param {object} input.threatTarget Nearest threat (route anchor).
+ * @param {object} input.selfPos Self position `{x, y}` (pixels).
+ * @param {number} input.pxPerUnit Pixels per scene unit.
+ * @param {object|null} input.navigation Navigation service.
+ * @param {object|null} input.combat Active combat.
+ * @param {object|null} input.scene Active scene.
+ * @param {object|null} input.tokenDoc Viewer token document (LOS probes).
+ * @param {object|null} input.perception Perception service (LOS probes).
+ * @returns {object[]} `{x, y, kind, tokenUuid, tokenId}` anchors.
+ */
+function _overwatchAnchors({ targets, threatTarget, selfPos, pxPerUnit,
+    navigation, combat, scene, tokenDoc, perception }) {
+    const anchors = [];
+    const seen = new Set();
+    const push = (point, kind, target) => {
+        if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return;
+        // Equal predictions (a lead point landing on the route waypoint)
+        // must not count double — the aim coverage score stays honest.
+        const key = `${Math.round(point.x)},${Math.round(point.y)}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        anchors.push({
+            x: point.x,
+            y: point.y,
+            kind,
+            tokenUuid: target?.tokenUuid ?? null,
+            tokenId: target?.tokenId ?? null
+        });
+    };
+    push(_overwatchRoutePoint({
+        threat: threatTarget, selfPos, pxPerUnit, navigation, combat, scene
+    }), "route", threatTarget);
+    for (const target of targets ?? []) {
+        if (target?.canAttack !== true || target?.hidden === true) continue;
+        push(_leadPointOf(target, selfPos, pxPerUnit), "lead", target);
+    }
+    for (const target of targets ?? []) {
+        if (!_isMemorySource(target?.source) || target?.hidden === true) continue;
+        push({ x: target.x, y: target.y }, "memory", target);
+    }
+    if (!perception || typeof perception.hasLineOfSight !== "function") {
+        return anchors;
+    }
+    return anchors.filter(anchor => {
+        try {
+            return perception.hasLineOfSight(tokenDoc, anchor) === true;
+        } catch(err) {
+            return true;
+        }
+    });
+}
+
+/**
+ * Trigger circle of a blast overwatch (issue #54): the predicted anchor
+ * covering the most other anchors within the blast radius wins — the
+ * grenade lands where converging approach routes intersect. Candidate
+ * centres must sit inside the throw range and must not blanket a
+ * friendly (the same `blastTokens` veto as `_bestBlastAim`); the visible
+ * threat's live position is the last-resort centre, so an empty
+ * prediction set degrades to the old straight-at-threat zone.
+ * @param {object} input
+ * @param {object[]} input.anchors Predicted anchors (`_overwatchAnchors`).
+ * @param {object} input.threatTarget Nearest live threat (fallback centre).
+ * @param {object} input.selfPos Self position `{x, y}` (pixels).
+ * @param {object|null} input.tokenDoc Viewer token document (self veto
+ *   exemption).
+ * @param {number} input.rangePx Weapon range in pixels.
+ * @param {number} input.radiusPx Blast radius in pixels.
+ * @param {object[]} input.tokens Coverage scan (`_blastTokens` shape).
+ * @param {number} input.viewerDisposition Self disposition.
+ * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @returns {{shape: "blast", targetPoint: {x: number, y: number}}|null}
+ */
+function _overwatchBlastZone({ anchors, threatTarget, selfPos, tokenDoc,
+    rangePx, radiusPx, tokens, viewerDisposition, options }) {
+    if (!(rangePx > 0) || !(radiusPx > 0)) return null;
+    const centres = [...(anchors ?? [])];
+    if (Number.isFinite(threatTarget?.x) && Number.isFinite(threatTarget?.y)) {
+        centres.push({ x: threatTarget.x, y: threatTarget.y, kind: "live" });
+    }
+    let best = null;
+    centres.forEach(centre => {
+        if (_distPx(selfPos, centre) > rangePx + 1e-9) return;
+        let hits = 0;
+        let blocked = false;
+        for (const token of tokens ?? []) {
+            if ((token.tokenId ?? token.id) === tokenDoc?.id) continue;
+            if (_distPx(centre, token) > radiusPx + 1e-9) continue;
+            const disp = Math.sign(_finiteOr(token.disposition, 0));
+            if (!_hostileTo(viewerDisposition, disp, options)) {
+                blocked = true;
+                break;
+            }
+        }
+        if (blocked) return;
+        for (const anchor of anchors ?? []) {
+            if (_distPx(centre, anchor) <= radiusPx + 1e-9) hits++;
+        }
+        // The threat's own square always counts — a trigger circle over
+        // the live enemy fires the moment it acts.
+        if (_distPx(centre, threatTarget) <= radiusPx + 1e-9) hits++;
+        if (hits <= 0) return;
+        // First-listed centre wins ties: route > lead > memory > live —
+        // the deterministic preference order of issue #54.
+        if (!best || hits > best.hits) best = { centre, hits };
+    });
+    if (!best) return null;
+    return {
+        shape: "blast",
+        targetPoint: { x: best.centre.x, y: best.centre.y }
+    };
+}
+
+/**
+ * Watch zone of one overwatch weapon (issue #54). Cone geometries steer
+ * `_bestConeAim` by the predicted anchors — the existing coverage sweep
+ * already maximizes the number of covered predictions with the friendly
+ * veto, so converging approach routes land the cone on the shared
+ * chokepoint naturally (all-anchors variant of the issue). A raw bearing
+ * on the nearest threat stays the last-resort fallback when nothing was
+ * predictable, preserving the issue #15 behaviour.
+ * @param {object} input
+ * @param {"cone"|"spray"|"blast"} input.kind Zone geometry of the weapon.
+ * @param {object} input.action Overwatch weapon action.
+ * @param {object[]} input.anchors Predicted anchors.
+ * @param {object} input.threatTarget Nearest live threat (fallback).
+ * @param {object} input.selfPos Self position `{x, y}` (pixels).
+ * @param {number} input.pxPerUnit Pixels per scene unit.
+ * @param {object|null} input.tokenDoc Viewer token document.
+ * @param {object[]} input.tokens Coverage scan (`_blastTokens` shape).
+ * @param {number} input.viewerDisposition Self disposition.
+ * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @returns {object|null} `{shape, direction?, arc?, range?, targetPoint?,
+ *   blastRadius?}`.
+ */
+function _overwatchZone({ kind, action, anchors, threatTarget, selfPos,
+    pxPerUnit, tokenDoc, tokens, viewerDisposition, options }) {
+    const range = _actionRange(action);
+    const rangePx = range * pxPerUnit;
+    if (kind === "blast") {
+        const zone = _overwatchBlastZone({
+            anchors, threatTarget, selfPos, tokenDoc, rangePx,
+            radiusPx: _actionBlastRadius(action) * pxPerUnit,
+            tokens, viewerDisposition, options
+        });
+        return zone ? { ...zone, blastRadius: _actionBlastRadius(action), range } : null;
+    }
+    const spec = _coneSpecOf(action);
+    const arc = spec?.angle ?? OVERWATCH_CONE_DEG;
+    const aim = _bestConeAim({
+        tokenDoc,
+        origin: selfPos,
+        rangePx,
+        angleDeg: arc,
+        tokens,
+        anchors,
+        viewerDisposition,
+        options,
+        perception: null,
+        requireLos: false
+    });
+    if (aim) return { shape: "cone", direction: aim.direction, arc, range };
+    const direction = _bearingTo(selfPos, threatTarget);
+    return Number.isFinite(direction)
+        ? { shape: "cone", direction, arc, range }
+        : null;
 }
 
 /**
@@ -2974,9 +3272,15 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
             projectedResourceDelta: {}
         });
     }
-    // Issue #15: `overwatch` declares a GM-rendered cone through the
-    // overwatch service (issue #14); no roll is made.
+    // Issue #15: `overwatch` declares a GM-rendered zone through the
+    // overwatch service (issue #14); no roll is made. Issue #54: the
+    // zone descriptor follows the weapon geometry — a watch cone
+    // (`direction`/`arc`/`range`, arc from `_coneSpecOf` for spray) or a
+    // blast trigger circle (`shape:"blast"` + `targetPoint`/
+    // `blastRadius`, matching the attack-step contract so the plan
+    // overlay draws it without a new reader).
     if (variant === "overwatch") {
+        const zone = candidate.zone ?? null;
         steps.push({
             id: `step-overwatch-${steps.length + 1}`,
             type: "overwatch",
@@ -2987,9 +3291,18 @@ function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }) {
                 weaponId: action.itemId ?? null,
                 itemUuid: action.itemUuid ?? null,
                 attackType: action.attackType ?? "standard",
-                direction: candidate.direction,
-                arc: 45,
-                range: _actionRange(action),
+                ...(zone?.shape === "blast"
+                    ? {
+                        shape: "blast",
+                        targetPoint: { x: zone.targetPoint.x, y: zone.targetPoint.y },
+                        blastRadius: zone.blastRadius,
+                        range: _actionRange(action)
+                    }
+                    : {
+                        direction: zone?.direction ?? candidate.direction,
+                        arc: zone?.arc ?? OVERWATCH_CONE_DEG,
+                        range: _actionRange(action)
+                    }),
                 targetTokenUuid: target?.tokenUuid ?? null
             },
             preconditions: ["turn"],
@@ -4039,30 +4352,53 @@ export function createPlannerService({
             }
         }
 
-        // Overwatch: declare a 45° watch cone toward the nearest visible
+        // Overwatch: declare a watch zone toward the nearest visible
         // threat. The step only registers the declaration — the reaction
         // shot itself stays under manual GM control (issue #14 service,
         // #15 candidate). Issue #30: only a live visible target is a
         // valid orientation anchor — for memory-only contacts a search
         // move or a spray/memory-strike is the documented turn, and a
         // hidden or entirely unknown position never steers a declaration.
+        // Issue #54: the zone aims at predicted positions (route
+        // waypoint, lead points, remembered contacts), not the square the
+        // enemy already occupies; spray and blast weapons declare their
+        // own geometry (template cone, trigger circle).
         if (!isPinned) {
-            const owAction = _overwatchAction(usableActions);
-            const owDirection = threatTarget?.canAttack === true
-                && threatTarget.hidden !== true
-                ? _bearingTo(selfPos, threatTarget) : null;
-            if (owAction && selfReactionUsed) {
-                // Issue #37: the reaction slot is spent — a declaration
-                // could never fire this round, so the cone is not offered.
-                rejectL0(`overwatch|${owAction.id}`, "reaction-used");
-            } else if (owAction && Number.isFinite(owDirection)
-                && ACTION_BUDGET_HALVES <= actionBudget) {
+            const owWeapons = _overwatchWeapons(usableActions);
+            const owGate = threatTarget?.canAttack === true
+                && threatTarget.hidden !== true;
+            // Anchors are computed once — only while an overwatch
+            // candidate is actually built, and the route probe stays
+            // limited to the single nearest threat (issue #54 bound).
+            const owAnchors = owWeapons.length && owGate
+                ? _overwatchAnchors({
+                    targets, threatTarget, selfPos, pxPerUnit,
+                    navigation, combat, scene, tokenDoc, perception
+                })
+                : [];
+            for (const { action: owAction, kind } of owWeapons) {
+                if (selfReactionUsed) {
+                    // Issue #37: the reaction slot is spent — a
+                    // declaration could never fire this round, so the
+                    // zone is not offered.
+                    rejectL0(`overwatch|${owAction.id}`, "reaction-used");
+                    continue;
+                }
+                if (!owGate || ACTION_BUDGET_HALVES > actionBudget) continue;
+                const zone = _overwatchZone({
+                    kind, action: owAction, anchors: owAnchors,
+                    threatTarget, selfPos, pxPerUnit, tokenDoc,
+                    tokens: blastTokens, viewerDisposition,
+                    options: blastOptions
+                });
+                if (!zone) continue;
                 candidates.push({
                     variant: "overwatch",
                     action: owAction,
                     target: threatTarget,
                     move: null,
-                    direction: owDirection
+                    direction: zone.direction ?? null,
+                    zone
                 });
             }
         }

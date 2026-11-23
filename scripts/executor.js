@@ -898,6 +898,9 @@ export function createExecutorService({
             return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
         }
         const input = step?.input ?? {};
+        // Issue #54: a `shape:"blast"` input carries the trigger-circle
+        // fields (`targetPoint`/`blastRadius`); cone inputs keep the
+        // legacy flat `direction`/`arc`/`range`.
         const outcome = await overwatch.declare({
             combat: context.combat,
             combatant: run.combatant,
@@ -905,6 +908,9 @@ export function createExecutorService({
                 direction: input.direction,
                 arc: input.arc,
                 range: input.range,
+                shape: input.shape ?? null,
+                targetPoint: input.targetPoint ?? null,
+                blastRadius: input.blastRadius ?? null,
                 weaponId: input.weaponId ?? input.itemUuid ?? null,
                 weaponName: input.name ?? input.weaponName ?? null,
                 attackType: input.attackType ?? null
