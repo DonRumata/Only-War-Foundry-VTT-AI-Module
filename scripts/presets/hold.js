@@ -113,7 +113,11 @@ export const HOLD_WEIGHTS = Object.freeze({
     engageDenial: 2,
     unpin: 3,
     grudge: 2,
-    ev: 1
+    ev: 1,
+    // Target inertia for defenders — keep holding the line against the
+    // same enemy rather than spreading attention every round.
+    stickyTarget: 5,
+    outnumber: 3
 
 });
 

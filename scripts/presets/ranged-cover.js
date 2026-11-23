@@ -93,7 +93,9 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     engageDenial: 0,
     unpin: 3,
     grudge: 1,
-    ev: 1
+    ev: 1,
+    stickyTarget: 3,
+    outnumber: 1
 
 });
 

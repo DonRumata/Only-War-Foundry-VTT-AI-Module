@@ -52,6 +52,7 @@ export const FLAG_KEYS = Object.freeze({
     reactionUsed: "reactionUsed",
     lastUsedWeapon: "lastUsedWeapon",
     lastAttacker: "lastAttacker",
+    lastTarget: "lastTarget",
     lastOrder: "lastOrder",
     delaySync: "delaySync",
     // Issue #25 L1 commitment: the persisted multi-turn plan record

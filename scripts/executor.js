@@ -1225,11 +1225,28 @@ export function createExecutorService({
             actionId: input.actionId ?? null,
             round: context.combat?.round ?? null
         };
-        if (!record.itemUuid && !record.itemId && !record.name) return;
+        if (record.itemUuid || record.itemId || record.name) {
+            try {
+                await run.combatant.setFlag(MODULE_ID, FLAG_KEYS.lastUsedWeapon, record);
+            } catch(err) {
+                // Inertia bookkeeping is best-effort — the shot already landed.
+            }
+        }
+        // Sticky-target memory (smoke finding): the planner's
+        // `stickyTarget` factor keeps a bot on the target it already
+        // engaged instead of ping-ponging between charge options.
+        const target = {
+            tokenUuid: input.targetTokenUuid ?? input.targetUuid ?? null,
+            tokenId: input.targetTokenId ?? null,
+            actorId: input.targetActorId ?? null,
+            round: context.combat?.round ?? null,
+            turn: context.combat?.turn ?? null
+        };
+        if (!target.tokenUuid && !target.tokenId && !target.actorId) return;
         try {
-            await run.combatant.setFlag(MODULE_ID, FLAG_KEYS.lastUsedWeapon, record);
+            await run.combatant.setFlag(MODULE_ID, FLAG_KEYS.lastTarget, target);
         } catch(err) {
-            // Inertia bookkeeping is best-effort — the shot already landed.
+            // Target bookkeeping is best-effort — the shot already landed.
         }
     }
 

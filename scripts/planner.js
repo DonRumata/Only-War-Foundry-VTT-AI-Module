@@ -165,7 +165,9 @@ export const SCORE_FACTORS = Object.freeze([
     "unpin",
     "grudge",
     "order",
-    "ev"
+    "ev",
+    "stickyTarget",
+    "outnumber"
 ]);
 
 /**
@@ -233,7 +235,12 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     // Issue #38: a leader's order is the moderate utility turn — it must
     // never outbid a ready attack, but always beats an empty hold.
     order: 5,
-    ev: 1
+    ev: 1,
+    // Smoke finding: a bot should keep pressing the target it already
+    // attacks instead of ping-ponging between near-equal charge options;
+    // ganging up on an ally-engaged hostile is the melee doctrine bonus.
+    stickyTarget: 4,
+    outnumber: 0
 });
 
 /**
@@ -1377,11 +1384,13 @@ function _isAllyDisposition(viewer, disp, { includeNeutral = false, dispositions
  *   per-pair melee reach (issue #39 review: long-reach weapons reach a
  *   cell further than `DEFAULT_MELEE_RANGE`); `null` uses `reachPx`.
  * @param {object} input.options `{includeNeutral, dispositions}`.
- * @returns {Set<string>}
+ * @returns {Map<string, number>} Hostile uuid → count of allies in melee
+ *   reach of it. `.has()` keeps the Set semantics callers already use;
+ *   the count feeds the `outnumber` factor (ganging up, OW +10/+20).
  */
 function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx,
     resolveReachPx = null, options }) {
-    const engaged = new Set();
+    const engaged = new Map();
     for (const target of tokens ?? []) {
         if (!target || target.tokenUuid == null) continue;
         const disp = Math.sign(_finiteOr(target.disposition, 0));
@@ -1395,8 +1404,7 @@ function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx
                 ? resolveReachPx(target, token) : null;
             const limit = Number.isFinite(pairReach) && pairReach > 0 ? pairReach : reachPx;
             if (_distPx(target, token) <= limit + 1e-9) {
-                engaged.add(target.tokenUuid);
-                break;
+                engaged.set(target.tokenUuid, (engaged.get(target.tokenUuid) ?? 0) + 1);
             }
         }
     }
@@ -1956,7 +1964,7 @@ function _teamContactRaws({ combat, combatant, perception, context,
         return Object.entries(contacts)
             .map(([tokenUuid, entry]) => ({ tokenUuid, ...entry }));
     }
-    const teamId = context?.team?.teamId;
+    const teamId = context?.team?.teamId ?? _teamIdOf(combatant);
     if (teamId && typeof perception?.teamLastKnownPositions === "function") {
         try {
             const shared = perception.teamLastKnownPositions(combat, combatant, teamId);
@@ -1966,6 +1974,38 @@ function _teamContactRaws({ combat, combatant, perception, context,
         }
     }
     return [];
+}
+
+/**
+ * Resolved fireteam `teamId` of a combatant without a TeamPlan context:
+ * combatant flag wins, then the linked token, then the actor — the same
+ * field-priority chain `resolveTeamConfig`/`perception._teamIdOf` apply
+ * (duplicated here because planner ↔ fireteam would be an import cycle).
+ * @param {object} combatant
+ * @returns {string|null}
+ */
+function _teamIdOf(combatant) {
+    const read = doc => {
+        if (!doc) return null;
+        try {
+            if (typeof doc.getFlag === "function") {
+                const flag = doc.getFlag(MODULE_ID, FLAG_KEYS.fireteam);
+                if (typeof flag?.teamId === "string" && flag.teamId) {
+                    return flag.teamId;
+                }
+            }
+        } catch(_err) {
+            // Fall back to the raw flags object below.
+        }
+        const flag = doc?.flags?.[MODULE_ID]?.[FLAG_KEYS.fireteam];
+        return typeof flag?.teamId === "string" && flag.teamId
+            ? flag.teamId : null;
+    };
+    const tokenDoc = _tokenDoc(combatant?.token);
+    return read(combatant)
+        ?? read(tokenDoc)
+        ?? read(combatant?.actor ?? tokenDoc?.actor)
+        ?? null;
 }
 
 /**
@@ -2861,6 +2901,9 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
  *   feeds the `leaveMeleeEngage`/`engageDenial` free-attack factors.
  * @param {object|null} [input.lastAttacker] Active `lastAttacker` flag
  *   record (`{tokenUuid, actorId, ...}`) — feeds the `grudge` factor.
+ * @param {object|null} [input.lastTarget] `lastTarget` flag/context
+ *   record (`{tokenUuid, tokenId, actorId, round}`) — feeds the
+ *   `stickyTarget` factor while fresh.
  * @param {object|null} [input.orderBoost] `{character, pressured}` — the
  *   `order` factor grows +0.5 in `disciplined`/`elite` teams and +0.5
  *   under morale pressure (issue #38, graceful #26 hook).
@@ -2870,7 +2913,7 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
     lastUsedWeapon = null, traits = [], dodgeTN = null,
     allyEngagedTargets = null, enemies = null, lastAttacker = null,
-    orderBoost = null }) {
+    orderBoost = null, lastTarget = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -2951,7 +2994,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     // Issue #39 review: the `heretic` trait fires into an ally's melee
     // without compunction — the factor never engages for it.
     const firesIntoMelee = personalityBehaviorFlags(traits).firesIntoMelee === true;
-    const alliedEngaged = !firesIntoMelee && allyEngagedTargets instanceof Set
+    const alliedEngaged = !firesIntoMelee
+        && allyEngagedTargets != null && typeof allyEngagedTargets.has === "function"
         && target?.tokenUuid != null
         && allyEngagedTargets.has(target.tokenUuid)
         && action && melee !== 1
@@ -2987,6 +3031,25 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
                 && target.actorId === lastAttacker.actorId))
         ? Math.min(Math.max(_finiteOr(lastAttacker.woundsLost, 5), 0) / 10, 1)
         : 0;
+    // Smoke finding: target inertia — a bot keeps pressing the target it
+    // already engaged/attacked instead of switching between near-equal
+    // options every round. Applies to any attack variant on that target,
+    // so a charge on the *same* target still earns it.
+    const stickyTarget = lastTarget && target
+        && ((lastTarget.tokenUuid != null
+                && target.tokenUuid === lastTarget.tokenUuid)
+            || (lastTarget.tokenId != null
+                && target.tokenId === lastTarget.tokenId)
+            || (lastTarget.actorId != null
+                && target.actorId === lastTarget.actorId))
+        ? 1 : 0;
+    // Ganging up (OW numerical superiority in melee): melee candidates
+    // against a target already engaged by allies earn up to the full
+    // factor at two-plus allies — only melee enjoys the rule bonus.
+    const allyCount = melee === 1 && target?.tokenUuid != null
+        && allyEngagedTargets != null && typeof allyEngagedTargets.get === "function"
+        ? (allyEngagedTargets.get(target.tokenUuid) ?? 0) : 0;
+    const outnumber = Math.min(allyCount, 2) / 2;
     return {
         attackNow,
         attackAfterMove,
@@ -3044,7 +3107,9 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         order: variant === "order"
             ? 1 + (orderBoost?.character === true ? 0.5 : 0)
                 + (orderBoost?.pressured === true ? 0.5 : 0)
-            : 0
+            : 0,
+        stickyTarget,
+        outnumber
     };
 }
 
@@ -3978,6 +4043,18 @@ export function createPlannerService({
             : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.lastAttacker)
                 ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.lastAttacker]);
         const lastAttacker = _activeGrudge(lastAttackerRecord, combat);
+        // Sticky-target memory: the combatant `lastTarget` flag the
+        // executor wrote after the previous attack — valid while the
+        // record is from this or the previous round, stale records read
+        // as "no favourite" so a long-gone target never locks the bot.
+        const lastTargetRecord = context.lastTarget !== undefined
+            ? context.lastTarget
+            : (combatant?.getFlag?.(MODULE_ID, FLAG_KEYS.lastTarget)
+                ?? combatant?.flags?.[MODULE_ID]?.[FLAG_KEYS.lastTarget]);
+        const lastTarget = lastTargetRecord && (lastTargetRecord.round == null
+            || !Number.isFinite(combat?.round)
+            || lastTargetRecord.round >= combat.round - 1)
+            ? lastTargetRecord : null;
         // Issue #37 reaction slot: a bot that already spent its reaction
         // this round cannot bank another one — overwatch declarations
         // drop out of the candidate set.
@@ -4643,6 +4720,7 @@ export function createPlannerService({
                 preferredWeapon, lastUsedWeapon,
                 traits: personality.traits, dodgeTN,
                 allyEngagedTargets, enemies: enemyContacts, lastAttacker,
+                lastTarget,
                 // Issue #38: disciplined/elite squads and pressured morale
                 // (graceful #26 hook) raise the leader's order utility.
                 orderBoost: {

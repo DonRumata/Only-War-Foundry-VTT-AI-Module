@@ -69,8 +69,13 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     engageDenial: 4,
     unpin: 4,
     grudge: 4,
-    ev: 1
-
+    ev: 1,
+    // Smoke finding: assault keeps swinging at the target it already
+    // attacks — the sticky pull must outbid the charge differential that
+    // otherwise ping-pongs it between near-equal hostiles; ganging up on
+    // an ally-engaged target is core melee doctrine.
+    stickyTarget: 8,
+    outnumber: 4
 });
 
 /**
