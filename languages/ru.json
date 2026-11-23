@@ -204,7 +204,7 @@
   "OWAI.Settings.MasterEnabled.Name": "Включить Only War AI",
   "OWAI.Settings.MasterEnabled.Hint": "Общий выключатель модуля. Выкл: AI-ходы не заявляются и не исполняются, GM-превью не открывается, внедрённые элементы интерфейса скрыты. Флаги NPC сохраняются и снова заработают при включении.",
   "OWAI.Settings.ThreatMapOverlay.Name": "Отладочный оверлей карты угроз",
-  "OWAI.Settings.ThreatMapOverlay.Hint": "Рисует тепловые клетки AI-карты угроз на сцене. Только для GM — игроки её не видят.",
+  "OWAI.Settings.ThreatMapOverlay.Hint": "Рисует тепловые клетки AI-карты угроз на сцене. Только для GM — игроки её не видят. Горячая клавиша: Alt+M.",
   "OWAI.Settings.AttackAdjudication.Name": "Арбитраж атак",
   "OWAI.Settings.AttackAdjudication.Hint": "Авто: броски AI резолвит системный API. Подтверждение GM: перед каждым шагом атаки/теста чат-карта предлагает GM бросить автоматически, бросить вручную, заменить проверкой навыка или забрать ход. Режим предпросмотра и так спрашивает GM один раз на весь план.",
   "OWAI.Settings.AttackAdjudication.Auto": "Автоматически",

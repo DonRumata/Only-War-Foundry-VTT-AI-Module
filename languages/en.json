@@ -204,7 +204,7 @@
   "OWAI.Settings.MasterEnabled.Name": "Enable Only War AI",
   "OWAI.Settings.MasterEnabled.Hint": "Master switch for the whole module. Off: no AI turns are claimed or executed, the GM preview never opens and injected UI is hidden. Individual NPC flags are kept for when it is turned back on.",
   "OWAI.Settings.ThreatMapOverlay.Name": "Threat map debug overlay",
-  "OWAI.Settings.ThreatMapOverlay.Hint": "Draw the AI threat-map heat cells on the scene canvas. GM-only debug visualization — players never see it.",
+  "OWAI.Settings.ThreatMapOverlay.Hint": "Draw the AI threat-map heat cells on the scene canvas. GM-only debug visualization — players never see it. Hotkey: Alt+M.",
   "OWAI.Settings.AttackAdjudication.Name": "Attack adjudication",
   "OWAI.Settings.AttackAdjudication.Hint": "Auto: the system roll API resolves AI attacks. GM confirm: before every attack/test step a GM chat card offers to execute it, roll it manually, substitute a skill test or take the turn back. Preview mode always asks the GM once for the whole plan.",
   "OWAI.Settings.AttackAdjudication.Auto": "Automatic",

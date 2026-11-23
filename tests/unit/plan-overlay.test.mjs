@@ -508,3 +508,93 @@ test("a stale marker re-draws the overlay with the stale flag", async () => {
     assert.equal(rig.preview.hasSession(operation.id), false);
     assert.deepEqual(rig.clears, [operation.id]);
 });
+
+// --- Attack ray + overlay persistence (review findings) ---------------------
+
+test("buildPlanOverlayModel emits an attack ray from origin to target centre", () => {
+    const model = buildPlanOverlayModel(makeSerializedPlan(), {
+        self: { x: 0, y: 0, w: 100, h: 100 },
+        target: { x: 300, y: 0, w: 100, h: 100 },
+        pxPerUnit: 100 / 1.5,
+        operationId: "op-ov-1",
+        sceneId: "scene-1"
+    });
+    // From the move destination centre to the target bounds centre.
+    assert.deepEqual(model.attackRay, {
+        from: { x: 250, y: 50 },
+        to: { x: 350, y: 50 }
+    });
+    assert.equal(model.sceneId, "scene-1");
+
+    // No resolvable target → no ray.
+    const rayless = buildPlanOverlayModel({
+        ...makeSerializedPlan(),
+        snapshot: { self: { tokenId: "npc1", x: 0, y: 0 }, target: null },
+        steps: makeSerializedPlan().steps.filter(step => step.type !== "attack")
+    }, { self: { x: 0, y: 0, w: 100, h: 100 } });
+    assert.equal(rayless.attackRay, null);
+});
+
+test("updateCombat without a turn advance keeps the plan overlay", () => {
+    const { templates } = makeCanvasWorld();
+    const api = createModuleApi();
+    api._state.enabled = true;
+    api.services.register("authority", { isController: () => true });
+    const overlay = createPlanOverlayService({ api, getDangerEnabled: () => false });
+    overlay.start();
+    overlay.showPlan(makeSerializedPlan(), {
+        combat: { combatants: [] },
+        combatant: { token: { id: "npc1", x: 0, y: 0, width: 1, height: 1 } },
+        operationId: "op-ov-1"
+    });
+    const root = templates.getChildByName("ow-ai-overlay");
+    const planLayer = root.getChildByName("plan");
+    assert.ok(planLayer.children.length > 0, "plan drawn");
+
+    const onUpdateCombat = Hooks._calls
+        .filter(call => call.event === "updateCombat").at(-1).fn;
+
+    // Unrelated Combat writes (operation flags during an open preview)
+    // must not wipe the picture.
+    onUpdateCombat({}, { flags: { "only-war-ai": { operation: { phase: "awaiting-preview" } } } });
+    assert.equal(overlay.describe().plan.active, true);
+    assert.ok(planLayer.children.length > 0, "overlay survives flag writes");
+
+    // A turn advance does clear it.
+    onUpdateCombat({}, { turn: 2, round: 1 });
+    assert.equal(overlay.describe().plan.active, false);
+    assert.equal(planLayer.children.length, 0);
+});
+
+test("canvasReady redraws the plan on the same scene and drops it on a scene change", () => {
+    const { templates } = makeCanvasWorld();
+    const api = createModuleApi();
+    api._state.enabled = true;
+    api.services.register("authority", { isController: () => true });
+    const overlay = createPlanOverlayService({ api, getDangerEnabled: () => false });
+    overlay.start();
+    overlay.showPlan(makeSerializedPlan(), {
+        combat: { combatants: [] },
+        combatant: { token: { id: "npc1", x: 0, y: 0, width: 1, height: 1 } },
+        operationId: "op-ov-1"
+    });
+    assert.equal(overlay.describe().plan.active, true);
+
+    const onCanvasReady = Hooks._calls
+        .filter(call => call.event === "canvasReady").at(-1).fn;
+
+    // Canvas re-init on the same scene: the PIXI tree is gone, the model
+    // is kept and the plan is redrawn.
+    resetOverlayRoot();
+    onCanvasReady();
+    const root = templates.getChildByName("ow-ai-overlay");
+    assert.ok(root, "root recreated");
+    assert.ok(root.getChildByName("plan").children.length > 0, "plan redrawn");
+    assert.equal(overlay.describe().plan.active, true);
+
+    // A scene switch drops the stale model — nothing is drawn.
+    canvas.scene = { ...canvas.scene, id: "scene-2" };
+    resetOverlayRoot();
+    onCanvasReady();
+    assert.equal(overlay.describe().plan.active, false);
+});
