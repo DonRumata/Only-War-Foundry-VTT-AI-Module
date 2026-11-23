@@ -424,6 +424,17 @@ export function createAuthorityService(deps = {}) {
         if (!combat || !isEnabled() || !isController()) return;
         const combatant = combat.combatant ?? combat.turns?.[combat.turn] ?? null;
         if (!combatant) return;
+        if (combatant.defeated === true || combatant.destroyed === true) {
+            // `skipDefeated` may be off — a dead combatant still lands on
+            // the turn pointer. The AI must never claim/act for a corpse:
+            // advance past it like Foundry's own skip would.
+            try {
+                if (typeof combat.nextTurn === "function") await combat.nextTurn();
+            } catch(_err) {
+                // End-of-combat race: a destroyed combat cannot advance.
+            }
+            return;
+        }
         const config = resolveConfig(combatant);
         if (!config?.enabled) return;
         const key = `${combat.id}:${combatant.id}:${combat.round}:${combat.turn}`;

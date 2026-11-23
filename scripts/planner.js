@@ -3692,7 +3692,7 @@ export function createPlannerService({
         if (!combat || combat.ended === true || combat.destroyed === true) {
             return { status: PLANNER_STATUS.disabled, reason: STALE_REASONS.combatEnded, plan: null };
         }
-        if (!combatant || combatant.destroyed === true) {
+        if (!combatant || combatant.destroyed === true || combatant.defeated === true) {
             return { status: PLANNER_STATUS.disabled, reason: "combatant-gone", plan: null };
         }
         const config = resolveConfig(combatant);

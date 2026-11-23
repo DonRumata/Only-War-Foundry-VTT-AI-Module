@@ -203,8 +203,8 @@ async function scriptedPlayerTurn() {
  * (apply with armour/TB/crits). Clicking the real buttons keeps the
  * automated run faithful. Buttons are marked once clicked.
  */
-async function flushDamage() {
-    return ev(async () => {
+async function flushDamage(victimId = null) {
+    return ev(async (victimArg) => {
         const clicked = { rolls: 0, applied: 0 };
         window.__drvInvoked ??= new Set();
         // Roll damage once per attack card (message ids survive re-renders).
@@ -218,24 +218,39 @@ async function flushDamage() {
             clicked.rolls++;
         }
         if (clicked.rolls) await new Promise((r) => setTimeout(r, 600));
-        // Apply pending hits: the per-hit handler needs a target; the card
-        // records the victim as rollData.tokenId / targetActor.
+        // Apply pending hits: the per-hit handler needs a VICTIM token in
+        // `game.user.targets`. Directed/suppression cards stamp
+        // `damages[i].targetTokenId`; plain attack cards carry no victim
+        // at all — the driver falls back to the most recent attack's
+        // target. `rd.tokenId` is the ATTACKER's speaker token, never a
+        // victim. An unresolvable hit is skipped — clicking it would only
+        // spam APPLY_DAMAGE_NO_TARGET or deal damage to nobody.
         for (const el of document.querySelectorAll('.chat-message[data-message-id]')) {
             const mid = el.dataset.messageId;
             const buttons = [...el.querySelectorAll('.apply-damage-hit:not([data-drv])')];
             if (!buttons.length) continue;
             const rd = game.messages.get(mid)?.getRollData?.() ?? {};
-            const token = (rd.tokenId && canvas.tokens.get(rd.tokenId))
-                ?? (rd.targetActor?._id && canvas.tokens.placeables.find((t) => t.actor?.id === rd.targetActor._id))
-                ?? null;
-            const placed = token && typeof token.setTarget === 'function';
-            if (placed) token.setTarget(true, { user: game.user, releaseOthers: true });
             for (const btn of buttons) {
+                const idx = Number(btn.closest('.damage-hit')?.dataset?.damageIndex);
+                const entry = rd.damages?.[Number.isFinite(idx) ? idx : 0] ?? null;
+                const victimId = entry?.targetTokenId ?? rd.targetTokenId ?? victimArg;
+                const victimActorId = rd.targetActor?.id ?? rd.targetActor?._id ?? null;
+                const token = victimId
+                    ? (canvas.tokens.get(victimId)
+                        ?? canvas.tokens.placeables.find((t) => t.id === victimId || t.document?.id === victimId))
+                    : (victimActorId
+                        ? canvas.tokens.placeables.find((t) => t.actor?.id === victimActorId)
+                        : null);
                 btn.dataset.drv = '1';
+                if (!token || typeof token.setTarget !== 'function') {
+                    clicked.skipped = (clicked.skipped ?? 0) + 1;
+                    continue;
+                }
+                token.setTarget(true, { user: game.user, releaseOthers: true });
                 btn.click();
+                token.setTarget(false, { user: game.user });
                 clicked.applied++;
             }
-            if (placed) token.setTarget(false, { user: game.user });
             if (clicked.applied) await new Promise((r) => setTimeout(r, 400));
         }
 
@@ -257,10 +272,13 @@ async function flushDamage() {
             }
         }
         return clicked;
-    });
+    }, victimId);
 }
 
 const handledOps = new Set();
+// The last attack's victim token id — plain damage cards record no
+// defender, so the damage pump aims `game.user.targets` at it.
+let lastVictim = null;
 let processed = 0;
 let noSessionTicks = 0;
 let lastWaitOpId = null;
@@ -348,6 +366,11 @@ while (processed < MAX_TURNS) {
         if (dump?.plan?.diagnostics || dump?.plan?.trace || dump?.plan?.personality || dump?.plan?.morale || dump?.plan?.team) {
             log({ type: 'plan-detail', combatant: dump.combatant, opId: state.opId, ...dump.plan });
         }
+        // Remember the attack victim for the damage pump: winner/candidate
+        // strings carry the target token id as `...|<tokenId>`.
+        const cand = dump?.plan?.diagnostics?.ranking?.[0]?.candidate ?? dump?.plan?.winner;
+        const cParts = typeof cand === 'string' ? cand.split('|') : [];
+        if (cParts.some((p) => /attack/.test(p)) && cParts[1]) lastVictim = cParts[1];
         if (SHOTS || action === 'capture') {
             await h.screenshot(page, `preview-${dump?.combatant ?? 'x'}-r${dump?.round ?? 0}`.replace(/\s+/g, '-'));
         }
@@ -392,7 +415,7 @@ while (processed < MAX_TURNS) {
         }
         handledOps.add(state.opId);
         processed++;
-        const dmg = await flushDamage();
+        const dmg = await flushDamage(lastVictim);
         if (dmg?.rolls || dmg?.applied) log({ type: 'damage-pump', ...dmg });
         continue;
     }
@@ -442,7 +465,8 @@ while (processed < MAX_TURNS) {
         if (SKIP_PLAYERS) {
             const played = await scriptedPlayerTurn();
             log({ type: 'player-turn', combatant: played?.name ?? state.current, shot: played?.shot ?? null, round: state.round });
-            const dmg = await flushDamage();
+            if (played?.shot?.target) lastVictim = played.shot.target;
+            const dmg = await flushDamage(lastVictim);
             if (dmg?.rolls || dmg?.applied) log({ type: 'damage-pump', ...dmg });
             await page.waitForTimeout(800);
         } else {

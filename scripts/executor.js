@@ -1443,10 +1443,12 @@ export function createExecutorService({
                 try {
                     await combat.nextTurn();
                 } catch(err) {
-                    // `endCombat()` can land mid-verify — a destroyed
-                    // combat's nextTurn throw is teardown noise, not a
-                    // failure worth logging.
-                    if (combat.destroyed !== true && combat.ended !== true) {
+                    // `endCombat()` can land mid-verify — in v13 the doc's
+                    // `destroyed` flag may not be set when the throw hits,
+                    // so membership in the collection is the honest check.
+                    const gone = combat.destroyed === true || combat.ended === true
+                        || (globalThis.game?.combats && !globalThis.game.combats.get(combat.id));
+                    if (!gone) {
                         console.error(`${MODULE_ID} | nextTurn failed`, err);
                     }
                 }

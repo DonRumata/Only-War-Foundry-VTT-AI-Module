@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Unit tests for the perception service (issue #401): LOS adapters,
  * disposition/state filtering, deterministic target scoring and the
  * last-known-position memory lifecycle.
@@ -287,7 +287,7 @@ test("measureDistance prefers grid measurement and falls back to pixels", () => 
         scene: { id: "scene-1", grid: { size: 100, distance: 2 }, tokens: { contents: [a, b] } }
     });
     try {
-        // Mock grid: Euclidean pixels / 100 * 1.5 → 4.5.
+        // Mock grid: Euclidean pixels / 100 * 1.5 в†’ 4.5.
         assert.equal(measureDistance(a, b), 4.5);
     } finally {
         restore();
@@ -300,7 +300,7 @@ test("measureDistance prefers grid measurement and falls back to pixels", () => 
         dimensions: { size: 100, distance: 2 }
     };
     try {
-        // No grid.measureDistance → pixel fallback: 300px / 100 * 2 = 6.
+        // No grid.measureDistance в†’ pixel fallback: 300px / 100 * 2 = 6.
         assert.equal(measureDistance(a, b), 6);
     } finally {
         globalThis.canvas = previous;
@@ -417,8 +417,7 @@ test("memory entries are sanitized to the contract fields", () => {
     });
     assert.deepEqual(Object.keys(entry).sort(), [
         "dispositionAtDetection",
-        "elevation",
-        "lastSeenRound",
+        "elevation",        "firstSeenRound",        "lastSeenRound",
         "lastSeenTurn",
         "sceneId",
         "x",
@@ -430,7 +429,7 @@ test("memory entries are sanitized to the contract fields", () => {
     assert.deepEqual(sanitizeMemory(null), {});
     assert.deepEqual(sanitizeMemory("junk"), {});
     assert.deepEqual(sanitizeMemory({ ok: { sceneId: "s", x: 1, y: 2 }, bad: { x: 1 } }), {
-        ok: { sceneId: "s", x: 1, y: 2, elevation: 0, lastSeenRound: 0, lastSeenTurn: 0, dispositionAtDetection: 0 }
+        ok: { sceneId: "s", x: 1, y: 2, elevation: 0, lastSeenRound: 0, lastSeenTurn: 0, firstSeenRound: 0, dispositionAtDetection: 0 }
     });
 });
 
@@ -475,7 +474,7 @@ test("memory expires after three full rounds without re-detection", () => {
     });
 
     const memory = seen(1);
-    // Round 1 → rounds 2,3,4 = three full rounds; entry survives until
+    // Round 1 в†’ rounds 2,3,4 = three full rounds; entry survives until
     // round 5 starts.
     assert.equal(isMemoryExpired(memory[uuid], 4, MEMORY_MAX_AGE_ROUNDS), false);
     assert.equal(isMemoryExpired(memory[uuid], 5, MEMORY_MAX_AGE_ROUNDS), true);
@@ -546,8 +545,7 @@ test("buildPerceptionSnapshot splits visible and last-known targets, stays immut
         assert.equal(known.tokenUuid, lost.uuid);
         assert.deepEqual(Object.keys(known).sort(), [
             "dispositionAtDetection",
-            "elevation",
-            "lastSeenRound",
+            "elevation",            "firstSeenRound",            "lastSeenRound",
             "lastSeenTurn",
             "sceneId",
             "tokenUuid",
@@ -596,7 +594,7 @@ test("scoreTarget is pure, deterministic and weight-driven", () => {
 
     const first = scoreTarget(npc, target);
     const second = scoreTarget(npc, target);
-    assert.equal(first.score, second.score, "identical inputs → identical score");
+    assert.equal(first.score, second.score, "identical inputs в†’ identical score");
     assert.equal(Object.isFrozen(first), true);
 
     // Non-attackable targets always rank below attackable ones.
@@ -660,9 +658,9 @@ test("scoreTarget falls back to target actor stats for threat and armour", () =>
         }
     };
     const scored = scoreTarget(npc, target);
-    // Armour 6 → expected 10 + 10 - 6 = 14 → 14 / (14 + 10).
+    // Armour 6 в†’ expected 10 + 10 - 6 = 14 в†’ 14 / (14 + 10).
     assert.equal(scored.components.effectiveness, 14 / 24);
-    // Threat proxy: 1d10 expected = 5.5 → 5.5/20.
+    // Threat proxy: 1d10 expected = 5.5 в†’ 5.5/20.
     assert.equal(scored.components.threat, 5.5 / 20);
 });
 
@@ -814,8 +812,7 @@ test("lastKnownPositions returns sanitized entries for combatant or token", asyn
         assert.equal(known[0].secretField, undefined, "no extra fields leak");
         assert.deepEqual(Object.keys(known[0]).sort(), [
             "dispositionAtDetection",
-            "elevation",
-            "lastSeenRound",
+            "elevation",            "firstSeenRound",            "lastSeenRound",
             "lastSeenTurn",
             "sceneId",
             "tokenUuid",
@@ -845,12 +842,12 @@ test("expireMemory removes entries after three rounds and forgetToken prunes del
         assert.equal(await service.expireMemory(combat), 0);
         assert.ok(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory)[target.uuid]);
 
-        // Three full rounds → forgotten.
+        // Three full rounds в†’ forgotten.
         combat = mockCombat({ round: 5, combatants: [combatant] });
         assert.equal(await service.expireMemory(combat), 1);
         assert.deepEqual(combatant.getFlag(MODULE_ID, FLAG_KEYS.memory), []);
 
-        // Re-record, then the token disappears → forgetToken prunes it.
+        // Re-record, then the token disappears в†’ forgetToken prunes it.
         await combatant.setFlag(MODULE_ID, FLAG_KEYS.memory, {
             [target.uuid]: { sceneId: "scene-1", x: 1, y: 1, lastSeenRound: 5 }
         });

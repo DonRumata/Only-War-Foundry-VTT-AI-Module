@@ -559,6 +559,13 @@ export function sanitizeMemoryEntry(entry) {
         elevation: Number.isFinite(entry.elevation) ? entry.elevation : 0,
         lastSeenRound: Number.isFinite(entry.lastSeenRound) ? entry.lastSeenRound : 0,
         lastSeenTurn: Number.isFinite(entry.lastSeenTurn) ? entry.lastSeenTurn : 0,
+        // First sighting timestamp — relay delay is measured from here so a
+        // member with continuous LOS still reports the contact (the plain
+        // `lastSeenRound` stays fresh on re-detection and would never age
+        // into relay reach).
+        firstSeenRound: Number.isFinite(entry.firstSeenRound)
+            ? entry.firstSeenRound
+            : (Number.isFinite(entry.lastSeenRound) ? entry.lastSeenRound : 0),
         dispositionAtDetection: Number.isFinite(entry.dispositionAtDetection)
             ? entry.dispositionAtDetection
             : 0
@@ -599,6 +606,10 @@ export function rememberContact(memory, contact) {
     if (typeof contact?.tokenUuid !== "string" || !contact.tokenUuid) return next;
     const entry = sanitizeMemoryEntry(contact);
     if (!entry) return next;
+    // Re-detection refreshes `lastSeen*` but keeps the first sighting —
+    // the comms-net relay measures its delay from the first report.
+    const prev = next[contact.tokenUuid];
+    entry.firstSeenRound = prev?.firstSeenRound ?? entry.firstSeenRound;
     next[contact.tokenUuid] = entry;
     return next;
 }
@@ -1381,7 +1392,12 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
             const memory = _readMemory(other);
             if (delay > 0) {
                 for (const key of Object.keys(memory)) {
-                    if ((memory[key]?.lastSeenRound ?? round) > round - delay) {
+                    // Delay is from FIRST sighting: a member keeping eyes on
+                    // the contact must still broadcast it after `delay`
+                    // rounds — `lastSeenRound` never ages on re-detection.
+                    const firstSeen = memory[key]?.firstSeenRound
+                        ?? memory[key]?.lastSeenRound ?? round;
+                    if (firstSeen > round - delay) {
                         delete memory[key];
                     }
                 }
