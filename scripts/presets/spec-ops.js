@@ -853,7 +853,13 @@ export function evaluateSpecOps({
         enriched.flankAngle = _flankAngle(candidate, context, cfg.flankMinAngleDegrees);
     }
     if (task === "regroup") {
-        enriched.cohesionRestore = _cohesionRestore(candidate, context);
+        // Issue #24 review: `fanatic.ignoreRegroup` zeroes the regroup
+        // pull structurally. The declared delta alone cannot do it —
+        // the task overlay *replaces* the weight and the L3 bound
+        // clamps any delta, so the flag is enforced on the factor.
+        enriched.cohesionRestore = context.traitFlags?.ignoreRegroup === true
+            ? 0
+            : _cohesionRestore(candidate, context);
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };

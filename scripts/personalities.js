@@ -106,9 +106,11 @@ export const PERSONALITIES = Object.freeze({
     }),
     fanatic: Object.freeze({
         category: "courage",
-        // `ignoreRegroup` is enforced through the strong negative
-        // `cohesionRestore`/`holdPosition` deltas — even on a `regroup`
-        // team task the cohesion pull is suppressed.
+        // `ignoreRegroup` is enforced structurally on the spec-ops
+        // `cohesionRestore` factor (evaluateSpecOps reads
+        // `context.traitFlags`) — the deltas alone cannot carry it: the
+        // task overlay replaces the weight and the L3 bound clamps any
+        // delta. `holdPosition: -4` stays a plain preference.
         deltas: Object.freeze({
             advance: 3, charge: 2, cohesionRestore: -12, holdPosition: -4
         }),
