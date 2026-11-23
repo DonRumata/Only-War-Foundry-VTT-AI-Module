@@ -481,7 +481,11 @@ test("difficulty: easy slips off the argmax with ~30% over a seed series", async
         actions: [LASGUN],
         targets: injectedTargets(world),
         moves: [{ x: 2200, y: 0, distance: 12, cost: 4, los: true }],
-        los: () => true
+        los: () => true,
+        // Personality off: the test measures slip mechanics — a growing
+        // trait pool (issue #39 review: `heretic`) shifts seeded picks
+        // and makes previously tied candidates score distinctly.
+        personality: false
     };
     const serial = plan => JSON.stringify(plan.steps);
     let slips = 0;

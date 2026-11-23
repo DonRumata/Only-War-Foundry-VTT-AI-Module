@@ -339,6 +339,10 @@ test("weapon range bands change the firing-position choice", async () => {
     const planner = makePlanner();
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 3,
+        // Personality off: the range-band assertion measures preset
+        // weights; a growing trait pool shifts seeded draws and changes
+        // the endpoint pick (issue #39 review: `heretic`).
+        personality: false,
         perception: makePerception({ visible: visibleTargets(world) }),
         navigation: makeNavigation([
             { x: 4400, y: 0, i: 44, j: 0, cost: 44, distance: 1.5, los: true, cover: 0 },

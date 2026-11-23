@@ -139,8 +139,8 @@ function planContext(world) {
 /* Pool integrity                                                      */
 /* ------------------------------------------------------------------ */
 
-test("personality pool: ~24 traits with valid categories and data", () => {
-    assert.equal(PERSONALITY_IDS.length, 24);
+test("personality pool: ~25 traits with valid categories and data", () => {
+    assert.equal(PERSONALITY_IDS.length, 25);
     for (const id of PERSONALITY_IDS) {
         const trait = PERSONALITIES[id];
         assert.ok(PERSONALITY_CATEGORIES.includes(trait.category), `${id} category`);
