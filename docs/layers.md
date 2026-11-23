@@ -89,7 +89,11 @@ morale: "pressured" | "desperate" | null, threats: [{tokenId, x, y}]}`
 **Reactive mode:** при `interventions > COMMITMENT_REACTIVE_THRESHOLD
 (=1)` одинакомандных пометок `gmControlled` за раунд эффективный ttl
 сворачивается до одного раунда — в ручном хаосе бот возвращается к
-baseline-планированию по ходу.
+baseline-планированию по ходу. Счёт идёт по `fireteam.teamId` члена;
+бот **без** команды не привязан ни к какому teamId и читает пометки
+всего боя — включая вражеских комбатантов (GM перенёс двух врагов —
+соло-бот тоже уходит в reactive). Осознанный выбор «world chaos»:
+соло-боту нечем сузить выборку.
 
 **gm-controlled маркировка:** `gm-intervention` в trace → executor
 ставит `flags["only-war-ai"].gmControlled = {round, turn, reason}` на
