@@ -13,14 +13,20 @@
 `attackNow, attackAfterMove, charge, melee, advance, threat, proximity,
 los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
+<<<<<<< HEAD
 danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
 alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge`.
+=======
+danger, weaponAffinity, weaponInertia, dropProne, readyWeapon, ev`.
+>>>>>>> feature/action-economy-37
 
-Issue #37: `attackType` теперь несёт EV-срез уклонения — значение фактора
-`desire × (1 − P(dodge))` для уклоняемых атак; недоджибельные
-(spray/cone/suppression, blast вне досягаемости half-move убегания,
-цель с потраченной реакцией) сохраняют полный `desire`. `vulnerable`
-дополнительно включает цель с флагом `reactionUsed` текущего раунда.
+Issue #37: EV-срез уклонения живёт на факторе `ev` — `damageNorm ×
+attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
+(ожидаемый урон атаки, кубики → среднее); `attackType` при этом остаётся
+сырым `desire`. Недоджибельные атаки (spray/cone/suppression, blast вне
+досягаемости half-move убегания, цель с потраченной реакцией) несут
+`chance 0` → полный `ev`. `vulnerable` дополнительно включает цель с
+флагом `reactionUsed` текущего раунда.
 
 Preset-only: `rangeBand`, `aimOpportunity` (rangedCover/hold);
 `insideZone, returnToZone, moveToLos, escapeMelee, searchMove,
@@ -47,6 +53,7 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | insideZone/returnToZone/moveToLos/escapeMelee/searchMove/anchorDrift | — | — | 3/26/6/10/14/−4 | — |
 | aimOpportunity | — | 1.5 | 1.5 | — |
 | attackType | 0.2 | 0.1 | 0.05 | 0.15 |
+| ev | 1 | 1 | 1 | 1 |
 | vulnerable | 1 | 0.5 | 0.5 | 1 |
 | meleeEngage | 6 | 2 | 2 | 3 |
 | area | 4 | 3 | 2 | 5 |
@@ -150,7 +157,10 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    `kind:"ready"|"draw"|"equip"` из `actions.list` с собственным `cost`
    (free под Quick Draw; модуль таланты не парсит), иначе — синтез по
    инвентарю: оружие без usable-записи при пустом/сухом списке атак
-   (клипы `clip.value === 0` у всех атакующих) → half-cost кандидат;
+   (клипы `clip.value === 0` у всех атакующих) → half-cost кандидат.
+   Синтез предлагается только при наличии исполнимого endpoint
+   (`api.actions.readyWeapon`/`ready`/`equip` — issue #53: без него шаг
+   гарантированно падает с `system-api-missing`, бот держит hold);
    `drop-prone` — free-действие при pinned либо при `danger ≥ 0.5`
    на собственной клетке (не для уже prone).
 8a. `unpin` кандидат (issue #39): у pinned-комбатанта при наличии
@@ -244,12 +254,17 @@ adjudicated-manual, adjudicated-skill-test`.
   "gm-confirm"` перед каждым attack/test шагом в automatic-режиме
   executor спрашивает GM — инъекция `context.adjudication` либо
   whisper-чаткарта с кнопками `execute | manual | skill-test | cancel`
-  (`renderChatMessage`-биндинг только для контроллера, `updateCombat`
-  авто-отменяет ожидание). `manual` считает шаг исполненным без ролла;
-  `skill-test` подменяет канал `prepare/executeTest`; `cancel` завершает
-  ход `cancelled` + `completeTurn(advanceTurn:false)`. В preview-режиме
-  гейт не работает — диалог предпросмотра уже является единственной
-  точкой подтверждения, GM не спрашивается дважды.
+  (`renderChatMessage`-биндинг только для контроллера, `updateCombat`/
+  `deleteCombat` авто-отменяют ожидание). `manual` считает шаг исполненным
+  без ролла; `skill-test` подменяет канал `prepare/executeTest`; `cancel`
+  завершает ход `cancelled` + `completeTurn(advanceTurn:false)`. Гейт
+  ограничен таймаутом `previewTimeoutSeconds` (issue #52: без ответа —
+  `cancel`, ход возвращается GM; `0` — ждать вечно), а отсутствие
+  chat-канала/ошибка `ChatMessage.create` — fail-closed `cancel`
+  (`adjudication-unavailable`): в мире `gm-confirm` необратимые роллы
+  без спроса не делаются. В preview-режиме гейт не работает — диалог
+  предпросмотра уже является единственной точкой подтверждения, GM не
+  спрашивается дважды.
 - Replan: `shouldReplan`, макс `DEFAULT_MAX_REPLANS = 1`; reset
   `stepIndex=0`; неудачный реплан → `plan-failed`.
 - Финиш: `operations.completeTurn` + продвижение хода через
@@ -288,8 +303,8 @@ adjudicated-manual, adjudicated-skill-test`.
   cone/spray/suppression, blast при недоказанном выходе из зоны за
   half-move, цель `reactionUsed` (`chance 0`). Planner читает флаг
   `reactionUsed` с документа цели-комбатанта (не только инъекцию),
-  складывает в `vulnerable` и режет `attackType`-EV; `breakdown.dodge`
-  показывает вердикт.
+  складывает в `vulnerable` и режет damage-scaled `ev`-фактор;
+  `breakdown.dodge` показывает вердикт.
 - Бот с потраченной реакцией не декларирует overwatch (`reaction-used`
   rejected) — слот занят, конус всё равно не выстрелит.
 

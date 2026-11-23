@@ -159,12 +159,16 @@ export const SCORE_FACTORS = Object.freeze([
     "weaponInertia",
     "dropProne",
     "readyWeapon",
+<<<<<<< HEAD
     "alliedEngagement",
     "leaveMeleeEngage",
     "engageDenial",
     "unpin",
     "grudge",
     "order"
+=======
+    "ev"
+>>>>>>> feature/action-economy-37
 ]);
 
 /**
@@ -221,6 +225,7 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     weaponInertia: 0.15,
     dropProne: 0,
     readyWeapon: 0,
+<<<<<<< HEAD
     // Issue #39: firing into an ally's melee is a real penalty (−20 by
     // the rules); the grudge and unpin pulls are the documented defaults,
     // while disengage/engage awareness stays neutral for skeleton bots.
@@ -232,6 +237,9 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     // Issue #38: a leader's order is the moderate utility turn — it must
     // never outbid a ready attack, but always beats an empty hold.
     order: 5
+=======
+    ev: 1
+>>>>>>> feature/action-economy-37
 });
 
 /**
@@ -2223,11 +2231,16 @@ function _weaponClipOf(actor, action) {
  * @param {object[]} input.allActions Every normalized action entry.
  * @param {object|null} input.actor Actor document for the inventory scan.
  * @param {object[]} input.usableActions Usable attack/test actions.
+ * @param {boolean} [input.readyCapable] Whether the system actions API
+ *   can execute a ready/draw call (issue #53 — synthesized candidates
+ *   are not offered when the endpoint is missing; explicit system
+ *   entries still pass, the system emitted them).
  * @returns {object[]} Normalized `ready-weapon` entries.
  */
-function _readyWeaponActions({ allActions, actor, usableActions }) {
+function _readyWeaponActions({ allActions, actor, usableActions, readyCapable = true }) {
     const explicit = (allActions ?? []).filter(action => action.type === "ready-weapon");
     if (explicit.length) return explicit;
+    if (!readyCapable) return [];
     const dry = !(usableActions ?? []).length
         || usableActions.every(action => _weaponClipOf(actor, action) === 0);
     if (!dry) return [];
@@ -2935,9 +2948,17 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         holdPosition,
         lastKnown: _isMemorySource(target?.source) ? 1 : 0,
         budgetOver,
-        attackType: dodgeInfo.dodgeable
-            ? attackDesire * (1 - dodgeInfo.chance)
-            : attackDesire,
+        attackType: attackDesire,
+        // Issue #37 counter-EV (review): the dodge discount scaled by
+        // expected weapon damage — `ev = damageNorm × attackDesire ×
+        // (1 − P(dodge))`. Undodgeable attacks (spray, unescapable
+        // blast, reaction-spent target) keep `chance` 0 → full value.
+        ev: action?.type === "attack"
+            ? Math.round(
+                Math.max(0, Math.min(1, _finiteOr(action.damage, 0) / 20))
+                * attackDesire
+                * (1 - dodgeInfo.chance) * 1e6) / 1e6
+            : 0,
         vulnerable,
         engaged,
         meleeEngage: melee * engaged,
@@ -3828,8 +3849,18 @@ export function createPlannerService({
         // Issue #37: ready-weapon candidates rescue a bot whose attack
         // list is dry (empty clip, unreadied weapon) — they keep it out
         // of the `no-action` failure when the system or the inventory
-        // still offers a live weapon to draw.
-        const readyActions = _readyWeaponActions({ allActions, actor, usableActions });
+        // still offers a live weapon to draw. Issue #53: synthesized
+        // inventory candidates only when the system can actually run
+        // the draw — a missing endpoint produces failed turns.
+        const readyApi = context.actionsApi
+            ?? globalThis.game?.darkHeresy?.api?.actions
+            ?? null;
+        const readyCapable = typeof readyApi?.readyWeapon === "function"
+            || typeof readyApi?.ready === "function"
+            || typeof readyApi?.equip === "function";
+        const readyActions = _readyWeaponActions({
+            allActions, actor, usableActions, readyCapable
+        });
         if (!usableActions.length && !readyActions.length
             && !preset.allowNoAction && targets.length) {
             diagnostics.trace = buildLayerTrace(diagnostics);

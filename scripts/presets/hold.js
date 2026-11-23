@@ -113,6 +113,8 @@ export const HOLD_WEIGHTS = Object.freeze({
     engageDenial: 2,
     unpin: 3,
     grudge: 2
+    ev: 1
+
 });
 
 /** Candidate variants whose action produces an attack/test step. */

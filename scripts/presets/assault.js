@@ -69,6 +69,8 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     engageDenial: 4,
     unpin: 4,
     grudge: 4
+    ev: 1
+
 });
 
 /**

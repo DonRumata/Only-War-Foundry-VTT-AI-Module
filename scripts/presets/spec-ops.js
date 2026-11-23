@@ -110,6 +110,8 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     engageDenial: 1,
     unpin: 4,
     grudge: 3
+    ev: 1
+
 });
 
 /**

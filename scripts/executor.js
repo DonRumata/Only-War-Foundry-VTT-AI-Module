@@ -59,6 +59,7 @@ import { isModuleEnabled } from "./module-state.js";
 import {
     getAttackAdjudication,
     getExecutionMode,
+    getPreviewTimeoutSeconds,
     getTurnPacingMs,
     isCaptureContextEnabled,
     isDiagnosticsEnabled,
@@ -236,6 +237,9 @@ function _mergeDelta(ledger, delta) {
  * @param {Function} [deps.pacing] Step/turn pacing delay getter (ms).
  * @param {Function} [deps.getAdjudication] Attack adjudication mode
  *   getter (`"auto"|"gm-confirm"`, issue #37).
+ * @param {Function} [deps.adjudicationTimeout] GM decision timeout
+ *   getter in seconds — reuses `previewTimeoutSeconds`, `0` waits
+ *   forever (issue #52).
  * @returns {object} Executor service.
  */
 export function createExecutorService({
@@ -248,7 +252,8 @@ export function createExecutorService({
     diagnostics = isDiagnosticsEnabled,
     log = (...args) => logDiagnostics(...args),
     pacing = getTurnPacingMs,
-    getAdjudication = getAttackAdjudication
+    getAdjudication = getAttackAdjudication,
+    adjudicationTimeout = getPreviewTimeoutSeconds
 } = {}) {
     /** Operation id → {promise, hookAdvanced}: dedup of repeated executions. */
     const executions = new Map();
@@ -340,8 +345,22 @@ export function createExecutorService({
                     return;
                 }
                 for (const [requestId, pending] of pendingAdjudications) {
+                    clearTimeout(pending.timer);
                     pendingAdjudications.delete(requestId);
                     pending.resolve({ action: "cancel", reason: "turn-stale" });
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication cancel failed`, err);
+            }
+        });
+        // Issue #52: the combat going away resolves every pending gate —
+        // without it a deleted combat would park the executor forever.
+        hooks.on("deleteCombat", () => {
+            try {
+                for (const [requestId, pending] of pendingAdjudications) {
+                    clearTimeout(pending.timer);
+                    pendingAdjudications.delete(requestId);
+                    pending.resolve({ action: "cancel", reason: "combat-ended" });
                 }
             } catch(err) {
                 console.error(`${MODULE_ID} | adjudication cancel failed`, err);
@@ -1061,6 +1080,7 @@ export function createExecutorService({
             ? { action: action.action, reason: action.reason ?? null }
             : { action, reason: null };
         if (!ADJUDICATION_ACTIONS.includes(verdict.action)) return false;
+        clearTimeout(pending.timer);
         pendingAdjudications.delete(requestId);
         pending.resolve(verdict);
         return true;
@@ -1148,13 +1168,26 @@ export function createExecutorService({
             }
         }
         if (typeof globalThis.ChatMessage?.create !== "function") {
-            // No chat channel (headless/test harness): the documented
-            // safe default keeps the turn running.
-            return { action: "execute" };
+            // No chat channel (headless/test harness): fail closed —
+            // a `gm-confirm` world asked for a decision and cannot be
+            // asked, so the turn goes back to manual GM control rather
+            // than executing irreversible rolls unattended (issue #52).
+            return { action: "cancel", reason: "adjudication-unavailable" };
         }
         const requestId = request.id;
         const pending = new Promise(resolve => {
-            pendingAdjudications.set(requestId, { resolve, request });
+            const entry = { resolve, request, timer: null };
+            const seconds = Number(adjudicationTimeout());
+            if (Number.isFinite(seconds) && seconds > 0) {
+                // Issue #52: a GM who never answers cannot park the
+                // combat — the gate resolves itself as a cancel, handing
+                // the turn back to manual control.
+                entry.timer = setTimeout(() => {
+                    pendingAdjudications.delete(requestId);
+                    resolve({ action: "cancel", reason: "adjudication-timeout" });
+                }, seconds * 1000);
+            }
+            pendingAdjudications.set(requestId, entry);
         });
         try {
             await globalThis.ChatMessage.create({
@@ -1164,8 +1197,10 @@ export function createExecutorService({
                 flags: { [MODULE_ID]: { adjudication: requestId } }
             });
         } catch(err) {
+            const entry = pendingAdjudications.get(requestId);
+            clearTimeout(entry?.timer);
             pendingAdjudications.delete(requestId);
-            return { action: "execute" };
+            return { action: "cancel", reason: "adjudication-unavailable" };
         }
         return pending;
     }

@@ -332,13 +332,44 @@ test("an inventory weapon becomes a synthesized ready candidate when the clip is
         seed: 1,
         targets: targetsOf(world),
         actions: [lasgunAction()],
-        moves: []
+        moves: [],
+        // Issue #53: the synthesized candidate is only offered when the
+        // system exposes a ready/draw endpoint to run it through.
+        actionsApi: { readyWeapon: async () => ({ ok: true }) }
     });
     assert.equal(result.status, PLANNER_STATUS.ok, JSON.stringify(result));
     const step = result.plan.steps.find(entry => entry.type === "ready-weapon");
     assert.ok(step, "ready-weapon step exists");
     assert.equal(step.input.weaponId, "w9");
     assert.equal(step.cost.halves, 1, "synthesized entries cost a half action");
+});
+
+test("a dry inventory without a ready API offers no synthesized candidates (issue #53)", async () => {
+    const world = makeWorld();
+    world.actor.items = [
+        {
+            id: "w1", uuid: "a.l", type: "weapon", name: "Lasgun",
+            system: { class: "basic", range: 30, clip: { value: 0, max: 30 } }
+        },
+        { id: "w9", uuid: "a.k9", type: "weapon", name: "Knife", system: { class: "melee" } }
+    ];
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { readyWeapon: 100 },
+        allowNoAction: true,
+        alwaysOfferHold: true
+    });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: targetsOf(world),
+        actions: [lasgunAction()],
+        moves: []
+        // No actionsApi and no game.darkHeresy.api.actions endpoint —
+        // the bot quietly holds instead of planning a step it cannot run.
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok, JSON.stringify(result));
+    assert.ok(result.plan.steps.every(step => step.type !== "ready-weapon"),
+        "no executable endpoint → no ready-weapon step");
 });
 
 test("a fully loaded loadout never offers ready-weapon candidates", async () => {
@@ -633,20 +664,22 @@ test("dodgeChanceOf models dodgeable, undodgeable and reaction-spent cases", () 
     assert.deepEqual(dodgeChanceOf({}, { type: "reload" }), { dodgeable: false, chance: 0 });
 });
 
-test("dodge reduces the attack-type EV of dodgeable attacks", async () => {
+test("dodge reduces the damage-scaled EV of dodgeable attacks", async () => {
     const world = makeWorld();
     const planner = createPlannerService();
-    planner.registerPreset("assault", { weights: { attackNow: 10, attackType: 1 } });
+    planner.registerPreset("assault", { weights: { attackNow: 10, attackType: 1, ev: 1 } });
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 1,
         targets: targetsOf(world, { dodge: 60 }),
-        actions: [lasgunAction()],
+        actions: [{ ...lasgunAction(), damage: 10 }],
         moves: []
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
-    // Standard desire 0.5 × (1 − 0.6) = 0.2 — the EV cut rides the
-    // attackType factor and the breakdown exposes the dodge verdict.
-    assert.ok(Math.abs(result.plan.breakdown.factors.attackType - 0.2) < 1e-9,
+    // attackType keeps the raw desire; the EV = damageNorm×desire×(1−P)
+    // rides its own factor: 0.5 × 0.5 × (1 − 0.6) = 0.1.
+    assert.equal(result.plan.breakdown.factors.attackType, 0.5,
+        "attackType stays the raw desire — the dodge cut lives on ev");
+    assert.ok(Math.abs(result.plan.breakdown.factors.ev - 0.1) < 1e-9,
         JSON.stringify(result.plan.breakdown.factors));
     assert.deepEqual(result.plan.breakdown.dodge, { dodgeable: true, chance: 0.6 });
 });
@@ -670,13 +703,16 @@ test("undodgeable attacks keep their full attack-type EV", async () => {
         actions: [{
             ...lasgunAction(),
             attackType: "suppressing_fire",
-            requirements: ["template"]
+            requirements: ["template"],
+            damage: 10
         }],
         moves: []
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
     assert.equal(result.plan.breakdown.factors.attackType, 0.55,
         "suppression desire is never cut by dodge");
+    assert.equal(result.plan.breakdown.factors.ev, 0.275,
+        "undodgeable keeps the full damage-scaled EV (0.5 × 0.55)");
     assert.deepEqual(result.plan.breakdown.dodge, { dodgeable: false, chance: 0 });
 });
 
@@ -971,6 +1007,73 @@ test("move-attack beyond the half-move rate is rejected (regression)", async () 
     assert.ok(result.plan.steps.every(step =>
         step.type !== "move" || step.cost.halves === 2),
         "a full move is the only legal relocation past the half rate");
+});
+
+// ---- Adjudication lifecycle (issue #52) -------------------------------
+
+test("an unanswered adjudication card times out and hands the turn back", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const state = {};
+    globalThis.ChatMessage = { create: async () => ({ id: "cm-1" }) };
+    try {
+        const executor = createExecutorService({
+            api,
+            getMode: () => "automatic",
+            adjudicationTimeout: () => 0.01
+        });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: attackPlan(world, { operationId: operation.id }),
+            planner: stubPlanner(),
+            rolls: stubRolls(state),
+            adjudicationMode: "gm-confirm"
+            // No injected resolver — the real chat-card gate times out.
+        });
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "adjudication-cancelled");
+        assert.equal((state.executes ?? []).length, 0, "no unattended roll ran");
+    } finally {
+        delete globalThis.ChatMessage;
+    }
+});
+
+test("a deleted combat resolves a pending adjudication as cancel", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const state = {};
+    const fns = {};
+    const fakeHooks = { on: (name, fn) => { fns[name] = fn; return 1; }, off: () => {} };
+    globalThis.ChatMessage = { create: async () => ({ id: "cm-1" }) };
+    try {
+        const executor = createExecutorService({
+            api,
+            getMode: () => "automatic",
+            hooks: fakeHooks,
+            adjudicationTimeout: () => 0
+        });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const runP = executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: attackPlan(world, { operationId: operation.id }),
+            planner: stubPlanner(),
+            rolls: stubRolls(state),
+            adjudicationMode: "gm-confirm"
+        });
+        // Let the run reach the chat-card gate, then drop the combat.
+        await new Promise(resolve => setTimeout(resolve, 10));
+        fns.deleteCombat();
+        const result = await runP;
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal((state.executes ?? []).length, 0);
+    } finally {
+        delete globalThis.ChatMessage;
+    }
 });
 
 // ---- API surface ------------------------------------------------------
