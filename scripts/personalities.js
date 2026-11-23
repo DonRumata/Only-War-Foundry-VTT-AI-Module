@@ -505,6 +505,11 @@ export function personalityWeightDelta({ traits = [], character = null } = {}) {
 
 /**
  * Apply the personality overlay to resolved preset weights.
+ * Unbounded deltas — legacy #19 semantics kept for export
+ * compatibility; the planner uses `boundedPersonalityOverlay`
+ * (`scripts/layers.js`, issue #24). No internal callers remain —
+ * slated for removal with issue #27 (cleanup issue #57).
+ * @deprecated Superseded by boundedPersonalityOverlay.
  * @param {object} weights Base weight map.
  * @param {object} profile `{traits, character}` resolution result.
  * @param {string[]} [profile.traits] Resolved trait ids.
