@@ -106,7 +106,15 @@ const pcIds = await page.evaluate(async (data) => {
         const actor = await Actor.create({
             name: data.names[i],
             type: 'acolyte',
-            system: { characteristics: { agility: { base: 35 }, weaponSkill: { base: 35 }, ballisticSkill: { base: 35 } } },
+            system: {
+                characteristics: {
+                    agility: { base: 35 }, weaponSkill: { base: 35 },
+                    ballisticSkill: { base: 35 }, toughness: { base: 35 },
+                    strength: { base: 35 }, willpower: { base: 30 }
+                },
+                wounds: { max: 10, value: 0 },
+                fate: { max: 2, value: 2 }
+            },
             ownership: { [data.userIds[i]]: CONST.DOCUMENT_OWNERSHIP_LEVELS.OWNER }
         });
         await actor.createEmbeddedDocuments('Item', [
@@ -137,7 +145,14 @@ const botIds = await page.evaluate(async (data) => {
     for (const spec of data) {
         const actor = await Actor.create({
             name: spec.name, type: 'npc',
-            system: { characteristics: { agility: { base: 40 }, weaponSkill: { base: 35 }, ballisticSkill: { base: 40 } } }
+            system: {
+                characteristics: {
+                    agility: { base: 40 }, weaponSkill: { base: 35 },
+                    ballisticSkill: { base: 40 }, toughness: { base: 40 },
+                    strength: { base: 35 }, willpower: { base: 30 }
+                },
+                wounds: { max: 12, value: 0 }
+            }
         });
         const created = await actor.createEmbeddedDocuments('Item',
             spec.weapons.map((w) => ({ name: w.name, type: 'weapon', system: w })));
