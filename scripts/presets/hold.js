@@ -104,7 +104,8 @@ export const HOLD_WEIGHTS = Object.freeze({
     weaponAffinity: 1,
     weaponInertia: 0.15,
     dropProne: 2,
-    readyWeapon: 2
+    readyWeapon: 2,
+    ev: 1
 });
 
 /** Candidate variants whose action produces an attack/test step. */

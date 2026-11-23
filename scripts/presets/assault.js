@@ -60,7 +60,8 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     weaponAffinity: 1,
     weaponInertia: 0.15,
     dropProne: 0,
-    readyWeapon: 2
+    readyWeapon: 2,
+    ev: 1
 });
 
 /**

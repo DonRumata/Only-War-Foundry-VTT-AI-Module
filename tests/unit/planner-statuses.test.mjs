@@ -422,9 +422,9 @@ test("attackType factor prefers full_auto for a ranged attack-in-place", async (
     assert.equal(result.status, PLANNER_STATUS.ok);
     const attack = result.plan.steps.find(step => step.type === "attack");
     assert.equal(attack.input.actionId, "w1-full");
-    // Issue #37 counter-EV: the attackType factor carries the dodge cut —
-    // full_auto desire 0.9 × (1 − default dodge 0.3) = 0.63.
-    assert.equal(result.plan.breakdown.factors.attackType, 0.63);
+    // Issue #37 counter-EV: attackType keeps the raw full_auto desire —
+    // the dodge cut rides the damage-scaled `ev` factor instead.
+    assert.equal(result.plan.breakdown.factors.attackType, 0.9);
     assert.deepEqual(result.plan.breakdown.dodge, { dodgeable: true, chance: 0.3 });
 });
 
