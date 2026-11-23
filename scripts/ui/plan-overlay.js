@@ -57,8 +57,8 @@ const BLAST_FILL_ALPHA = 0.18;
 const BLAST_EDGE_ALPHA = 0.8;
 const TARGET_COLOR = 0x66ff66;
 const TARGET_ALPHA = 0.9;
-const RAY_COLOR = 0xff5555;
-const RAY_ALPHA = 0.85;
+const RAY_COLOR = 0xff2233;
+const RAY_ALPHA = 0.95;
 
 /** Polygon fan step of rendered cone sectors (degrees). */
 const CONE_FAN_STEP_DEG = 5;
@@ -761,10 +761,15 @@ export function createPlanOverlayService({
     function _drawRay(layer, ray, dim) {
         if (!ray?.from || !ray?.to) return;
         const graphics = new PIXI.Graphics();
-        graphics.lineStyle(2, RAY_COLOR, RAY_ALPHA * dim, 0.5);
+        // Wide glow underlay so the red beam stays visible over the cyan
+        // route and the green target ring.
+        graphics.lineStyle(9, RAY_COLOR, (RAY_ALPHA * dim) * 0.3, 0.5);
         graphics.moveTo(ray.from.x, ray.from.y);
         graphics.lineTo(ray.to.x, ray.to.y);
-        const s = 5;
+        graphics.lineStyle(4, RAY_COLOR, RAY_ALPHA * dim, 0.5);
+        graphics.moveTo(ray.from.x, ray.from.y);
+        graphics.lineTo(ray.to.x, ray.to.y);
+        const s = 10;
         graphics.beginFill(RAY_COLOR, RAY_ALPHA * dim);
         graphics.lineStyle(0, RAY_COLOR, 0);
         graphics.drawPolygon([
