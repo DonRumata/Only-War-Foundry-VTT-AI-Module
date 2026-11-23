@@ -1040,3 +1040,156 @@ test("executor: a successful order test stamps lastOrder", async () => {
     assert.equal(record.round, world.combat.round);
     assert.equal(record.result, "success");
 });
+
+/* ------------------------------------------------------------------ */
+/* E. Review: shared contacts steer overwatch; willfulness distrusts  */
+/* ------------------------------------------------------------------ */
+
+test("a shared team-contact steers the overwatch cone (review)", async () => {
+    // Issue #38 review: a living teammate's fresh sighting is valid
+    // intel for the watch cone — unlike the bot's stale own memory,
+    // which the issue #30 rule still excludes.
+    const member = makeMember({ fireteam: { teamId: "alpha" } });
+    const world = makeTeamWorld([member], { enemyX: 2000 });
+    const teamContact = {
+        tokenId: world.enemyToken.id,
+        tokenUuid: `Scene.${world.scene.id}.Token.${world.enemyToken.id}`,
+        x: 2000,
+        y: 0,
+        elevation: 0,
+        lastSeenRound: 1,
+        lastSeenTurn: 0,
+        sourceCombatantId: "c-teammate",
+        source: "team-contact"
+    };
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { overwatch: 10, holdPosition: 1 },
+        allowNoAction: true,
+        alwaysOfferHold: true
+    });
+    const result = await planner.planTurn(world.combat, member.combatant, {
+        seed: 1,
+        targets: [teamContact],
+        actions: [{
+            id: "las", name: "Lasgun", type: "attack",
+            itemUuid: "Actor.a.Item.w1", itemId: "w1",
+            class: "ranged", range: 100, damage: 5,
+            cost: "half", attackType: "standard", weaponId: "w1"
+        }],
+        moves: [],
+        team: { teamId: "alpha", contacts: [] }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const ow = result.plan.steps.find(step => step.type === "overwatch");
+    assert.ok(ow, "a team-contact anchors a declaration");
+    assert.equal(ow.input.direction, 0, "the cone faces the shared point");
+    assert.equal(ow.input.targetTokenUuid, teamContact.tokenUuid);
+});
+
+test("an own last-known still never steers the overwatch cone (review)", async () => {
+    const member = makeMember({ fireteam: { teamId: "alpha" } });
+    const world = makeTeamWorld([member], { enemyX: 2000 });
+    const lastKnown = {
+        tokenId: world.enemyToken.id,
+        tokenUuid: `Scene.${world.scene.id}.Token.${world.enemyToken.id}`,
+        x: 2000,
+        y: 0,
+        elevation: 0,
+        lastSeenRound: 1,
+        lastSeenTurn: 0,
+        source: "last-known"
+    };
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { overwatch: 10, holdPosition: 1 },
+        allowNoAction: true,
+        alwaysOfferHold: true
+    });
+    const result = await planner.planTurn(world.combat, member.combatant, {
+        seed: 1,
+        targets: [lastKnown],
+        actions: [{
+            id: "las", name: "Lasgun", type: "attack",
+            itemUuid: "Actor.a.Item.w1", itemId: "w1",
+            class: "ranged", range: 100, damage: 5,
+            cost: "half", attackType: "standard", weaponId: "w1"
+        }],
+        moves: [],
+        team: { teamId: "alpha", contacts: [] }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.steps.every(step => step.type !== "overwatch"),
+        "stale own memory is not a declaration anchor");
+});
+
+test("the loner trait ignores shared team contacts entirely (review)", async () => {
+    const member = makeMember({ fireteam: { teamId: "alpha" } });
+    const world = makeTeamWorld([member], { enemyX: 2000 });
+    const teamContact = {
+        tokenId: world.enemyToken.id,
+        tokenUuid: `Scene.${world.scene.id}.Token.${world.enemyToken.id}`,
+        x: 2000,
+        y: 0,
+        elevation: 0,
+        lastSeenRound: 1,
+        lastSeenTurn: 0,
+        sourceCombatantId: "c-teammate",
+        source: "team-contact"
+    };
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const trusting = await planner.planTurn(world.combat, member.combatant, {
+        seed: 1,
+        actions: [],
+        targets: [],
+        moves: [{ x: 100, y: 0, distance: 1.5, cost: 2 }],
+        team: { teamId: "alpha", contacts: [teamContact] }
+    });
+    assert.equal(trusting.status, PLANNER_STATUS.ok);
+    assert.ok(trusting.plan.snapshot.targets.some(
+        t => t.tokenUuid === teamContact.tokenUuid),
+        "a trusting member sees the shared contact");
+    const loner = await planner.planTurn(world.combat, member.combatant, {
+        seed: 1,
+        personality: ["loner"],
+        actions: [],
+        targets: [],
+        moves: [{ x: 100, y: 0, distance: 1.5, cost: 2 }],
+        team: { teamId: "alpha", contacts: [teamContact] }
+    });
+    assert.equal(loner.status, PLANNER_STATUS.ok);
+    assert.ok(loner.plan.snapshot.targets.every(
+        t => t.tokenUuid !== teamContact.tokenUuid),
+        "the loner distrusts squad chatter — no shared contact");
+});
+
+test("a rabble squad character ignores shared team contacts (review)", async () => {
+    const member = makeMember({ fireteam: { teamId: "alpha" } });
+    const world = makeTeamWorld([member], { enemyX: 2000 });
+    const teamContact = {
+        tokenId: world.enemyToken.id,
+        tokenUuid: `Scene.${world.scene.id}.Token.${world.enemyToken.id}`,
+        x: 2000,
+        y: 0,
+        elevation: 0,
+        lastSeenRound: 1,
+        lastSeenTurn: 0,
+        sourceCombatantId: "c-teammate",
+        source: "team-contact"
+    };
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, member.combatant, {
+        seed: 1,
+        personality: [],
+        actions: [],
+        targets: [],
+        moves: [{ x: 100, y: 0, distance: 1.5, cost: 2 }],
+        team: { teamId: "alpha", character: "rabble", contacts: [teamContact] }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.snapshot.targets.every(
+        t => t.tokenUuid !== teamContact.tokenUuid),
+        "an undisciplined squad ignores shared intel");
+});
