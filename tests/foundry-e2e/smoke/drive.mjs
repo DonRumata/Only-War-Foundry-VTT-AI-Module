@@ -61,13 +61,18 @@ async function ev(fn, arg) {
             return await page.evaluate(fn, arg);
         } catch (err) {
             const text = String(err);
-            const transient = /Execution context|navigat|Cannot read propert|destroyed|Target closed|game is not defined|Cannot read/i.test(text);
+            const transient = /Execution context|navigat|Cannot read propert|destroyed|Target closed|game is not defined|Cannot read|Protocol error|Session|Connection|IPC|detached|no frame/i.test(text);
             if (!transient) throw err;
+            if (attempt === 0) log({ type: 'eval-transient', text: text.slice(0, 300) });
             await page.waitForTimeout(1500);
         }
     }
+    log({ type: 'eval-exhausted', note: 'evaluate kept failing for ~90s' });
     return null;
 }
+
+process.on('unhandledRejection', (err) => log({ type: 'unhandled', text: String(err).slice(0, 400) }));
+process.on('uncaughtException', (err) => log({ type: 'uncaught', text: String(err).slice(0, 400) }));
 
 /** Poll until Foundry reports `game.ready`. */
 async function waitForGame() {
@@ -429,6 +434,20 @@ while (processed < MAX_TURNS) {
     await page.waitForTimeout(800);
 }
 
+/** Click Yes/OK on blocking dialogs (endCombat confirm, etc.). */
+async function acceptDialogs() {
+    return ev(() => {
+        const buttons = [
+            ...document.querySelectorAll('.dialog button, .window-app button, .application button')
+        ];
+        const ok = buttons.find((b) => /yes|ok|confirm|accept/i.test(b.dataset.action ?? '')
+            || /^(yes|ok|confirm|accept)$/i.test((b.textContent ?? '').trim()));
+        if (!ok) return false;
+        ok.click();
+        return true;
+    });
+}
+
 const tail = await ev(() => {
     const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
     return {
@@ -439,11 +458,22 @@ const tail = await ev(() => {
     };
 });
 if (END_COMBAT && tail?.started) {
-    await ev(async () => {
+    // endCombat() resolves only after the "end this encounter?" dialog —
+    // fire without awaiting, then accept the dialog when it appears.
+    await ev(() => {
         const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
-        await combat?.endCombat();
+        combat?.endCombat?.().catch(() => {});
+        return true;
     });
-    tail.ended = true;
+    for (let i = 0; i < 20; i++) {
+        await page.waitForTimeout(600);
+        const gone = !(await ev(() => {
+            const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
+            return combat?.started === true;
+        }));
+        if (gone) { tail.ended = true; break; }
+        await acceptDialogs();
+    }
 }
 log({ type: 'driver-done', ...tail });
 console.log('DRIVER EXIT');
