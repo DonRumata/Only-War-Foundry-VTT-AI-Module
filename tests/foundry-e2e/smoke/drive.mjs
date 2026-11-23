@@ -366,9 +366,29 @@ while (processed < MAX_TURNS) {
         }, { opId: state.opId, action });
         log({ type: 'decision', opId: state.opId, combatant: dump?.combatant, action, ok: res?.ok, reason: res?.reason ?? null, result: res?.result ?? null });
 
-        const advanced = await waitAdvance(before, 60000);
+        const advanced = res?.ok === false
+            ? false
+            : await waitAdvance(before, 60000);
         if (!advanced) {
             log({ type: 'stall', opId: state.opId, combatant: dump?.combatant, note: 'turn did not advance in 60s' });
+            // The op is stuck non-terminal (e.g. a dead target at confirm):
+            // cancel the session, close the orphaned preview dialog and
+            // push the turn forward — otherwise the run waits forever on
+            // hasSession + handledOps below.
+            await ev(async ({ opId }) => {
+                try {
+                    await game.modules.get('only-war-ai').api.services
+                        .get('preview')?.resolvePreview?.(opId, 'cancel');
+                } catch (e) { /* best effort */ }
+                for (const app of [...document.querySelectorAll('.ow-ai-preview, #ow-ai-preview')]) {
+                    app.closest('.window-app, .application')
+                        ?.querySelector('[data-action="close"], button.close, a.close')
+                        ?.click();
+                }
+                const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
+                await combat?.nextTurn();
+                return true;
+            }, { opId: state.opId });
         }
         handledOps.add(state.opId);
         processed++;
