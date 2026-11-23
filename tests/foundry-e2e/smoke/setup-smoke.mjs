@@ -171,6 +171,9 @@ const botIds = await page.evaluate(async (data) => {
             await created[w].update({ 'system.magazine': loadedMag.id });
         }
         await actor.setFlag('only-war-ai', 'config', { enabled: true, preset: spec.preset });
+        // All bots share one comms net — relayed sightings reach the
+        // distant squads with a one-round radio delay.
+        await actor.setFlag('only-war-ai', 'commsNet', 'defense');
         if (spec.personality) {
             await actor.setFlag('only-war-ai', 'personality', spec.personality);
         }
