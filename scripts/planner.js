@@ -3983,6 +3983,12 @@ export function createPlannerService({
                 || personality.character === "rabble"
         });
         diagnostics.metrics.targetsEvaluated = targets.length;
+        diagnostics.targets = targets.map((t) => ({
+            id: t.tokenId ?? t.token?.id ?? null,
+            source: t.source ?? "self",
+            canAttack: t.canAttack !== false,
+            lastSeenRound: t.lastSeenRound ?? null
+        }));
         // Issue #16 threat map: one aggregated danger field built once per
         // plan from the resolved enemies' weapon loadouts (weapon EV +
         // range emitters). `context.threatMap` injects a ready map or a
