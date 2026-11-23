@@ -4619,6 +4619,11 @@ export function createPlannerService({
             // an explicit aim action — synthesized aim stays invisible.
             aimActions,
             aimAvailable: aimActions.some(action => action.synthesized !== true),
+            // Issue #24 review: merged trait flags reach preset
+            // evaluators (`context.traitFlags`) — behaviour flags like
+            // `ignoreRegroup` are enforced structurally, not through
+            // bounded deltas the task overlay would mask.
+            traitFlags: personalityBehaviorFlags(personality.traits),
             ...planContext
         };
         const scored = [];

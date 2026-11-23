@@ -106,9 +106,11 @@ export const PERSONALITIES = Object.freeze({
     }),
     fanatic: Object.freeze({
         category: "courage",
-        // `ignoreRegroup` is enforced through the strong negative
-        // `cohesionRestore`/`holdPosition` deltas — even on a `regroup`
-        // team task the cohesion pull is suppressed.
+        // `ignoreRegroup` is enforced structurally on the spec-ops
+        // `cohesionRestore` factor (evaluateSpecOps reads
+        // `context.traitFlags`) — the deltas alone cannot carry it: the
+        // task overlay replaces the weight and the L3 bound clamps any
+        // delta. `holdPosition: -4` stays a plain preference.
         deltas: Object.freeze({
             advance: 3, charge: 2, cohesionRestore: -12, holdPosition: -4
         }),
@@ -523,6 +525,11 @@ export function personalityWeightDelta({ traits = [], character = null } = {}) {
 
 /**
  * Apply the personality overlay to resolved preset weights.
+ * Unbounded deltas — legacy #19 semantics kept for export
+ * compatibility; the planner uses `boundedPersonalityOverlay`
+ * (`scripts/layers.js`, issue #24). No internal callers remain —
+ * slated for removal with issue #27 (cleanup issue #57).
+ * @deprecated Superseded by boundedPersonalityOverlay.
  * @param {object} weights Base weight map.
  * @param {object} profile `{traits, character}` resolution result.
  * @param {string[]} [profile.traits] Resolved trait ids.

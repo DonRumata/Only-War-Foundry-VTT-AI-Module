@@ -189,6 +189,14 @@ executor). Preview показывает цепочку шагов (`planIntentOf
 - `resolvePersonality` source/генерация не менялись; при выключенном
   слое (флаг или `context.personality === false`) —
   `source: "disabled"`, нет черт, нет jitter, базовые веса.
+- **Поведенческие флаги** (`ignoreRegroup`, `firesIntoMelee`,
+  `distrustsContacts`) НЕ выражаются дельтами — скоба ±30% любой такой
+  сигнал задавит, а task-оверлей spec-ops ключ веса заменяет. Они
+  применяются структурно: `context.traitFlags` (объединённые
+  `personalityBehaviorFlags(traits)`) доезжает до `preset.evaluate`,
+  и `evaluateSpecOps` на `ignoreRegroup` обнуляет фактор
+  `cohesionRestore` целиком (аналог — фактор `alliedEngagement` под
+  `firesIntoMelee` в `_factorsOf`).
 
 ### L4 — base utility + lookahead
 
