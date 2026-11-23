@@ -57,6 +57,8 @@ const BLAST_FILL_ALPHA = 0.18;
 const BLAST_EDGE_ALPHA = 0.8;
 const TARGET_COLOR = 0x66ff66;
 const TARGET_ALPHA = 0.9;
+const RAY_COLOR = 0xff5555;
+const RAY_ALPHA = 0.85;
 
 /** Polygon fan step of rendered cone sectors (degrees). */
 const CONE_FAN_STEP_DEG = 5;
@@ -418,16 +420,26 @@ export function buildPlanOverlayModel(plan, context = {}) {
         }
     }
 
+    // Attack ray: the GM must see *who* the shot goes at — a beam from
+    // the attack origin (move destination or self) to the target centre.
+    const targetCenter = target ? _center(target.bounds) : null;
+    const attackRay = attackOrigin && targetCenter
+        ? { from: { x: attackOrigin.x, y: attackOrigin.y },
+            to: { x: targetCenter.x, y: targetCenter.y } }
+        : null;
+
     return {
         operationId: context.operationId ?? plan?.operationId ?? null,
         planId: plan?.id ?? null,
+        sceneId: context.sceneId ?? null,
         stale: context.stale !== null && context.stale !== undefined
             && context.stale !== false,
         self,
         route,
         cones,
         blasts,
-        target
+        target,
+        attackRay
     };
 }
 
@@ -706,6 +718,32 @@ export function createPlanOverlayService({
     }
 
     /**
+     * Draw the attack ray — a beam from the attack origin to the target
+     * centre so the GM sees at a glance who the shot goes at.
+     * @param {PIXI.Container} layer
+     * @param {object} ray `{from, to}`.
+     * @param {number} dim Alpha multiplier for stale plans.
+     */
+    function _drawRay(layer, ray, dim) {
+        if (!ray?.from || !ray?.to) return;
+        const graphics = new PIXI.Graphics();
+        graphics.lineStyle(2, RAY_COLOR, RAY_ALPHA * dim, 0.5);
+        graphics.moveTo(ray.from.x, ray.from.y);
+        graphics.lineTo(ray.to.x, ray.to.y);
+        const s = 5;
+        graphics.beginFill(RAY_COLOR, RAY_ALPHA * dim);
+        graphics.lineStyle(0, RAY_COLOR, 0);
+        graphics.drawPolygon([
+            ray.to.x, ray.to.y - s,
+            ray.to.x + s, ray.to.y,
+            ray.to.x, ray.to.y + s,
+            ray.to.x - s, ray.to.y
+        ]);
+        graphics.endFill();
+        layer.addChild(graphics);
+    }
+
+    /**
      * Draw the target highlight ring around the target bounds.
      * @param {PIXI.Container} layer
      * @param {object} target `{bounds: {x, y, w, h}}`.
@@ -738,6 +776,7 @@ export function createPlanOverlayService({
         for (const cone of _planModel.cones) _drawCone(layer, cone, dim);
         for (const blast of _planModel.blasts) _drawBlast(layer, blast, dim);
         _drawRoute(layer, _planModel.route, dim);
+        _drawRay(layer, _planModel.attackRay, dim);
         _drawTarget(layer, _planModel.target, dim);
     }
 
@@ -773,7 +812,8 @@ export function createPlanOverlayService({
             target: _tokenBounds(targetDoc),
             pxPerUnit: _pxPerUnit(),
             operationId: context.operationId ?? null,
-            stale: context.stale ?? null
+            stale: context.stale ?? null,
+            sceneId: globalThis.canvas?.scene?.id ?? null
         });
         _renderPlan();
         log(`plan overlay: plan=${_planModel.planId} cones=${_planModel.cones.length} `
@@ -1030,15 +1070,26 @@ export function createPlanOverlayService({
             }
         };
         on("canvasReady", () => {
-            _planModel = null;
+            // The PIXI tree died with the canvas — recreate it and
+            // redraw the plan when the preview still lives on the same
+            // scene (a scene switch drops it instead).
+            const sceneId = globalThis.canvas?.scene?.id ?? null;
+            if (_planModel && _planModel.sceneId !== sceneId) _planModel = null;
+            _renderPlan();
             _renderDanger();
         });
         on("canvasTearDown", () => {
             _planModel = null;
             resetOverlayRoot();
         });
-        on("updateCombat", () => {
-            clearPlan();
+        on("updateCombat", (_combat, changed) => {
+            // The plan overlay dies only with the turn — unrelated
+            // Combat updates (operation flag writes during an open
+            // preview, marker changes) must not wipe the picture.
+            const changedKeys = changed && typeof changed === "object" ? changed : {};
+            if (changedKeys.round != null || changedKeys.turn != null) {
+                clearPlan();
+            }
             _renderDanger();
         });
         on("deleteCombat", () => {
