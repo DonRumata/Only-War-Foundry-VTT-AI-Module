@@ -81,14 +81,16 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   пометка `gm-intervention` на один раунд; файртим понижает меченного
   члена со сложных заданий (flank/assault/advance → support).
 - Combatant: `morale` (issue #26) — рекорд позы файртимы; evaluated
-  форма `{tier, pending, counters, losses, leaderId, combatId, round,
-  state, schema}` пишется только controller'ом на всех живых членов при
-  `buildTeamPlan`; короткая форма `{state|tier: "confident"|"pressured"|
-  "desperate", pressured?, desperate?}` — ручной членский оверрайд
-  (не перезатирается оценкой). Гистерезис 2 раунда; гибель лидера
-  форсирует переход. Легаси-чтения: `desperate` снимает delay-ожидание
-  (member-effective tier), `pressured` усиливает фактор `order`.
-  Отсутствие флага = нормальная мораль.
+  форма `{tier, pending, counters, losses, seenEnemies, leaderId,
+  combatId, round, state, schema}` пишется только controller'ом на всех
+  живых членов при `buildTeamPlan`; короткая форма `{state|tier:
+  "confident"|"pressured"|"desperate", pressured?, desperate?}` —
+  ручной членский оверрайд (не перезатирается оценкой). Гистерезис 2
+  раунда; гибель лидера форсирует переход. Headcount `enemies` — только
+  увиденный противник (`seenEnemies` + членские `memory` + live-LOS).
+  Легаси-чтения: `desperate` снимает delay-ожидание (member-effective
+  tier), `pressured` усиливает фактор `order`. Отсутствие флага =
+  нормальная мораль.
 - Actor/Token/Combatant: `personality = string[]` — явный список черт
   личности (issue #19, id из пула `scripts/personalities.js`); резолвится
   той же цепочкой Combatant → Token → Actor, без флага черты

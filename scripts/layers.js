@@ -70,6 +70,7 @@ import {
     MORALE_HYSTERESIS_ROUNDS,
     MORALE_LOSS_LOG_MAX,
     MORALE_RECENT_LOSS_ROUNDS,
+    MORALE_SEEN_ENEMIES_MAX,
     MORALE_SAFE_DANGER,
     MORALE_TIERS
 } from "./constants.js";
@@ -240,6 +241,9 @@ export function sanitizeMoraleRecord(raw) {
         losses: (Array.isArray(raw.losses) ? raw.losses : [])
             .filter(entry => Number.isFinite(entry))
             .slice(-MORALE_LOSS_LOG_MAX),
+        seenEnemies: (Array.isArray(raw.seenEnemies) ? raw.seenEnemies : [])
+            .filter(id => typeof id === "string" && id)
+            .slice(-MORALE_SEEN_ENEMIES_MAX),
         initialStrength: Number.isFinite(raw.initialStrength) && raw.initialStrength > 0
             ? raw.initialStrength : null,
         counters
@@ -265,7 +269,7 @@ export function isEvaluatedMoraleRecord(record) {
  * Propose the morale tier from the counted battlefield picture (issue
  * #26). Pure — the counters are gathered by the caller:
  *
- * - `desperate` — the enemy outnumbers the team by
+ * - `desperate` — the *seen* enemy headcount outnumbers the team by
  *   `options.outnumberRatio` (default
  *   `MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — a 2:1 deficit is the
  *   squad's normal war; a smaller numerical edge stays `pressured`),
@@ -441,6 +445,11 @@ export function evaluateMoraleRecord(previous, counters = {}, meta = {}) {
         leaderId: leaderId ?? prev?.leaderId ?? null,
         losses,
         initialStrength,
+        // Issue #26 review: the squad's "ever seen" hostile set — the
+        // caller merges prev.seenEnemies with memory keys and live LOS;
+        // the count drives `enemies` so an unseen enemy never panics
+        // the team (blissfully ignorant until first contact).
+        seenEnemies: counters.seenEnemies ?? prev?.seenEnemies ?? [],
         counters: next
     });
 }

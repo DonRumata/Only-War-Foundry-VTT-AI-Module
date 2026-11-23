@@ -256,6 +256,14 @@ export const MORALE_SAFE_DANGER = 0.5;
 /** Bound on the morale `losses` log kept on the fireteam record. */
 export const MORALE_LOSS_LOG_MAX = 16;
 
+/**
+ * Bound on the `seenEnemies` list persisted on the evaluated morale
+ * record (issue #26 review): the squad's "ever seen" hostile set —
+ * a tokenUuid is remembered once a member spots it (or once it enters
+ * a member's memory) and stays counted while the enemy lives.
+ */
+export const MORALE_SEEN_ENEMIES_MAX = 128;
+
 /** Default pacing delay between AI execution steps in milliseconds. */
 export const DEFAULT_TURN_PACING_MS = 800;
 

@@ -698,6 +698,61 @@ test("buildTeamPlan: context.morale injection drives the team posture", async ()
     }
 });
 
+test("buildTeamPlan: unseen enemies never panic the team — memory and LOS reveal them", async () => {
+    const members = [
+        makeMember({ fireteam: { teamId: "alpha" }, x: 0, initiative: 20 }),
+        makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 15 })
+    ];
+    // 2 members vs 4 hostiles the squad has never spotted: the natural
+    // combat scan finds them, but nothing proves the team knows — the
+    // headcount reads 0 and the posture stays pressured.
+    const world = makeTeamWorld(members, { enemyCount: 4 });
+    const service = createFireteamService({ planner: createPlannerService() });
+    const context = { seed: 5, personality: false };
+    const first = await service.buildTeamPlan(world.combat, "alpha", context);
+    assert.equal(first.status, FIRETEAM_STATUS.ok);
+    assert.equal(first.teamPlan.diagnostics.morale.counters.enemies, 0);
+    assert.equal(first.teamPlan.diagnostics.morale.tier, "pressured");
+
+    // A memory record proves a hostile was once seen — it joins the
+    // headcount and persists on the evaluated record.
+    members[0].combatant.flags[MODULE_ID][FLAG_KEYS.memory] = {
+        [world.enemies[0].token.id]: { x: 2000, y: 0, lastSeenRound: 1 }
+    };
+    world.combat.round = 2;
+    const second = await service.buildTeamPlan(world.combat, "alpha", context);
+    assert.equal(second.teamPlan.diagnostics.morale.counters.enemies, 1);
+    assert.ok(moraleFlag(members[0].combatant).seenEnemies
+        .includes(world.enemies[0].token.id));
+
+    // A live LOS probe reveals a first-contact hostile immediately —
+    // no memory write needed; the earlier sighting persists.
+    context.perception = {
+        hasLineOfSight: (_from, to) => to.id === world.enemies[1].token.id
+    };
+    world.combat.round = 3;
+    const third = await service.buildTeamPlan(world.combat, "alpha", context);
+    const counters = third.teamPlan.diagnostics.morale.counters;
+    assert.equal(counters.enemies, 2);
+    const seen = moraleFlag(members[0].combatant).seenEnemies;
+    assert.ok(seen.includes(world.enemies[0].token.id)
+        && seen.includes(world.enemies[1].token.id));
+
+    // Once both members remember all four, the 2:1 ratio flips the
+    // proposal to desperate (after hysteresis).
+    const memory = Object.fromEntries(
+        world.enemies.map(e => [e.token.id, { x: e.token.x, y: e.token.y }]));
+    for (const member of members) {
+        member.combatant.flags[MODULE_ID][FLAG_KEYS.memory] = memory;
+    }
+    world.combat.round = 4;
+    await service.buildTeamPlan(world.combat, "alpha", context);
+    world.combat.round = 5;
+    const fifth = await service.buildTeamPlan(world.combat, "alpha", context);
+    assert.equal(fifth.teamPlan.diagnostics.morale.counters.enemies, 4);
+    assert.equal(fifth.teamPlan.diagnostics.morale.tier, "desperate");
+});
+
 /* ------------------------------------------------------------------ */
 /* Barks                                                               */
 /* ------------------------------------------------------------------ */
