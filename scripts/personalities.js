@@ -271,10 +271,14 @@ export const PERSONALITIES = Object.freeze({
     }),
     loner: Object.freeze({
         category: "maneuver",
+        // Issue #38 review: the loner does not trust squad chatter —
+        // `distrustsContacts` drops shared team contacts from its target
+        // set entirely (own memory still works).
         deltas: Object.freeze({ cohesionRestore: -8, aimAlone: 1 }),
         jitter: 0.01,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        flags: Object.freeze({ distrustsContacts: true })
     }),
     // --- Командность ---------------------------------------------------
     leader: Object.freeze({

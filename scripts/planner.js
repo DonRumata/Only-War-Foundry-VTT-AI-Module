@@ -1746,9 +1746,13 @@ function _fallbackTargets(combat, combatant, input) {
  * @param {object} input.grid Normalized grid info.
  * @param {object|null} input.perception Perception service or null.
  * @param {object} input.context Planning context overrides.
+ * @param {boolean} [input.distrustsContacts] Ignore shared team contacts
+ *   (issue #38 review: `distrustsContacts` trait flag or `rabble` squad
+ *   character).
  * @returns {object[]}
  */
-function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context }) {
+function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context,
+    distrustsContacts = false }) {
     const measure = raw => {
         const doc = _tokenDoc(raw) ?? raw;
         if (typeof perception?.measureDistance === "function" && doc) {
@@ -1807,7 +1811,7 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
     // target list marked `team-contact`. Live/injected records always win;
     // between two memory records the fresher sighting wins, and an equal
     // timestamp keeps the existing (own) entry.
-    for (const raw of _teamContactRaws({ combat, combatant, perception, context })) {
+    for (const raw of _teamContactRaws({ combat, combatant, perception, context, distrustsContacts })) {
         const shared = _normalizeTarget(raw, {
             ...input,
             source: raw?.sourceCombatantId != null || raw?.source === "team-contact"
@@ -1868,9 +1872,15 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
  * @param {object} input.combatant Active combatant document.
  * @param {object|null} input.perception Perception service or null.
  * @param {object} input.context Planning context.
+ * @param {boolean} [input.distrustsContacts] Personality gate (issue #38
+ *   review): a `distrustsContacts` trait flag or a `rabble` squad
+ *   character makes the bot ignore shared contacts entirely — its own
+ *   memory still works.
  * @returns {object[]}
  */
-function _teamContactRaws({ combat, combatant, perception, context }) {
+function _teamContactRaws({ combat, combatant, perception, context,
+    distrustsContacts = false }) {
+    if (distrustsContacts === true) return [];
     if (context?.shareContacts === false || context?.team?.shareContacts === false) {
         return [];
     }
@@ -3301,7 +3311,13 @@ export function createPlannerService({
             : halfMoveRate;
 
         const targets = _resolveTargets({
-            combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context
+            combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context,
+            // Issue #38 review: a `distrustsContacts` trait (loner) or a
+            // `rabble` squad character makes the bot ignore shared
+            // contacts — willfulness over shared intel.
+            distrustsContacts:
+                personalityBehaviorFlags(personality.traits).distrustsContacts === true
+                || personality.character === "rabble"
         });
         diagnostics.metrics.targetsEvaluated = targets.length;
         // Issue #16 threat map: one aggregated danger field built once per
@@ -3908,12 +3924,17 @@ export function createPlannerService({
         // threat. The step only registers the declaration — the reaction
         // shot itself stays under manual GM control (issue #14 service,
         // #15 candidate). Issue #30: only a live visible target is a
-        // valid orientation anchor — for memory-only contacts a search
+        // valid orientation anchor — for own-memory contacts a search
         // move or a spray/memory-strike is the documented turn, and a
         // hidden or entirely unknown position never steers a declaration.
+        // Issue #38 review: a `team-contact` shared by a living teammate
+        // DOES steer the cone — fresh squad intel, not the bot's stale
+        // own memory (which stays excluded by the #30 rule).
         if (!isPinned) {
             const owAction = _overwatchAction(usableActions);
-            const owDirection = threatTarget?.canAttack === true
+            const owDirection = threatTarget
+                && (threatTarget.canAttack === true
+                    || threatTarget.source === "team-contact")
                 && threatTarget.hidden !== true
                 ? _bearingTo(selfPos, threatTarget) : null;
             if (owAction && selfReactionUsed) {
