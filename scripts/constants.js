@@ -107,7 +107,11 @@ export const SETTING_KEYS = Object.freeze({
     // multi-turn plan. GM-only whispers by default; `barksToPlayers`
     // widens the audience to the whole table.
     aiBarks: "aiBarks",
-    barksToPlayers: "barksToPlayers"
+    barksToPlayers: "barksToPlayers",
+    // Issue #26: outnumber ratio at which the enemy headcount alone
+    // turns the morale proposal `desperate` (default
+    // `MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — a 2:1 deficit).
+    moraleDesperateRatio: "moraleDesperateRatio"
 });
 
 /**
@@ -212,6 +216,15 @@ export const MORALE_RECENT_LOSS_ROUNDS = 3;
  * `desperate` (issue #26).
  */
 export const MORALE_DESPERATE_RECENT_LOSSES = 2;
+
+/**
+ * Outnumber ratio for the `desperate` proposal (issue #26): the enemy
+ * headcount must reach `members × ratio` — default 2 (a 5v10 fight is
+ * the team's normal war, not despair; parity and small deficits stay
+ * `pressured`). GM-tunable via the `moraleDesperateRatio` world
+ * setting / `context.moraleOutnumberRatio`.
+ */
+export const MORALE_DESPERATE_OUTNUMBER_RATIO = 2;
 
 /**
  * Fraction of the starting strength the team must lose before the

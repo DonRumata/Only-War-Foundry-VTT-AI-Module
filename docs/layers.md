@@ -122,11 +122,14 @@ baseline-планированию по ходу.
 - `leaderDead` — флагged-лидер погиб ⇒ **форсированный переход без
   гистерезиса** (и тир никогда не выйдет в confident).
 
-Пороги tier'а — `proposeMoraleTier`: outnumbered / `casualtiesRecent ≥
-MORALE_RECENT_LOSS_DESPERATE` / половина стартового состава потеряна /
-все прижаты / провал пространства ⇒ `desperate`; `members > enemies` без
-свежих потерь и удержанным пространством ⇒ `confident`; иначе
-`pressured`.
+Пороги tier'а — `proposeMoraleTier`: `enemies ≥ members ×
+moraleDesperateRatio` (world setting, default
+`MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — бой 5 на 10 обычная война
+отряда; `context.moraleOutnumberRatio` перебивает на план) /
+`casualtiesRecent ≥ MORALE_RECENT_LOSS_DESPERATE` / половина стартового
+состава потеряна / все прижаты / провал пространства ⇒ `desperate`;
+`members > enemies` без свежих потерь и удержанным пространством ⇒
+`confident`; иначе `pressured`.
 
 **Гистерезис** `MORALE_HYSTERESIS_ROUNDS = 2`: смена предложенного тира
 зажигает `pending = {tier, count}` — один ход нового расклада тир не

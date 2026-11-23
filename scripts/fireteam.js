@@ -63,6 +63,7 @@ import {
 import { emitBarkOnce } from "./barks.js";
 import {
     getAIDifficulty,
+    getMoraleDesperateRatio,
     getPreferredCohesion,
     logDiagnostics
 } from "./settings.js";
@@ -1909,7 +1910,14 @@ export function createFireteamService({
                     combatId,
                     teamId,
                     leaderId,
-                    hysteresis: context.moraleHysteresis
+                    hysteresis: context.moraleHysteresis,
+                    // Issue #26 review: GM-tunable desperation threshold
+                    // (world setting `moraleDesperateRatio`, default 2 —
+                    // a 2:1 deficit; `context.moraleOutnumberRatio`
+                    // overrides per plan).
+                    outnumberRatio: Number.isFinite(context.moraleOutnumberRatio)
+                        ? context.moraleOutnumberRatio
+                        : getMoraleDesperateRatio()
                 });
                 result.wrote = await _writeMoraleRecords(members, record);
                 result.barked = await _barkMoraleChange(previous, record, {

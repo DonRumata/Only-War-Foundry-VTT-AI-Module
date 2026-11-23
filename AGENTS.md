@@ -119,6 +119,10 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `manualOverrideGrace` (default `false`, issue #25) — ручной перенос
   токена GM: off — `gm-intervention` (отмена committed-плана + реплан),
   on — безусловный ход, план продолжается с новой позиции.
+  `moraleDesperateRatio` (default `2`, issue #26) — кратность перевеса
+  врагов, при которой численность одна предлагает `desperate`
+  (`enemies >= members × ratio`; 5 на 10 — грань, малый недобор —
+  pressured). План-оверрайд — `context.moraleOutnumberRatio`.
 - Combat: `operation = { id, combatId, combatantId, round, turn, controllerId,
   phase, revision, startedAt, completedAt?, reason?, result? }` —
   авторитетная запись жизненного цикла AI-хода; пишет только

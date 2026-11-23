@@ -38,6 +38,7 @@ import {
     DEFAULT_TURN_PACING_MS,
     EXECUTION_MODES,
     MODULE_ID,
+    MORALE_DESPERATE_OUTNUMBER_RATIO,
     SETTING_KEYS
 } from "./constants.js";
 
@@ -195,6 +196,20 @@ export function registerSettings() {
         config: true,
         type: Boolean,
         default: false
+    });
+
+    // Issue #26 review: GM-tunable desperation threshold — the enemy
+    // headcount ratio that alone turns the morale proposal `desperate`.
+    // Default 2: a 2:1 deficit is the squad's normal war; fighting at
+    // parity or a small disadvantage stays `pressured`.
+    game.settings.register(MODULE_ID, SETTING_KEYS.moraleDesperateRatio, {
+        name: "OWAI.Settings.MoraleDesperateRatio.Name",
+        hint: "OWAI.Settings.MoraleDesperateRatio.Hint",
+        scope: "world",
+        config: true,
+        type: Number,
+        range: { min: 1, max: 10, step: 0.5 },
+        default: 2
     });
 }
 
@@ -376,6 +391,23 @@ export function barksToPlayers() {
         return value === true;
     } catch(_err) {
         return false;
+    }
+}
+
+/**
+ * The enemy-headcount ratio at which numbers alone propose `desperate`
+ * (issue #26): `enemies >= members × ratio` — default
+ * `MORALE_DESPERATE_OUTNUMBER_RATIO` (2), a 2:1 deficit. Values below 1
+ * or damaged read as the default; `context.moraleOutnumberRatio`
+ * overrides per plan.
+ * @returns {number}
+ */
+export function getMoraleDesperateRatio() {
+    try {
+        const value = Number(game.settings.get(MODULE_ID, SETTING_KEYS.moraleDesperateRatio));
+        return Number.isFinite(value) && value >= 1 ? value : MORALE_DESPERATE_OUTNUMBER_RATIO;
+    } catch(_err) {
+        return MORALE_DESPERATE_OUTNUMBER_RATIO;
     }
 }
 

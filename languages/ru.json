@@ -223,6 +223,8 @@
   "OWAI.Settings.AiBarks.Hint": "Короткие фразы в чате, телеграфирующие намерения AI: при смене тира морали группы и при старте многоходового плана. По умолчанию — шёпот только мастеру.",
   "OWAI.Settings.BarksToPlayers.Name": "Реплики видны игрокам",
   "OWAI.Settings.BarksToPlayers.Hint": "Выкл (по умолчанию): реплики AI идут шёпотом мастеру. Вкл: телеграфирование намерений видит весь стол.",
+  "OWAI.Settings.MoraleDesperateRatio.Name": "Отчаяние при перевесе",
+  "OWAI.Settings.MoraleDesperateRatio.Hint": "Кратность численного перевеса врага, при которой поза команды предлагается desperate: враги >= члены x коэффициент. По умолчанию 2 - бой 5 на 10 обычная война отряда; паритет и малый недобор остаются pressured.",
   "OWAI.Morale.confident": "Уверенная",
   "OWAI.Morale.pressured": "Под давлением",
   "OWAI.Morale.desperate": "Отчаянная",

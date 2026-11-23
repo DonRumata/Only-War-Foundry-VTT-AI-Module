@@ -64,6 +64,7 @@ import {
     MORALE_CONFIDENT_SPACE_CONTROL,
     MORALE_DEFAULT_TIER,
     MORALE_DESPERATE_LOSS_RATIO,
+    MORALE_DESPERATE_OUTNUMBER_RATIO,
     MORALE_DESPERATE_RECENT_LOSSES,
     MORALE_DESPERATE_SPACE_CONTROL,
     MORALE_HYSTERESIS_ROUNDS,
@@ -264,11 +265,14 @@ export function isEvaluatedMoraleRecord(record) {
  * Propose the morale tier from the counted battlefield picture (issue
  * #26). Pure — the counters are gathered by the caller:
  *
- * - `desperate` — the enemy outnumbers the team, at least half of the
- *   starting strength fell, `MORALE_DESPERATE_RECENT_LOSSES` members
- *   died inside the recent window, every living member is pinned or the
- *   space-control share collapsed to
- *   `MORALE_DESPERATE_SPACE_CONTROL` or below;
+ * - `desperate` — the enemy outnumbers the team by
+ *   `options.outnumberRatio` (default
+ *   `MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — a 2:1 deficit is the
+ *   squad's normal war; a smaller numerical edge stays `pressured`),
+ *   at least half of the starting strength fell,
+ *   `MORALE_DESPERATE_RECENT_LOSSES` members died inside the recent
+ *   window, every living member is pinned or the space-control share
+ *   collapsed to `MORALE_DESPERATE_SPACE_CONTROL` or below;
  * - `confident` — the team holds a headcount edge, nobody fell recently
  *   and its own cells are mostly free of enemy threat coverage;
  * - `pressured` — parity (the baseline, every other case).
@@ -279,9 +283,12 @@ export function isEvaluatedMoraleRecord(record) {
  * @param {object} counters `{members, defeated, casualties,
  *   casualtiesRecent, pinned, enemies, spaceControl, leaderDead,
  *   initialStrength}`.
+ * @param {object} [options]
+ * @param {number} [options.outnumberRatio] Enemy-headcount ratio that
+ *   alone proposes `desperate` (issue #26 review).
  * @returns {string} One of `MORALE_TIERS`.
  */
-export function proposeMoraleTier(counters = {}) {
+export function proposeMoraleTier(counters = {}, { outnumberRatio = null } = {}) {
     const members = Number.isFinite(counters.members) ? counters.members : 0;
     const enemies = Number.isFinite(counters.enemies) ? counters.enemies : 0;
     const pinned = Number.isFinite(counters.pinned) ? counters.pinned : 0;
@@ -294,7 +301,9 @@ export function proposeMoraleTier(counters = {}) {
         : members + casualties;
     const space = Number.isFinite(counters.spaceControl)
         ? counters.spaceControl : null;
-    if ((enemies > 0 && enemies > members)
+    const ratio = Number.isFinite(outnumberRatio) && outnumberRatio >= 1
+        ? outnumberRatio : MORALE_DESPERATE_OUTNUMBER_RATIO;
+    if ((enemies > 0 && enemies >= members * ratio)
         || (initial > 0 && casualties >= initial * MORALE_DESPERATE_LOSS_RATIO)
         || recent >= MORALE_DESPERATE_RECENT_LOSSES
         || (members > 0 && pinned >= members)
@@ -354,6 +363,10 @@ export function moraleSpaceControl(points, dangerAt, safeDanger = MORALE_SAFE_DA
  * @param {string|null} [meta.teamId] Owning team id.
  * @param {string|null} [meta.leaderId] Elected leader this round.
  * @param {number} [meta.hysteresis] Required consecutive proposals.
+ * @param {number} [meta.outnumberRatio] Enemy-headcount ratio that
+ *   alone proposes `desperate` (world setting `moraleDesperateRatio` /
+ *   `context.moraleOutnumberRatio`, default
+ *   `MORALE_DESPERATE_OUTNUMBER_RATIO = 2`).
  * @returns {object} New sanitized record.
  */
 export function evaluateMoraleRecord(previous, counters = {}, meta = {}) {
@@ -392,7 +405,9 @@ export function evaluateMoraleRecord(previous, counters = {}, meta = {}) {
         leaderDead,
         initialStrength
     };
-    let proposal = proposeMoraleTier(next);
+    let proposal = proposeMoraleTier(next, {
+        outnumberRatio: meta.outnumberRatio
+    });
     let tier = prev?.tier ?? MORALE_DEFAULT_TIER;
     let pending = prev?.pending ?? null;
     const leaderChanged = leaderDead === true
