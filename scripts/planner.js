@@ -3990,7 +3990,8 @@ export function createPlannerService({
             id: t.tokenId ?? t.token?.id ?? null,
             source: t.source ?? "self",
             canAttack: t.canAttack !== false,
-            lastSeenRound: t.lastSeenRound ?? null
+            lastSeenRound: t.lastSeenRound ?? null,
+            via: t.sourceCombatantId ?? null
         }));
         // Issue #16 threat map: one aggregated danger field built once per
         // plan from the resolved enemies' weapon loadouts (weapon EV +

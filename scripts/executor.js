@@ -1443,7 +1443,12 @@ export function createExecutorService({
                 try {
                     await combat.nextTurn();
                 } catch(err) {
-                    console.error(`${MODULE_ID} | nextTurn failed`, err);
+                    // `endCombat()` can land mid-verify — a destroyed
+                    // combat's nextTurn throw is teardown noise, not a
+                    // failure worth logging.
+                    if (combat.destroyed !== true && combat.ended !== true) {
+                        console.error(`${MODULE_ID} | nextTurn failed`, err);
+                    }
                 }
                 for (const window of ADVANCE_VERIFY_WINDOWS) {
                     await _sleep(window);
