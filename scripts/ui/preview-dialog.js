@@ -98,6 +98,7 @@ const STALE_WATCH_HOOKS = Object.freeze([
     "deleteToken",
     "updateActor",
     "updateCombatant",
+    "deleteCombatant",
     "updateCombat",
     "deleteCombat",
     "createWall",
@@ -886,14 +887,29 @@ export function createPreviewController({
         }
         const operations = _operations(session);
         if (operations && typeof operations.transitionOperation === "function") {
-            try {
-                await operations.transitionOperation(
-                    session.combat, session.operationId, "awaiting-preview", "executing"
-                );
-            } catch(err) {
-                // Non-fatal: the plan executes under the same operation id.
+            const transition = await operations.transitionOperation(
+                session.combat, session.operationId, "awaiting-preview", "executing"
+            ).catch(() => null);
+            // The operation already left `awaiting-preview` elsewhere
+            // (authority abort, another client, a stale pass): executing
+            // would run the steps under a dead operation and lose the
+            // turn advance — drop the session instead.
+            if (transition?.ok === false) {
+                _drop(session, PREVIEW_DECISIONS.cancel);
+                return {
+                    ok: false,
+                    decision: PREVIEW_DECISIONS.confirm,
+                    reason: transition?.reason ?? "transition-failed"
+                };
             }
         }
+        // Lock the session before the long `executePlan` await: disarm the
+        // auto-cancel timer and mark it resolved so a stale-watch pass or
+        // the timeout callback can no longer cancel the operation
+        // mid-flight — that raced `completeTurn` would win the operation
+        // and lose the turn advance.
+        _cancelTimeout(session);
+        session.resolved = "executing";
         const executor = _service("executor", session.executor);
         let result = null;
         if (executor && typeof executor.executePlan === "function") {

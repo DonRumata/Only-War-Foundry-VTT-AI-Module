@@ -3689,8 +3689,11 @@ export function createPlannerService({
                 return { status: PLANNER_STATUS.waitingForGm, reason: "not-controller", plan: null };
             }
         }
-        if (!combat || combat.ended === true) {
+        if (!combat || combat.ended === true || combat.destroyed === true) {
             return { status: PLANNER_STATUS.disabled, reason: STALE_REASONS.combatEnded, plan: null };
+        }
+        if (!combatant || combatant.destroyed === true) {
+            return { status: PLANNER_STATUS.disabled, reason: "combatant-gone", plan: null };
         }
         const config = resolveConfig(combatant);
         if (!config?.enabled) {
@@ -5244,7 +5247,8 @@ export function createPlannerService({
             return { valid: false, reason: STALE_REASONS.invalidPlan };
         }
         const combat = currentContext.combat ?? _findCombat(snapshot.combatId);
-        if (!combat || combat.id !== snapshot.combatId || combat.ended === true) {
+        if (!combat || combat.id !== snapshot.combatId
+            || combat.ended === true || combat.destroyed === true) {
             return { valid: false, reason: STALE_REASONS.combatEnded };
         }
         const combatant = currentContext.combatant !== undefined
@@ -5281,6 +5285,7 @@ export function createPlannerService({
         const position = _tokenPosition(tokenDoc);
         const self = snapshot.self ?? {};
         if (!tokenDoc || tokenDoc.destroyed === true
+            || combatant?.destroyed === true
             || tokenDoc.id !== self.tokenId
             || position.x !== self.x || position.y !== self.y
             || _finiteOr(tokenDoc.elevation, 0) !== _finiteOr(self.elevation, 0)

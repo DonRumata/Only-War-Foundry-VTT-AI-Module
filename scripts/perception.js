@@ -1527,15 +1527,23 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
      * @returns {Promise<void>}
      */
     async function _refreshCombat(combat) {
-        if (!combat) return;
+        if (!combat || combat.destroyed === true || combat.ended === true) return;
         if (!globalThis.canvas?.scene) {
             state.pendingCombat = combat;
             return;
         }
         await expireMemory(combat, combat.round);
         for (const combatant of _combatantList(combat)) {
-            if (!isAiEnabled(combatant)) continue;
-            await rememberPositions(combat, combatant);
+            if (!isAiEnabled(combatant) || combatant?.destroyed === true) continue;
+            // A combatant deleted mid-refresh must not abort the pass —
+            // its flag write throws on the destroyed document.
+            try {
+                await rememberPositions(combat, combatant);
+            } catch(err) {
+                logDiagnostics("perception: combatant memory write skipped", {
+                    reason: String(err?.message ?? err)
+                });
+            }
         }
         logDiagnostics("perception: memory refreshed", {
             combat: combat.id,

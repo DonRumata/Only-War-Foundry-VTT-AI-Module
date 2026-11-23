@@ -356,6 +356,24 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     /**
+     * Expiry pass on `deleteToken`/`deleteCombatant`: a declaration never
+     * survives the entity it was declared on — without this the flag
+     * record lingers as a dead zone that can re-render later.
+     * @param {object} doc Deleted token document or combatant.
+     */
+    function _expireOnDeleted(doc) {
+        const id = doc?.id ?? _tokenDoc(doc)?.id ?? null;
+        if (!id) return;
+        const combat = globalThis.game?.combat ?? null;
+        for (const { combatant, record } of activeOverwatches(combat)) {
+            if (record.tokenId !== id && combatant?.tokenId !== id
+                && combatant?.id !== id) continue;
+            if (_isController()) clear(combatant);
+        }
+        _renderAll();
+    }
+
+    /**
      * Register the watcher hooks driving expiry and re-rendering.
      * @returns {void}
      */
@@ -371,7 +389,8 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
         on("updateCombat", _expireOnTurnStart);
         on("updateToken", _expireOnTokenMove);
         on("updateCombatant", _renderAll);
-        on("deleteCombatant", _renderAll);
+        on("deleteCombatant", _expireOnDeleted);
+        on("deleteToken", _expireOnDeleted);
         on("deleteCombat", _renderAll);
     }
 

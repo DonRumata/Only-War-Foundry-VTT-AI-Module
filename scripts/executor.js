@@ -345,6 +345,10 @@ export function createExecutorService({
                     return;
                 }
                 for (const [requestId, pending] of pendingAdjudications) {
+                    // Issue #37 follow-up: a turn advance in ANOTHER combat
+                    // must not cancel this combat's pending gate.
+                    if (pending.combatId && combat?.id
+                        && pending.combatId !== combat.id) continue;
                     clearTimeout(pending.timer);
                     pendingAdjudications.delete(requestId);
                     pending.resolve({ action: "cancel", reason: "turn-stale" });
@@ -1176,7 +1180,10 @@ export function createExecutorService({
         }
         const requestId = request.id;
         const pending = new Promise(resolve => {
-            const entry = { resolve, request, timer: null };
+            const entry = {
+                resolve, request, timer: null,
+                combatId: context.combat?.id ?? null
+            };
             const seconds = Number(adjudicationTimeout());
             if (Number.isFinite(seconds) && seconds > 0) {
                 // Issue #52: a GM who never answers cannot park the
@@ -1408,7 +1415,7 @@ export function createExecutorService({
      * @returns {Promise<boolean>} true when the turn moved past the op.
      */
     async function _advanceForOperation(combat, operation, context) {
-        if (!combat || combat.ended === true) return false;
+        if (!combat || combat.ended === true || combat.destroyed === true) return false;
         if (!_isController(context)) return false;
         if (typeof combat.nextTurn !== "function") return false;
         const onTurn = () => {
@@ -1427,6 +1434,9 @@ export function createExecutorService({
             // resolves (out-of-order document writes); keep verifying for a
             // few seconds and re-drive while the op's turn is still held.
             for (let attempt = 0; attempt <= ADVANCE_VERIFY_RETRIES; attempt++) {
+                // Combat deleted mid-verify: the op's turn can never
+                // advance — bail instead of spamming nextTurn errors.
+                if (combat.destroyed === true || combat.ended === true) return true;
                 const before = key();
                 // Pacing before the advance keeps each bot's turn visible.
                 if (attempt === 0 && pacing() > 0) await _sleep(pacing());
@@ -1462,10 +1472,14 @@ export function createExecutorService({
      */
     async function _advanceTurn(context, run) {
         if (run.record.hookAdvanced === true) return;
-        if (context.combat?.ended === true) return;
+        if (context.combat?.ended === true || context.combat?.destroyed === true) return;
         if (!_isController(context)) return;
         if (typeof context.combat?.nextTurn !== "function") return;
-        await _advanceForOperation(context.combat, context.operation ?? run.operation, context);
+        // Direct runPlan/executePlan callers carry no `operation` — the
+        // plan snapshot's round/turn still scopes the advance so a
+        // manually-moved turn is not advanced a second time.
+        await _advanceForOperation(context.combat,
+            context.operation ?? run.operation ?? run.plan?.snapshot ?? null, context);
     }
 
     /**
