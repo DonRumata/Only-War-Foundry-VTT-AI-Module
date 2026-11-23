@@ -1672,7 +1672,7 @@ function _pixelDistance(from, to, grid) {
  * @returns {boolean}
  */
 function _isMemorySource(source) {
-    return source === "last-known" || source === "team-contact";
+    return source === "last-known" || source === "team-contact" || source === "relay";
 }
 
 /**
@@ -1884,12 +1884,15 @@ function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId, grid, 
     // target list marked `team-contact`. Live/injected records always win;
     // between two memory records the fresher sighting wins, and an equal
     // timestamp keeps the existing (own) entry.
-    for (const raw of _teamContactRaws({ combat, combatant, perception, context, distrustsContacts })) {
+    for (const raw of _teamContactRaws({ combat, combatant, perception, context, distrustsContacts })
+        .concat(_netContactRaws({ combat, combatant, perception, context, distrustsContacts }))) {
         const shared = _normalizeTarget(raw, {
             ...input,
-            source: raw?.sourceCombatantId != null || raw?.source === "team-contact"
-                ? "team-contact"
-                : "last-known"
+            source: raw?.relay === true || raw?.source === "relay"
+                ? "relay"
+                : (raw?.sourceCombatantId != null || raw?.source === "team-contact"
+                    ? "team-contact"
+                    : "last-known")
         });
         if (!shared) continue;
         const key = shared.tokenUuid ?? shared.tokenId;
@@ -1974,6 +1977,69 @@ function _teamContactRaws({ combat, combatant, perception, context,
         }
     }
     return [];
+}
+
+/**
+ * Comms-net contacts (smoke finding): combatants sharing a `commsNet`
+ * flag id exchange last-known contacts with a radio delay — distant
+ * squads advance toward reported contacts instead of holding forever,
+ * without the instant dogpile a zero-latency merge would produce.
+ * `context.commsNet` injects the id in tests; `context.commsDelay`
+ * overrides the default one-round lag; entries arrive `source: "relay"`.
+ * @param {object} input
+ * @param {object} input.combat Combat document.
+ * @param {object} input.combatant Active combatant document.
+ * @param {object|null} input.perception Perception service or null.
+ * @param {object} input.context Planning context.
+ * @param {boolean} [input.distrustsContacts] Same personality gate as
+ *   `_teamContactRaws` — a distrusting bot believes no hearsay either.
+ * @returns {object[]}
+ */
+function _netContactRaws({ combat, combatant, perception, context,
+    distrustsContacts = false }) {
+    if (distrustsContacts === true) return [];
+    if (context?.shareContacts === false || context?.team?.shareContacts === false) {
+        return [];
+    }
+    const netId = context?.commsNet ?? _commsNetOf(combatant);
+    if (!netId || typeof perception?.netLastKnownPositions !== "function") return [];
+    const delay = _finiteOr(context?.commsDelay, 1);
+    try {
+        const shared = perception.netLastKnownPositions(combat, combatant, netId, delay);
+        return Array.isArray(shared) ? shared : [];
+    } catch(err) {
+        return [];
+    }
+}
+
+/**
+ * Resolved `commsNet` id of a combatant without a context injection:
+ * combatant flag wins, then the linked token, then the actor — matching
+ * `perception._commsNetOf` (duplicated to keep services cycle-free).
+ * @param {object} combatant
+ * @returns {string|null}
+ */
+function _commsNetOf(combatant) {
+    const read = doc => {
+        if (!doc) return null;
+        try {
+            if (typeof doc.getFlag === "function") {
+                const flag = doc.getFlag(MODULE_ID, FLAG_KEYS.commsNet);
+                if (typeof flag === "string" && flag) return flag;
+                if (typeof flag?.netId === "string" && flag.netId) return flag.netId;
+            }
+        } catch(_err) {
+            // Fall back to the raw flags object below.
+        }
+        const flag = doc?.flags?.[MODULE_ID]?.[FLAG_KEYS.commsNet];
+        if (typeof flag === "string" && flag) return flag;
+        return typeof flag?.netId === "string" && flag.netId ? flag.netId : null;
+    };
+    const tokenDoc = _tokenDoc(combatant?.token);
+    return read(combatant)
+        ?? read(tokenDoc)
+        ?? read(combatant?.actor ?? tokenDoc?.actor)
+        ?? null;
 }
 
 /**
@@ -3062,7 +3128,10 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         cover,
         exposure: move && move.stay !== true ? Math.max(0, 1 - cover) : 0,
         holdPosition,
-        lastKnown: _isMemorySource(target?.source) ? 1 : 0,
+        // Comms-net hearsay weighs half of a direct memory: the squad
+        // still advances on it, but a fresher own sighting always wins.
+        lastKnown: _isMemorySource(target?.source)
+            ? (target?.source === "relay" ? 0.5 : 1) : 0,
         budgetOver,
         attackType: attackDesire,
         // Issue #37 counter-EV (review): the dodge discount scaled by

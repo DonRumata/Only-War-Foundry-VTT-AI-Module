@@ -46,6 +46,7 @@ export const FLAG_KEYS = Object.freeze({
     operation: "operation",
     memory: "memory",
     fireteam: "fireteam",
+    commsNet: "commsNet",
     overwatch: "overwatch",
     aim: "aim",
     personality: "personality",

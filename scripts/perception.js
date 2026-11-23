@@ -1315,6 +1315,96 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
     }
 
     /**
+     * Resolved `commsNet` id of a combatant (combatant flag wins, then
+     * the linked token, then the actor — the same field-priority chain
+     * `_teamIdOf` applies). Combatants sharing a net id exchange
+     * last-known contacts; the GM joins/leaves a unit to a net simply by
+     * writing the flag, mid-combat included.
+     * @param {object} combatant
+     * @returns {string|null}
+     */
+    function _commsNetOf(combatant) {
+        const read = doc => {
+            if (!doc) return null;
+            try {
+                if (typeof doc.getFlag === "function") {
+                    const flag = doc.getFlag(MODULE_ID, FLAG_KEYS.commsNet);
+                    if (typeof flag === "string" && flag) return flag;
+                    if (typeof flag?.netId === "string" && flag.netId) return flag.netId;
+                }
+            } catch(_err) {
+                // Fall back to the raw flags object below.
+            }
+            const flag = doc?.flags?.[MODULE_ID]?.[FLAG_KEYS.commsNet];
+            if (typeof flag === "string" && flag) return flag;
+            return typeof flag?.netId === "string" && flag.netId ? flag.netId : null;
+        };
+        return read(combatant)
+            ?? read(_tokenDocument(combatant?.token))
+            ?? read(combatant?.actor ?? _tokenDocument(combatant?.token)?.actor)
+            ?? null;
+    }
+
+    /**
+     * Merged shared contacts of a combatant's comms net (smoke finding):
+     * distant squads otherwise hold position forever because they never
+     * see the enemy. Same living/on-scene/AI-enabled gates as
+     * `teamLastKnownPositions`, plus a radio delay — a member only shares
+     * contacts it has held for `delayRounds` or more, so the net spreads
+     * sightings turn-by-turn instead of instantly dogpiling the map.
+     * Returned teammate entries carry `relay: true` so the planner can
+     * weigh relayed intel below own sightings.
+     * @param {object} combat Combat document.
+     * @param {object} combatant Combatant asking for net contacts.
+     * @param {string} netId Shared comms-net id of the combatant.
+     * @param {number} [delayRounds] Minimum age of a contact before it is
+     *   broadcast (default 1 round).
+     * @returns {object[]} Sorted `{tokenUuid, ...entry, sourceCombatantId,
+     *   relay}` records.
+     */
+    function netLastKnownPositions(combat, combatant, netId, delayRounds = 1) {
+        if (!combat || !combatant || typeof netId !== "string" || !netId) return [];
+        const round = Number.isFinite(combat.round) ? combat.round : 0;
+        const delay = Number.isFinite(delayRounds) && delayRounds > 0 ? delayRounds : 0;
+        const ownId = combatant.id ?? null;
+        const teammateMemories = [];
+        for (const other of _combatantList(combat)) {
+            if (!other || other === combatant) continue;
+            if (ownId !== null && other.id === ownId) continue;
+            if (other.defeated === true || other.destroyed === true) continue;
+            if (!isAiEnabled(other)) continue;
+            if (_commsNetOf(other) !== netId) continue;
+            const doc = _tokenDocument(other.token);
+            if (!doc || doc.destroyed === true) continue;
+            const uuid = _tokenUuid(doc);
+            if (uuid && !_tokenExistsOnScene(uuid)) continue;
+            const memory = _readMemory(other);
+            if (delay > 0) {
+                for (const key of Object.keys(memory)) {
+                    if ((memory[key]?.lastSeenRound ?? round) > round - delay) {
+                        delete memory[key];
+                    }
+                }
+            }
+            teammateMemories.push({ combatantId: other.id ?? null, memory });
+        }
+        const merged = mergeTeamMemory(_readMemory(combatant), teammateMemories, round);
+        const sceneId = globalThis.canvas?.scene?.id ?? combat.scene?.id ?? null;
+        const pruned = {};
+        for (const [uuid, entry] of Object.entries(merged)) {
+            if (sceneId && entry.sceneId !== sceneId) continue;
+            if (!_tokenExistsOnScene(uuid)) continue;
+            pruned[uuid] = entry;
+        }
+        return Object.entries(pruned)
+            .map(([tokenUuid, entry]) => ({
+                tokenUuid, ...entry,
+                relay: entry.sourceCombatantId != null
+            }))
+            .sort((a, b) => a.tokenUuid.localeCompare(b.tokenUuid));
+    }
+
+    /**
      * Merged shared contacts of a combatant's fireteam (issue #38): the
      * sanitized memory of every living, AI-enabled teammate whose token
      * still stands on the scene, deduped with `mergeTeamMemory`. A dead,
@@ -1517,6 +1607,7 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
         rememberPositions,
         lastKnownPositions,
         teamLastKnownPositions,
+        netLastKnownPositions,
         expireMemory,
         forgetToken,
         sanitizeMemory,
