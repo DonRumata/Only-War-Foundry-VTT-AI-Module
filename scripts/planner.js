@@ -1369,11 +1369,15 @@ function _isAllyDisposition(viewer, disp, { includeNeutral = false, dispositions
  * @param {object[]} input.tokens Scene token scan (`_blastTokens` shape).
  * @param {number} input.viewerDisposition Viewer disposition.
  * @param {string|null} input.selfTokenUuid Viewer token uuid — excluded.
- * @param {number} input.reachPx Melee reach in pixels.
+ * @param {number} input.reachPx Melee reach in pixels (fallback).
+ * @param {Function} [input.resolveReachPx] `(target, ally) => px|null` —
+ *   per-pair melee reach (issue #39 review: long-reach weapons reach a
+ *   cell further than `DEFAULT_MELEE_RANGE`); `null` uses `reachPx`.
  * @param {object} input.options `{includeNeutral, dispositions}`.
  * @returns {Set<string>}
  */
-function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx, options }) {
+function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx,
+    resolveReachPx = null, options }) {
     const engaged = new Set();
     for (const target of tokens ?? []) {
         if (!target || target.tokenUuid == null) continue;
@@ -1384,7 +1388,10 @@ function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx
             if (selfTokenUuid != null && token.tokenUuid === selfTokenUuid) continue;
             if (token.tokenUuid != null && token.tokenUuid === target.tokenUuid) continue;
             if (!_isAllyDisposition(viewerDisposition, token.disposition, options)) continue;
-            if (_distPx(target, token) <= reachPx + 1e-9) {
+            const pairReach = typeof resolveReachPx === "function"
+                ? resolveReachPx(target, token) : null;
+            const limit = Number.isFinite(pairReach) && pairReach > 0 ? pairReach : reachPx;
+            if (_distPx(target, token) <= limit + 1e-9) {
                 engaged.add(target.tokenUuid);
                 break;
             }
@@ -1404,7 +1411,7 @@ function _allyEngagedTargets({ tokens, viewerDisposition, selfTokenUuid, reachPx
  * @param {object[]} targets Normalized planner targets (pixels).
  * @param {object[]} threats Resolved threat sources with `emitters`.
  * @param {number} pxPerUnit Pixels per scene unit (`_pxPerUnit`).
- * @returns {object[]} `{x, y, reachPx}` entries.
+ * @returns {object[]} `{x, y, reachPx, tokenUuid}` entries.
  */
 function _enemyContacts(targets, threats, pxPerUnit) {
     const emittersOf = new Map();
@@ -1430,9 +1437,35 @@ function _enemyContacts(targets, threats, pxPerUnit) {
         const reach = meleeRanges.length
             ? Math.max(...meleeRanges)
             : DEFAULT_MELEE_RANGE;
-        contacts.push({ x: target.x, y: target.y, reachPx: reach * scale });
+        contacts.push({ x: target.x, y: target.y, reachPx: reach * scale,
+            tokenUuid: target.tokenUuid ?? null });
     }
     return contacts;
+}
+
+/**
+ * Melee reach of a token's actor in pixels (issue #39 review): the
+ * longest `range`/`reach` of its melee-class weapon items — a spear
+ * armed ally engages a cell further than the unarmed default. `null`
+ * when the token or its loadout cannot be resolved (the caller falls
+ * back to {@link DEFAULT_MELEE_RANGE}).
+ * @param {string|null} tokenId Token id to resolve.
+ * @param {object} input Lookup context.
+ * @param {object|null} [input.combat] Combat searched first.
+ * @param {object|null} [input.scene] Scene for the token collection.
+ * @param {number} [input.pxPerUnit] Pixels per scene unit.
+ * @returns {number|null}
+ */
+function _tokenMeleeReachPx(tokenId, { combat = null, scene = null, pxPerUnit = 1 } = {}) {
+    const doc = _findToken(tokenId, { combat, scene });
+    const actor = _actorOf(doc);
+    const scale = pxPerUnit > 0 ? pxPerUnit : 1;
+    const ranges = _list(actor?.items)
+        .filter(item => item?.type === "weapon"
+            && String(item.system?.class ?? "").toLowerCase() === "melee")
+        .map(item => _finiteOr(item.system?.range ?? item.system?.reach, 0))
+        .filter(range => range > 0);
+    return ranges.length ? Math.max(...ranges) * scale : null;
 }
 
 /**
@@ -2902,7 +2935,10 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     // the −20 shooting-into-melee penalty — only point-target attacks
     // suffer it. Melee actions and blast/cone templates are exempt: the
     // template candidates already veto any aim point covering an ally.
-    const alliedEngaged = allyEngagedTargets instanceof Set
+    // Issue #39 review: the `heretic` trait fires into an ally's melee
+    // without compunction — the factor never engages for it.
+    const firesIntoMelee = personalityBehaviorFlags(traits).firesIntoMelee === true;
+    const alliedEngaged = !firesIntoMelee && allyEngagedTargets instanceof Set
         && target?.tokenUuid != null
         && allyEngagedTargets.has(target.tokenUuid)
         && action && melee !== 1
@@ -2925,15 +2961,19 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         engagedAtEnd = engagedAtEnd || endIn;
     }
     const engageDenial = !engagedAtStart && engagedAtEnd ? 1 : 0;
-    // Issue #39: `grudge` marks candidates whose target is the recorded
-    // last attacker — the combatant remembers who hurt it.
+    // Issue #39 review: `grudge` marks candidates whose target is the
+    // recorded last attacker — scaled by the wounds actually lost so a
+    // scratch barely registers while a near-kill pulls hard (default 5
+    // when the record carries no wound count).
     const grudge = lastAttacker && target
         && ((lastAttacker.tokenUuid != null
                 && target.tokenUuid === lastAttacker.tokenUuid)
             || (lastAttacker.tokenId != null
                 && target.tokenId === lastAttacker.tokenId)
             || (lastAttacker.actorId != null
-                && target.actorId === lastAttacker.actorId)) ? 1 : 0;
+                && target.actorId === lastAttacker.actorId))
+        ? Math.min(Math.max(_finiteOr(lastAttacker.woundsLost, 5), 0) / 10, 1)
+        : 0;
     return {
         attackNow,
         attackAfterMove,
@@ -3973,15 +4013,27 @@ export function createPlannerService({
         // inputs — hostiles engaged in melee with an ally
         // (`alliedEngagement`) and enemy contact reaches for the
         // free-attack factors (`leaveMeleeEngage`/`engageDenial`).
+        const enemyContacts = _enemyContacts(targets, threats, pxPerUnit);
+        const contactReachPx = new Map();
+        for (const contact of enemyContacts) {
+            if (contact.tokenUuid != null) contactReachPx.set(contact.tokenUuid, contact.reachPx);
+        }
         const allyEngagedTargets = _allyEngagedTargets({
             tokens: blastTokens,
             viewerDisposition,
             selfTokenUuid: _tokenUuid(tokenDoc, sceneId)
                 ?? tokenDoc?.uuid ?? tokenDoc?.id ?? null,
             reachPx: DEFAULT_MELEE_RANGE * (pxPerUnit > 0 ? pxPerUnit : 1),
+            // Review: engagement reach is the pair's max — a spear-armed
+            // ally or a long-limbed hostile engages a cell further.
+            resolveReachPx: (target, ally) => {
+                const hostile = contactReachPx.get(target.tokenUuid) ?? null;
+                const friendly = _tokenMeleeReachPx(ally.tokenId, { combat, scene, pxPerUnit });
+                const best = Math.max(hostile ?? 0, friendly ?? 0);
+                return best > 0 ? best : null;
+            },
             options: blastOptions
         });
-        const enemyContacts = _enemyContacts(targets, threats, pxPerUnit);
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             const moves = _resolveMoves({

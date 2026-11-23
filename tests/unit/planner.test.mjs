@@ -351,7 +351,9 @@ test("different preset weights produce different plans", async () => {
         ]
     });
     const planner = createPlannerService();
-    const context = () => ({ seed: 3, targets: injectedTargets(world) });
+    // Personality off — the test measures preset weight effects; a
+    // growing trait pool shifts seeded draws (issue #39: `heretic`).
+    const context = () => ({ seed: 3, targets: injectedTargets(world), personality: false });
     const first = await planner.planTurn(world.combat, world.combatant, context());
     assert.equal(first.status, PLANNER_STATUS.ok);
     // Default assault weights include threat — the far, dangerous target wins.

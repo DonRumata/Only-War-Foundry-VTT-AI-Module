@@ -117,6 +117,18 @@ export const PERSONALITIES = Object.freeze({
         bias: Object.freeze({ easy: 1.5, normal: 1, hard: 0.8 }),
         flags: Object.freeze({ ignoreRegroup: true })
     }),
+    heretic: Object.freeze({
+        category: "courage",
+        // Issue #39: heretics fire into an ally's melee without
+        // compunction — the `firesIntoMelee` flag zeroes the
+        // `alliedEngagement` factor outright (no weight delta can say
+        // "ignore the shooting-into-melee risk" for every preset).
+        deltas: Object.freeze({ vulnerable: 2, threat: -2, grudge: 1 }),
+        jitter: 0.02,
+        weight: 3,
+        bias: Object.freeze({ easy: 1.2, normal: 1, hard: 1 }),
+        flags: Object.freeze({ firesIntoMelee: true })
+    }),
     bloodthirsty: Object.freeze({
         category: "courage",
         // Issue #39: craves contact and remembers who hurt it —

@@ -485,6 +485,29 @@ export function createGrudgesService({
     }
 
     /**
+     * Seed the wound cache from live actor documents (issue #39 review):
+     * without a baseline the first `updateActor` only seeds and the first
+     * wound loss after `ready` goes unattributed. Combatant actors get a
+     * dedicated pass so a client joining mid-combat still tracks them.
+     * @param {object|null} [combat] When given, seed only its actors.
+     * @returns {void}
+     */
+    function _seedWoundCache(combat = null) {
+        if (combat) {
+            for (const combatant of _list(combat?.combatants)) {
+                const actor = combatant?.actor ?? combatant?.token?.actor ?? null;
+                const total = _woundTotal(actor);
+                if (actor?.id && total !== null) _woundCache.set(actor.id, total);
+            }
+            return;
+        }
+        for (const actor of _list(globalThis.game?.actors)) {
+            const total = _woundTotal(actor);
+            if (actor?.id && total !== null) _woundCache.set(actor.id, total);
+        }
+    }
+
+    /**
      * Register the watcher hook driving the wound tracker.
      * @returns {void}
      */
@@ -492,6 +515,15 @@ export function createGrudgesService({
         if (!H || _registered.length) return;
         if (typeof H.on === "function") {
             _registered.push(["updateActor", H.on("updateActor", _onUpdateActor)]);
+            // A combat created after `ready` seeds its combatants'
+            // baselines so its very first wound loss can attribute.
+            _registered.push(["createCombat", H.on("createCombat", combat => {
+                try {
+                    _seedWoundCache(combat);
+                } catch(err) {
+                    console.error(`${MODULE_ID} | grudges seed failed`, err);
+                }
+            })]);
         }
     }
 
@@ -516,6 +548,7 @@ export function createGrudgesService({
             if (_started) return;
             _started = true;
             _subscribe();
+            _seedWoundCache();
         },
         /** Remove watcher hooks and drop the wound cache. */
         stop() {

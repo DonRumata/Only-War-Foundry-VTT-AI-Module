@@ -250,6 +250,52 @@ test("ranged attack on a target engaged with an ally is penalized", async () => 
     assert.equal(without.plan.breakdown.contributions.alliedEngagement, 0);
 });
 
+test("the heretic trait fires into an ally's melee freely (review)", async () => {
+    const world = makeWorld({ enemies: [{ x: 300, y: 0 }] });
+    const tokens = scanOf(world, [
+        { tokenUuid: "ally-uuid", x: 360, y: 0, disposition: -1 }
+    ]);
+    const captured = [];
+    const planner = capturingPlanner(captured, { alliedEngagement: -5 });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: tokens,
+        personality: ["heretic"]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.equal(factorsOf(captured, isAttackOn(world.enemies[0])).alliedEngagement, 0,
+        "firesIntoMelee zeroes the factor outright");
+});
+
+test("a long-reach ally engages beyond the default melee range (review)", async () => {
+    // "Ally" = a same-disposition combatant carrying a spear (melee
+    // range 3 units ≈ 200px); the enemy stands 140px away — inside the
+    // spear reach but outside the default 2-unit reach.
+    const world = makeWorld({ enemies: [
+        { x: 300, y: 0 },
+        { x: 160, y: 0, disposition: -1 }
+    ] });
+    const ally = world.enemies[1];
+    ally.actor.items = [{
+        id: "spear", uuid: `Actor.${ally.actor.id}.Item.spear`,
+        name: "Spear", type: "weapon",
+        system: { class: "melee", range: 3 }
+    }];
+    const captured = [];
+    const planner = capturingPlanner(captured, { alliedEngagement: -5 });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world)
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.equal(factorsOf(captured, isAttackOn(world.enemies[0])).alliedEngagement, 1,
+        "the spear reach marks the engagement");
+});
+
 test("melee, blast and cone attacks are exempt from alliedEngagement", async () => {
     // Enemy in melee reach of both the bot and an adjacent ally.
     const melee = makeWorld({
@@ -555,9 +601,40 @@ test("the grudge factor marks the recorded last attacker", async () => {
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
     const marked = factorsOf(captured, isAttackOn(world.enemies[0]));
-    assert.equal(marked.grudge, 1, "the attacker is marked");
+    assert.equal(marked.grudge, 0.5,
+        "no woundsLost on the record — the default moderate pull (5/10)");
     const other = factorsOf(captured, isAttackOn(world.enemies[1]));
     assert.equal(other.grudge, 0, "bystanders are not marked");
+});
+
+test("the grudge factor scales with wounds actually lost (review)", async () => {
+    const world = makeWorld({ enemies: [{ x: 300, y: 0 }] });
+    const captured = [];
+    const planner = capturingPlanner(captured, { grudge: 4 });
+    const base = {
+        tokenUuid: world.enemies[0].token.uuid,
+        tokenId: world.enemies[0].token.id,
+        actorId: world.enemies[0].actor.id,
+        round: 1
+    };
+    const light = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1, actions: world.actions, targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        lastAttacker: { ...base, woundsLost: 2 }
+    });
+    assert.equal(light.status, PLANNER_STATUS.ok);
+    assert.equal(factorsOf(captured, isAttackOn(world.enemies[0])).grudge, 0.2,
+        "a scratch barely registers");
+    const heavyCaptured = [];
+    const heavyPlanner = capturingPlanner(heavyCaptured, { grudge: 4 });
+    const heavy = await heavyPlanner.planTurn(world.combat, world.combatant, {
+        seed: 1, actions: world.actions, targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        lastAttacker: { ...base, woundsLost: 14 }
+    });
+    assert.equal(heavy.status, PLANNER_STATUS.ok);
+    assert.equal(factorsOf(heavyCaptured, isAttackOn(world.enemies[0])).grudge,
+        1, "a near-kill pulls the full factor");
 });
 
 test("the combatant lastAttacker flag drives grudge with expiry rules", async () => {
@@ -584,8 +661,8 @@ test("the combatant lastAttacker flag drives grudge with expiry rules", async ()
         blastTokens: scanOf(world)
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
-    assert.equal(factorsOf(captured, isAttackOn(world.enemies[0])).grudge, 1,
-        "the live flag feeds the factor");
+    assert.equal(factorsOf(captured, isAttackOn(world.enemies[0])).grudge, 0.4,
+        "the live flag feeds the factor, scaled by woundsLost");
 
     // The same flag in a combat already 4 rounds later is expired.
     world.combat.round = 1 + GRUDGE_MAX_AGE_ROUNDS + 1;
@@ -824,4 +901,39 @@ test("grudges service is controller-gated and heals do not attribute", async () 
     const heal = await service.handleUpdateActor(world.actor, {});
     assert.equal(heal.reason, "no-loss");
     assert.equal(world.combatant.flags[MODULE_ID]?.[FLAG_KEYS.lastAttacker], undefined);
+});
+
+test("start() seeds the wound cache so the first loss attributes (review)", async () => {
+    const world = makeWorld({ enemies: [{ x: 300, y: 0 }] });
+    world.actor.system.wounds = { value: 5, critical: 0, max: 14 };
+    const damageCard = {
+        id: "m-dmg",
+        flags: { "only-war-local": { rollData: {
+            ownerId: world.enemies[0].actor.id,
+            tokenId: world.enemies[0].token.id,
+            damages: [{ targetActorId: world.actor.id, targetTokenId: world.token.id }]
+        } } }
+    };
+    globalThis.game.actors = [world.actor];
+    try {
+        const service = createGrudgesService({
+            getCombat: () => world.combat,
+            getCombats: () => [world.combat],
+            getMessages: () => [damageCard],
+            log: () => {}
+        });
+        service.start();
+        // No baseline updateActor needed: the very first wound loss
+        // after start() already attributes — the join-mid-combat gap
+        // of the lazy seed is closed.
+        world.actor.system.wounds.value = 8;
+        const result = await service.handleUpdateActor(world.actor, {});
+        service.stop();
+        assert.equal(result.ok, true);
+        assert.equal(result.attributed, true);
+        const record = world.combatant.flags[MODULE_ID][FLAG_KEYS.lastAttacker];
+        assert.equal(record.woundsLost, 3);
+    } finally {
+        delete globalThis.game.actors;
+    }
 });

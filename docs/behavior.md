@@ -87,10 +87,14 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
   по `_blastTokens`) стоит в ближнем бою с союзником: любой другой токен
   той же disposition, что у viewer (`includeNeutral` учитывает
   нейтралов, явный `dispositions`-allow-list — «всё не из списка»), в
-  радиусе `DEFAULT_MELEE_RANGE` (2 scene-единицы). Сам бот и сама цель
-  союзником не считаются. Фактор =1 только для точечных атак — melee,
+  радиусе пары — `max(melee-эмиттеры цели, melee-оружие союзника)`,
+  фолбэк `DEFAULT_MELEE_RANGE` (2 scene-единицы; копьё и длинные лапы
+  реально держат контакт дальше). Сам бот и сама цель союзником не
+  считаются. Фактор =1 только для точечных атак — melee,
   blast-шаблон и cone-шаблон освобождены (шаблонные кандидаты уже
-  ветируют союзников в зоне). Дефолт −2.
+  ветируют союзников в зоне). Черта `heretic` обнуляет фактор целиком
+  (флаг `firesIntoMelee`) — еретик стреляет в спины без зазрения.
+  Дефолт −2.
 - `leaveMeleeEngage` — кандидат стартует в melee-reach ≥1 врага и
   заканчивает вне reach *этого же* врага: выход из ближнего боя без
   Disengage провоцирует свободную атаку. Сравнение идёт поконтактно
@@ -102,7 +106,9 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
 - `unpin` — кандидат `unpin` (см. п. 8a) существует только у
   pinned-бота с WP-характеристикой; фактор =1 у него одного.
 - `grudge` — цель кандидата совпадает с записанным `lastAttacker`
-  (`tokenUuid|tokenId|actorId`). Рекорд читается из флага Combatant
+  (`tokenUuid|tokenId|actorId`), масштаб `min(woundsLost/10, 1)`
+  (дефолт 5, когда рекорд без счётчика) — царапина почти не тянет,
+  тяжёлый удар тянет в полную силу. Рекорд читается из флага Combatant
   (`context.lastAttacker` — инъекция для тестов/макросов), фильтруется
   `grudgeActive` (окно `GRUDGE_MAX_AGE_ROUNDS = 2` раунда) и снимается,
   если атакующего можно доказать мёртвым (defeated/destroyed
@@ -318,7 +324,9 @@ adjudicated-manual, adjudicated-skill-test`.
   `updateActor`; in-memory кэш последних wounds на actorId (старое
   значение в hook недоступно). Отслеживаемый тотал — `wounds.value +
   wounds.critical` (в системе раны растут при уроне): потеря →
-  атрибуция, прирост/отсутствие изменений — нет.
+  атрибуция, прирост/отсутствие изменений — нет. `start()` сеет кэш по
+  `game.actors`, `createCombat` — по комбатантам нового боя: первая
+  потеря ран после подключения уже атрибутится.
 - Атрибуция консервативная (`attributeLastAttacker`, pure): только
   targeted-карточки чата — (1) summary-карточка
   `flags["only-war-local"].damageOperation`, чей `target` называет бота
