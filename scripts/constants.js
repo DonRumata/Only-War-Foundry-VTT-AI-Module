@@ -44,6 +44,7 @@ export const FLAG_KEYS = Object.freeze({
     actorConfig: "config",
     override: "override",
     operation: "operation",
+    teamManeuvers: "teamManeuvers",
     memory: "memory",
     fireteam: "fireteam",
     commsNet: "commsNet",

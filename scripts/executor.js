@@ -82,6 +82,9 @@ import {
     createStepHandlers
 } from "./executor/steps.js";
 import {
+    createTeamTurns
+} from "./executor/team-turn.js";
+import {
     _findCombatant,
     _finiteOr,
     _gridSizeOf,
@@ -181,6 +184,8 @@ export function createExecutorService({
         _report
     } = bookkeeping;
     const stepHandlers = createStepHandlers({ _rolls, _service, api });
+    const teamTurns = createTeamTurns({ service: _service, isController: _isController,
+        isEnabled, resolveConfig, log });
     const {
         _stepRoll,
         _runStep
@@ -476,6 +481,28 @@ export function createExecutorService({
     }
 
     /**
+     * Shared planning entry for claimed turns and GM preview replans.
+     * @param {object} context Executor context.
+     * @param {object} [run] Current execution state, when available.
+     * @returns {Promise<object|null>} Fresh plan result.
+     */
+    async function planCurrentTurn(context, run = null) {
+        const planner = _planner(context);
+        const combatant = run?.combatant ?? _combatantOf(context, context.combat);
+        const plannedContext = _planContext(context, context.operation, run?.replanCount
+            ?? _finiteOr(context.planContext?.replanCount, 0), run);
+        if (!isEnabled() || !_isController(context) || typeof planner?.planTurn !== "function") return null;
+        if (context.operation?.controllerId && !teamTurns.ownsTurn(context, combatant)) {
+            return { status: "failed", reason: STALE_REASONS.turnStale, plan: null };
+        }
+        const coordinated = await teamTurns.plan(context, combatant, planner, plannedContext);
+        if (context.operation?.controllerId && !teamTurns.ownsTurn(context, combatant)) {
+            return { status: "failed", reason: STALE_REASONS.turnStale, plan: null };
+        }
+        return coordinated ?? planner.planTurn(context.combat, combatant, plannedContext);
+    }
+
+    /**
      * Pre-step snapshot validation via the planner. The self-position check
      * is split in two: the executor first compares the live token position
      * with the *expected* position (the plan-time spot or the endpoint of
@@ -545,6 +572,9 @@ export function createExecutorService({
      * @returns {Promise<object>} `{action: "replan"|"stop", reason?}`.
      */
     async function _handleFailure(failReason, context, run) {
+        // Replanning into a solo attack would bypass a failed team barrier.
+        // The next claimed turn starts fresh after discarding this maneuver.
+        if (run.plan?.teamTurn) return { action: "stop", reason: failReason };
         const planner = _planner(context);
         const decision = typeof planner?.shouldReplan === "function"
             ? planner.shouldReplan({
@@ -703,6 +733,23 @@ export function createExecutorService({
      * @returns {Promise<object>} Terminal result.
      */
     async function _execute(context, run) {
+        const coordinated = !!run.plan?.teamTurn;
+        const teamCheck = () => {
+            const check = teamTurns.validate(run.plan, context, run.combatant, _planner(context));
+            return check.valid ? _validate(run, context) : check;
+        };
+        if (coordinated) {
+            const verdict = await teamTurns.begin(run.plan, context, run.combatant, _planner(context));
+            if (!verdict.valid) {
+                const result = _result({
+                    status: EXECUTOR_STATUS.failed, reason: verdict.reason, operationId: run.operationId,
+                    planId: run.plan.id
+                });
+                await teamTurns.finish(run.plan, context, run.combatant, result);
+                await _finish(context, run, result, teamTurns.ownsTurn(context, run.combatant, true));
+                return result;
+            }
+        }
         const stepsDone = [];
         const resourceDelta = {};
         const chatMessageIds = [];
@@ -787,7 +834,10 @@ export function createExecutorService({
                 // Snapshot validation before every state-changing step —
                 // manual intervention (external moves, deleted targets,
                 // spent resources) surfaces here as a stale reason.
-                const verdict = _validate(run, context);
+                const verdict = !coordinated ? _validate(run, context)
+                    : step.type === "end-turn"
+                        ? { valid: teamTurns.ownsTurn(context, run.combatant, true), reason: STALE_REASONS.turnStale }
+                        : teamCheck();
                 if (!verdict.valid) {
                     const outcome = await _handleFailure(verdict.reason, context, run);
                     if (outcome.action === "replan") {
@@ -818,6 +868,15 @@ export function createExecutorService({
                         failedStep = step.id;
                         break;
                     }
+                    if (coordinated) {
+                        const afterDecision = teamCheck();
+                        if (!afterDecision.valid) {
+                            status = EXECUTOR_STATUS.failed;
+                            reason = afterDecision.reason;
+                            failedStep = step.id;
+                            break;
+                        }
+                    }
                     if (decision.action === "manual") {
                         stepsDone.push({
                             stepId: step.id,
@@ -835,9 +894,10 @@ export function createExecutorService({
                     if (decision.action === "skill-test") adjudicated = "skill-test";
                 }
 
+                const stepContext = coordinated && irreversible ? { ...context, teamCheck } : context;
                 const outcome = adjudicated === "skill-test" && step.type === "attack"
-                    ? await _stepRoll("test", step, context, run.plan, run.operationId)
-                    : await _runStep(step, context, run);
+                    ? await _stepRoll("test", step, stepContext, run.plan, run.operationId)
+                    : await _runStep(step, stepContext, run);
                 if (outcome.ok) {
                     stepsDone.push({
                         stepId: step.id,
@@ -949,6 +1009,7 @@ export function createExecutorService({
             // manual GM control — the operation closes but the turn is
             // not advanced. Controller/module cancellations leave the
             // operation to its real owner and stay silent.
+            if (coordinated) await teamTurns.finish(run.plan, context, run.combatant, result);
             if (reason === EXECUTOR_REASONS.adjudicationCancelled) {
                 await _finish(context, run, result, false);
             }
@@ -956,7 +1017,7 @@ export function createExecutorService({
         }
         const result = _result({
             status,
-            reason,
+            reason: reason ?? run.plan?.teamTurn?.reason ?? null,
             operationId: run.operationId,
             planId: run.plan?.id ?? null,
             stepsDone,
@@ -971,6 +1032,7 @@ export function createExecutorService({
         // operation completes but `nextTurn` waits for that adjudication
         // (manual turn advance or the timeout releases the wait).
         const waiting = _registerDamageWait(context, run, result);
+        if (coordinated) await teamTurns.finish(run.plan, context, run.combatant, result);
         await _finish(context, run, result, !waiting);
         if (status !== EXECUTOR_STATUS.completed) _report(context, run, result);
         log(`execution ${run.operationId}: ${status} reason=${reason} steps=${stepsDone.length}`);
@@ -1085,11 +1147,7 @@ export function createExecutorService({
                 let planned = null;
                 const plannedContext = _planContext(context, context.operation, 0, run);
                 try {
-                    planned = await planner.planTurn(
-                        context.combat,
-                        run.combatant,
-                        plannedContext
-                    );
+                    planned = await planCurrentTurn(context, run);
                 } catch(err) {
                     planned = null;
                 }
@@ -1110,7 +1168,7 @@ export function createExecutorService({
                 // Issue #27: the replay capture rides the plan journal
                 // when `aiCaptureContext` is on — fire-and-forget, the
                 // flag write never delays the turn.
-                _capturePlanContext(context, run, plannedContext);
+                if (!run.plan.teamTurn) _capturePlanContext(context, run, plannedContext);
             }
 
             // Preview mode: preflight only — the operation stays in
@@ -1168,6 +1226,27 @@ export function createExecutorService({
     return {
         executePlan,
         runPlan,
+        planCurrentTurn,
+        /**
+         * Validate a coordinated preview before the GM confirms it.
+         * @param {object} plan
+         * @param {object} context
+         * @returns {object} Freshness verdict.
+         */
+        validateTeamTurn(plan, context = {}) {
+            return teamTurns.validate(plan, context, _combatantOf(context, context.combat),
+                _planner(context), { before: true });
+        },
+        /**
+         * A GM taking the turn back also cancels any unfinished maneuver.
+         * @param {object} plan
+         * @param {object} context
+         * @returns {Promise<void>}
+         */
+        cancelTeamTurn(plan, context = {}) {
+            return teamTurns.finish(plan, context, _combatantOf(context, context.combat),
+                { status: EXECUTOR_STATUS.cancelled });
+        },
         resolveAdjudication,
         /**
          * Whether an adjudication request is still pending a GM decision.

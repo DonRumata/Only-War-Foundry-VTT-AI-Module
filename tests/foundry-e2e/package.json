@@ -12,6 +12,7 @@
     "test:navigation": "node navigation.test.mjs",
     "test:fireteam": "node fireteam.test.mjs",
     "test:fireteam-tactics": "node fireteam-tactics.test.mjs",
+    "test:team-turn": "node team-turn.test.mjs",
     "test:executor": "node executor.test.mjs",
     "test:assault": "node preset-assault.test.mjs",
     "test:ranged-cover": "node preset-ranged-cover.test.mjs",

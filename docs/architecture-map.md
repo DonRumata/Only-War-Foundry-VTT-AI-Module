@@ -9,6 +9,7 @@
 
 ```text
 Хуки Foundry → authority → operations.claimTurn → executor.runPlan
+  → для отряда: создать или продолжить манёвр на Combat
   → planner.planTurn ← восприятие, навигация, угрозы, действия системы
   → preview: подтверждение GM / automatic: исполнение
   → executor.executePlan → проверка snapshot перед изменяющими шагами
@@ -20,9 +21,9 @@
 необратимый бросок отдельно. При попадании операция может быть уже
 `completed`, пока ход ещё ждёт применения урона.
 
-Обычный хук хода планирует одного комбатанта; командный
-`fireteam.buildTeamPlan` — отдельная точка входа для расчёта планов членов
-отряда, не для исполнения всего раунда.
+Обычный хук хода исполняет только шаги текущего комбатанта. Для отряда
+`fireteam.buildTeamPlan` даёт начальные назначения, а `executor/team-turn.js`
+проверяет оставшуюся работу и строит свежий план для текущего хода.
 
 ## Сервисы и интерфейс
 
@@ -79,6 +80,7 @@
 | Файл | Где искать |
 |---|---|
 | [`executor/steps.js`](../scripts/executor/steps.js) | `_stepMove`, `_stepRoll`, обработчики шагов. Идентификатор броска — `operationId.stepId`. |
+| [`executor/team-turn.js`](../scripts/executor/team-turn.js) | Прогресс манёвра на Combat, фазовый барьер, проверка всех обязательных участников и отмена остатка. |
 | [`executor/bookkeeping.js`](../scripts/executor/bookkeeping.js) | Журналы перемещений и replay, запись/отмена `committedPlan` и маркеры исполнения. |
 | [`executor/adjudication.js`](../scripts/executor/adjudication.js) | `gm-confirm` в automatic: GM-карточка, решения и таймаут. |
 | [`executor/damage-wait.js`](../scripts/executor/damage-wait.js) | Связывает карточки урона по `apiOperationId` и ждёт применения всех попаданий; урон применяет система, не AI. |

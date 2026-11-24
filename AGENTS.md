@@ -481,6 +481,13 @@ resolved-строка и селект характера в NPC-sheet.
 
 ## Executor (issue #407)
 
+`scripts/executor/team-turn.js` связывает `TeamPlan` с занятыми
+authority ходами. Combat-флаг `teamManeuvers` хранит только временные
+назначения, ожидаемые позиции и оставшуюся работу. Снимок `TeamPlan` не
+переносится на следующий ход. Барьер движения не блокирует `nextTurn`;
+подтверждение GM действует только на шаги текущего участника. Изменение
+плана, отмена превью и смена контроллера не откатывают выполненные шаги.
+
 `scripts/executor.js` — выполнение сериализуемого plan шаг за шагом:
 `api.services.get("executor").runPlan({combat, operation, operations,
 signal})` — точка интеграции authority (#400); `executePlan(plan, context)`

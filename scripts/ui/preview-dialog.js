@@ -408,6 +408,7 @@ export function buildPreviewViewModel(plan, context = {}) {
         resources,
         breakdown,
         intent,
+        teamPhase: plan?.teamTurn?.phase ?? null,
         morale,
         diagnostics,
         trace,
@@ -470,6 +471,8 @@ export function localizePreviewViewModel(vm, i18n = null) {
     return {
         ...vm,
         title: _label(i18nSource, "OWAI.Preview.Title", "AI plan preview"),
+        teamPhaseLabel: vm.teamPhase
+            ? _label(i18nSource, `OWAI.Preview.TeamTurn.${vm.teamPhase}`, vm.teamPhase) : null,
         npc: vm.npc
             ? {
                 ...vm.npc,
@@ -824,12 +827,15 @@ export function createPreviewController({
             return { valid: true, reason: null };
         }
         try {
-            return planner.validateSnapshot(session.plan, {
+            const verdict = planner.validateSnapshot(session.plan, {
                 combat: session.combat ?? null,
                 combatant: session.combatant ?? null,
                 token: _tokenDoc(session.combatant?.token),
                 scene: session.combat?.scene ?? globalThis.canvas?.scene ?? null
             });
+            const executor = _service("executor", session.executor);
+            return verdict.valid && session.plan?.teamTurn
+                ? (executor?.validateTeamTurn?.(session.plan, session) ?? verdict) : verdict;
         } catch(err) {
             return { valid: false, reason: STALE_REASONS.stale };
         }
@@ -1036,6 +1042,9 @@ export function createPreviewController({
      * @returns {Promise<object>} Decision outcome.
      */
     async function _cancel(session, reason) {
+        if (session.plan?.teamTurn) {
+            await _service("executor", session.executor)?.cancelTeamTurn?.(session.plan, session);
+        }
         const operations = _operations(session);
         if (operations && typeof operations.completeTurn === "function") {
             try {
@@ -1084,13 +1093,17 @@ export function createPreviewController({
         }
         let planned = null;
         try {
-            planned = await planner.planTurn(session.combat, session.combatant, {
+            const updatedContext = {
                 ...(session.planContext ?? {}),
                 ...(planContext ?? {}),
                 operation: session.operation,
                 operationId: session.operationId,
                 replanCount: used + 1
-            });
+            };
+            const executor = _service("executor", session.executor);
+            planned = session.plan?.teamTurn && executor?.planCurrentTurn
+                ? await executor.planCurrentTurn({ ...session, planContext: updatedContext })
+                : await planner.planTurn(session.combat, session.combatant, updatedContext);
         } catch(err) {
             planned = null;
         }
