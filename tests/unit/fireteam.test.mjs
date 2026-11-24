@@ -385,6 +385,24 @@ test("reserveResources never assigns one target twice beyond task capacity", () 
     assert.equal(result.targets.filter(t => t.task === "assault").length, 1);
 });
 
+test("TeamPlan measures cohesion in scene units, not canvas pixels", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, initiative: 20 });
+    const wing = makeMember({ fireteam: { teamId: "alpha" }, x: 300 });
+    const world = makeTeamWorld([leader, wing]);
+    const service = createFireteamService({ planner: createPlannerService() });
+    const ctx = { targets: injectedTargets(world), moves: [], seed: 42 };
+    const plan = async () => (await service.buildTeamPlan(world.combat, "alpha", ctx)).teamPlan;
+    const cohesion = t => t.breakdown.cohesion.find(row => row.combatantId === wing.combatant.id);
+    const nearby = await plan();
+    assert.equal(cohesion(nearby).distance, 4.5);
+    assert.equal(cohesion(nearby).within, true);
+    wing.token.x = 400;
+    const farther = await plan();
+    assert.equal(cohesion(farther).distance, 6);
+    assert.equal(cohesion(farther).within, false);
+    assert.ok(farther.breakdown.cohesionPenalty > nearby.breakdown.cohesionPenalty);
+});
+
 test("buildTeamPlan produces a phased TeamPlan with barrier and assignments", async () => {
     const leader = makeMember({ fireteam: { teamId: "alpha" }, x: 0, y: 0, initiative: 20 });
     const flanker = makeMember({ fireteam: { teamId: "alpha" }, x: 50, y: 150, initiative: 10 });

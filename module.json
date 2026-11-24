@@ -1,7 +1,7 @@
 {
   "id": "only-war-ai",
   "title": "Only War AI",
-  "description": "Opt-in AI module for the Only War Foundry VTT system. Per-actor AI configuration with token and combatant overrides, fixed behaviour presets and a preview-first execution model. Planner and turn execution arrive in follow-up updates.",
+  "description": "Opt-in NPC turn automation for the Only War Foundry VTT system, with tactical presets, fireteams and GM previews.",
   "version": "0.1.0",
   "socket": true,
   "authors": [

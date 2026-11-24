@@ -941,6 +941,7 @@ export function createFireteamService({
      *   endpoint in the same coordinate space as `center`.
      * @param {{x: number|null, y: number|null}} input.center Team centre
      *   (leader position or centroid).
+     * @param {number} [input.unitsPerPixel] Convert canvas distances to scene units.
      * @param {number} input.preferredCohesion Distance in scene units.
      * @param {string} input.task Member task.
      * @param {number|null} [input.detachedUntilPhase] Phase index bounding
@@ -956,6 +957,7 @@ export function createFireteamService({
     function evaluateCohesion({
         endpoint = null,
         center = null,
+        unitsPerPixel = 1,
         preferredCohesion = DEFAULT_PREFERRED_COHESION,
         task = "support",
         detachedUntilPhase = null,
@@ -967,7 +969,7 @@ export function createFireteamService({
             ? preferredCohesion : DEFAULT_PREFERRED_COHESION;
         const distance = Number.isFinite(endpoint?.x) && Number.isFinite(endpoint?.y)
             && Number.isFinite(center?.x) && Number.isFinite(center?.y)
-            ? Math.hypot(endpoint.x - center.x, endpoint.y - center.y)
+            ? Math.hypot(endpoint.x - center.x, endpoint.y - center.y) * unitsPerPixel
             : null;
         if (distance === null) {
             return {
@@ -2531,10 +2533,25 @@ export function createFireteamService({
             memberMorale: moraleInfo.effective
         });
 
-        // Cohesion evaluation: leader position is the team centre; detached
+        // Cohesion evaluation: occupied cell centres are in pixels, but
+        // the configured preferred distance is in scene units. Detached
         // maneuvers need a reachable endpoint, a bounded separation and a
         // legal rejoin point.
-        const center = leaderPos;
+        const grid = (context.scene ?? combat.scene)?.grid;
+        const size = _finiteOr(grid?.size, 0);
+        const unitsPerPixel = size > 0 ? _finiteOr(grid?.distance, 1) / size : 1;
+        const projectedCenter = member => {
+            const planned = plans.get(member?.combatantId)?.plan?.steps
+                ?.find(step => step?.type === "move")?.input?.to;
+            if (planned) return planned;
+            if (!Number.isFinite(member?.position?.x) || !Number.isFinite(member?.position?.y)) return null;
+            const token = _tokenDoc(member.combatant?.token);
+            return {
+                x: member.position.x + (_finiteOr(token?.width, 1) * size / 2),
+                y: member.position.y + (_finiteOr(token?.height, 1) * size / 2)
+            };
+        };
+        const center = projectedCenter(ordered.find(member => member.combatantId === election.combatantId));
         const memberEntries = [];
         let cohesionPenalty = 0;
         let score = 0;
@@ -2543,12 +2560,10 @@ export function createFireteamService({
             const assignment = assignMap.get(member.combatantId);
             const plan = plans.get(member.combatantId)?.plan ?? null;
             const move = (plan?.steps ?? []).find(step => step?.type === "move");
-            const endpoint = move?.input?.to
-                ? { x: move.input.to.x, y: move.input.to.y }
-                : (member.position ?? null);
             const cohesion = evaluateCohesion({
-                endpoint,
+                endpoint: projectedCenter(member),
                 center,
+                unitsPerPixel,
                 preferredCohesion,
                 task: assignment.task,
                 detachedUntilPhase: _finiteOr(context.detachedUntilPhase, 1),

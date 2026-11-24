@@ -71,16 +71,7 @@ jobs:
         env:
           VERSION: ${{ steps.release.outputs.version_number }}
         run: |
-          jq empty module.json
-          test "$(jq -r '.id' module.json)" = "only-war-ai"
-
-          rm -rf release
-          mkdir -p release/only-war-ai
-          cp -r languages scripts styles templates module.json README.md LICENSE release/only-war-ai/
-
-          jq --arg version "$VERSION" '.version = $version' \
-            module.json > release/only-war-ai/module.json
-          jq empty release/only-war-ai/module.json
+          node tools/stage-release.mjs "$VERSION" "$GITHUB_REPOSITORY" release/only-war-ai
 
       - name: Build release archive
         shell: bash

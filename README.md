@@ -79,6 +79,16 @@ E2E-тесты в `tests/foundry-e2e/` требуют запущенный Found
 ## Создание релиза
 
 `.github/workflows/release.yml` собирает ZIP и `module.json` при push тега `v*.*.*` либо при ручном запуске с `version` и `source_ref` — по образцу vehicle-модуля.
+Манифест релиза указывает на ZIP этой же версии. Для проверки содержимого
+пакета без тега и публикации можно собрать его во временную директорию:
+
+```text
+node tools/stage-release.mjs 0.1.0 DonRumata/Only-War-Foundry-VTT-AI-Module release/only-war-ai
+```
+
+Сначала должна быть выпущена совместимая версия `only-war-local` с
+публичным API и разрешением владельцу цели применять адресный урон.
+См. [приёмку релиза](docs/test-scenarios.md#приёмка-релиза-363).
 
 ## Лицензия
 
