@@ -73,7 +73,10 @@ import {
 } from "./planner/actions.js";
 import {
     ACTION_BUDGET_HALVES,
+    CHARGE_MIN_DISTANCE,
+    CHARGE_STRAIGHT_TOLERANCE,
     CHARGE_SWITCH_MARGIN,
+    SEEK_MAX_CANDIDATES,
     DEFAULT_DODGE_TN,
     DEFAULT_LOOKAHEAD_LAMBDA,
     DEFAULT_LOOKAHEAD_TOP_K,
@@ -141,6 +144,8 @@ import {
     _resolveTargets
 } from "./planner/targets.js";
 import {
+    _chargeAimsAt,
+    _chargeStraight,
     _deepFreeze,
     _finiteOr,
     _gridInfo,
@@ -424,6 +429,11 @@ export function createPlannerService({
         // view, and navigation feeds the flank move probe further down.
         const perception = _service("perception", context.perception);
         const navigation = _service("navigation", context.navigation);
+        // Resolve the personality before L1 too: a commitment replay
+        // used to show a blank personality line in the preview — the
+        // profile is a cheap flag/seeded read, and the replayed plan now
+        // carries it for display even though no scoring runs.
+        const personalityProfile = _resolvePersonality();
         const commitmentContext = perception
             ? { ...context, perception } : context;
         // Issue #24/#25 L1 commitment: a valid committed plan (flag
@@ -477,7 +487,7 @@ export function createPlannerService({
                 : null;
             const plan = _assemblePlan({
                 combat, combatant, context, authority, seed, presetId,
-                diagnostics, steps, personality: null,
+                diagnostics, steps, personality: personalityProfile,
                 winner: {
                     score: 0,
                     breakdown: {
@@ -501,7 +511,6 @@ export function createPlannerService({
         // assignments. The team tier alone feeds `expectedState.morale`
         // (a tier change invalidates the commitment); the legacy #38
         // graceful morale reads stay unconditional.
-        const personalityProfile = _resolvePersonality();
         const moralePosture = applyMoraleLayer({
             combatant, context, flags: layerFlags, diagnostics,
             traits: personalityProfile.traits
@@ -1014,12 +1023,49 @@ export function createPlannerService({
                         rejectL0(`attack-in-place|${tag}`, "out-of-range");
                     }
                     let attackMoveFound = false;
+                    let chargeRuleVeto = false;
+                    let attackMoves = moves;
                     // A charge exists to close distance вЂ” when a melee
                     // attack is already possible in place (which
                     // `alreadyEngaged` feeds), repositioning
                     // move-attacks are only generated for ranged actions.
                     if (!melee || !inPlace) {
-                        for (const move of moves) {
+                        // OW charge rules (smoke tuning): the run-up must
+                        // cover at least CHARGE_MIN_DISTANCE units and
+                        // follow a straight line; candidates reach out to
+                        // the system `charge` rate (3×AB) instead of the
+                        // ordinary full-move budget, so melee gets its
+                        // own enumeration.
+                        const chargeTooClose = melee === true
+                            && Number.isFinite(selfTargetDistance)
+                            && selfTargetDistance < CHARGE_MIN_DISTANCE;
+                        if (melee === true && !chargeTooClose && !chargeVeto
+                            && Array.isArray(context.moves) !== true
+                            && navigation) {
+                            const chargeLimit = _finiteOr(
+                                context.chargeMove
+                                    ?? context.rates?.charge ?? moveRates?.charge,
+                                null);
+                            const budget = chargeLimit ?? totalMoveBudget;
+                            if (budget !== null) {
+                                const chargeRemaining = spentMove > 0
+                                    ? Math.max(0, budget - spentMove) : null;
+                                attackMoves = _resolveMoves({
+                                    tokenDoc, target, range,
+                                    selfPos, targetPos: targetPosOf(target),
+                                    grid, navigation, perception,
+                                    context: {
+                                        ...planContext,
+                                        moveBudget: budget
+                                    }
+                                }).filter(move => move?.stay === true
+                                    || !Number.isFinite(move?.cost)
+                                    || chargeRemaining === null
+                                    || move.cost <= chargeRemaining + 1e-9);
+                                diagnostics.metrics.movesEvaluated += attackMoves.length;
+                            }
+                        }
+                        for (const move of attackMoves) {
                             if (move.stay) continue;
                             if (!Number.isFinite(move.distance) || move.distance > range + 1e-9) continue;
                             // Moving into melee reach is a charge; any
@@ -1084,6 +1130,30 @@ export function createPlannerService({
                                 rejectOnce(`charge|${tag}`, chargeVeto);
                                 continue;
                             }
+                            // OW run-up rules: a charge covers at least
+                            // CHARGE_MIN_DISTANCE units and follows a
+                            // straight line to the endpoint (smoke
+                            // tuning).
+                            if (variant === "charge" && chargeTooClose) {
+                                rejectOnce(`charge|${tag}`, "charge-too-close");
+                                chargeRuleVeto = true;
+                                continue;
+                            }
+                            if (variant === "charge"
+                                && !_chargeStraight(move, selfPos, grid,
+                                    CHARGE_STRAIGHT_TOLERANCE)) {
+                                rejectOnce(`charge|${tag}`, "charge-bent-route");
+                                continue;
+                            }
+                            // The straight run must point AT the target —
+                            // a charge line that ends beside the enemy
+                            // on a line heading elsewhere is vetoed.
+                            if (variant === "charge"
+                                && !_chargeAimsAt(move, selfPos,
+                                    targetPosOf(target), grid, range)) {
+                                rejectOnce(`charge|${tag}`, "charge-off-line");
+                                continue;
+                            }
                             // Engaged veto (smoke finding): charging a
                             // different target while already in reach of
                             // an enemy is only justified when the new
@@ -1109,9 +1179,9 @@ export function createPlannerService({
                             attackFound = true;
                         }
                     }
-                    if (!inPlace && !attackMoveFound) {
+                    if (!inPlace && !attackMoveFound && !chargeRuleVeto) {
                         rejectL0(`${melee ? "charge" : "move-attack"}|${tag}`,
-                            moves.some(move => !move.stay) ? "out-of-range" : "no-route");
+                            attackMoves.some(move => !move.stay) ? "out-of-range" : "no-route");
                     }
                 }
             }
@@ -1135,6 +1205,81 @@ export function createPlannerService({
             } else if (!attackFound) {
                 routesMissing = true;
                 rejectL0(`approach|${target.tokenUuid}`, "no-route");
+            }
+
+            // Seek mechanic (smoke request): on a non-visible contact —
+            // own memory, relay or radio intel — offer cautious close-in
+            // variants whose endpoints stay out of the presumed firing
+            // lane (`los:false` toward the contact point = wall geometry
+            // hides the cell). Action economy is unchanged: a short seek
+            // fits a half move, a long one spends the full action; the
+            // `seek` factor lets presets/personalities decide whether
+            // hiding outranks the faster open approach.
+            if (_isMemorySource(target.source) && Number.isFinite(distance)) {
+                let seeked = 0;
+                for (const move of moves) {
+                    if (seeked >= SEEK_MAX_CANDIDATES) break;
+                    if (move.stay || move.los !== false) continue;
+                    if (!Number.isFinite(move.distance)
+                        || move.distance >= distance - 1e-9) continue;
+                    if (isPinned && move.distance < distance) continue;
+                    const seekHalves = halfMoveLimit !== null
+                        && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1;
+                    if (seekHalves > actionBudget) continue;
+                    candidates.push({
+                        target, action: null, move, variant: "seek"
+                    });
+                    seeked++;
+                }
+            }
+
+            // Run mechanic (smoke request): a sprint at the run rate is
+            // the only way to close more than a full move in one turn.
+            // It always costs the whole action economy (2 halves — no
+            // attack follows) and is offered only when its nearest
+            // endpoint lands strictly closer than the best approach
+            // endpoint; a pinned/prone bot cannot sprint at all. The
+            // executor marks the bot `running` for the +20-evasion
+            // window after such a move.
+            const runRate = _finiteOr(
+                moveRates?.run ?? context.rates?.run, null);
+            const runNav = navigation
+                || Array.isArray(context.runMoves);
+            if (runRate !== null && runRate > 0
+                && !isPinned && !isProne && actionBudget >= 2 && runNav) {
+                const runRemaining = spentMove > 0
+                    ? Math.max(0, runRate - spentMove) : runRate;
+                const runContext = {
+                    ...planContext,
+                    moveBudget: { mode: "run" },
+                    moves: Array.isArray(context.runMoves)
+                        ? context.runMoves : undefined
+                };
+                let runMove = null;
+                for (const move of _resolveMoves({
+                    tokenDoc, target,
+                    range: _isMemorySource(target.source) && bandRange > 0
+                        ? bandRange : approachRange,
+                    bandRange,
+                    selfPos, targetPos: targetPosOf(target),
+                    grid, navigation, perception, context: runContext
+                })) {
+                    if (move.stay) continue;
+                    if (!Number.isFinite(move.cost)
+                        || move.cost > runRemaining + 1e-9) continue;
+                    if (!runMove || (_finiteOr(move.distance, Infinity)
+                        < _finiteOr(runMove.distance, Infinity))) {
+                        runMove = move;
+                    }
+                }
+                diagnostics.metrics.movesEvaluated += runMove ? 1 : 0;
+                if (runMove && Number.isFinite(runMove.distance)
+                    && runMove.distance
+                        < (_finiteOr(approachMove?.distance, Infinity) - 1e-9)) {
+                    candidates.push({
+                        target, action: null, move: runMove, variant: "run"
+                    });
+                }
             }
         }
 

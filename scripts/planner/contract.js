@@ -125,7 +125,9 @@ export const SCORE_FACTORS = Object.freeze([
     "ev",
     "stickyTarget",
     "outnumber",
-    "tieUp"
+    "tieUp",
+    "seek",
+    "run"
 ]);
 
 
@@ -207,8 +209,23 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     outnumber: 0,
     // Spec-ops doctrine: binding a known pure shooter in melee switches
     // its gun off — a doctrine bonus, not a universal default.
-    tieUp: 0
+    tieUp: 0,
+    // Seek mechanic (smoke request): closing on a non-visible contact
+    // through wall-blocked endpoints is a doctrine preference, not a
+    // universal default.
+    seek: 0,
+    // Run mechanic (smoke request): a full-action sprint at the run rate.
+    // Distance closed is already paid by `advance` — the factor only
+    // carries preset taste for burning the whole turn on movement.
+    run: 0
 });
+
+
+/**
+ * How many distinct hidden endpoints the seek variant may propose per
+ * memory-source target.
+ */
+export const SEEK_MAX_CANDIDATES = 3;
 
 
 /**
@@ -220,7 +237,11 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
  */
 export const PRESET_SKELETONS = Object.freeze({
     assault: Object.freeze({
-        weights: Object.freeze({ ...DEFAULT_PRESET_WEIGHTS }),
+        weights: Object.freeze({
+            ...DEFAULT_PRESET_WEIGHTS,
+            seek: 1.5,
+            run: 1.5
+        }),
         // Smoke finding: assault closes with the enemy — radio-intel
         // approach markers kick in at zero intel.
         seekContacts: true
@@ -261,7 +282,11 @@ export const PRESET_SKELETONS = Object.freeze({
             cover: 1,
             lastKnown: 1,
             aim: 2,
-            overwatch: 1
+            overwatch: 1,
+            // Doctrine: cautious wall-hugging advance on hearsay beats
+            // sprinting into the presumed firing lane.
+            seek: 3,
+            run: 1
         }),
         allowNoAction: true,
         // Smoke finding: spec-ops seek contact — radio-intel approach
@@ -388,6 +413,22 @@ export const DROP_PRONE_DANGER = 0.5;
  * charge it instead (smoke finding).
  */
 export const CHARGE_SWITCH_MARGIN = 0.25;
+
+
+/**
+ * Minimum straight-line distance (scene units) a charge must cover
+ * before contact — OW requires a running start; a bot already close
+ * cannot charge.
+ */
+export const CHARGE_MIN_DISTANCE = 4;
+
+
+/**
+ * Fraction of one grid cell a charge route's waypoint may deviate from
+ * the straight self→endpoint segment before the route counts as bent
+ * (OW: a charge moves in a straight line).
+ */
+export const CHARGE_STRAIGHT_TOLERANCE = 0.75;
 
 
 /** Candidate variants that produce an attack/test step. */

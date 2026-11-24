@@ -127,6 +127,8 @@
   "OWAI.Preview.Action.None": "(no attack action — hold)",
   "OWAI.Preview.TargetNumber": "TN",
   "OWAI.Preview.Score": "Plan score",
+  "OWAI.Preview.PlanSource": "Plan source",
+  "OWAI.Preview.CommitmentReplay": "Committed plan (replayed)",
   "OWAI.Preview.Route.Label": "Route",
   "OWAI.Preview.Route.Empty": "No movement — the NPC stays in place.",
   "OWAI.Preview.Route.Cost": "Movement cost",

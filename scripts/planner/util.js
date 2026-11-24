@@ -205,6 +205,69 @@ export function _pixelDistance(from, to, grid) {
 
 
 /**
+ * Whether a move follows a straight line from the viewer to its
+ * endpoint — the OW charge rule (smoke tuning). Every serialized
+ * waypoint must sit within `tolerance` cells of the self→endpoint
+ * segment; moves without waypoints are unverifiable and pass.
+ * @param {object} move Normalized move `{x, y, waypoints?}`.
+ * @param {{x: number, y: number}} selfPos Viewer position (pixels).
+ * @param {object} grid `_gridInfo` result.
+ * @param {number} [tolerance] Max perpendicular deviation in cells.
+ * @returns {boolean}
+ */
+export function _chargeStraight(move, selfPos, grid, tolerance = 0.75) {
+    const points = [
+        selfPos,
+        ...(Array.isArray(move?.waypoints) ? move.waypoints : []),
+        { x: move?.x, y: move?.y }
+    ].filter(p => Number.isFinite(p?.x) && Number.isFinite(p?.y));
+    if (points.length <= 2) return true;
+    const a = points[0];
+    const b = points[points.length - 1];
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const len2 = (dx * dx) + (dy * dy);
+    if (len2 < 1e-9) return true;
+    const size = Number.isFinite(grid?.size) && grid.size > 0 ? grid.size : 100;
+    const maxDev = tolerance * size;
+    for (const p of points.slice(1, -1)) {
+        const t = (((p.x - a.x) * dx) + ((p.y - a.y) * dy)) / len2;
+        const dev = Math.hypot(p.x - (a.x + (t * dx)), p.y - (a.y + (t * dy)));
+        if (dev > maxDev) return false;
+    }
+    return true;
+}
+
+
+/**
+ * Whether the charge line actually runs AT the target: the straight
+ * self→endpoint line, extended past the endpoint, must pass within the
+ * weapon's melee reach of the target. Without this a straight run can
+ * slide beside the enemy and still land in contact — a legal endpoint
+ * but no real charge at it (smoke tuning).
+ * @param {object} move Normalized move `{x, y}`.
+ * @param {{x: number, y: number}} selfPos Viewer position (pixels).
+ * @param {{x: number|null, y: number|null}} targetPos Target position.
+ * @param {object} grid `_gridInfo` result.
+ * @param {number} reach Melee reach in scene units.
+ * @returns {boolean}
+ */
+export function _chargeAimsAt(move, selfPos, targetPos, grid, reach = 2) {
+    if (!Number.isFinite(move?.x) || !Number.isFinite(selfPos?.x)
+        || !Number.isFinite(targetPos?.x) || !Number.isFinite(targetPos?.y)) return true;
+    const dx = move.x - selfPos.x;
+    const dy = move.y - selfPos.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1e-9) return true;
+    const off = Math.abs((dx * (targetPos.y - selfPos.y))
+        - (dy * (targetPos.x - selfPos.x))) / len;
+    const size = Number.isFinite(grid?.size) && grid.size > 0 ? grid.size : 100;
+    const unit = Number.isFinite(grid?.distance) && grid.distance > 0 ? grid.distance : 1;
+    return off <= ((reach + 0.5) / unit) * size;
+}
+
+
+/**
  * Grid description of a scene in a normalized, serializable shape.
  * @param {object|null} scene
  * @returns {{type: *, size: *, distance: *}}

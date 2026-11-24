@@ -120,7 +120,14 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     // tool — an operative ties up a known pure shooter (high ranged EV,
     // no melee emitter) so it cannot fire. `melee` stays negative so the
     // pull only ever wins against a genuinely dangerous gun.
-    tieUp: 6
+    tieUp: 6,
+    // Seek doctrine (smoke): a hidden endpoint on a hearsay contact beats
+    // the identical approach step — peering around cover is the spec-ops
+    // way of closing in.
+    seek: 3,
+    // Run mechanic (smoke): sprinting between cover is acceptable when
+    // the next hide lies past a full move — a modest pull.
+    run: 1
 
 });
 

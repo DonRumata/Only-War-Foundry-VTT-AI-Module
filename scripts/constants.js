@@ -54,6 +54,10 @@ export const FLAG_KEYS = Object.freeze({
     lastUsedWeapon: "lastUsedWeapon",
     lastAttacker: "lastAttacker",
     lastTarget: "lastTarget",
+    // Smoke request (run mechanic): set on the actor after a full-action
+    // sprint — the system reads it as the +20-evasion window vs ranged
+    // attacks and the executor clears it when the bot's next turn starts.
+    running: "running",
     lastOrder: "lastOrder",
     delaySync: "delaySync",
     // Issue #25 L1 commitment: the persisted multi-turn plan record

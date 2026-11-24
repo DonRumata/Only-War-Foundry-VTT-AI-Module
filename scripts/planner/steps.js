@@ -53,11 +53,13 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
     if (move && !move.stay) {
         // Issue #31: charge folds its movement into the attack's full
         // action (0 here); a bundled move costs one half; a standalone
-        // move beyond the half-move rate costs a full action.
+        // move beyond the half-move rate costs a full action; a run is
+        // always the whole action economy however short the sprint.
         const moveHalves = variant === "charge" ? 0
-            : (candidate.action === null || candidate.action === undefined)
-                ? (halfMoveLimit !== null && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1)
-                : 1;
+            : variant === "run" ? 2
+                : (candidate.action === null || candidate.action === undefined)
+                    ? (halfMoveLimit !== null && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1)
+                    : 1;
         steps.push({
             id: `step-move-${steps.length + 1}`,
             type: "move",
@@ -65,7 +67,10 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
             input: {
                 to: { x: move.x, y: move.y, i: move.i, j: move.j },
                 waypoints: move.waypoints ?? [],
-                approximate: move.approximate === true
+                approximate: move.approximate === true,
+                // `run` rides the step so the executor can stamp the
+                // +20-evasion marker after the sprint lands.
+                ...(variant === "run" ? { mode: "run" } : {})
             },
             preconditions: ["turn", "self-position", "collision"],
             projectedResourceDelta: { movement: -(_finiteOr(move.cost, 0)) }

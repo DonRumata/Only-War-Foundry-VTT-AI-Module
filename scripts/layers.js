@@ -1021,6 +1021,8 @@ function _committedTokenAlive(doc, combat) {
  *    moved over `moveTolerancePx`, died or disappeared.
  * 7. `l0-veto` — a cheap legality pass: `pinned`/`prone` self vetoes a
  *    committed `charge` step before it executes.
+ * 8. `plan-exhausted` — every substantive step is a move whose endpoint
+ *    the bot already occupies; replaying would burn an empty turn.
  *
  * @param {object} record Sanitized committed-plan record.
  * @param {object} live Live view.
@@ -1111,6 +1113,26 @@ export function validateCommitment(record, live = {}) {
                     to: { x: liveSelf.x, y: liveSelf.y }
                 });
             }
+        }
+    }
+    // Smoke finding: a plan whose remaining substance is "be at X"
+    // where the bot already stands at X used to replay an empty turn —
+    // the executor skipped the satisfied move and spent the rest on
+    // `end-turn`. Check the substance up front so the L1 layer falls
+    // through to fresh planning.
+    const substantive = steps.filter(step => step?.type && step.type !== "end-turn");
+    if (substantive.length > 0 && liveSelf
+        && Number.isFinite(liveSelf.x) && Number.isFinite(liveSelf.y)) {
+        const reached = step => {
+            const to = step?.input?.to;
+            return Number.isFinite(to?.x) && Number.isFinite(to?.y)
+                && Math.abs(liveSelf.x - to.x) < tol
+                && Math.abs(liveSelf.y - to.y) < tol;
+        };
+        if (substantive.every(step => step.type === "move" && reached(step))) {
+            return fail(COMMITMENT_REASONS.planExhausted, {
+                steps: substantive.length
+            });
         }
     }
     const target = expected.target;

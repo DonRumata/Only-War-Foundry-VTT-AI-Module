@@ -305,7 +305,16 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
             : 0,
         stickyTarget,
         outnumber,
-        tieUp
+        tieUp,
+        // Seek mechanic (smoke request): the cautious wall-hugging
+        // advance — only seek-variant candidates (hidden endpoints on a
+        // non-visible contact) light the factor; the doctrine weight
+        // decides whether hiding outranks a faster open approach.
+        seek: variant === "seek" ? 1 : 0,
+        // Run mechanic (smoke request): a full-action sprint beyond the
+        // full-move rate — the doctrine weight prices burning the whole
+        // turn on ground gain.
+        run: variant === "run" ? 1 : 0
     };
 }
 

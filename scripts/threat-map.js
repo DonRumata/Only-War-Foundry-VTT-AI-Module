@@ -13,10 +13,11 @@
  * - `dangerAt(point)` returns a normalized `0..1` score: the sum of
  *   per-source contributions capped at 1. A ranged emitter contributes
  *   its full normalized strength `min(1, ev / referenceDamage)` inside
- *   half its weapon range and decays linearly to zero at the range edge
- *   (long shots are less threatening); melee emitters contribute full
- *   strength inside melee reach and decay linearly to zero across the
- *   charge allowance. A wall-check LOS probe gates every contribution;
+ *   a quarter of its weapon range and decays linearly to zero at the
+ *   range edge (a tight "point-blank band" reads hotter than a washed
+ *   out half-range plateau); melee emitters contribute full strength
+ *   inside melee reach and decay linearly to zero across the charge
+ *   allowance. A wall-check LOS probe gates every contribution;
  *   without a probe the threat pessimistically counts (the bot assumes
  *   the enemy can shoot).
  * - The map complements the `cover`/`exposure` factors instead of
@@ -323,9 +324,11 @@ export function buildThreatMap({
             return strength * (1 - ((distance - reach) / allowance));
         }
         if (!(emitter.range > 0) || distance >= emitter.range) return 0;
-        const half = emitter.range / 2;
-        return distance <= half ? strength
-            : strength * (1 - ((distance - half) / half));
+        // Short band (smoke tuning): a quarter of the reach reads at
+        // full strength, the heat decays linearly to zero at the edge.
+        const band = emitter.range / 4;
+        return distance <= band ? strength
+            : strength * (1 - ((distance - band) / (emitter.range - band)));
     }
 
     /**

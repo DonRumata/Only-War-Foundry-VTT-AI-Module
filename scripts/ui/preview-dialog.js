@@ -387,6 +387,9 @@ export function buildPreviewViewModel(plan, context = {}) {
 
     const maxReplans = Number.isFinite(context.maxReplans) ? context.maxReplans : 1;
     const replanCount = _finiteOr(plan?.replanCount, 0);
+    // A commitment replay carries no scoring — the preview marks it
+    // instead of showing a misleading bare 0 (smoke finding).
+    const commitmentReplay = plan?.breakdown?.reason === "commitment";
 
     return {
         planId: plan?.id ?? null,
@@ -394,8 +397,10 @@ export function buildPreviewViewModel(plan, context = {}) {
             ?? plan?.operationId ?? null,
         npc,
         preset: plan?.preset ?? null,
-        score: Number.isFinite(plan?.score) ? plan.score : null,
-        hasScore: Number.isFinite(plan?.score),
+        score: commitmentReplay ? null
+            : (Number.isFinite(plan?.score) ? plan.score : null),
+        hasScore: !commitmentReplay && Number.isFinite(plan?.score),
+        commitmentReplay,
         target,
         action,
         route,
@@ -723,6 +728,79 @@ export function createPreviewController({
     }
 
     /**
+     * Token placeable of a serialized token id/uuid on the viewed canvas.
+     * @param {string|null} idOrUuid
+     * @returns {object|null}
+     */
+    function _canvasToken(idOrUuid) {
+        if (!idOrUuid) return null;
+        try {
+            const tokens = globalThis.canvas?.tokens;
+            if (!tokens) return null;
+            const id = String(idOrUuid).split(".").pop();
+            return tokens.get?.(id)
+                ?? (tokens.placeables ?? []).find(t => t?.id === id)
+                ?? null;
+        } catch(_err) {
+            return null;
+        }
+    }
+
+    /**
+     * Serialized token reference of a plan's first attack/test step.
+     * @param {object|null} plan
+     * @returns {string|null}
+     */
+    function _planTargetRef(plan) {
+        const attack = (plan?.steps ?? [])
+            .find(step => step?.type === "attack" || step?.type === "test");
+        return attack?.input?.targetTokenId
+            ?? attack?.input?.targetTokenUuid ?? null;
+    }
+
+    /**
+     * Mark the turn like a real player's (smoke request): the acting bot
+     * is controlled and its attack target joins the GM's target set, so
+     * the canvas reads exactly like a manual attack setup.
+     * @param {object} session
+     */
+    function _applyTargeting(session) {
+        if (globalThis.game?.user?.isGM !== true) return;
+        try {
+            const bot = _canvasToken(session.combatant?.tokenId
+                ?? _tokenDoc(session.combatant?.token)?.id);
+            if (bot && !bot.controlled) {
+                bot.control?.({ releaseOthers: true });
+            }
+            const target = _canvasToken(_planTargetRef(session.plan));
+            if (target) {
+                target.setTarget?.(true, { releaseOthers: true });
+            }
+            session._targeted = target ?? null;
+            session._controlled = bot ?? null;
+        } catch(_err) {
+            // Canvas marking is best-effort.
+        }
+    }
+
+    /**
+     * Release the selection/target marks of a resolved session.
+     * @param {object} session
+     */
+    function _releaseTargeting(session) {
+        try {
+            session?._targeted?.setTarget?.(false);
+            session?._controlled?.release?.();
+        } catch(_err) {
+            // Best-effort cleanup.
+        }
+        if (session) {
+            session._targeted = null;
+            session._controlled = null;
+        }
+    }
+
+    /**
      * Display name of the previewed NPC for notifications.
      * @param {object} session
      * @returns {string}
@@ -852,6 +930,16 @@ export function createPreviewController({
         _cancelTimeout(session);
         pending.delete(session.operationId);
         _clearOverlay(session);
+        // Smoke finding: on confirm the execution record owns the same
+        // placeables — releasing the session handle here would clear the
+        // target off the GM's damage card mid-adjudication. On cancel
+        // (dialog close, timeout, stale) the marks die immediately.
+        if (decision !== PREVIEW_DECISIONS.confirm) {
+            _releaseTargeting(session);
+        } else {
+            session._targeted = null;
+            session._controlled = null;
+        }
         const dialog = session.dialog;
         session.dialog = null;
         try {
@@ -1016,6 +1104,9 @@ export function createPreviewController({
         _scheduleTimeout(session);
         _render(session);
         _showOverlay(session);
+        // The replanned attack may aim at a different token — refresh the
+        // GM's selection/target marks.
+        _applyTargeting(session);
         log(`preview ${session.operationId} replanned -> ${planned.plan.id}`);
         return { ok: true, decision: PREVIEW_DECISIONS.replan, plan: planned.plan };
     }
@@ -1082,6 +1173,10 @@ export function createPreviewController({
         _showOverlay(session);
         // Issue #32: pan the GM view onto the acting bot.
         if (getCenterOnBot()) centerOnToken(_tokenDoc(session.combatant?.token));
+        // Smoke request: the acting bot is selected and its attack
+        // target joins the GM's target set — the canvas reads like a
+        // player's turn.
+        _applyTargeting(session);
         log(`preview ${operationId}: plan ${plan.id} timeout=${session.timeoutSeconds}s`);
         return { ok: true, operationId, session };
     }

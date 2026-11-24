@@ -65,6 +65,12 @@
             <span class="ow-ai-value">{{score}}</span>
         </div>
         {{/if}}
+        {{#if commitmentReplay}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.PlanSource"}}</label>
+            <span class="ow-ai-value">{{localize "OWAI.Preview.CommitmentReplay"}}</span>
+        </div>
+        {{/if}}
     </div>
 
     <fieldset>

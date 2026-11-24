@@ -81,7 +81,13 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     outnumber: 4,
     // Smoke: closing on a known pure shooter denies its fire too — a
     // modest tie-up pull, secondary to the charge doctrine itself.
-    tieUp: 2
+    tieUp: 2,
+    // Smoke: assault still prefers a covered approach over a naked
+    // sprint when intel is thin — a mild pull, far below charge doctrine.
+    seek: 1.5,
+    // Run mechanic (smoke): burning the whole turn on a sprint to close
+    // on the enemy fits assault doctrine — a mild pull below charge.
+    run: 1.5
 });
 
 /**

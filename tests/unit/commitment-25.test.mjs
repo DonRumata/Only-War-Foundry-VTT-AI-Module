@@ -458,6 +458,43 @@ test("validateCommitment: the cheap L0 pass vetoes a committed charge", () => {
     }
 });
 
+test("validateCommitment: an already-finished move plan is exhausted", () => {
+    const world = makeWorld();
+    const moveStep = {
+        id: "step-move-1", type: "move", cost: { movement: 8, halves: 2 },
+        input: { to: { x: 200, y: 0 } }
+    };
+    const record = committedRecord(world, {
+        steps: [moveStep, {
+            id: "step-end-turn-2", type: "end-turn", cost: {}, input: {}
+        }],
+        expectedState: {
+            self: { x: 200, y: 0, elevation: 0 },
+            target: null,
+            threats: []
+        }
+    });
+    const live = {
+        combatId: world.combat.id, round: 1,
+        self: { x: 200, y: 0, elevation: 0 },
+        resolveToken: () => world.enemyToken,
+        isTokenAlive: () => true
+    };
+    // Smoke finding: the bot stands on the committed endpoint — the
+    // replay would skip the only substantive step and burn the turn.
+    assert.equal(validateCommitment(record, live).reason,
+        COMMITMENT_REASONS.planExhausted);
+    // An endpoint still ahead keeps the commitment alive.
+    const open = committedRecord(world, {
+        steps: [{ ...moveStep, input: { to: { x: 800, y: 0 } } },
+            { id: "step-end-turn-2", type: "end-turn", cost: {}, input: {} }],
+        expectedState: { target: null, threats: [] }
+    });
+    assert.equal(validateCommitment(open, {
+        ...live, self: { x: 0, y: 0, elevation: 0 }
+    }).valid, true);
+});
+
 /* ------------------------------------------------------------------ */
 /* applyCommitmentLayer — flag records and the funnel decision         */
 /* ------------------------------------------------------------------ */

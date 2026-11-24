@@ -38,6 +38,7 @@ import {
 } from "./config-resolver.js";
 import {
     ATTACK_ADJUDICATION_MODES,
+    FLAG_KEYS,
     MODULE_ID
 } from "./constants.js";
 import {
@@ -239,6 +240,26 @@ export function createExecutorService({
     }
 
     /**
+     * Release a record's canvas marks (selected bot + targeted token).
+     * Called on the combat's turn change and on combat end — never on
+     * operation close, so the marks outlive the damage-adjudication
+     * wait (smoke finding: the target dropped off the card mid-apply).
+     * @param {object|null} record Execution record carrying marks.
+     */
+    function _releaseMarks(record) {
+        try {
+            record?._targeted?.setTarget?.(false);
+            record?._controlled?.release?.();
+        } catch(_err) {
+            // Best-effort cleanup.
+        }
+        if (record) {
+            record._targeted = null;
+            record._controlled = null;
+        }
+    }
+
+    /**
      * Subscribe the module hooks once: the operation-completed turn
      * handoff, the `updateCombat` adjudication auto-cancel and the
      * `renderChatMessage` adjudication button binding (issue #37).
@@ -282,13 +303,32 @@ export function createExecutorService({
                         && entry.combatId !== combat.id) continue;
                     _releaseDamageWait(opId, "turn-advanced");
                 }
+                // The turn moved on — every record's selection/target
+                // marks for this combat die with it.
+                for (const record of executions.values()) {
+                    if (record?.combatId && combat?.id
+                        && record.combatId !== combat.id) continue;
+                    _releaseMarks(record);
+                }
+                // Run mechanic: the +20-evasion window ends at the start
+                // of the runner's next turn — the flag on the combatant
+                // now acting expires.
+                try {
+                    const currentActor = combat?.combatant?.actor;
+                    if (currentActor?.getFlag?.(MODULE_ID, FLAG_KEYS.running)) {
+                        currentActor.unsetFlag(MODULE_ID, FLAG_KEYS.running)
+                            ?.catch?.(() => {});
+                    }
+                } catch(_err) {
+                    // Marker cleanup is best-effort.
+                }
             } catch(err) {
                 console.error(`${MODULE_ID} | adjudication cancel failed`, err);
             }
         });
         // Issue #52: the combat going away resolves every pending gate —
         // without it a deleted combat would park the executor forever.
-        hooks.on("deleteCombat", () => {
+        hooks.on("deleteCombat", combat => {
             try {
                 for (const [requestId, pending] of pendingAdjudications) {
                     clearTimeout(pending.timer);
@@ -297,6 +337,21 @@ export function createExecutorService({
                 }
                 for (const opId of [...pendingDamage.keys()]) {
                     _releaseDamageWait(opId, "combat-ended");
+                }
+                for (const record of executions.values()) {
+                    _releaseMarks(record);
+                }
+                // Run mechanic: combat end wipes every leftover evasion
+                // marker on its combatants.
+                try {
+                    for (const c of combat?.combatants ?? []) {
+                        if (c?.actor?.getFlag?.(MODULE_ID, FLAG_KEYS.running)) {
+                            c.actor.unsetFlag(MODULE_ID, FLAG_KEYS.running)
+                                ?.catch?.(() => {});
+                        }
+                    }
+                } catch(_err) {
+                    // Marker cleanup is best-effort.
                 }
             } catch(err) {
                 console.error(`${MODULE_ID} | adjudication cancel failed`, err);
@@ -659,8 +714,35 @@ export function createExecutorService({
 
         // Issue #32: pan the GM view onto the acting bot before its
         // first step so automated turns stay watchable.
-        if (getCenterOnBot()) {
-            centerOnToken(_tokenDoc(context.token ?? run.combatant?.token));
+        const botDoc = _tokenDoc(context.token ?? run.combatant?.token);
+        if (getCenterOnBot()) centerOnToken(botDoc);
+        // Smoke request: mark the turn like a player's — the acting bot
+        // is selected and its attack target joins the GM's target set.
+        // The marks live on the execution record and die with the
+        // combat's turn change (updateCombat hook) so the damage card
+        // keeps its target while the GM adjudicates.
+        if (globalThis.game?.user?.isGM === true) {
+            try {
+                const marks = run.record ?? run;
+                const tokens = globalThis.canvas?.tokens;
+                const bot = botDoc?.id ? tokens?.get?.(botDoc.id) : null;
+                if (bot && !bot.controlled) {
+                    bot.control?.({ releaseOthers: true });
+                    marks._controlled = bot;
+                }
+                const attackStep = (run.plan?.steps ?? [])
+                    .find(s => s?.type === "attack" || s?.type === "test");
+                const tRef = attackStep?.input?.targetTokenId
+                    ?? attackStep?.input?.targetTokenUuid;
+                const tId = tRef ? String(tRef).split(".").pop() : null;
+                const target = tId ? tokens?.get?.(tId) : null;
+                if (target) {
+                    target.setTarget?.(true, { releaseOthers: true });
+                    marks._targeted = target;
+                }
+            } catch(_err) {
+                // Canvas marking is best-effort.
+            }
         }
 
         for (;;) {
@@ -795,6 +877,26 @@ export function createExecutorService({
                     if (step.type === "move" && outcome.position) {
                         _noteMove(context, run, outcome.position);
                     }
+                    // Run mechanic: a sprint stamps the actor `running`
+                    // — the system reads the flag as the +20-evasion
+                    // window vs ranged fire until the bot's next turn
+                    // (cleared in the updateCombat/deleteCombat hooks).
+                    if (step.type === "move" && step.input?.mode === "run"
+                        && outcome.position && !outcome.skipped
+                        && _isController(context)) {
+                        try {
+                            const flagActor = run.combatant?.actor;
+                            if (flagActor && typeof flagActor.setFlag === "function") {
+                                await flagActor.setFlag(MODULE_ID, FLAG_KEYS.running, {
+                                    combatId: context.combat?.id ?? null,
+                                    round: context.combat?.round ?? null,
+                                    operationId: run.operationId ?? null
+                                });
+                            }
+                        } catch(_err) {
+                            // The evasion marker is best-effort — never fatal.
+                        }
+                    }
                     run.stepIndex++;
                     // Pacing: let the move animation/roll card breathe so
                     // automated turns stay watchable (world setting).
@@ -911,7 +1013,11 @@ export function createExecutorService({
             // Issue #27: the per-layer reason trace of the active plan.
             trace: plan?.diagnostics?.trace ?? []
         };
-        const record = { promise: null, hookAdvanced: false };
+        const record = {
+            promise: null,
+            hookAdvanced: false,
+            combatId: context.combat?.id ?? null
+        };
         run.record = record;
         record.promise = (async () => {
             const early = await _preflight(context, run);
@@ -955,7 +1061,11 @@ export function createExecutorService({
             // Issue #27: the per-layer reason trace of the active plan.
             trace: context.plan?.diagnostics?.trace ?? []
         };
-        const record = { promise: null, hookAdvanced: false };
+        const record = {
+            promise: null,
+            hookAdvanced: false,
+            combatId: context.combat?.id ?? null
+        };
         run.record = record;
         record.promise = (async () => {
             const early = await _preflight(context, run);

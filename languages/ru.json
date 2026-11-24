@@ -127,6 +127,8 @@
   "OWAI.Preview.Action.None": "(нет боевого действия — удержание)",
   "OWAI.Preview.TargetNumber": "TN",
   "OWAI.Preview.Score": "Оценка плана",
+  "OWAI.Preview.PlanSource": "Источник плана",
+  "OWAI.Preview.CommitmentReplay": "Закоммиченный план (реплей)",
   "OWAI.Preview.Route.Label": "Маршрут",
   "OWAI.Preview.Route.Empty": "Без движения — NPC остаётся на месте.",
   "OWAI.Preview.Route.Cost": "Стоимость движения",

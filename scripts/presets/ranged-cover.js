@@ -96,7 +96,10 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     grudge: 1,
     ev: 1,
     stickyTarget: 3,
-    outnumber: 1
+    outnumber: 1,
+    // Run mechanic (smoke): a sprint between firing positions is a
+    // fallback — useful when the next cover lies past a full move.
+    run: 0.5
 
 });
 

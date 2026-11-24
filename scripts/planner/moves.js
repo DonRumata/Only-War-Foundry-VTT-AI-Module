@@ -42,7 +42,10 @@ export function _normalizeMove(raw, { selfPos, targetPos, grid, stay = false }) 
         cost: _finiteOr(raw.cost, 0),
         costCells: _finiteOr(raw.costCells, null),
         distance,
-        los: raw.los === true ? true : null,
+        // `los` keeps tri-state: `true` the endpoint sees the target,
+        // `false` a wall check proved it hidden, `null` unprobed — the
+        // seek variant filters on an explicit `false`.
+        los: raw.los === true ? true : (raw.los === false ? false : null),
         cover: Number.isFinite(raw.cover) ? raw.cover : 0,
         approximate: raw.approximate === true,
         stay: stay || !moved,

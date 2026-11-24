@@ -324,6 +324,10 @@ export function createBookkeeping({
         // moves on — the record/journal must reflect this turn's moves
         // when the next combatant plans.
         await _syncCommitment(context, run, result);
+        // The selection/target marks put down at `_execute` deliberately
+        // survive `_finish`: the GM still needs the target mark while
+        // applying the damage card. They are released on the combat
+        // `updateCombat` turn change (executor.js hook).
         if (advanceTurn) await _advanceTurn(context, run);
     }
 
