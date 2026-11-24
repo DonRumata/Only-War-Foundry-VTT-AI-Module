@@ -63,18 +63,18 @@ export function createTurnAdvance({
         const id = combat.id ?? "combat";
         const prior = advanceChains.get(id) ?? Promise.resolve();
         const next = prior.then(async () => {
-            if (!onTurn()) return true;
+            if (combat.destroyed === true || combat.ended === true || !onTurn()) return true;
+            const delay = pacing();
+            if (delay > 0) await _sleep(delay);
             const key = () => `${combat.round}:${combat.turn}`;
             // A resolved `nextTurn` can be silently reverted well after it
             // resolves (out-of-order document writes); keep verifying for a
             // few seconds and re-drive while the op's turn is still held.
             for (let attempt = 0; attempt <= ADVANCE_VERIFY_RETRIES; attempt++) {
-                // Combat deleted mid-verify: the op's turn can never
-                // advance — bail instead of spamming nextTurn errors.
-                if (combat.destroyed === true || combat.ended === true) return true;
+                // Manual advances or a controller change can happen while pacing.
+                if (combat.destroyed === true || combat.ended === true || !onTurn()) return true;
+                if (!_isController(context)) return false;
                 const before = key();
-                // Pacing before the advance keeps each bot's turn visible.
-                if (attempt === 0 && pacing() > 0) await _sleep(pacing());
                 try {
                     await combat.nextTurn();
                 } catch(err) {
