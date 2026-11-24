@@ -10,12 +10,14 @@
  * combatant removal or combat end.
  */
 import { FLAG_KEYS, MODULE_ID } from "./constants.js";
+import {
+    coneFanPoints,
+    ensureOverlayLayer,
+    removeOverlayLayer
+} from "./ui/plan-overlay.js";
 
 /** Default cone arc when the declaring step does not carry one. */
 const DEFAULT_ARC_DEG = 45;
-
-/** Polygon fan step of the rendered cone sector (degrees). */
-const CONE_FAN_STEP_DEG = 5;
 
 /** Cone overlay tint and opacity. */
 const CONE_COLOR = 0xff8800;
@@ -99,29 +101,53 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
 
     /**
      * Sanitized flag payload of a declaration: no Document references, no
-     * arbitrary caller data beyond the cone spec.
-     * @param {object} spec Step input `{direction, arc, range, weaponId, ...}`.
+     * arbitrary caller data beyond the zone spec. Two zone shapes exist
+     * (issue #54): the default watch `cone` (`direction`/`arc`/`range`)
+     * and the `blast` trigger circle (`targetPoint` in canvas pixels +
+     * `blastRadius` in scene units — "enemy entered the circle → the
+     * grenade lands there").
+     * @param {object} spec Step input `{direction|shape, arc, range,
+     *   targetPoint?, blastRadius?, weaponId, ...}`.
      * @param {object|null} combat Active combat.
      * @param {object|null} combatant Declaring combatant.
      * @returns {object|null}
      */
     function _sanitize(spec, combat, combatant) {
-        const direction = Number(spec?.direction);
-        if (!Number.isFinite(direction)) return null;
-        const range = Number(spec?.range ?? spec?.reach);
-        if (!Number.isFinite(range) || range <= 0) return null;
         const tokenDoc = _tokenDoc(combatant?.token);
-        return {
+        const base = {
             combatantId: combatant?.id ?? null,
             tokenId: combatant?.tokenId ?? tokenDoc?.id ?? null,
             sceneId: tokenDoc?.parent?.id ?? tokenDoc?.scene?.id ?? null,
-            direction: ((direction % 360) + 360) % 360,
-            arc: Number.isFinite(spec?.arc) && spec.arc > 0 ? spec.arc : DEFAULT_ARC_DEG,
-            range,
             weaponId: spec?.weaponId ?? spec?.itemUuid ?? null,
             weaponName: spec?.weaponName ?? spec?.name ?? null,
             attackType: spec?.attackType ?? null,
             round: combat?.round ?? null
+        };
+        if (spec?.shape === "blast" || spec?.zone?.shape === "blast") {
+            const point = spec?.zone?.targetPoint ?? spec?.targetPoint;
+            const radius = Number(spec?.zone?.blastRadius ?? spec?.blastRadius);
+            if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+                || !Number.isFinite(radius) || radius <= 0) return null;
+            const range = Number(spec?.zone?.range ?? spec?.range);
+            return {
+                ...base,
+                shape: "blast",
+                targetPoint: { x: point.x, y: point.y },
+                blastRadius: radius,
+                range: Number.isFinite(range) && range > 0 ? range : null
+            };
+        }
+        const direction = Number(spec?.zone?.direction ?? spec?.direction);
+        if (!Number.isFinite(direction)) return null;
+        const range = Number(spec?.zone?.range ?? spec?.range ?? spec?.reach);
+        if (!Number.isFinite(range) || range <= 0) return null;
+        const arc = Number(spec?.zone?.arc ?? spec?.arc);
+        return {
+            ...base,
+            shape: "cone",
+            direction: ((direction % 360) + 360) % 360,
+            arc: Number.isFinite(arc) && arc > 0 ? arc : DEFAULT_ARC_DEG,
+            range
         };
     }
 
@@ -131,7 +157,8 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
      * @param {object} input `{combat, combatant, spec}`.
      * @param {object|null} input.combat Active combat.
      * @param {object|null} input.combatant Declaring combatant.
-     * @param {object} input.spec Step input `{direction, arc, range, ...}`.
+     * @param {object} input.spec Step input: cone `{direction, arc,
+     *   range, ...}` or blast `{shape:"blast", targetPoint, blastRadius}`.
      * @returns {Promise<object>} `{ok, record?|reason}`
      */
     async function declare({ combat = null, combatant = null, spec = {} } = {}) {
@@ -195,38 +222,25 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     // --- GM-only canvas rendering -----------------------------------------
+    // Issue #30: declarations render into the shared GM-only overlay root
+    // (`scripts/ui/plan-overlay.js`) — same layer lifecycle as the preview
+    // plan and the danger heatmap, nothing written to documents.
 
     /**
-     * Remove the overlay container (and children) from the canvas.
+     * Remove the overlay layer (and children) from the canvas.
      * @returns {void}
      */
     function _teardownContainer() {
-        if (_container) {
-            try {
-                _container.parent?.removeChild?.(_container);
-                _container.destroy?.({ children: true });
-            } catch(err) {
-                // Best effort — a stale PIXI tree must not break the service.
-            }
-            _container = null;
-        }
+        _container = null;
+        removeOverlayLayer("overwatch");
     }
 
     /**
-     * Lazily create the overlay container on the templates layer.
+     * Lazily fetch the shared `overwatch` sub-layer of the overlay root.
      * @returns {PIXI.Container|null}
      */
     function _ensureContainer() {
-        if (_container && !_container.destroyed) return _container;
-        _container = null;
-        if (typeof PIXI === "undefined") return null;
-        const layer = globalThis.canvas?.templates ?? globalThis.canvas?.stage ?? null;
-        if (!layer || typeof layer.addChild !== "function") return null;
-        _container = new PIXI.Container();
-        _container.name = "ow-ai-overwatch";
-        _container.eventMode = "none";
-        _container.zIndex = 10;
-        layer.addChild(_container);
+        _container = ensureOverlayLayer("overwatch");
         return _container;
     }
 
@@ -258,33 +272,39 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     /**
-     * Draw one cone sector into the overlay container.
+     * Draw one watch zone into the overlay container: the cone sector of
+     * a plain/spray declaration, the trigger circle of a blast one
+     * (issue #54 — `targetPoint` is stored in canvas pixels,
+     * `blastRadius` in scene units).
      * @param {PIXI.Container} container
      * @param {object} combatant Declaring combatant.
      * @param {object} record Sanitized overwatch record.
      * @returns {void}
      */
-    function _drawCone(container, combatant, record) {
-        const center = _tokenCenter(combatant?.token);
+    function _drawZone(container, combatant, record) {
         const pxPerUnit = _pxPerUnit();
-        if (!center || pxPerUnit <= 0) return;
+        if (pxPerUnit <= 0) return;
+        if (record?.shape === "blast") {
+            const point = record.targetPoint;
+            const radius = Number(record.blastRadius) * pxPerUnit;
+            if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+                || !(radius > 0)) return;
+            const graphics = new PIXI.Graphics();
+            graphics.beginFill(CONE_COLOR, CONE_FILL_ALPHA);
+            graphics.lineStyle(2, CONE_COLOR, CONE_EDGE_ALPHA, 0.5);
+            graphics.drawCircle(point.x, point.y, radius);
+            graphics.endFill();
+            container.addChild(graphics);
+            return;
+        }
+        const center = _tokenCenter(combatant?.token);
+        if (!center) return;
         const radius = record.range * pxPerUnit;
         const arc = Number(record.arc) || DEFAULT_ARC_DEG;
-        const halfArc = arc / 2;
-        const start = record.direction - halfArc;
-        const points = [center.x, center.y];
-        const steps = Math.max(1, Math.ceil(arc / CONE_FAN_STEP_DEG));
-        for (let i = 0; i <= steps; i++) {
-            const angle = (start + (arc * i / steps)) * (Math.PI / 180);
-            points.push(
-                center.x + (Math.cos(angle) * radius),
-                center.y + (Math.sin(angle) * radius)
-            );
-        }
         const graphics = new PIXI.Graphics();
         graphics.beginFill(CONE_COLOR, CONE_FILL_ALPHA);
         graphics.lineStyle(2, CONE_COLOR, CONE_EDGE_ALPHA, 0.5);
-        graphics.drawPolygon(points);
+        graphics.drawPolygon(coneFanPoints(center, record.direction, arc, radius));
         graphics.endFill();
         container.addChild(graphics);
     }
@@ -302,19 +322,28 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
         }
         const combat = globalThis.game?.combat ?? null;
         for (const { combatant, record } of activeOverwatches(combat)) {
-            _drawCone(container, combatant, record);
+            _drawZone(container, combatant, record);
         }
     }
 
     /**
      * Expiry pass on `updateCombat`: a combatant's overwatch ends the
-     * moment its own turn starts (Only War: until your next turn).
+     * moment its own turn starts (Only War: until your next turn). Only a
+     * real round/turn advance expires a declaration — the module's own
+     * `operation` flag writes fire `updateCombat` too, and re-running the
+     * expiry on every update used to erase a zone declared moments
+     * earlier on the same turn (smoke finding). A record stamped with
+     * the current round is kept for the same reason.
      * @param {object} combat
+     * @param {object} [change] Update diff; non-turn changes are ignored.
      */
-    function _expireOnTurnStart(combat) {
+    function _expireOnTurnStart(combat, change) {
+        if (change && change.turn === undefined && change.round === undefined) return;
         const current = combat?.combatant ?? null;
-        if (!current || !overwatchOf(current)) return;
+        const record = current ? overwatchOf(current) : null;
+        if (!record) return;
         if (!_isController()) return;
+        if (Number.isFinite(record.round) && record.round === combat?.round) return;
         clear(current);
     }
 
@@ -336,6 +365,24 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
     }
 
     /**
+     * Expiry pass on `deleteToken`/`deleteCombatant`: a declaration never
+     * survives the entity it was declared on — without this the flag
+     * record lingers as a dead zone that can re-render later.
+     * @param {object} doc Deleted token document or combatant.
+     */
+    function _expireOnDeleted(doc) {
+        const id = doc?.id ?? _tokenDoc(doc)?.id ?? null;
+        if (!id) return;
+        const combat = globalThis.game?.combat ?? null;
+        for (const { combatant, record } of activeOverwatches(combat)) {
+            if (record.tokenId !== id && combatant?.tokenId !== id
+                && combatant?.id !== id) continue;
+            if (_isController()) clear(combatant);
+        }
+        _renderAll();
+    }
+
+    /**
      * Register the watcher hooks driving expiry and re-rendering.
      * @returns {void}
      */
@@ -351,7 +398,8 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
         on("updateCombat", _expireOnTurnStart);
         on("updateToken", _expireOnTokenMove);
         on("updateCombatant", _renderAll);
-        on("deleteCombatant", _renderAll);
+        on("deleteCombatant", _expireOnDeleted);
+        on("deleteToken", _expireOnDeleted);
         on("deleteCombat", _renderAll);
     }
 

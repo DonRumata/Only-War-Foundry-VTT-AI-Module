@@ -25,7 +25,8 @@
     "test:master-switch": "node master-switch.test.mjs",
     "test:player-view": "node player-view.test.mjs",
     "test:tactical": "node tactical.test.mjs",
-    "test:all": "npm run test:foundation && npm run test:authority && npm run test:perception && npm run test:planner && npm run test:navigation && npm run test:assault && npm run test:ranged-cover && npm run test:hold && npm run test:spec-ops && npm run test:executor && npm run test:fireteam && npm run test:fireteam-tactics && npm run test:preview && npm run test:grid-types && npm run test:multi-gm && npm run test:stale-replan && npm run test:master-switch && npm run test:player-view && npm run test:tactical && npm run test:performance"
+    "test:overlay": "node plan-overlay.test.mjs",
+    "test:all": "npm run test:foundation && npm run test:authority && npm run test:perception && npm run test:planner && npm run test:navigation && npm run test:assault && npm run test:ranged-cover && npm run test:hold && npm run test:spec-ops && npm run test:executor && npm run test:fireteam && npm run test:fireteam-tactics && npm run test:preview && npm run test:grid-types && npm run test:multi-gm && npm run test:stale-replan && npm run test:master-switch && npm run test:player-view && npm run test:tactical && npm run test:performance && npm run test:overlay"
   },
   "devDependencies": {
     "playwright-core": "1.61.1"

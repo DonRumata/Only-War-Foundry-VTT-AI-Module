@@ -74,8 +74,10 @@ export const SPEC_OPS_CONFIG = Object.freeze({
 export const SPEC_OPS_WEIGHTS = Object.freeze({
     attackNow: 9,
     attackAfterMove: 7,
-    charge: 3,
-    melee: 0,
+    // Smoke: a lasgun-armed operative has no doctrine for knife charges —
+    // melee is the fallback when nothing fires, never a plan.
+    charge: -3,
+    melee: -4,
     advance: 3,
     threat: 3,
     proximity: 1.5,
@@ -92,11 +94,41 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     meleeEngage: 3,
     area: 5,
     aim: 2,
-    aimAlone: 0.5,
+    aimAlone: 1.5,
     reload: 3,
-    overwatch: 1,
+    overwatch: 2,
     // Issue #16: spec-ops reads the threat map like rangedCover does.
-    danger: -2
+    danger: -2,
+    // Issue #37: spec-ops takes cover under fire but keeps moving when it
+    // can; signature weapons and backup weapons score as elsewhere.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 1,
+    readyWeapon: 2,
+    // Issue #39: spec-ops is disciplined fire — real shooting-into-
+    // melee avoidance (−6, roughly the −20 rules penalty), mild engage
+    // pull and a real grudge memory.
+    alliedEngagement: -6,
+    leaveMeleeEngage: -6,
+    engageDenial: 1,
+    unpin: 4,
+    grudge: 3,
+    ev: 1,
+    stickyTarget: 4,
+    outnumber: 2,
+    // Spec-ops doctrine (smoke): melee is a *denial* tool, not a damage
+    // tool — an operative ties up a known pure shooter (high ranged EV,
+    // no melee emitter) so it cannot fire. `melee` stays negative so the
+    // pull only ever wins against a genuinely dangerous gun.
+    tieUp: 6,
+    // Seek doctrine (smoke): a hidden endpoint on a hearsay contact beats
+    // the identical approach step — peering around cover is the spec-ops
+    // way of closing in.
+    seek: 3,
+    // Run mechanic (smoke): sprinting between cover is acceptable when
+    // the next hide lies past a full move — a modest pull.
+    run: 1
+
 });
 
 /**
@@ -132,7 +164,8 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         cover: 2,
         exposure: -1,
         holdPosition: -2,
-        flankAngle: 8
+        flankAngle: 8,
+        flankProgress: 6
     }),
     assault: Object.freeze({
         attackNow: 8,
@@ -145,7 +178,8 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         cover: 1,
         holdPosition: -2,
         attackType: 0.2,
-        meleeEngage: 4
+        meleeEngage: 4,
+        tieUp: 4
     }),
     regroup: Object.freeze({
         attackNow: 4,
@@ -174,7 +208,8 @@ export const SPEC_OPS_SOLO_WEIGHTS = Object.freeze({
     holdPosition: 2,
     attackType: 0.1,
     vulnerable: 0.5,
-    meleeEngage: 2
+    meleeEngage: 2,
+    tieUp: 3
 });
 
 /** Candidate variants whose action produces an attack/test step. */
@@ -469,6 +504,37 @@ function _flankAngle(candidate, context, minAngleDeg) {
  * @param {object} candidate
  * @param {object} context
  * @returns {number}
+ */
+/**
+ * `flankProgress` factor: how much closer the candidate endpoint lands
+ * to the team's flank maneuver point (`context.team.flankPoint`)
+ * relative to the current position — the move that actually runs the
+ * maneuver, not just the firing angle `flankAngle` rewards.
+ * @param {object} candidate
+ * @param {object} context
+ * @returns {number}
+ */
+function _flankProgress(candidate, context) {
+    const point = context.team?.flankPoint ?? null;
+    const self = context.selfPos;
+    const endpoint = _candidateEndpoint(candidate, context);
+    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+        || !Number.isFinite(self?.x) || !Number.isFinite(self?.y) || !endpoint) {
+        return 0;
+    }
+    const base = _dist(self, point);
+    if (!(base > 0)) return 0;
+    return Math.round(_clamp01((base - _dist(endpoint, point)) / base) * 1e4) / 1e4;
+}
+
+/**
+ * Cohesion-restoration progress of the candidate endpoint toward the
+ * team's regroup point (or centre): 1 when the endpoint lands on it,
+ * 0 when it keeps or extends the distance. Feeds the
+ * `cohesionRestore` factor for `regroup`/`support` tasks (issue #56).
+ * @param {object} candidate Scored candidate `{variant, move?}`.
+ * @param {object} context Evaluation context (`selfPos`, `team`).
+ * @returns {number} 0..1.
  */
 function _cohesionRestore(candidate, context) {
     const regroupPoint = context.team?.regroupPoint ?? context.team?.center
@@ -805,6 +871,11 @@ export function createSpecOpsTactic(config = {}) {
 export function specOpsVeto({ candidate = {} } = {}) {
     if (!ATTACK_VARIANTS.has(candidate.variant)) return null;
     const target = candidate.target;
+    // A blast aim point on a last-known position is the deliberate
+    // "room clearing" memory-strike — the planner only offers it when
+    // every covered square stays clear of friendlies, so it survives
+    // the hidden-target veto the preset otherwise demands.
+    if (candidate.aim && target?.source === "last-known") return null;
     if (target?.source === "last-known" || target?.hidden === true) {
         return SPEC_OPS_VETO_HIDDEN_TARGET;
     }
@@ -838,9 +909,16 @@ export function evaluateSpecOps({
     const enriched = { ...factors };
     if (task === "flank") {
         enriched.flankAngle = _flankAngle(candidate, context, cfg.flankMinAngleDegrees);
+        enriched.flankProgress = _flankProgress(candidate, context);
     }
     if (task === "regroup") {
-        enriched.cohesionRestore = _cohesionRestore(candidate, context);
+        // Issue #24 review: `fanatic.ignoreRegroup` zeroes the regroup
+        // pull structurally. The declared delta alone cannot do it —
+        // the task overlay *replaces* the weight and the L3 bound
+        // clamps any delta, so the flag is enforced on the factor.
+        enriched.cohesionRestore = context.traitFlags?.ignoreRegroup === true
+            ? 0
+            : _cohesionRestore(candidate, context);
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
@@ -857,6 +935,7 @@ export function evaluateSpecOps({
                 task: task ?? "solo",
                 reason: task ? null : "no-fireteam",
                 flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
+                flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null,
                 cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null
             }
         }
@@ -875,7 +954,12 @@ export function specOpsPresetDefinition() {
         evaluate: evaluateSpecOps,
         veto: specOpsVeto,
         allowNoTarget: true,
-        allowNoAction: true
+        allowNoAction: true,
+        // Smoke finding: spec-ops doctrine seeks contact — with zero
+        // intel (no LOS, memory or relay) the squad's radio puts rough
+        // unattackable approach markers on the nearest hostiles so the
+        // operatives advance instead of idling.
+        seekContacts: true
     };
 }
 

@@ -103,8 +103,10 @@ async function testBehindWallExitsToLosAndAttacks() {
     const outcome = await planner.planTurn(game.combat, combatant, {
       seed: 11,
       hold: { radiusMeters: 30 },
+      // Issue #31: move+attack endpoints must fit the half-move rate
+      // (agility 40 → cost ≤ 4).
       moves: [
-        { x: 700, y: 800, cost: 6, distance: 5.4, los: true },
+        { x: 700, y: 800, cost: 4, distance: 5.4, los: true },
         { x: 500, y: 500, cost: 1, distance: 4 }
       ]
     });
@@ -142,7 +144,7 @@ async function testHoldsPositionWithAttack() {
     const outcome = await planner.planTurn(game.combat, combatant, {
       seed: 7,
       moves: [
-        { x: 700, y: 800, cost: 6, distance: 5.4, los: true, cover: 0.8 }
+        { x: 700, y: 800, cost: 4, distance: 5.4, los: true, cover: 0.8 }
       ]
     });
     return JSON.parse(JSON.stringify(outcome));
@@ -185,7 +187,7 @@ async function testMeleeContactIsAnswered() {
   assert.equal(result.status, 'ok', `expected ok plan, got ${result.status}`);
   const plan = result.plan;
   assert.equal(plan.breakdown?.position?.meleeContact, true, 'melee contact should be recorded');
-  assert.ok(['attack-in-place', 'move-attack'].includes(plan.breakdown?.variant),
+  assert.ok(['attack-in-place', 'move-attack', 'aim-attack'].includes(plan.breakdown?.variant),
     `expected attack or retreat-attack, got ${plan.breakdown?.variant}`);
   assert.ok(plan.steps.some((s) => s.type === 'attack'), 'attack step exists');
 }

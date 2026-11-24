@@ -22,6 +22,7 @@ import {
     createThreatMapService,
     expectedCounterDamage,
     expectedDamageOf,
+    threatSourcesOf,
     weaponEmitters
 } from "../../scripts/threat-map.js";
 import {
@@ -205,26 +206,59 @@ test("weaponEmitters derives ranged and melee emitters from actor items", () => 
     assert.deepEqual(weaponEmitters(null), []);
 });
 
-test("buildThreatMap dangerAt covers ranged emitters in range only", () => {
+test("buildThreatMap dangerAt covers ranged emitters with a range falloff", () => {
     const map = buildThreatMap({
         threats: [{ x: 3000, y: 0, ev: 10, range: 30 }],
         grid: GRID,
         los: false
     });
-    // 2000 px = 30 m — right at the weapon's reach.
-    assert.equal(map.dangerAt({ x: 1000, y: 0 }), 1);
+    // Short band (smoke tuning): a quarter of the reach (7.5 m) reads
+    // full strength; 15 m sits mid-decay → 1 − 7.5/22.5 ≈ 0.67.
+    const mid = map.dangerAt({ x: 2000, y: 0 });
+    assert.ok(mid > 0.6 && mid < 0.75, `expected ~0.67, got ${mid}`);
+    // 25 m — the far band decays linearly to zero at the reach edge.
+    const far = map.dangerAt({ x: 1340, y: 0 });
+    assert.ok(far > 0.15 && far < 0.3, `expected ~0.23, got ${far}`);
     // 3300 px away = 49.5 m — beyond the 30 m reach.
     assert.equal(map.dangerAt({ x: -300, y: 0 }), 0);
     assert.equal(map.dangerAt({ x: 3000, y: 0 }), 1);
     assert.equal(map.dangerAt(null), 0);
 });
 
+test("threat sources: memory/relay contacts shade at reduced weight (smoke)", () => {
+    // Smoke finding: a hearsay contact printed full-strength heat. The
+    // weight ladder mirrors the scoring convention — direct sighting 1,
+    // own memory 0.5, squad relay 0.25.
+    const targets = [
+        { tokenId: "a", tokenUuid: "u-a", x: 3000, y: 0, name: "Vis",
+            source: "visible", damage: 10, range: 30 },
+        { tokenId: "b", tokenUuid: "u-b", x: 3000, y: 0, name: "Mem",
+            source: "last-known", damage: 10, range: 30 },
+        { tokenId: "c", tokenUuid: "u-c", x: 3000, y: 0, name: "Rel",
+            source: "relay", damage: 10, range: 30 }
+    ];
+    const sources = threatSourcesOf(targets, {});
+    assert.equal(sources.length, 3);
+    const map = buildThreatMap({ threats: sources, grid: GRID, los: false });
+    const byId = Object.fromEntries(
+        map.explain({ x: 3000, y: 0 }).map(e => [e.id, e.contribution]));
+    assert.equal(byId["u-a"], 1);
+    assert.equal(byId["u-b"], 0.5);
+    assert.equal(byId["u-c"], 0.25);
+    // An explicit profile weight still wins over the source default.
+    const custom = threatSourcesOf([{ tokenId: "d", tokenUuid: "u-d",
+        x: 3000, y: 0, source: "relay", weight: 0.8, damage: 10, range: 30 }], {});
+    assert.equal(custom[0].weight, 0.8);
+});
+
 test("buildThreatMap: a sight-blocking probe zeroes contributions", () => {
     const threats = [{ x: 3000, y: 0, ev: 10, range: 30 }];
     const open = buildThreatMap({ threats, grid: GRID, los: () => true });
     const walled = buildThreatMap({ threats, grid: GRID, los: () => false });
-    assert.equal(open.dangerAt({ x: 1000, y: 0 }), 1);
-    assert.equal(walled.dangerAt({ x: 1000, y: 0 }), 0);
+    const openDanger = open.dangerAt({ x: 2000, y: 0 });
+    assert.ok(openDanger > 0.6 && openDanger < 0.75,
+        `expected ~0.67, got ${openDanger}`);
+    assert.equal(walled.dangerAt({ x: 2000, y: 0 }), 0);
 });
 
 test("buildThreatMap: contributions saturate at 1 and melee falls off", () => {
@@ -236,9 +270,10 @@ test("buildThreatMap: contributions saturate at 1 and melee falls off", () => {
         grid: GRID,
         los: false
     });
-    // Both sources cover the point: 0.5 + 0.8 = 1.3 → capped at 1.
-    assert.equal(two.dangerAt({ x: 1000, y: 0 }), 1);
-    const explain = two.explain({ x: 1000, y: 0 });
+    // Both sources cover the point at full strength: 0.5 + 0.8 = 1.3 →
+    // capped at 1.
+    assert.equal(two.dangerAt({ x: 2500, y: 0 }), 1);
+    const explain = two.explain({ x: 2500, y: 0 });
     assert.equal(explain.length, 2);
 
     const melee = buildThreatMap({
@@ -264,7 +299,9 @@ test("threat-map service: refresh builds the field once per plan", () => {
         los: false
     });
     assert.equal(service.map(), map);
-    assert.equal(service.dangerAt({ x: 1000, y: 0 }), 1);
+    const midDanger = service.dangerAt({ x: 2000, y: 0 });
+    assert.ok(midDanger > 0.6 && midDanger < 0.75,
+        `expected ~0.67, got ${midDanger}`);
     assert.equal(service.dangerAt({ x: -300, y: 0 }), 0);
     // A second refresh swaps the field — one map per plan.
     service.refresh({ threats: [], grid: GRID });
@@ -335,20 +372,65 @@ test("planner: the threat map adds the danger factor to move scoring", async () 
 });
 
 test("planner: danger is reported on a covered endpoint", async () => {
-    // Enemy only 22.5 m away — the stay cell itself is covered.
-    const world = makeWorld({ enemies: [{ x: 1500, y: 0 }] });
+    // Enemy 15 m away — past the quarter-reach short band (7.5 m of a
+    // 30 m reach), mid-decay → 1 − 7.5/22.5 ≈ 0.67.
+    const world = makeWorld({ enemies: [{ x: 1000, y: 0 }] });
     const planner = _plannerWith({ attackNow: 30 });
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 3,
         actions: [LASGUN],
         targets: injectedTargets(world),
-        moves: [{ x: 0, y: 0, distance: 22.5, cost: 0, los: true }],
-        threats: [{ x: 1500, y: 0, ev: 10, range: 30 }],
+        moves: [{ x: 0, y: 0, distance: 15, cost: 0, los: true }],
+        threats: [{ x: 1000, y: 0, ev: 10, range: 30 }],
         los: () => true
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
-    assert.equal(result.plan.breakdown.factors.danger, 1);
-    assert.equal(result.plan.breakdown.contributions.danger, -1);
+    const danger = result.plan.breakdown.factors.danger;
+    assert.ok(danger > 0.6 && danger < 0.75, `expected ~0.67, got ${danger}`);
+    assert.ok(Math.abs(result.plan.breakdown.contributions.danger + danger) < 1e-3,
+        `expected contribution ≈ -${danger}, got ${result.plan.breakdown.contributions.danger}`);
+});
+
+test("planner: seek offers hidden endpoints on a memory contact", async () => {
+    const world = makeWorld({ enemies: [{ x: 3000, y: 0 }] });
+    const planner = _plannerWith({ seek: 10, advance: 0.5, proximity: 0.5 });
+    const context = {
+        seed: 11,
+        actions: [LASGUN],
+        targets: [{
+            ...injectedTargets(world)[0],
+            distance: 30,
+            canAttack: false,
+            source: "last-known"
+        }],
+        moves: [
+            // Hidden: wall-shadowed cell, still closing on the contact.
+            { x: 1500, y: 0, distance: 15, cost: 15, los: false, cover: 0.5 },
+            // Open lane: closer but fully exposed to the presumed spot.
+            { x: 2000, y: 0, distance: 10, cost: 20, los: true, cover: 0 },
+            { x: 0, y: 0, distance: 30, cost: 0, stay: true }
+        ],
+        threatMap: false
+    };
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const moveStep = result.plan.steps.find(step => step.type === "move");
+    assert.equal(moveStep.input.to.x, 1500,
+        "a doctrine-weighted seek outbids the faster open approach");
+    assert.equal(result.plan.breakdown.factors.seek, 1);
+
+    // Without the doctrine weight the open approach wins on proximity.
+    const open = await _plannerWith({ seek: 0, advance: 0.5, proximity: 5 })
+        .planTurn(world.combat, world.combatant, context);
+    const openMove = open.plan.steps.find(step => step.type === "move");
+    assert.equal(openMove.input.to.x, 2000);
+    // A visible contact never produces seek candidates.
+    const visible = await _plannerWith({ seek: 10 })
+        .planTurn(world.combat, world.combatant, {
+            ...context,
+            targets: [{ ...injectedTargets(world)[0], distance: 30, source: "visible" }]
+        });
+    assert.equal(visible.plan.breakdown.factors.seek ?? 0, 0);
 });
 
 test("planner: easy difficulty ignores the derived threat field", async () => {
@@ -481,7 +563,11 @@ test("difficulty: easy slips off the argmax with ~30% over a seed series", async
         actions: [LASGUN],
         targets: injectedTargets(world),
         moves: [{ x: 2200, y: 0, distance: 12, cost: 4, los: true }],
-        los: () => true
+        los: () => true,
+        // Personality off: the test measures slip mechanics — a growing
+        // trait pool (issue #39 review: `heretic`) shifts seeded picks
+        // and makes previously tied candidates score distinctly.
+        personality: false
     };
     const serial = plan => JSON.stringify(plan.steps);
     let slips = 0;
@@ -657,4 +743,61 @@ test("fireteam: without a readable kill-EV the team keeps distributing", async (
         objective: { targetId: "other-target" }
     });
     assert.equal(ordered.teamPlan.convergence, null);
+});
+
+test("planner: run offers a full-action sprint beyond the full move", async () => {
+    const world = makeWorld({ enemies: [{ x: 3000, y: 0 }] });
+    const context = {
+        seed: 13,
+        actions: [LASGUN],
+        targets: [{
+            ...injectedTargets(world)[0],
+            distance: 30,
+            canAttack: false,
+            source: "visible"
+        }],
+        rates: { half: 4, full: 8, charge: 12, run: 24 },
+        moves: [
+            // Best a full move reaches: still 15 cells short.
+            { x: 1500, y: 0, distance: 15, cost: 15, los: true },
+            { x: 0, y: 0, distance: 30, cost: 0, stay: true }
+        ],
+        runMoves: [
+            // The run-rate endpoint lands 3x closer.
+            { x: 2500, y: 0, distance: 5, cost: 20, los: true },
+            { x: 0, y: 0, distance: 30, cost: 0, stay: true }
+        ],
+        threatMap: false
+    };
+    const planner = _plannerWith({ run: 10, advance: 0.5, proximity: 0.5 });
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const moveStep = result.plan.steps.find(step => step.type === "move");
+    assert.equal(moveStep.input.to.x, 2500,
+        "a doctrine-weighted run outbids the shorter full-move approach");
+    assert.equal(result.plan.breakdown.factors.run, 1);
+    // A run is always the whole action economy — no matter the distance.
+    assert.equal(moveStep.cost.halves, 2);
+    // The sprint flag rides the step so the executor can stamp the
+    // +20-evasion marker on the actor.
+    assert.equal(moveStep.input.mode, "run");
+
+    // A doctrine that refuses the sprint keeps the plain approach: the
+    // run endpoint is strictly closer, so proximity/advance would
+    // otherwise still prefer it — the negative weight must outweigh.
+    const walk = await _plannerWith({ run: -20, advance: 0.5, proximity: 5 })
+        .planTurn(world.combat, world.combatant, context);
+    const walkMove = walk.plan.steps.find(step => step.type === "move");
+    assert.equal(walkMove.input.to.x, 1500);
+    assert.equal(walkMove.input.mode, undefined);
+    // A run endpoint that cannot beat the approach is never offered.
+    const noGain = await _plannerWith({ run: 10 })
+        .planTurn(world.combat, world.combatant, {
+            ...context,
+            runMoves: [
+                { x: 1200, y: 0, distance: 18, cost: 12, los: true },
+                { x: 0, y: 0, distance: 30, cost: 0, stay: true }
+            ]
+        });
+    assert.equal(noGain.plan.breakdown.factors.run ?? 0, 0);
 });

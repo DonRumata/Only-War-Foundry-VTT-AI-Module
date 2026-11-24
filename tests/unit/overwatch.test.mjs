@@ -104,6 +104,42 @@ test("activeOverwatches lists declarations of the active combat only", async () 
     assert.deepEqual(service.activeOverwatches(other), []);
 });
 
+test("turn-start expiry keeps a same-round declaration and ignores flag writes (smoke)", async () => {
+    // Smoke finding: re-deploying overwatch wiped both zones — the
+    // module's own `operation` flag writes fire `updateCombat` too, and
+    // the expiry pass cleared the fresh record on every update.
+    const { combat, combatant } = makeWorld();
+    const service = createOverwatchService({ api: makeApi() });
+    service.start();
+    try {
+        await service.declare({ combat, combatant, spec: SPEC });
+        const handler = Hooks._calls
+            .filter(call => call.type === "on" && call.event === "updateCombat")
+            .at(-1)?.fn;
+        assert.ok(handler, "updateCombat expiry handler registered");
+        // A Combat flag write (module operation bookkeeping) changes
+        // neither round nor turn — it must not expire the zone.
+        handler(combat, { flags: { "only-war-ai": { operation: {} } } });
+        assert.equal(service.overwatchOf(combatant)?.direction, 45,
+            "a non-turn update must not clear the fresh declaration");
+        // A turn advance inside the same round: a record declared this
+        // round is still fresh — it only expires on a later round.
+        combat.turn = 1;
+        handler(combat, { turn: 1 });
+        assert.equal(service.overwatchOf(combatant)?.direction, 45,
+            "a same-round re-declaration survives the turn-start pass");
+        // The next round's turn start does expire it (OW: until your
+        // next turn).
+        combat.round = 2;
+        combat.turn = 0;
+        handler(combat, { round: 2, turn: 0 });
+        assert.equal(service.overwatchOf(combatant), null,
+            "the declaration expires on the next round's turn start");
+    } finally {
+        service.stop();
+    }
+});
+
 test("renderAll is a no-op for non-GM clients and absent PIXI", () => {
     const { combat, combatant } = makeWorld();
     const service = createOverwatchService({ api: makeApi() });

@@ -20,6 +20,9 @@ import { createPlannerService } from "./planner.js";
 import { createExecutorService } from "./executor.js";
 import { createFireteamService } from "./fireteam.js";
 import { createOverwatchService } from "./overwatch.js";
+import { createReactionsService } from "./reactions.js";
+import { createGrudgesService } from "./grudges.js";
+import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
 import { registerAssaultPreset } from "./presets/assault.js";
 import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
@@ -86,9 +89,27 @@ Hooks.once("init", () => {
     }
 
     try {
+        _registerPlanOverlayService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register plan overlay service`, err);
+    }
+
+    try {
         _registerOverwatchService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register overwatch service`, err);
+    }
+
+    try {
+        _registerReactionsService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register reactions service`, err);
+    }
+
+    try {
+        _registerGrudgesService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register grudges service`, err);
     }
 
     try {
@@ -166,12 +187,36 @@ Hooks.once("ready", () => {
         console.error(`${MODULE_ID} | Failed to start perception service`, err);
     }
 
+    // Start the shared GM-only overlay root before the overwatch service
+    // so its layer lifecycle exists when the cone renderer subscribes.
+    try {
+        api?.services?.get?.("planOverlay")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start plan overlay service`, err);
+    }
+
     // Start the overwatch service: GM-only cone overlays and declaration
     // expiry only run in a compatible world.
     try {
         api?.services?.get?.("overwatch")?.start?.();
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to start overwatch service`, err);
+    }
+
+    // Start the reactions service: the per-round `reactionUsed` flag
+    // refresh on turn starts only runs in a compatible world.
+    try {
+        api?.services?.get?.("reactions")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start reactions service`, err);
+    }
+
+    // Start the grudges service: the `updateActor` wound tracker feeding
+    // the `lastAttacker` flag only runs in a compatible world.
+    try {
+        api?.services?.get?.("grudges")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start grudges service`, err);
     }
     console.log(`${MODULE_ID} | Ready`);
 });
@@ -271,6 +316,34 @@ function _registerFireteamService(api) {
 }
 
 /**
+ * Register the `planOverlay` service on the module API (issues #29/#36):
+ * the shared GM-only canvas layer for preview plans and the danger
+ * heatmap. A GM-restricted keybinding (Alt+M) toggles the heatmap.
+ * @param {object} api Module API object.
+ */
+function _registerPlanOverlayService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("planOverlay")) {
+        api.services.register("planOverlay", createPlanOverlayService({ api, hooks: Hooks }));
+    }
+    try {
+        game.keybindings?.register?.(MODULE_ID, "threatMapOverlay", {
+            name: "OWAI.Keybinding.ThreatMapOverlay.Name",
+            hint: "OWAI.Keybinding.ThreatMapOverlay.Hint",
+            editable: [{ key: "KeyM", modifiers: ["Alt"] }],
+            restricted: true,
+            onDown: () => {
+                api.services.get("planOverlay")?.toggleDanger?.();
+            }
+        });
+    } catch(err) {
+        // Keybinding registration is optional — the world setting and the
+        // service API remain the documented toggles.
+        console.warn(`${MODULE_ID} | Threat-overlay keybinding not registered`, err);
+    }
+}
+
+/**
  * Register the `overwatch` service on the module API (issue #14):
  * declare-only overwatch cones and their GM-only rendering. Sibling
  * services are resolved lazily, so registration order does not matter.
@@ -280,6 +353,34 @@ function _registerOverwatchService(api) {
     if (!api?.services) return;
     if (!api.services.has("overwatch")) {
         api.services.register("overwatch", createOverwatchService({ api }));
+    }
+}
+
+/**
+ * Register the `reactions` service on the module API (issue #37): the
+ * per-round `reactionUsed` flag — `markUsed`/`clear` for the system side
+ * and GM macros, the `updateCombat` refresh on turn starts. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerReactionsService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("reactions")) {
+        api.services.register("reactions", createReactionsService({ api }));
+    }
+}
+
+/**
+ * Register the `grudges` service on the module API (issue #39): the
+ * `lastAttacker` flag — `updateActor` wound tracking with conservative
+ * chat-card attribution feeding the planner's `grudge` factor. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerGrudgesService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("grudges")) {
+        api.services.register("grudges", createGrudgesService({ api }));
     }
 }
 

@@ -33,150 +33,64 @@
  * - Preview mode emits `only-war-ai.previewRequested` (issue #409) with the
  *   serialized plan so the GM preview dialog can confirm/cancel/replan.
  */
-import { FLAG_KEYS, MODULE_ID } from "./constants.js";
-import { resolveEffectiveConfig } from "./config-resolver.js";
-import { STALE_REASONS } from "./planner.js";
-import { isModuleEnabled } from "./module-state.js";
 import {
+    resolveEffectiveConfig
+} from "./config-resolver.js";
+import {
+    ATTACK_ADJUDICATION_MODES,
+    FLAG_KEYS,
+    MODULE_ID
+} from "./constants.js";
+import {
+    isModuleEnabled
+} from "./module-state.js";
+import {
+    STALE_REASONS
+} from "./planner.js";
+import {
+    getAttackAdjudication,
+    getCenterOnBot,
     getExecutionMode,
+    getPreviewTimeoutSeconds,
     getTurnPacingMs,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "./settings.js";
+import {
+    centerOnToken
+} from "./ui/plan-overlay.js";
+import {
+    createAdjudication
+} from "./executor/adjudication.js";
+import {
+    createTurnAdvance
+} from "./executor/advance.js";
+import {
+    createBookkeeping
+} from "./executor/bookkeeping.js";
+import {
+    ADJUDICATION_ACTIONS,
+    EXECUTOR_REASONS,
+    EXECUTOR_STATUS,
+    IRREVERSIBLE_STEP_TYPES,
+    STEP_STATUS
+} from "./executor/contract.js";
+import {
+    createDamageWait
+} from "./executor/damage-wait.js";
+import {
+    createStepHandlers
+} from "./executor/steps.js";
+import {
+    _findCombatant,
+    _finiteOr,
+    _gridSizeOf,
+    _mergeDelta,
+    _selfPosition,
+    _sleep,
+    _tokenDoc
+} from "./executor/util.js";
 
-/** Terminal/interim statuses of an execution result. */
-export const EXECUTOR_STATUS = Object.freeze({
-    completed: "completed",
-    partial: "partial",
-    failed: "failed",
-    cancelled: "cancelled",
-    preview: "preview"
-});
-
-/** Stable reason codes produced by the executor itself. */
-export const EXECUTOR_REASONS = Object.freeze({
-    notController: "not-controller",
-    controllerChanged: "controller-changed",
-    configDisabled: "config-disabled",
-    moduleDisabled: "module-disabled",
-    previewMode: "preview-mode",
-    systemApiMissing: "system-api-missing",
-    noPlanner: "no-planner",
-    noCombatant: "no-combatant",
-    planFailed: "plan-failed",
-    moveFailed: "move-failed",
-    rollFailed: "roll-failed",
-    invalidStep: "invalid-step",
-    alreadyAtEndpoint: "already-at-endpoint",
-    actionBudgetSpent: "action-budget-spent"
-});
-
-/** Step types that spend irreversible resources through the system API. */
-const IRREVERSIBLE_STEP_TYPES = Object.freeze(new Set(["attack", "test"]));
-
-/** System roll API entry points per step type (system PR #440). */
-const ROLL_API = Object.freeze({
-    attack: Object.freeze({ prepare: "prepareAttack", execute: "executeAttack" }),
-    test: Object.freeze({ prepare: "prepareTest", execute: "executeTest" })
-});
-
-/** Step statuses recorded inside {@link ExecutionResult.stepsDone}. */
-export const STEP_STATUS = Object.freeze({
-    done: "done",
-    skipped: "skipped",
-    failed: "failed"
-});
-
-/** Settle windows checked after each turn advance (cumulative ~4.5 s). */
-const ADVANCE_VERIFY_WINDOWS = Object.freeze([600, 1200, 2400]);
-
-/** Retry budget for a silently reverted turn advance. */
-const ADVANCE_VERIFY_RETRIES = 2;
-
-/**
- * Sleep helper for the advance-verification window.
- * @param {number} ms
- * @returns {Promise<void>}
- */
-function _sleep(ms) {
-    return new Promise(resolve => {
-        globalThis.setTimeout(resolve, ms);
-    });
-}
-
-/**
- * Normalize a Foundry collection/Map/array into a plain array.
- * @param {*} collection
- * @returns {object[]}
- */
-function _list(collection) {
-    if (!collection) return [];
-    if (Array.isArray(collection)) return collection;
-    if (Array.isArray(collection.contents)) return collection.contents;
-    if (typeof collection.values === "function") return [...collection.values()];
-    if (typeof collection[Symbol.iterator] === "function") return [...collection];
-    return [];
-}
-
-/**
- * Unwrap a Token placeable to its TokenDocument; documents pass through.
- * @param {*} token
- * @returns {object|null}
- */
-function _tokenDoc(token) {
-    if (!token || typeof token !== "object") return null;
-    const doc = token.document;
-    if (doc && typeof doc === "object" && doc.documentName === "Token") return doc;
-    return token;
-}
-
-/**
- * Find a combatant of the combat by its own id.
- * @param {object} combat
- * @param {string|null} combatantId
- * @returns {object|null}
- */
-function _findCombatant(combat, combatantId) {
-    if (!combatantId) return null;
-    const collection = combat?.combatants;
-    if (collection && typeof collection.get === "function") {
-        const hit = collection.get(combatantId);
-        if (hit) return hit;
-    }
-    for (const entry of _list(collection)) {
-        if (entry?.id === combatantId) return entry;
-    }
-    return null;
-}
-
-/**
- * Numeric helper: value when finite, otherwise fallback.
- * @param {*} value
- * @param {number} fallback
- * @returns {number}
- */
-function _finiteOr(value, fallback) {
-    return Number.isFinite(value) ? value : fallback;
-}
-
-/**
- * Merge a resource-delta object into the ledger: numeric fields add up,
- * everything else is stored as the latest value.
- * @param {object} ledger
- * @param {object|null} delta
- */
-function _mergeDelta(ledger, delta) {
-    if (!delta || typeof delta !== "object") return;
-    for (const [key, value] of Object.entries(delta)) {
-        if (Number.isFinite(value) && Number.isFinite(ledger[key])) {
-            ledger[key] += value;
-        } else if (Number.isFinite(value)) {
-            ledger[key] = value;
-        } else {
-            ledger[key] = value;
-        }
-    }
-}
 
 /**
  * Create the `executor` service published as `api.services.get("executor")`.
@@ -194,6 +108,11 @@ function _mergeDelta(ledger, delta) {
  * @param {Function} [deps.diagnostics] Diagnostics-enabled predicate.
  * @param {Function} [deps.log] Diagnostic logger.
  * @param {Function} [deps.pacing] Step/turn pacing delay getter (ms).
+ * @param {Function} [deps.getAdjudication] Attack adjudication mode
+ *   getter (`"auto"|"gm-confirm"`, issue #37).
+ * @param {Function} [deps.adjudicationTimeout] GM decision timeout
+ *   getter in seconds — reuses `previewTimeoutSeconds`, `0` waits
+ *   forever (issue #52).
  * @returns {object} Executor service.
  */
 export function createExecutorService({
@@ -205,11 +124,67 @@ export function createExecutorService({
     idGen = null,
     diagnostics = isDiagnosticsEnabled,
     log = (...args) => logDiagnostics(...args),
-    pacing = getTurnPacingMs
+    pacing = getTurnPacingMs,
+    getAdjudication = getAttackAdjudication,
+    adjudicationTimeout = getPreviewTimeoutSeconds
 } = {}) {
     /** Operation id → {promise, hookAdvanced}: dedup of repeated executions. */
     const executions = new Map();
+    /**
+     * Record an execution with a bounded dedup window (smoke review):
+     * the map is keyed per operation id and would otherwise grow for the
+     * session's lifetime. Insertion-ordered eviction keeps the newest
+     * 256 records — an evicted record only loses the idempotent-replay
+     * guarantee, which matters for at most the last few turns anyway.
+     * @param {string|null} operationId
+     * @param {object} record
+     */
+    const _recordExecution = (operationId, record) => {
+        while (executions.size >= 256) {
+            executions.delete(executions.keys().next().value);
+        }
+        executions.set(operationId, record);
+    };
+    /** Adjudication request id → pending `{resolve, request}` pair (#37). */
+    const pendingAdjudications = new Map();
+    /**
+     * Deferred turn advances waiting on GM damage adjudication (issue
+     * #56): operationId → `{combat, combatId, operation, watch, expect,
+     * timer, context}` — `watch` holds unsettled damage-card message
+     * ids, `expect` marks a landed attack whose damage card the GM has
+     * not rolled yet.
+     */
+    const pendingDamage = new Map();
     let hookSubscribed = false;
+
+    const turnAdvance = createTurnAdvance({ _isController, log, pacing });
+    const {
+        _advanceForOperation,
+        _advanceTurn
+    } = turnAdvance;
+    const damageWait = createDamageWait({ _advanceForOperation, _isController, log, pendingDamage });
+    const {
+        _registerDamageWait,
+        _onDamageMessage,
+        _releaseDamageWait
+    } = damageWait;
+    const adjudication = createAdjudication({ adjudicationTimeout, pendingAdjudications });
+    const {
+        resolveAdjudication,
+        _adjudicate
+    } = adjudication;
+    const bookkeeping = createBookkeeping({ _advanceTurn, _isController, _operations, diagnostics, log });
+    const {
+        _noteMove,
+        _capturePlanContext,
+        _finish,
+        _report
+    } = bookkeeping;
+    const stepHandlers = createStepHandlers({ _rolls, _service, api });
+    const {
+        _stepRoll,
+        _runStep
+    } = stepHandlers;
 
     const _idGen = typeof idGen === "function"
         ? idGen
@@ -250,6 +225,45 @@ export function createExecutorService({
      * `advanceTurn: false` (e.g. config-disabled refusals) are skipped so a
      * GM keeps manual control of the turn.
      */
+    /**
+     * Resolved attack-adjudication mode for this execution
+     * (issue #37): a validated `context.adjudicationMode` injection wins,
+     * otherwise the `attackAdjudication` world setting answers.
+     * @param {object} context
+     * @returns {string} `"auto"|"gm-confirm"`.
+     */
+    function _adjudicationMode(context) {
+        const injected = context?.adjudicationMode;
+        return ATTACK_ADJUDICATION_MODES.includes(injected)
+            ? injected
+            : getAdjudication();
+    }
+
+    /**
+     * Release a record's canvas marks (selected bot + targeted token).
+     * Called on the combat's turn change and on combat end — never on
+     * operation close, so the marks outlive the damage-adjudication
+     * wait (smoke finding: the target dropped off the card mid-apply).
+     * @param {object|null} record Execution record carrying marks.
+     */
+    function _releaseMarks(record) {
+        try {
+            record?._targeted?.setTarget?.(false);
+            record?._controlled?.release?.();
+        } catch(_err) {
+            // Best-effort cleanup.
+        }
+        if (record) {
+            record._targeted = null;
+            record._controlled = null;
+        }
+    }
+
+    /**
+     * Subscribe the module hooks once: the operation-completed turn
+     * handoff, the `updateCombat` adjudication auto-cancel and the
+     * `renderChatMessage` adjudication button binding (issue #37).
+     */
     function _subscribeHook() {
         if (hookSubscribed || typeof hooks?.on !== "function") return;
         hookSubscribed = true;
@@ -263,6 +277,123 @@ export function createExecutorService({
                 _advanceForOperation(combat, operation, {});
             } catch(err) {
                 console.error(`${MODULE_ID} | operationCompleted handler failed`, err);
+            }
+        });
+        // Issue #37: a pending adjudication belongs to the claimed turn —
+        // when the combat moves on (manual advance, turn stole) the gate
+        // resolves itself instead of parking the executor promise.
+        hooks.on("updateCombat", (combat, change) => {
+            try {
+                if (!change || (change.turn === undefined && change.round === undefined)) {
+                    return;
+                }
+                for (const [requestId, pending] of pendingAdjudications) {
+                    // Issue #37 follow-up: a turn advance in ANOTHER combat
+                    // must not cancel this combat's pending gate.
+                    if (pending.combatId && combat?.id
+                        && pending.combatId !== combat.id) continue;
+                    clearTimeout(pending.timer);
+                    pendingAdjudications.delete(requestId);
+                    pending.resolve({ action: "cancel", reason: "turn-stale" });
+                }
+                // Issue #56: a manual turn advance releases the damage
+                // wait — the GM moved the combat on without the card.
+                for (const [opId, entry] of pendingDamage) {
+                    if (entry.combatId && combat?.id
+                        && entry.combatId !== combat.id) continue;
+                    _releaseDamageWait(opId, "turn-advanced");
+                }
+                // The turn moved on — every record's selection/target
+                // marks for this combat die with it.
+                for (const record of executions.values()) {
+                    if (record?.combatId && combat?.id
+                        && record.combatId !== combat.id) continue;
+                    _releaseMarks(record);
+                }
+                // Run mechanic: the +20-evasion window ends at the start
+                // of the runner's next turn — the flag on the combatant
+                // now acting expires.
+                try {
+                    const currentActor = combat?.combatant?.actor;
+                    if (currentActor?.getFlag?.(MODULE_ID, FLAG_KEYS.running)) {
+                        currentActor.unsetFlag(MODULE_ID, FLAG_KEYS.running)
+                            ?.catch?.(() => {});
+                    }
+                } catch(_err) {
+                    // Marker cleanup is best-effort.
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication cancel failed`, err);
+            }
+        });
+        // Issue #52: the combat going away resolves every pending gate —
+        // without it a deleted combat would park the executor forever.
+        hooks.on("deleteCombat", combat => {
+            try {
+                for (const [requestId, pending] of pendingAdjudications) {
+                    clearTimeout(pending.timer);
+                    pendingAdjudications.delete(requestId);
+                    pending.resolve({ action: "cancel", reason: "combat-ended" });
+                }
+                for (const opId of [...pendingDamage.keys()]) {
+                    _releaseDamageWait(opId, "combat-ended");
+                }
+                for (const record of executions.values()) {
+                    _releaseMarks(record);
+                }
+                // Run mechanic: combat end wipes every leftover evasion
+                // marker on its combatants.
+                try {
+                    for (const c of combat?.combatants ?? []) {
+                        if (c?.actor?.getFlag?.(MODULE_ID, FLAG_KEYS.running)) {
+                            c.actor.unsetFlag(MODULE_ID, FLAG_KEYS.running)
+                                ?.catch?.(() => {});
+                        }
+                    }
+                } catch(_err) {
+                    // Marker cleanup is best-effort.
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication cancel failed`, err);
+            }
+        });
+        // Issue #56: damage cards are created (GM clicks "Damage" on the
+        // attack card) and updated (each applied hit rewrites the
+        // message) outside the executor — feed both events into the
+        // pending waits.
+        hooks.on("createChatMessage", message => {
+            try {
+                _onDamageMessage(message);
+            } catch(err) {
+                console.error(`${MODULE_ID} | damage-wait create hook failed`, err);
+            }
+        });
+        hooks.on("updateChatMessage", message => {
+            try {
+                _onDamageMessage(message);
+            } catch(err) {
+                console.error(`${MODULE_ID} | damage-wait update hook failed`, err);
+            }
+        });
+        // Issue #37: adjudication card buttons resolve the pending gate —
+        // only the authority controller may click through, so a player
+        // reading the whispered card cannot drive the executor.
+        hooks.on("renderChatMessage", (message, html) => {
+            try {
+                const root = html instanceof HTMLElement
+                    ? html
+                    : (html?.[0] ?? null);
+                const card = root?.querySelector?.("[data-ow-ai-adjudication]");
+                if (!card) return;
+                const requestId = card.dataset.owAiAdjudication;
+                for (const button of card.querySelectorAll("[data-ow-ai-adjudicate]")) {
+                    button.addEventListener("click", () => {
+                        if (!_isController({})) return;
+                        resolveAdjudication(requestId, button.dataset.owAiAdjudicate);
+                    });
+                }
+            } catch(err) {
+                console.error(`${MODULE_ID} | adjudication card binding failed`, err);
             }
         });
     }
@@ -334,20 +465,14 @@ export function createExecutorService({
             operation: operation ?? context.operation ?? null,
             operationId: context.operationId ?? operation?.id ?? null,
             replanCount,
+            // Issue #33: the replanned turn is budgeted against what was
+            // already spent — GM manual inputs (context.spent) plus steps
+            // this run already executed.
+            ...(run?.spent && (run.spent.movement > 0 || run.spent.halves > 0)
+                ? { spent: { ...run.spent } }
+                : {}),
             includeNeutral: (run?.config ?? resolveConfig(run?.combatant ?? context.combatant))?.includeNeutral === true
         };
-    }
-
-    /**
-     * Plan-time self position of the active plan's snapshot.
-     * @param {object|null} plan
-     * @returns {{x: number, y: number}|null}
-     */
-    function _selfPosition(plan) {
-        const self = plan?.snapshot?.self;
-        return self && Number.isFinite(self.x) && Number.isFinite(self.y)
-            ? { x: self.x, y: self.y }
-            : null;
     }
 
     /**
@@ -412,338 +537,6 @@ export function createExecutorService({
     }
 
     /**
-     * Waypoint payload for `TokenDocument#move` (Foundry 13+): the
-     * serialized navigation `planRoute` waypoints stored in the plan,
-     * normalized to `{x, y, elevation?}` with the step endpoint appended.
-     * The path itself is never recomputed here.
-     * @param {object} step Move step.
-     * @param {{x: number, y: number}} to Destination.
-     * @returns {object[]}
-     */
-    function _movePayload(step, to) {
-        const raw = Array.isArray(step?.input?.waypoints) ? step.input.waypoints : [];
-        const points = raw
-            .filter(point => Number.isFinite(point?.x) && Number.isFinite(point?.y))
-            .map(point => ({
-                x: point.x,
-                y: point.y,
-                ...(Number.isFinite(point.elevation) ? { elevation: point.elevation } : {})
-            }));
-        const last = points[points.length - 1];
-        if (!last || last.x !== to.x || last.y !== to.y) {
-            points.push({ x: to.x, y: to.y });
-        }
-        return points;
-    }
-
-    /**
-     * Execute a `move` step: idempotent when the token already sits on the
-     * endpoint; uses `TokenDocument#move` (v13+) or an `update({x, y})`
-     * fallback.
-     * @param {object} step
-     * @param {object} context
-     * @param {object} combatant
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _stepMove(step, context, combatant) {
-        const tokenDoc = _tokenDoc(context.token ?? combatant?.token);
-        if (!tokenDoc || tokenDoc.destroyed === true) {
-            return { ok: false, reason: STALE_REASONS.tokenMoved };
-        }
-        const to = step?.input?.to ?? step?.input?.destination ?? null;
-        if (!Number.isFinite(to?.x) || !Number.isFinite(to?.y)) {
-            return { ok: false, reason: EXECUTOR_REASONS.invalidStep };
-        }
-        // Hex grids snap the token to the cell — the plan's fractional `to`
-        // and the stored integer position differ by <0.5px.
-        const curX = tokenDoc._source?.x ?? tokenDoc.x;
-        const curY = tokenDoc._source?.y ?? tokenDoc.y;
-        if (Math.abs(curX - to.x) < 0.5 && Math.abs(curY - to.y) < 0.5) {
-            return {
-                ok: true,
-                skipped: true,
-                reason: EXECUTOR_REASONS.alreadyAtEndpoint,
-                position: { x: to.x, y: to.y }
-            };
-        }
-        try {
-            if (typeof tokenDoc.move === "function") {
-                const moved = await tokenDoc.move(_movePayload(step, to), {
-                    method: "api",
-                    showRuler: false
-                });
-                if (moved === false) return { ok: false, reason: EXECUTOR_REASONS.moveFailed };
-            } else if (typeof tokenDoc.update === "function") {
-                await tokenDoc.update({ x: to.x, y: to.y });
-            } else {
-                return { ok: false, reason: EXECUTOR_REASONS.moveFailed };
-            }
-        } catch(err) {
-            return {
-                ok: false,
-                reason: EXECUTOR_REASONS.moveFailed,
-                error: String(err?.message ?? err)
-            };
-        }
-        return {
-            ok: true,
-            position: { x: to.x, y: to.y, elevation: to.elevation },
-            delta: step?.projectedResourceDelta ?? {}
-        };
-    }
-
-    /**
-     * Input for `prepareAttack`/`prepareTest`: the serialized step input
-     * enriched with actor/token references and traceability flags. Extra
-     * keys are ignored by the system API.
-     * @param {object} step
-     * @param {object} plan Active plan.
-     * @param {string} operationId
-     * @returns {object}
-     */
-    function _rollInput(step, plan, operationId) {
-        const input = { ...(step?.input ?? {}) };
-        // Steps serialize `itemUuid`; the rolls API expects `weaponId` —
-        // an owned item id or UUID both resolve through `_findActorItem`.
-        input.weaponId = input.weaponId ?? input.weaponItemId ?? input.itemUuid ?? null;
-        input.actorUuid = input.actorUuid ?? plan?.actorUuid ?? plan?.snapshot?.self?.actorUuid ?? null;
-        input.actorId = input.actorId ?? plan?.snapshot?.self?.actorId ?? null;
-        input.tokenUuid = input.tokenUuid ?? plan?.tokenUuid ?? plan?.snapshot?.self?.tokenUuid ?? null;
-        input.targetUuid = input.targetUuid ?? input.targetTokenUuid ?? null;
-        // The step contract keeps the canonical `suppressing_fire` attack
-        // type; the system API expects the underlying burst mode plus the
-        // `suppressionFire` flag (`resolveSuppressionBurstMode` keeps it).
-        if (input.attackType === "suppressing_fire") {
-            input.suppressionFire = true;
-            input.attackType = input.burstMode ?? "semi_auto";
-        }
-        input.flags = {
-            ...(input.flags ?? {}),
-            aiOperationId: operationId,
-            aiStepId: step?.id ?? null
-        };
-        return input;
-    }
-
-    /**
-     * Execute an `attack`/`test` step through the system rolls API. The
-     * operation id is scoped per step so system-side idempotency replays
-     * this exact step only.
-     * @param {"attack"|"test"} kind
-     * @param {object} step
-     * @param {object} context
-     * @param {object} plan Active plan.
-     * @param {string} operationId
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _stepRoll(kind, step, context, plan, operationId) {
-        const rolls = _rolls(context);
-        const names = ROLL_API[kind];
-        const prepare = rolls?.[names.prepare];
-        const execute = rolls?.[names.execute];
-        if (typeof prepare !== "function" || typeof execute !== "function") {
-            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
-        }
-        let prepared;
-        try {
-            prepared = await prepare(_rollInput(step, plan, operationId));
-        } catch(err) {
-            return {
-                ok: false,
-                reason: EXECUTOR_REASONS.rollFailed,
-                error: String(err?.message ?? err)
-            };
-        }
-        if (!prepared || prepared.status === "failed" || prepared.status === "error"
-            || prepared.ok === false) {
-            return {
-                ok: false,
-                reason: prepared?.reason ?? EXECUTOR_REASONS.rollFailed,
-                stale: prepared?.reason === "stale-state"
-            };
-        }
-        let outcome;
-        try {
-            outcome = await execute(prepared, { operationId: `${operationId}.${step.id}` });
-        } catch(err) {
-            return {
-                ok: false,
-                reason: EXECUTOR_REASONS.rollFailed,
-                error: String(err?.message ?? err)
-            };
-        }
-        if (!outcome || outcome.status === "failed" || outcome.status === "error"
-            || outcome.ok === false) {
-            return {
-                ok: false,
-                reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed,
-                stale: outcome?.reason === "stale-state"
-            };
-        }
-        return {
-            ok: true,
-            delta: outcome.resourceDelta ?? {},
-            chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
-            duplicate: outcome.duplicate === true
-        };
-    }
-
-    /**
-     * Execute an `aim` step (issue #15): books the aim bonus on the
-     * combatant `aim` flag. For `aim-attack` plans the following attack
-     * step carries `input.aim` and consumes the flag; a standalone `aim`
-     * plan leaves the record until the next attack (aimedUntil).
-     * @param {object} step
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _stepAim(step, context, run) {
-        const input = step?.input ?? {};
-        const bonus = _finiteOr(input.aim, 10);
-        const record = {
-            bonus,
-            declaredRound: context.combat?.round ?? null
-        };
-        const combatant = run.combatant;
-        if (typeof combatant?.setFlag === "function") {
-            try {
-                await combatant.setFlag(MODULE_ID, FLAG_KEYS.aim, record);
-            } catch(err) {
-                return {
-                    ok: false,
-                    reason: "flag-write-failed",
-                    error: String(err?.message ?? err)
-                };
-            }
-        }
-        return { ok: true };
-    }
-
-    /**
-     * Execute a `reload` step (issue #15) through
-     * `game.darkHeresy.api.actions.reload` — magazine swap or clip refill,
-     * idempotent through the step-scoped operation id.
-     * @param {object} step
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _stepReload(step, context, run) {
-        const api = context.actionsApi
-            ?? globalThis.game?.darkHeresy?.api?.actions
-            ?? null;
-        if (typeof api?.reload !== "function") {
-            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
-        }
-        const input = step?.input ?? {};
-        const plan = run.plan;
-        const operationId = `${run.operationId}.${step.id}`;
-        let outcome;
-        try {
-            outcome = await api.reload({
-                actorUuid: plan?.snapshot?.self?.actorUuid ?? null,
-                actorId: plan?.snapshot?.self?.actorId ?? null,
-                weaponId: input.weaponId ?? input.itemUuid ?? null,
-                magazineItemId: input.magazineItemId ?? null
-            }, { operationId });
-        } catch(err) {
-            return {
-                ok: false,
-                reason: EXECUTOR_REASONS.rollFailed,
-                error: String(err?.message ?? err)
-            };
-        }
-        if (!outcome || outcome.status === "failed" || outcome.status === "error"
-            || outcome.ok === false) {
-            return {
-                ok: false,
-                reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed,
-                stale: outcome?.reason === "stale-state"
-            };
-        }
-        return {
-            ok: true,
-            delta: outcome.resourceDelta ?? {},
-            chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
-            duplicate: outcome.duplicate === true
-        };
-    }
-
-    /**
-     * Execute an `overwatch` step: declare a watch cone on the combatant
-     * flag through the overwatch service (issue #14). Declare-only — the
-     * reaction shot itself stays with the GM.
-     * @param {object} step
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _stepOverwatch(step, context, run) {
-        const overwatch = _service("overwatch", context.overwatch);
-        if (!overwatch || typeof overwatch.declare !== "function") {
-            return { ok: false, reason: EXECUTOR_REASONS.systemApiMissing, terminal: true };
-        }
-        const input = step?.input ?? {};
-        const outcome = await overwatch.declare({
-            combat: context.combat,
-            combatant: run.combatant,
-            spec: {
-                direction: input.direction,
-                arc: input.arc,
-                range: input.range,
-                weaponId: input.weaponId ?? input.itemUuid ?? null,
-                weaponName: input.name ?? input.weaponName ?? null,
-                attackType: input.attackType ?? null
-            }
-        });
-        if (!outcome?.ok) {
-            return { ok: false, reason: outcome?.reason ?? EXECUTOR_REASONS.rollFailed };
-        }
-        return { ok: true, record: outcome.record };
-    }
-
-    /**
-     * Run one plan step.
-     * @param {object} step
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @returns {Promise<object>} Step outcome.
-     */
-    async function _runStep(step, context, run) {
-        switch (step?.type) {
-            case "move":
-                return _stepMove(step, context, run.combatant);
-            case "attack":
-            case "test": {
-                const outcome = await _stepRoll(step.type, step, context,
-                    run.plan, run.operationId);
-                // AimedUntil: a taken shot consumes the combatant `aim`
-                // flag so the bonus never applies twice (issue #15).
-                if (outcome.ok && step.type === "attack"
-                    && typeof run.combatant?.unsetFlag === "function") {
-                    try {
-                        await run.combatant.unsetFlag(MODULE_ID, FLAG_KEYS.aim);
-                    } catch(err) {
-                        // Flag cleanup is best-effort — the shot already landed.
-                    }
-                }
-                return outcome;
-            }
-            case "aim":
-                return _stepAim(step, context, run);
-            case "reload":
-                return _stepReload(step, context, run);
-            case "overwatch":
-                return _stepOverwatch(step, context, run);
-            case "end-turn":
-                return { ok: true };
-            default:
-                return { ok: false, reason: EXECUTOR_REASONS.invalidStep };
-        }
-    }
-
-    /**
      * Stale/failure policy: ask the planner whether a replan is granted
      * (at most one per turn) and rebuild the plan on the fresh snapshot.
      * @param {string} failReason
@@ -763,12 +556,29 @@ export function createExecutorService({
         run.report = decision.report ?? run.report ?? null;
         if (decision?.action === "replan" && typeof planner?.planTurn === "function") {
             run.replanCount = decision.replanCount ?? (run.replanCount + 1);
+            // Issue #33: a GM drag spends movement too — the drift
+            // between the last expected position and where the token
+            // sits now joins the accumulated spend, so the replanned
+            // turn only budgets the remainder.
+            const staleDoc = _tokenDoc(context.token ?? run.combatant?.token);
+            const liveX = staleDoc?._source?.x ?? staleDoc?.x;
+            const liveY = staleDoc?._source?.y ?? staleDoc?.y;
+            const expected = run.expectedPosition ?? _selfPosition(run.plan);
+            if (run.spent && Number.isFinite(liveX) && Number.isFinite(liveY)
+                && Number.isFinite(expected?.x) && Number.isFinite(expected?.y)) {
+                const drift = Math.hypot(liveX - expected.x, liveY - expected.y)
+                    / _gridSizeOf(context);
+                // Sub-cell drift is grid-snap noise (hex rounds to the
+                // cell) — a real drag is at least half a cell.
+                if (drift > 0.5) run.spent.movement += drift;
+            }
             let replanned = null;
+            const replanContext = _planContext(context, context.operation, run.replanCount, run);
             try {
                 replanned = await planner.planTurn(
                     context.combat,
                     run.combatant,
-                    _planContext(context, context.operation, run.replanCount, run)
+                    replanContext
                 );
             } catch(err) {
                 replanned = null;
@@ -777,6 +587,9 @@ export function createExecutorService({
                 run.plan = replanned.plan;
                 run.stepIndex = 0;
                 run.expectedPosition = _selfPosition(run.plan) ?? run.expectedPosition;
+                // Issue #27: the swapped plan carries its own trace.
+                run.trace = run.plan?.diagnostics?.trace ?? [];
+                _capturePlanContext(context, run, replanContext);
                 log(`replan ${run.replanCount}: ${failReason} -> ${replanned.plan.id}`);
                 return { action: "replan" };
             }
@@ -805,191 +618,6 @@ export function createExecutorService({
             return verdict.valid ? "step-failed" : (verdict.reason ?? "step-failed");
         }
         return outcome?.reason ?? "step-failed";
-    }
-
-    /** In-flight turn advances per combat — serializes `nextTurn` calls. */
-    const advanceChains = new Map();
-
-    /**
-     * Advance the combat turn once for one operation — turn-keyed, chained
-     * and verified. Two advances for the same operation can never race:
-     * requests queue behind the in-flight one, and a caller whose turn is
-     * already past `operation.{round,turn}` is a no-op. This matters
-     * because two overlapping `nextTurn` calls can land out of order and
-     * restore an older turn — observed in live sessions as a parked combat.
-     * After a short settle window the pair is re-read and the call retries
-     * a bounded number of times before reporting a controlled diagnostic.
-     * @param {object} combat Combat document.
-     * @param {object} operation Operation record carrying `round`/`turn`.
-     * @param {object} context
-     * @returns {Promise<boolean>} true when the turn moved past the op.
-     */
-    async function _advanceForOperation(combat, operation, context) {
-        if (!combat || combat.ended === true) return false;
-        if (!_isController(context)) return false;
-        if (typeof combat.nextTurn !== "function") return false;
-        const onTurn = () => {
-            // Operations without turn coordinates (direct runPlan callers)
-            // keep the legacy always-advance semantics.
-            if (!Number.isFinite(operation?.round) || !Number.isFinite(operation?.turn)) return true;
-            return combat.round === operation.round && combat.turn === operation.turn;
-        };
-        if (!onTurn()) return true;
-        const id = combat.id ?? "combat";
-        const prior = advanceChains.get(id) ?? Promise.resolve();
-        const next = prior.then(async () => {
-            if (!onTurn()) return true;
-            const key = () => `${combat.round}:${combat.turn}`;
-            // A resolved `nextTurn` can be silently reverted well after it
-            // resolves (out-of-order document writes); keep verifying for a
-            // few seconds and re-drive while the op's turn is still held.
-            for (let attempt = 0; attempt <= ADVANCE_VERIFY_RETRIES; attempt++) {
-                const before = key();
-                // Pacing before the advance keeps each bot's turn visible.
-                if (attempt === 0 && pacing() > 0) await _sleep(pacing());
-                try {
-                    await combat.nextTurn();
-                } catch(err) {
-                    console.error(`${MODULE_ID} | nextTurn failed`, err);
-                }
-                for (const window of ADVANCE_VERIFY_WINDOWS) {
-                    await _sleep(window);
-                    if (key() !== before) return true;
-                }
-            }
-            log(`advance stalled: ${key()} unchanged after ${ADVANCE_VERIFY_RETRIES + 1} attempts`);
-            return false;
-        });
-        advanceChains.set(id, next);
-        try {
-            return await next;
-        } finally {
-            if (advanceChains.get(id) === next) advanceChains.delete(id);
-        }
-    }
-
-    /**
-     * Advance the combat turn once. The `operationCompleted` hook emitted
-     * by `completeTurn` (#400) is the primary handoff; when no operations
-     * service or hook fired, the controller advances directly (plain-GM
-     * fallback).
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @returns {Promise<void>}
-     */
-    async function _advanceTurn(context, run) {
-        if (run.record.hookAdvanced === true) return;
-        if (context.combat?.ended === true) return;
-        if (!_isController(context)) return;
-        if (typeof context.combat?.nextTurn !== "function") return;
-        await _advanceForOperation(context.combat, context.operation ?? run.operation, context);
-    }
-
-    /**
-     * Close the authority operation for a terminal execution and advance
-     * the combat turn. Best-effort: flag failures never crash the result.
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @param {object} result Public result summary.
-     * @param {boolean} advanceTurn Whether the hook/fallback may advance.
-     * @returns {Promise<void>}
-     */
-    async function _finish(context, run, result, advanceTurn = true) {
-        const operations = _operations(context);
-        const payload = {
-            completed: result.status === EXECUTOR_STATUS.completed,
-            failed: result.status === EXECUTOR_STATUS.failed,
-            cancelled: result.status === EXECUTOR_STATUS.cancelled,
-            reason: result.reason,
-            advanceTurn,
-            result: {
-                status: result.status,
-                planId: result.planId,
-                reason: result.reason,
-                replanCount: result.replanCount,
-                stepsDone: result.stepsDone,
-                resourceDelta: result.resourceDelta,
-                chatMessageIds: result.chatMessageIds
-            }
-        };
-        if (operations && typeof operations.completeTurn === "function") {
-            try {
-                await operations.completeTurn(context.combat, run.operationId, payload);
-            } catch(err) {
-                console.error(`${MODULE_ID} | completeTurn failed`, err);
-            }
-        }
-        if (advanceTurn) await _advanceTurn(context, run);
-    }
-
-    /**
-     * Compact summary of the planner's rejected candidates for GM-facing
-     * diagnostics ("pinned ×3, no-los ×2"). Returns `null` when the report
-     * carries no rejection list.
-     * @param {*} report Planner diagnostics or a replan report.
-     * @returns {string|null}
-     */
-    function _rejectedSummary(report) {
-        const rejected = Array.isArray(report?.rejected) ? report.rejected : [];
-        if (!rejected.length) return null;
-        const counts = new Map();
-        for (const entry of rejected) {
-            const reason = entry?.reason ?? "unknown";
-            counts.set(reason, (counts.get(reason) ?? 0) + 1);
-        }
-        return [...counts.entries()]
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 4)
-            .map(([reason, count]) => (count > 1 ? `${reason} ×${count}` : reason))
-            .join(", ");
-    }
-
-    /**
-     * GM-facing diagnostics for stopped turns: a warning notification plus
-     * a whispered chat card with the plan diagnostics when diagnostics are
-     * enabled.
-     * @param {object} context
-     * @param {object} run Shared execution state.
-     * @param {object} result Terminal result.
-     */
-    function _report(context, run, result) {
-        const i18n = globalThis.game?.i18n;
-        const name = run.combatant?.name ?? "NPC";
-        const message = i18n?.format?.("OWAI.Notifications.ExecutorStopped", {
-            name,
-            reason: result.reason ?? "unknown"
-        }) ?? `Only War AI: ${name} stopped (${result.reason})`;
-        try {
-            globalThis.ui?.notifications?.warn?.(message);
-        } catch(err) {
-            // Notifications are best-effort diagnostics.
-        }
-        log(`execution ${run.operationId} stopped: ${result.reason}`, run.report ?? "");
-        if (diagnostics() && typeof globalThis.ChatMessage !== "undefined") {
-            const rejected = _rejectedSummary(run.report);
-            const detail = rejected
-                ? (i18n?.format?.("OWAI.Chat.ExecutorDiagnosticsDetail", { list: rejected })
-                    ?? ` rejected: ${rejected}`)
-                : "";
-            const content = i18n?.format?.("OWAI.Chat.ExecutorDiagnostics", {
-                name,
-                reason: result.reason ?? "unknown",
-                plan: result.planId ?? "—",
-                detail
-            }) ?? message;
-            const whisper = _list(globalThis.game?.users)
-                .filter(user => user?.isGM)
-                .map(user => user.id);
-            try {
-                Promise.resolve(globalThis.ChatMessage.create({
-                    content: `<p>${content}</p>`,
-                    whisper,
-                    speaker: { alias: "Only War AI" }
-                })).catch(() => {});
-            } catch(err) {
-                // Chat diagnostics are optional.
-            }
-        }
     }
 
     /**
@@ -1084,6 +712,39 @@ export function createExecutorService({
         let irreversibleSpent = false;
         let skippedIrreversible = false;
 
+        // Issue #32: pan the GM view onto the acting bot before its
+        // first step so automated turns stay watchable.
+        const botDoc = _tokenDoc(context.token ?? run.combatant?.token);
+        if (getCenterOnBot()) centerOnToken(botDoc);
+        // Smoke request: mark the turn like a player's — the acting bot
+        // is selected and its attack target joins the GM's target set.
+        // The marks live on the execution record and die with the
+        // combat's turn change (updateCombat hook) so the damage card
+        // keeps its target while the GM adjudicates.
+        if (globalThis.game?.user?.isGM === true) {
+            try {
+                const marks = run.record ?? run;
+                const tokens = globalThis.canvas?.tokens;
+                const bot = botDoc?.id ? tokens?.get?.(botDoc.id) : null;
+                if (bot && !bot.controlled) {
+                    bot.control?.({ releaseOthers: true });
+                    marks._controlled = bot;
+                }
+                const attackStep = (run.plan?.steps ?? [])
+                    .find(s => s?.type === "attack" || s?.type === "test");
+                const tRef = attackStep?.input?.targetTokenId
+                    ?? attackStep?.input?.targetTokenUuid;
+                const tId = tRef ? String(tRef).split(".").pop() : null;
+                const target = tId ? tokens?.get?.(tId) : null;
+                if (target) {
+                    target.setTarget?.(true, { releaseOthers: true });
+                    marks._targeted = target;
+                }
+            } catch(_err) {
+                // Canvas marking is best-effort.
+            }
+        }
+
         for (;;) {
             const steps = Array.isArray(run.plan?.steps) ? run.plan.steps : [];
             while (run.stepIndex < steps.length) {
@@ -1141,23 +802,100 @@ export function createExecutorService({
                     break;
                 }
 
-                const outcome = await _runStep(step, context, run);
+                // Issue #37 adjudication gate: a `gm-confirm` world pauses
+                // before every irreversible step and lets the GM decide —
+                // execute, roll manually, substitute a skill test or take
+                // the turn back. The gate only runs on `automatic`: the
+                // preview mode already carries its own confirmation point,
+                // so the GM is never asked twice for the same plan.
+                let adjudicated = null;
+                if (irreversible && getMode() === "automatic"
+                    && _adjudicationMode(context) === "gm-confirm") {
+                    const decision = await _adjudicate(step, context, run);
+                    if (decision.action === "cancel") {
+                        status = EXECUTOR_STATUS.cancelled;
+                        reason = EXECUTOR_REASONS.adjudicationCancelled;
+                        failedStep = step.id;
+                        break;
+                    }
+                    if (decision.action === "manual") {
+                        stepsDone.push({
+                            stepId: step.id,
+                            type: step.type,
+                            status: STEP_STATUS.done,
+                            reason: EXECUTOR_REASONS.adjudicationManual
+                        });
+                        irreversibleSpent = true;
+                        run.stepIndex++;
+                        if (run.stepIndex < steps.length) await _sleep(pacing());
+                        continue;
+                    }
+                    // "skill-test" substitutes the roll channel below;
+                    // "execute" falls through to the normal path.
+                    if (decision.action === "skill-test") adjudicated = "skill-test";
+                }
+
+                const outcome = adjudicated === "skill-test" && step.type === "attack"
+                    ? await _stepRoll("test", step, context, run.plan, run.operationId)
+                    : await _runStep(step, context, run);
                 if (outcome.ok) {
                     stepsDone.push({
                         stepId: step.id,
                         type: step.type,
                         status: outcome.skipped ? STEP_STATUS.skipped : STEP_STATUS.done,
-                        reason: outcome.reason ?? null,
+                        reason: adjudicated === "skill-test"
+                            ? EXECUTOR_REASONS.adjudicationSkillTest
+                            : (outcome.reason ?? null),
                         duplicate: outcome.duplicate === true
                     });
                     _mergeDelta(resourceDelta, outcome.delta);
                     if (outcome.chatMessageIds) chatMessageIds.push(...outcome.chatMessageIds);
+                    // A landed attack expects the GM to roll and apply a
+                    // damage card before the turn advances — the bot
+                    // never applies damage itself (damage-wait below).
+                    if (Number.isFinite(outcome.hits) && outcome.hits > 0) {
+                        run.expectDamage = true;
+                    }
                     if (irreversible && !outcome.skipped) irreversibleSpent = true;
+                    // Issue #33: accumulate this turn's spent budget so a
+                    // later replan only offers the remainder.
+                    if (!outcome.skipped && run.spent) {
+                        run.spent.halves += _finiteOr(step?.cost?.halves, 0);
+                        run.spent.movement += Math.max(0,
+                            -_finiteOr(outcome.delta?.movement, 0));
+                    }
                     if (step.type === "move" && !outcome.skipped && outcome.position) {
                         run.expectedPosition = {
                             x: outcome.position.x,
                             y: outcome.position.y
                         };
+                    }
+                    // Issue #25: every own move lands in the bounded
+                    // `moveJournal` flag — the source of truth the L1
+                    // layer uses to tell the bot's own motion apart from
+                    // a GM drag when validating `expectedState.self`.
+                    if (step.type === "move" && outcome.position) {
+                        _noteMove(context, run, outcome.position);
+                    }
+                    // Run mechanic: a sprint stamps the actor `running`
+                    // — the system reads the flag as the +20-evasion
+                    // window vs ranged fire until the bot's next turn
+                    // (cleared in the updateCombat/deleteCombat hooks).
+                    if (step.type === "move" && step.input?.mode === "run"
+                        && outcome.position && !outcome.skipped
+                        && _isController(context)) {
+                        try {
+                            const flagActor = run.combatant?.actor;
+                            if (flagActor && typeof flagActor.setFlag === "function") {
+                                await flagActor.setFlag(MODULE_ID, FLAG_KEYS.running, {
+                                    combatId: context.combat?.id ?? null,
+                                    round: context.combat?.round ?? null,
+                                    operationId: run.operationId ?? null
+                                });
+                            }
+                        } catch(_err) {
+                            // The evasion marker is best-effort — never fatal.
+                        }
                     }
                     run.stepIndex++;
                     // Pacing: let the move animation/roll card breathe so
@@ -1195,7 +933,7 @@ export function createExecutorService({
             reason = reason ?? EXECUTOR_REASONS.actionBudgetSpent;
         }
         if (status === EXECUTOR_STATUS.cancelled) {
-            return _result({
+            const result = _result({
                 status,
                 reason,
                 operationId: run.operationId,
@@ -1207,6 +945,14 @@ export function createExecutorService({
                 chatMessageIds,
                 diagnostics: run.report ?? run.plan?.diagnostics
             });
+            // Issue #37: an adjudication cancel hands the turn back to
+            // manual GM control — the operation closes but the turn is
+            // not advanced. Controller/module cancellations leave the
+            // operation to its real owner and stay silent.
+            if (reason === EXECUTOR_REASONS.adjudicationCancelled) {
+                await _finish(context, run, result, false);
+            }
+            return result;
         }
         const result = _result({
             status,
@@ -1220,7 +966,12 @@ export function createExecutorService({
             chatMessageIds,
             diagnostics: run.report ?? run.plan?.diagnostics
         });
-        await _finish(context, run, result, true);
+        // Damage-wait: when the turn produced a landed attack the GM
+        // still has to roll the damage card and apply its hits — the
+        // operation completes but `nextTurn` waits for that adjudication
+        // (manual turn advance or the timeout releases the wait).
+        const waiting = _registerDamageWait(context, run, result);
+        await _finish(context, run, result, !waiting);
         if (status !== EXECUTOR_STATUS.completed) _report(context, run, result);
         log(`execution ${run.operationId}: ${status} reason=${reason} steps=${stepsDone.length}`);
         return result;
@@ -1248,17 +999,32 @@ export function createExecutorService({
             expectedPosition: _selfPosition(plan),
             replanCount: _finiteOr(plan?.replanCount, 0),
             stepIndex: 0,
+            // Issue #33: budget already consumed this turn (GM manual
+            // actions via context.spent / planContext.spent + executed
+            // steps) — feeds replan planContext.
+            spent: {
+                movement: _finiteOr(
+                    context.spent?.movement ?? context.planContext?.spent?.movement, 0),
+                halves: _finiteOr(
+                    context.spent?.halves ?? context.planContext?.spent?.halves, 0)
+            },
             report: null,
-            record: null
+            record: null,
+            // Issue #27: the per-layer reason trace of the active plan.
+            trace: plan?.diagnostics?.trace ?? []
         };
-        const record = { promise: null, hookAdvanced: false };
+        const record = {
+            promise: null,
+            hookAdvanced: false,
+            combatId: context.combat?.id ?? null
+        };
         run.record = record;
         record.promise = (async () => {
             const early = await _preflight(context, run);
             if (early) return early;
             return _execute(context, run);
         })();
-        executions.set(operationId, record);
+        _recordExecution(operationId, record);
         return record.promise;
     }
 
@@ -1284,10 +1050,22 @@ export function createExecutorService({
             expectedPosition: _selfPosition(context.plan),
             replanCount: _finiteOr(context.plan?.replanCount, 0),
             stepIndex: 0,
+            spent: {
+                movement: _finiteOr(
+                    context.spent?.movement ?? context.planContext?.spent?.movement, 0),
+                halves: _finiteOr(
+                    context.spent?.halves ?? context.planContext?.spent?.halves, 0)
+            },
             report: null,
-            record: null
+            record: null,
+            // Issue #27: the per-layer reason trace of the active plan.
+            trace: context.plan?.diagnostics?.trace ?? []
         };
-        const record = { promise: null, hookAdvanced: false };
+        const record = {
+            promise: null,
+            hookAdvanced: false,
+            combatId: context.combat?.id ?? null
+        };
         run.record = record;
         record.promise = (async () => {
             const early = await _preflight(context, run);
@@ -1305,11 +1083,12 @@ export function createExecutorService({
                     return result;
                 }
                 let planned = null;
+                const plannedContext = _planContext(context, context.operation, 0, run);
                 try {
                     planned = await planner.planTurn(
                         context.combat,
                         run.combatant,
-                        _planContext(context, context.operation, 0, run)
+                        plannedContext
                     );
                 } catch(err) {
                     planned = null;
@@ -1327,6 +1106,11 @@ export function createExecutorService({
                 }
                 run.plan = planned.plan;
                 run.expectedPosition = _selfPosition(run.plan);
+                run.trace = run.plan?.diagnostics?.trace ?? [];
+                // Issue #27: the replay capture rides the plan journal
+                // when `aiCaptureContext` is on — fire-and-forget, the
+                // flag write never delays the turn.
+                _capturePlanContext(context, run, plannedContext);
             }
 
             // Preview mode: preflight only — the operation stays in
@@ -1377,16 +1161,26 @@ export function createExecutorService({
             }
             return _execute(context, run);
         })();
-        executions.set(operationId, record);
+        _recordExecution(operationId, record);
         return record.promise;
     }
 
     return {
         executePlan,
         runPlan,
+        resolveAdjudication,
+        /**
+         * Whether an adjudication request is still pending a GM decision.
+         * @param {string} requestId
+         * @returns {boolean}
+         */
+        adjudicationPending(requestId) {
+            return pendingAdjudications.has(requestId);
+        },
         statuses: EXECUTOR_STATUS,
         reasons: EXECUTOR_REASONS,
         stepStatuses: STEP_STATUS,
+        adjudicationActions: ADJUDICATION_ACTIONS,
         /**
          * Whether an execution result already exists for an operation id.
          * @param {string} operationId
@@ -1405,3 +1199,10 @@ export function createExecutorService({
         }
     };
 }
+// Public surface — re-exported consts moved to executor/contract.js.
+export {
+    ADJUDICATION_ACTIONS,
+    EXECUTOR_REASONS,
+    EXECUTOR_STATUS,
+    STEP_STATUS
+};

@@ -12,10 +12,12 @@
  *   their melee reach plus a charge allowance with a linear falloff.
  * - `dangerAt(point)` returns a normalized `0..1` score: the sum of
  *   per-source contributions capped at 1. A ranged emitter contributes
- *   its full normalized strength `min(1, ev / referenceDamage)` whenever
- *   the point sits inside weapon range; melee emitters contribute full
- *   strength inside melee reach and decay linearly to zero across the
- *   charge allowance. A wall-check LOS probe gates every contribution;
+ *   its full normalized strength `min(1, ev / referenceDamage)` inside
+ *   a quarter of its weapon range and decays linearly to zero at the
+ *   range edge (a tight "point-blank band" reads hotter than a washed
+ *   out half-range plateau); melee emitters contribute full strength
+ *   inside melee reach and decay linearly to zero across the charge
+ *   allowance. A wall-check LOS probe gates every contribution;
  *   without a probe the threat pessimistically counts (the bot assumes
  *   the enemy can shoot).
  * - The map complements the `cover`/`exposure` factors instead of
@@ -191,8 +193,13 @@ function _normalizeThreat(raw, index) {
         id: raw.tokenUuid ?? raw.tokenId ?? raw.id ?? `threat-${index}`,
         tokenId: raw.tokenId ?? null,
         tokenUuid: raw.tokenUuid ?? null,
+        name: raw.name ?? raw.tokenName ?? null,
         x,
         y,
+        // Smoke finding: memory/relay contacts used to shade the danger
+        // field at full strength — a hearsay position is deliberately
+        // weaker (`threatSourcesOf` stamps 1 / 0.5 / 0.25).
+        weight: Math.max(0, Math.min(1, _finiteOr(raw.weight, 1))),
         emitters
     };
 }
@@ -316,13 +323,18 @@ export function buildThreatMap({
             if (distance >= reach + allowance) return 0;
             return strength * (1 - ((distance - reach) / allowance));
         }
-        return emitter.range > 0 && distance <= emitter.range + 1e-9 ? strength : 0;
+        if (!(emitter.range > 0) || distance >= emitter.range) return 0;
+        // Short band (smoke tuning): a quarter of the reach reads at
+        // full strength, the heat decays linearly to zero at the edge.
+        const band = emitter.range / 4;
+        return distance <= band ? strength
+            : strength * (1 - ((distance - band) / (emitter.range - band)));
     }
 
     /**
      * Per-source contribution records for `point` (deterministic order).
      * @param {{x: number, y: number}} point
-     * @returns {object[]} `{id, contribution}` entries.
+     * @returns {object[]} `{id, name, contribution}` entries.
      */
     function explain(point) {
         if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return [];
@@ -331,10 +343,12 @@ export function buildThreatMap({
             const distance = _distanceUnits({ x: source.x, y: source.y }, point, grid);
             if (!Number.isFinite(distance)) continue;
             const contribution = Math.max(0, ...source.emitters.map(
-                emitter => _emitterContribution(source, emitter, distance)));
+                emitter => _emitterContribution(source, emitter, distance)))
+                * source.weight;
             if (contribution > 0 && _losOpen(probe, { x: source.x, y: source.y }, point)) {
                 entries.push({
                     id: source.id,
+                    name: source.name ?? null,
                     contribution: Math.round(contribution * 1e4) / 1e4
                 });
             }
@@ -439,8 +453,9 @@ export function threatSourcesOf(targets, { combat = null, scene = null, findToke
             const single = _normalizeEmitter(profile);
             if (single) emitters = [single];
         }
+        let doc = null;
         if (!emitters.length) {
-            const doc = lookup(target.tokenId ?? target.tokenUuid);
+            doc = lookup(target.tokenId ?? target.tokenUuid);
             const actor = _actorOfTarget(doc);
             emitters = weaponEmitters(actor);
         }
@@ -448,12 +463,36 @@ export function threatSourcesOf(targets, { combat = null, scene = null, findToke
         sources.push({
             tokenId: target.tokenId ?? null,
             tokenUuid: target.tokenUuid ?? null,
+            name: target.name ?? doc?.name ?? null,
             x: target.x,
             y: target.y,
+            weight: _threatWeight(target),
             emitters
         });
     }
     return sources;
+}
+
+/**
+ * Danger-field weight of a threat by how the bot knows about it (smoke
+ * finding — last-known/relay contacts used to draw full-strength heat):
+ * a direct sighting counts in full, own last-known memory at half, and
+ * squad hearsay (`team-contact`/`relay`) at a quarter — matching the
+ * scoring convention where relay memory weighs half of direct memory.
+ * An explicit `weight`/`threatProfile.weight` on the target wins.
+ * @param {object} target Normalized planner target with `source`.
+ * @returns {number} 0..1.
+ */
+function _threatWeight(target) {
+    const explicit = target?.threatProfile?.weight ?? target?.weight;
+    if (Number.isFinite(explicit)) return Math.max(0, Math.min(1, explicit));
+    switch (target?.source) {
+        case "last-known": return 0.5;
+        case "team-contact":
+        case "relay":
+        case "intel": return 0.25;
+        default: return 1;
+    }
 }
 
 /**

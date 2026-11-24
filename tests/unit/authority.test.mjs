@@ -323,9 +323,11 @@ test("completeTurn emits the operationCompleted hook (executor integration point
     const { combat, combatant } = makeEnabledCombat();
     const claim = await ops.claimTurn(combat, combatant, { controllerId: "gm" });
     await ops.completeTurn(combat, claim.operation.id, { completed: true });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].event, `${MODULE_ID}.operationCompleted`);
-    assert.equal(calls[0].op.phase, "completed");
+    const completed = calls.filter((c) => c.event === `${MODULE_ID}.operationCompleted`);
+    assert.equal(completed.length, 1);
+    assert.equal(completed[0].op.phase, "completed");
+    const phased = calls.filter((c) => c.event === `${MODULE_ID}.phaseChanged`);
+    assert.equal(phased.length, 1);
 });
 
 /* ---------- controller change ---------- */

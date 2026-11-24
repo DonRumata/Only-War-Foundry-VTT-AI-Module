@@ -514,6 +514,37 @@ test("evaluateSpecOps: regroup task pulls toward the rejoin point", () => {
     assert.ok(closer.score > farther.score);
 });
 
+test("evaluateSpecOps: fanatic ignoreRegroup zeroes the regroup pull (review)", () => {
+    // Issue #24 review: `context.traitFlags.ignoreRegroup` suppresses
+    // the `cohesionRestore` factor structurally — the task overlay
+    // replaces the weight, so no delta could carry the flag.
+    const context = {
+        selfPos: { x: 400, y: 0 },
+        team: {
+            task: "regroup",
+            center: { x: 0, y: 0 },
+            regroupPoint: { x: 0, y: 0 }
+        }
+    };
+    const candidate = {
+        variant: "approach",
+        target: { tokenId: "e1", x: 2000, y: 0 },
+        move: { x: 200, y: 0 }
+    };
+    const factors = { attackNow: 0, holdPosition: 0 };
+    const trusting = evaluateSpecOps({ factors, candidate, context });
+    assert.equal(trusting.breakdown.factors.cohesionRestore, 0.5);
+    const fanatic = evaluateSpecOps({
+        factors,
+        candidate,
+        context: { ...context, traitFlags: { ignoreRegroup: true } }
+    });
+    assert.equal(fanatic.breakdown.factors.cohesionRestore, 0,
+        "the flag mutes the regroup pull entirely");
+    assert.ok(fanatic.score < trusting.score,
+        "without the pull the same endpoint scores lower");
+});
+
 test("evaluateSpecOps solo fallback reports no-fireteam", () => {
     const factors = {
         attackNow: 0, attackAfterMove: 0, charge: 0, melee: 0,
@@ -794,4 +825,51 @@ test("explicit caller assignments and context.tactic override the spec-ops tacti
     });
     assert.equal(off.teamPlan.tactic, null);
     assert.equal(off.teamPlan.diagnostics.tactic, null);
+});
+
+test("specOpsVeto lets the blast memory-strike through on a last-known contact", () => {
+    // Point attacks on remembered targets stay vetoed; a blast aim point
+    // is the deliberate room-clearing strike the planner already vetted.
+    const point = specOpsVeto({
+        candidate: {
+            variant: "attack-in-place",
+            target: { source: "last-known" }
+        }
+    });
+    assert.equal(point, SPEC_OPS_VETO_HIDDEN_TARGET);
+    const blast = specOpsVeto({
+        candidate: {
+            variant: "attack-in-place",
+            aim: { x: 300, y: 0 },
+            target: { source: "last-known" }
+        }
+    });
+    assert.equal(blast, null);
+});
+
+test("flank task scores endpoint progress toward the flankPoint", () => {
+    const context = {
+        selfPos: { x: 0, y: 0 },
+        team: { task: "flank", flankPoint: { x: 400, y: 0 }, center: { x: 0, y: 0 } }
+    };
+    const closing = evaluateSpecOps({
+        candidate: {
+            variant: "approach",
+            move: { x: 300, y: 0, distance: 1.5 },
+            target: { x: 600, y: 0, distance: 9 }
+        },
+        context
+    });
+    const statics = evaluateSpecOps({
+        candidate: {
+            variant: "approach",
+            move: { x: 0, y: 0, distance: 9 },
+            target: { x: 600, y: 0, distance: 9 }
+        },
+        context
+    });
+    assert.ok(closing.breakdown.team.flankProgress > 0.5,
+        "closing on the flank point reports progress");
+    assert.equal(statics.breakdown.team.flankProgress, 0,
+        "staying put reports none");
 });

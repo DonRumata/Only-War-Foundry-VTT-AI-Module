@@ -60,3 +60,17 @@ test("localization keys use the OWAI namespace", () => {
         assert.ok(key.startsWith("OWAI."), `${key} uses OWAI. prefix`);
     }
 });
+
+test("no localization key is a strict prefix of another", () => {
+    // Foundry's expandObject collapses `"A.B": x` and `"A.B.C": y` into a
+    // string-vs-object collision and drops the whole translation file.
+    for (const file of ["languages/en.json", "languages/ru.json"]) {
+        const keys = Object.keys(_readJson(file));
+        for (const key of keys) {
+            assert.ok(
+                !keys.some(other => other !== key && other.startsWith(`${key}.`)),
+                `${file}: "${key}" shadows its own children`
+            );
+        }
+    }
+});

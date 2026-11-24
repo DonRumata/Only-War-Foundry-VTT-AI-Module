@@ -225,15 +225,21 @@ test("gridKindOf/hexVariantOf normalize Foundry grid types", () => {
 });
 
 test("diagonalRuleOf accepts numeric and string forms", () => {
-    assert.equal(diagonalRuleOf({ grid: { diagonals: 1 } }), "equidistant");
-    assert.equal(diagonalRuleOf({ grid: { diagonals: 2 } }), "exact");
-    assert.equal(diagonalRuleOf({ grid: { diagonals: 3 } }), "approximate");
-    assert.equal(diagonalRuleOf({ grid: { diagonals: 4 } }), "rectilinear");
+    // Foundry 13 CONST.GRID_DIAGONALS enum (issue #32).
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 0 } }), "equidistant");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 1 } }), "exact");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 2 } }), "approximate");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 3 } }), "rectilinear");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 4 } }), "approximate");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 5 } }), "approximate");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: 6 } }), "illegal");
     assert.equal(diagonalRuleOf({ grid: {} }), "equidistant");
     assert.equal(diagonalRuleOf(null), "equidistant");
+    assert.equal(diagonalRuleOf({ grid: { diagonals: "exact" } }), "exact");
     assert.equal(diagonalCostOf("exact"), Math.SQRT2);
     assert.equal(diagonalCostOf("rectilinear"), 2);
     assert.equal(diagonalCostOf("equidistant"), 1);
+    assert.equal(diagonalCostOf("illegal"), Number.POSITIVE_INFINITY);
 });
 
 test("wallBlocks covers numeric and object wall schemas", () => {

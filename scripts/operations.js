@@ -87,6 +87,26 @@ export function createOperationService({ now, idGen, hooks } = {}) {
     const _idGen = typeof idGen === "function" ? idGen : () => foundry.utils.randomID();
 
     /**
+     * Broadcast `only-war-ai.phaseChanged` after a phase write — the
+     * preview dialog listens to drop sessions whose operation left
+     * `awaiting-preview` (without this emission the preview UI lingered
+     * stale through the whole execution window).
+     * @param {object} combat Combat document.
+     * @param {object} operation Operation record after the write.
+     * @param {string|null} oldPhase Phase before the transition.
+     * @param {string} newPhase Phase after the transition.
+     */
+    function _emitPhaseChanged(combat, operation, oldPhase, newPhase) {
+        try {
+            hooks?.callAll?.(
+                `${MODULE_ID}.phaseChanged`, combat, _clone(operation), oldPhase, newPhase
+            );
+        } catch(_err) {
+            // Hook delivery is best-effort — flag state is authoritative.
+        }
+    }
+
+    /**
      * Claim an AI turn for the given combatant. Succeeds only when no live
      * operation exists for the same (combatId, combatantId, round, turn);
      * a live operation from an older turn is marked `turn-stale` first.
@@ -160,6 +180,7 @@ export function createOperationService({ now, idGen, hooks } = {}) {
             updated.completedAt = _now();
         }
         await _write(combat, updated);
+        _emitPhaseChanged(combat, updated, operation.phase, nextPhase);
         return { ok: true, operation: readOperation(combat) ?? updated };
     }
 
@@ -196,6 +217,7 @@ export function createOperationService({ now, idGen, hooks } = {}) {
             completedAt: _now()
         };
         await _write(combat, updated);
+        _emitPhaseChanged(combat, updated, operation.phase, phase);
         // Integration point: only after the operation is completed may the
         // turn be advanced (`combat.nextTurn` via the executor, #407).
         hooks?.callAll?.(`${MODULE_ID}.operationCompleted`, combat, _clone(updated));

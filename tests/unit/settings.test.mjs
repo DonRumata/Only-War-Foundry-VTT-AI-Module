@@ -6,15 +6,21 @@ import assert from "node:assert/strict";
 
 import {
     getAIDifficulty,
+    getAttackAdjudication,
+    getDamageWaitAutoAdvance,
     getExecutionMode,
+    getLayerFlags,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
     getTurnPacingMs,
     isDiagnosticsEnabled,
     isMasterEnabled,
+    isThreatMapOverlayEnabled,
     registerSettings
 } from "../../scripts/settings.js";
 import {
+    ATTACK_ADJUDICATION_MODES,
+    DEFAULT_LAYER_FLAGS,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
     DEFAULT_TURN_PACING_MS,
@@ -26,7 +32,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 7);
+    assert.equal(registered.length, 22);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -149,6 +155,20 @@ test("aiDifficulty defaults to normal with easy/normal/hard choices (issue #16)"
     assert.equal(getAIDifficulty(), "normal");
 });
 
+test("threatMapOverlay defaults to false and reads a stored value (issue #36)", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.threatMapOverlay);
+    assert.ok(entry, "threatMapOverlay registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, false);
+    assert.equal(isThreatMapOverlayEnabled(), false);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.threatMapOverlay, true);
+    assert.equal(isThreatMapOverlayEnabled(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.threatMapOverlay, "garbage");
+    assert.equal(isThreatMapOverlayEnabled(), false);
+});
+
 test("getAIDifficulty honours a stored value and rejects damaged ones", async () => {
     _resetMocks();
     registerSettings();
@@ -158,4 +178,67 @@ test("getAIDifficulty honours a stored value and rejects damaged ones", async ()
     assert.equal(getAIDifficulty(), "hard");
     await game.settings.set(MODULE_ID, SETTING_KEYS.aiDifficulty, "nightmare");
     assert.equal(getAIDifficulty(), "normal");
+});
+
+test("attackAdjudication defaults to auto with auto/gm-confirm choices (issue #37)", () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(
+        e => e.key === SETTING_KEYS.attackAdjudication);
+    assert.ok(entry, "attackAdjudication registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.default, "auto");
+    assert.deepEqual(Object.keys(entry.data.choices), [...ATTACK_ADJUDICATION_MODES]);
+    assert.equal(getAttackAdjudication(), "auto");
+});
+
+test("getAttackAdjudication honours a stored value and rejects damaged ones", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.attackAdjudication, "gm-confirm");
+    assert.equal(getAttackAdjudication(), "gm-confirm");
+    await game.settings.set(MODULE_ID, SETTING_KEYS.attackAdjudication, "garbage");
+    assert.equal(getAttackAdjudication(), "auto");
+});
+
+test("layer toggles register with issue #24 defaults", () => {
+    _resetMocks();
+    registerSettings();
+    for (const [key, expected] of Object.entries(DEFAULT_LAYER_FLAGS)) {
+        const settingKey = SETTING_KEYS[
+            `layers${key[0].toUpperCase()}${key.slice(1)}`];
+        const entry = game.settings._registered.find(e => e.key === settingKey);
+        assert.ok(entry, `${settingKey} registered`);
+        assert.equal(entry.data.scope, "world");
+        assert.equal(entry.data.type, Boolean);
+        assert.equal(entry.data.default, expected);
+    }
+    assert.deepEqual(getLayerFlags(), { ...DEFAULT_LAYER_FLAGS });
+});
+
+test("getLayerFlags honours stored values and rejects damaged ones", async () => {
+    _resetMocks();
+    registerSettings();
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersMorale, true);
+    assert.equal(getLayerFlags().morale, true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersPersonality, false);
+    assert.equal(getLayerFlags().personality, false);
+    // Damaged values fall back to the defaults.
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersLookahead, "garbage");
+    assert.equal(getLayerFlags().lookahead, DEFAULT_LAYER_FLAGS.lookahead);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.layersCommitment, 1);
+    assert.equal(getLayerFlags().commitment, DEFAULT_LAYER_FLAGS.commitment);
+});
+
+test("damageWaitAutoAdvance defaults to true and honours a stored value (smoke)", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.damageWaitAutoAdvance);
+    assert.ok(entry, "damageWaitAutoAdvance registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.type, Boolean);
+    assert.equal(entry.data.default, true);
+    assert.equal(getDamageWaitAutoAdvance(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.damageWaitAutoAdvance, false);
+    assert.equal(getDamageWaitAutoAdvance(), false);
 });

@@ -225,3 +225,139 @@ test("a lone distant hostile outside the cone range yields no template step", as
             && entry.reason === "cone-no-safe-aim"
     ));
 });
+
+// --- Issue #30: cone orientation only by perceived anchors ------------------
+
+test("a spray cone never orients at hostiles the bot cannot perceive", async () => {
+    // The only perceived target sits far outside the flamer's reach; an
+    // extra hostile on the scene (no LOS, no memory — injected through
+    // `blastTokens` like the live canvas scan would) must not steer the
+    // template. Before issue #30 the cone happily aimed at it.
+    const world = makeWorld({ enemies: [{ x: 90000, y: 0 }] });
+    const { targets, blastTokens } = injected(world);
+    blastTokens.push({
+        tokenUuid: `Scene.${world.scene.id}.Token.ghost`,
+        tokenId: "ghost",
+        x: 300,
+        y: 0,
+        elevation: 0,
+        disposition: 1
+    });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets,
+        blastTokens,
+        actions: [sprayAction()],
+        moves: []
+    });
+    const attack = result.plan?.steps.find(step => step.type === "attack");
+    assert.ok(!attack || !attack.input.template?.direction,
+        "no template aimed at an unperceived hostile");
+    const diagnostics = result.plan?.diagnostics ?? result.diagnostics ?? {};
+    assert.ok((diagnostics.rejected ?? []).some(
+        entry => entry.reason === "cone-no-safe-aim"
+    ), "unperceived hostiles yield no cone aim");
+});
+
+test("a spray cone aims the remembered point of a last-known contact", async () => {
+    // The contact was seen at (400, 0) east; its live position drifted
+    // west to (-500, 0) — the template must point at the memory, never
+    // at the true position the bot cannot perceive (issue #30).
+    const world = makeWorld({ enemies: [{ x: 90000, y: 0 }] });
+    const lastKnown = {
+        tokenId: "lost-enemy",
+        tokenUuid: `Scene.${world.scene.id}.Token.lost-enemy`,
+        x: 400,
+        y: 0,
+        elevation: 0,
+        source: "last-known"
+    };
+    const blastTokens = [{
+        tokenUuid: `Scene.${world.scene.id}.Token.lost-enemy`,
+        tokenId: "lost-enemy",
+        x: -500,
+        y: 0,
+        elevation: 0,
+        disposition: 1
+    }];
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: [lastKnown],
+        blastTokens,
+        actions: [sprayAction()],
+        moves: []
+    });
+    const attack = result.plan?.steps.find(step => step.type === "attack");
+    assert.ok(attack?.input?.template, "cone attack produced");
+    assert.ok(Math.abs(attack.input.template.direction) < 20,
+        "cone aims the remembered point (~0°), not the live position (~180°)");
+    assert.equal(attack.input.template.angle, 30);
+    assert.equal(attack.input.template.range, 8);
+    assert.deepEqual(attack.input.covered, [lastKnown.tokenUuid]);
+});
+
+test("no visible or last-known contact produces no overwatch or spray candidate", async () => {
+    // Issue #30 DoD: without perception anchors there is nothing to
+    // orient a cone at — neither a spray/suppression template nor an
+    // overwatch declaration may appear.
+    const world = makeWorld({ enemies: [{ x: 300, y: 0 }] });
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { overwatch: 10, holdPosition: 1 },
+        allowNoTarget: true,
+        allowNoAction: true,
+        alwaysOfferHold: true
+    });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: [],
+        actions: [sprayAction(), { id: "las", name: "Lasgun", itemUuid: "Actor.a.Item.w1", class: "ranged", range: 30, damage: 5, cost: "half", attackType: "standard", weaponId: "w1" }],
+        moves: []
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.steps.every(step => step.type !== "overwatch"),
+        "no overwatch without a perceived threat");
+    assert.ok(result.plan.steps.every(step => !step.input?.template),
+        "no spray template without a perceived target");
+});
+
+test("overwatch never declares on a last-known or hidden contact", async () => {
+    // Issue #30 memory rules: a remembered contact may steer a spray or
+    // a memory-strike blast, but an overwatch declaration needs a live
+    // visible threat — search moves cover last-known positions instead.
+    const world = makeWorld({ enemies: [{ x: 90000, y: 0 }] });
+    const lastKnown = {
+        tokenId: "lost-enemy",
+        tokenUuid: `Scene.${world.scene.id}.Token.lost-enemy`,
+        x: 1500,
+        y: 0,
+        elevation: 0,
+        source: "last-known"
+    };
+    const hiddenContact = {
+        tokenId: "sneaky",
+        tokenUuid: `Scene.${world.scene.id}.Token.sneaky`,
+        x: 200,
+        y: 0,
+        elevation: 0,
+        hidden: true,
+        source: "injected"
+    };
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { overwatch: 10, holdPosition: 1 },
+        allowNoAction: true,
+        alwaysOfferHold: true
+    });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: [lastKnown, hiddenContact],
+        actions: [{ id: "las", name: "Lasgun", itemUuid: "Actor.a.Item.w1", class: "ranged", range: 30, damage: 5, cost: "half", attackType: "standard", weaponId: "w1" }],
+        moves: []
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.steps.every(step => step.type !== "overwatch"),
+        "no overwatch on memory-only or hidden contacts");
+});

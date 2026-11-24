@@ -213,15 +213,22 @@ export function hexVariantOf(type) {
 export function diagonalRuleOf(scene, grid = null) {
     const raw = scene?.grid?.diagonals ?? grid?.diagonals ?? null;
     const map = {
-        1: "equidistant",
-        2: "exact",
-        3: "approximate",
-        4: "rectilinear",
+        // Foundry 13 `CONST.GRID_DIAGONALS` enum values; the two
+        // ALTERNATING variants model as `approximate` like the 5/10 rule,
+        // ILLEGAL forbids diagonal steps outright.
+        0: "equidistant",
+        1: "exact",
+        2: "approximate",
+        3: "rectilinear",
+        4: "approximate",
+        5: "approximate",
+        6: "illegal",
         equidistant: "equidistant",
         exact: "exact",
         approximate: "approximate",
         alternating: "approximate",
-        rectilinear: "rectilinear"
+        rectilinear: "rectilinear",
+        illegal: "illegal"
     };
     return map[raw] ?? "equidistant";
 }
@@ -230,6 +237,7 @@ export function diagonalRuleOf(scene, grid = null) {
  * Cell-cost multiplier of a diagonal step for the given rule.
  * `approximate` models the 5/10 alternation with a flat 1.5 multiplier —
  * a documented slight overestimate, never underestimates the real cost.
+ * `illegal` returns Infinity so diagonal edges are never taken.
  * @param {string} rule
  * @returns {number}
  */
@@ -238,6 +246,7 @@ export function diagonalCostOf(rule) {
         case "exact": return Math.SQRT2;
         case "approximate": return 1.5;
         case "rectilinear": return 2;
+        case "illegal": return Number.POSITIVE_INFINITY;
         default: return 1;
     }
 }

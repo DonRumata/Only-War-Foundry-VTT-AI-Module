@@ -24,6 +24,20 @@
             <span class="ow-ai-value">{{npc.personalityLabel}}</span>
         </div>
         {{/if}}
+        {{#if intentLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Intent"}}</label>
+            <span class="ow-ai-value">{{intentLabel}}</span>
+        </div>
+        {{/if}}
+        {{#if morale.tierLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Morale"}}</label>
+            <span class="ow-ai-value">
+                {{morale.tierLabel}}{{#if morale.effectiveTierLabel}} ({{morale.effectiveTierLabel}}){{/if}}
+            </span>
+        </div>
+        {{/if}}
         <div class="form-group">
             <label>{{localize "OWAI.Preview.Target.Label"}}</label>
             <span class="ow-ai-value">
@@ -51,6 +65,12 @@
             <span class="ow-ai-value">{{score}}</span>
         </div>
         {{/if}}
+        {{#if commitmentReplay}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.PlanSource"}}</label>
+            <span class="ow-ai-value">{{localize "OWAI.Preview.CommitmentReplay"}}</span>
+        </div>
+        {{/if}}
     </div>
 
     <fieldset>
@@ -67,6 +87,11 @@
             {{localize "OWAI.Preview.Route.Cost"}}: {{route.cost}}
             {{#if route.approximate}} — {{localize "OWAI.Preview.Route.Approximate"}}{{/if}}
         </p>
+        {{#if diagnostics.enabled}}
+        <button type="button" class="ow-ai-copy-route" data-clipboard="route">
+            <i class="fas fa-copy"></i> {{localize "OWAI.Preview.Route.Copy"}}
+        </button>
+        {{/if}}
         {{else}}
         <p class="notes">{{localize "OWAI.Preview.Route.Empty"}}</p>
         {{/if}}
@@ -76,7 +101,7 @@
         <legend>{{localize "OWAI.Preview.Steps"}}</legend>
         <ul class="ow-ai-steps">
             {{#each steps}}
-            <li><code>{{this.id}}</code> — {{this.label}}{{#if this.name}}: {{this.name}}{{/if}}</li>
+            <li><code>{{this.id}}</code> — {{this.label}}{{#if this.name}}: {{this.name}}{{/if}}{{#if this.detailLabel}} ({{this.detailLabel}}){{/if}}</li>
             {{/each}}
         </ul>
     </fieldset>
@@ -102,6 +127,17 @@
             {{/each}}
         </ul>
     </details>
+
+    {{#if traceLines.length}}
+    <details class="ow-ai-preview-trace">
+        <summary>{{localize "OWAI.Preview.Trace"}}</summary>
+        <ul>
+            {{#each traceLines}}
+            <li>{{this}}</li>
+            {{/each}}
+        </ul>
+    </details>
+    {{/if}}
 
     {{#if diagnostics.enabled}}
     <details class="ow-ai-preview-diagnostics">
@@ -136,6 +172,11 @@
         <button type="button" data-action="replan" {{#unless replan.allowed}}disabled{{/unless}}>
             <i class="fas fa-sync-alt"></i> {{localize "OWAI.Preview.Replan"}}
         </button>
+        {{#if diagnostics.enabled}}
+        <button type="button" data-clipboard="info">
+            <i class="fas fa-download"></i> {{localize "OWAI.Preview.ExportInfo"}}
+        </button>
+        {{/if}}
         <button type="button" data-action="cancel">
             <i class="fas fa-times"></i> {{localize "OWAI.Preview.Cancel"}}
         </button>

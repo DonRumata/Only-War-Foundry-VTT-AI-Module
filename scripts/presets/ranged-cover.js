@@ -79,7 +79,28 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 2,
     // Issue #16: the preset's whole doctrine is staying out of kill lanes.
-    danger: -3
+    danger: -3,
+    // Issue #37: dropping prone is this doctrine's free-action answer to
+    // suppression fire; signature weapons and readying a backup still pay.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 1.5,
+    readyWeapon: 2,
+    // Issue #39 + smoke: a shooter preset — firing into a friendly melee
+    // is a real −20 penalty, not a veto (−6): an unengaged comparable
+    // target still wins, but the only available shot is not refused.
+    alliedEngagement: -6,
+    leaveMeleeEngage: -6,
+    engageDenial: 0,
+    unpin: 3,
+    grudge: 1,
+    ev: 1,
+    stickyTarget: 3,
+    outnumber: 1,
+    // Run mechanic (smoke): a sprint between firing positions is a
+    // fallback — useful when the next cover lies past a full move.
+    run: 0.5
+
 });
 
 /** Candidate variants whose action produces an attack/test step. */

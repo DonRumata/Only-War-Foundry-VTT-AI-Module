@@ -8,6 +8,7 @@
  */
 import {
     AI_PRESETS,
+    ATTACK_ADJUDICATION_MODES,
     EXECUTION_MODES,
     FIRETEAM_CHARACTERS,
     MODULE_API_VERSION,
@@ -39,6 +40,7 @@ export function createModuleApi() {
             "authority.election": true,
             "authority.socket": true,
             "config.resolveEffectiveConfig": true,
+            "executor.adjudication": true,
             "executor.executePlan": true,
             "executor.runPlan": true,
             "fireteam.buildTeamPlan": true,
@@ -52,10 +54,15 @@ export function createModuleApi() {
             "perception.snapshot": true,
             "perception.memory": true,
             "perception.targets": true,
+            "planner.commitment": true,
+            "planner.freeActions": true,
+            "planner.layers": true,
             "planner.personalities": true,
             "planner.planTurn": true,
             "planner.presets": true,
+            "planner.trace": true,
             "planner.validateSnapshot": true,
+            "reactions.flags": true,
             "services.register": true,
             "services.get": true,
             "ui.npcSheet": true,
@@ -68,6 +75,8 @@ export function createModuleApi() {
         presets: Object.freeze([...AI_PRESETS]),
         overrideModes: Object.freeze([...OVERRIDE_MODES]),
         executionModes: Object.freeze([...EXECUTION_MODES]),
+        /** Attack adjudication modes (issue #37, `attackAdjudication` setting). */
+        attackAdjudicationModes: Object.freeze([...ATTACK_ADJUDICATION_MODES]),
         /** Bot personality trait ids and fireteam characters (issue #19). */
         personalities: Object.freeze([...PERSONALITY_IDS]),
         fireteamCharacters: Object.freeze([...FIRETEAM_CHARACTERS]),

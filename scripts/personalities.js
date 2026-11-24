@@ -9,6 +9,12 @@
  *   resolved preset weights before scoring — the same overlay pattern
  *   the spec-ops task weights use (`{...base, ...overlay}`), except
  *   personality deltas add up instead of replacing the base value.
+ * - Weapon affinity (issue #37): a trait may carry `weaponAffinity`
+ *   `{classes?, keywords?, blast?}` — a direct, non-weight flavour hook
+ *   read by the planner's `weaponAffinity` factor: sniper → long-las/
+ *   needle weapons, heavy-handed → flame/heavy, grenadier → blast.
+ *   Matching is purely data-driven (class id or name substring); it
+ *   never changes the candidate set, only the factor value.
  * - Generation is seeded from the stable document identity
  *   (`actor.id` → `token.uuid` → `token.id` → `combatant.id`) through
  *   `fnv1a` + `mulberry32`: 1–2 traits drawn without replacement from a
@@ -89,16 +95,22 @@ export const PERSONALITIES = Object.freeze({
     }),
     reckless: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ attackNow: 4, charge: 3, threat: -3, cover: -3 }),
+        // Issue #39: reckless bots worry less about hitting an ally's
+        // melee partner — a mild +1 against the engagement penalty.
+        deltas: Object.freeze({
+            attackNow: 4, charge: 3, threat: -3, cover: -3, alliedEngagement: 1
+        }),
         jitter: 0.04,
         weight: 6,
         bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 })
     }),
     fanatic: Object.freeze({
         category: "courage",
-        // `ignoreRegroup` is enforced through the strong negative
-        // `cohesionRestore`/`holdPosition` deltas — even on a `regroup`
-        // team task the cohesion pull is suppressed.
+        // `ignoreRegroup` is enforced structurally on the spec-ops
+        // `cohesionRestore` factor (evaluateSpecOps reads
+        // `context.traitFlags`) — the deltas alone cannot carry it: the
+        // task overlay replaces the weight and the L3 bound clamps any
+        // delta. `holdPosition: -4` stays a plain preference.
         deltas: Object.freeze({
             advance: 3, charge: 2, cohesionRestore: -12, holdPosition: -4
         }),
@@ -107,16 +119,36 @@ export const PERSONALITIES = Object.freeze({
         bias: Object.freeze({ easy: 1.5, normal: 1, hard: 0.8 }),
         flags: Object.freeze({ ignoreRegroup: true })
     }),
+    heretic: Object.freeze({
+        category: "courage",
+        // Issue #39: heretics fire into an ally's melee without
+        // compunction — the `firesIntoMelee` flag zeroes the
+        // `alliedEngagement` factor outright (no weight delta can say
+        // "ignore the shooting-into-melee risk" for every preset).
+        deltas: Object.freeze({ vulnerable: 2, threat: -2, grudge: 1 }),
+        jitter: 0.02,
+        weight: 3,
+        bias: Object.freeze({ easy: 1.2, normal: 1, hard: 1 }),
+        flags: Object.freeze({ firesIntoMelee: true })
+    }),
     bloodthirsty: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ vulnerable: 6, attackNow: 2 }),
+        // Issue #39: craves contact and remembers who hurt it —
+        // `engageDenial` +3, `grudge` +4.
+        deltas: Object.freeze({
+            vulnerable: 6, attackNow: 2, engageDenial: 3, grudge: 4
+        }),
         jitter: 0.01,
         weight: 7,
         bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
     }),
     cunning: Object.freeze({
         category: "courage",
-        deltas: Object.freeze({ attackType: 0.15, los: 3, exposure: -2 }),
+        // Issue #39: cunning bots pick their shots — an extra −2 against
+        // firing into a melee their allies are winning.
+        deltas: Object.freeze({
+            attackType: 0.15, los: 3, exposure: -2, alliedEngagement: -2
+        }),
         jitter: -0.03,
         weight: 8,
         bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.8 })
@@ -132,12 +164,19 @@ export const PERSONALITIES = Object.freeze({
         category: "courage",
         // The positive `cohesionRestore` delta is the pull toward
         // regrouping with the team under pressure.
+        // Issue #39: cowards nurse no grudges — they avoid the attacker
+        // rather than avenging the hit (`grudge` −2).
         deltas: Object.freeze({
-            proximity: -3, attackNow: -3, cohesionRestore: 6, holdPosition: 2
+            proximity: -3, attackNow: -3, cohesionRestore: 6, holdPosition: 2,
+            grudge: -2
         }),
         jitter: 0.02,
         weight: 5,
-        bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 })
+        bias: Object.freeze({ easy: 2.5, normal: 1, hard: 0.3 }),
+        // Issue #26 L2 morale: mere `pressured` reads as `desperate` to a
+        // coward — it regroups and pulls toward cover while the rest of
+        // the team still holds the baseline posture.
+        flags: Object.freeze({ fragileMorale: true })
     }),
     // --- Навык / опыт --------------------------------------------------
     veteran: Object.freeze({
@@ -166,28 +205,47 @@ export const PERSONALITIES = Object.freeze({
         deltas: Object.freeze({ attackType: 0.15, area: 3, melee: 2 }),
         jitter: 0.01,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        // Issue #37: heavy class and flame weapons ("огнемётчик" flavour).
+        weaponAffinity: Object.freeze({
+            classes: Object.freeze(["heavy"]),
+            keywords: Object.freeze(["flame", "flamer"])
+        })
     }),
     grenadier: Object.freeze({
         category: "skill",
         deltas: Object.freeze({ area: 6 }),
         jitter: 0,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        // Issue #37: blast weapons are his natural reach.
+        weaponAffinity: Object.freeze({
+            blast: true,
+            keywords: Object.freeze(["grenade", "frag", "krak"])
+        })
     }),
     duelist: Object.freeze({
         category: "skill",
-        deltas: Object.freeze({ melee: 4, meleeEngage: 4, charge: 3 }),
+        // Issue #39: the duelist seeks contact — `engageDenial` +3.
+        deltas: Object.freeze({
+            melee: 4, meleeEngage: 4, charge: 3, engageDenial: 3
+        }),
         jitter: 0,
         weight: 6,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1.2 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1.2 }),
+        // Issue #37: melee weapon affinity mirrors the melee deltas.
+        weaponAffinity: Object.freeze({ classes: Object.freeze(["melee"]) })
     }),
     sniper: Object.freeze({
         category: "skill",
         deltas: Object.freeze({ los: 4, proximity: -3, aim: 3, aimAlone: 1 }),
         jitter: -0.02,
         weight: 6,
-        bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.5 })
+        bias: Object.freeze({ easy: 0.5, normal: 1, hard: 1.5 }),
+        // Issue #37: long-las / needle class flavour (issue's "снайпер").
+        weaponAffinity: Object.freeze({
+            keywords: Object.freeze(["long-las", "long las", "needle", "sniper", "stalker"])
+        })
     }),
     // --- Позиция / манёвр ---------------------------------------------
     flanker: Object.freeze({
@@ -231,10 +289,14 @@ export const PERSONALITIES = Object.freeze({
     }),
     loner: Object.freeze({
         category: "maneuver",
+        // Issue #38 review: the loner does not trust squad chatter —
+        // `distrustsContacts` drops shared team contacts from its target
+        // set entirely (own memory still works).
         deltas: Object.freeze({ cohesionRestore: -8, aimAlone: 1 }),
         jitter: 0.01,
         weight: 5,
-        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 })
+        bias: Object.freeze({ easy: 1, normal: 1, hard: 1 }),
+        flags: Object.freeze({ distrustsContacts: true })
     }),
     // --- Командность ---------------------------------------------------
     leader: Object.freeze({
@@ -463,6 +525,11 @@ export function personalityWeightDelta({ traits = [], character = null } = {}) {
 
 /**
  * Apply the personality overlay to resolved preset weights.
+ * Unbounded deltas — legacy #19 semantics kept for export
+ * compatibility; the planner uses `boundedPersonalityOverlay`
+ * (`scripts/layers.js`, issue #24). No internal callers remain —
+ * slated for removal with issue #27 (cleanup issue #57).
+ * @deprecated Superseded by boundedPersonalityOverlay.
  * @param {object} weights Base weight map.
  * @param {object} profile `{traits, character}` resolution result.
  * @param {string[]} [profile.traits] Resolved trait ids.
@@ -528,6 +595,54 @@ export function personalityJitterFactor({ seed = 0, candidateId = "", amp = 0 } 
     const hash = parseInt(fnv1a(String(candidateId)), 16) >>> 0;
     const roll = mulberry32(((seed >>> 0) ^ PERSONALITY_JITTER_SEED_XOR ^ hash) >>> 0)();
     return 1 + (((roll * 2) - 1) * amp);
+}
+
+/**
+ * Whether one trait's `weaponAffinity` spec matches a normalized planner
+ * action. A spec matches when any declared field matches: `classes` —
+ * exact match of the lowercased weapon class; `keywords` — substring of
+ * the lowercased action/weapon name; `blast` — the action carries a
+ * blast radius.
+ * @param {object} spec `weaponAffinity` spec of a trait.
+ * @param {object|null} action Normalized action (`{class, name, itemName,
+ *   attackType, blastRadius}` fields when known).
+ * @returns {boolean}
+ */
+function _weaponAffinityMatches(spec, action) {
+    if (!spec || !action || typeof action !== "object") return false;
+    const cls = String(action.class ?? "").toLowerCase();
+    if (Array.isArray(spec.classes)
+        && spec.classes.some(entry => String(entry).toLowerCase() === cls)
+        && cls.length > 0) {
+        return true;
+    }
+    const haystack = [action.name, action.itemName, action.attackType]
+        .map(entry => String(entry ?? "").toLowerCase())
+        .join("|");
+    if (Array.isArray(spec.keywords)
+        && spec.keywords.some(entry => {
+            const keyword = String(entry).toLowerCase();
+            return keyword.length > 0 && haystack.includes(keyword);
+        })) {
+        return true;
+    }
+    return spec.blast === true && Number.isFinite(action.blastRadius) && action.blastRadius > 0;
+}
+
+/**
+ * Weapon affinity of a resolved trait list toward one action (issue #37):
+ * `true` when any trait's `weaponAffinity` spec matches — read by the
+ * planner's `weaponAffinity` factor. Pure and deterministic.
+ * @param {string[]} traits Resolved trait ids.
+ * @param {object|null} action Normalized planner action.
+ * @returns {boolean}
+ */
+export function personalityWeaponAffinity(traits, action) {
+    for (const id of traits ?? []) {
+        const spec = PERSONALITIES[id]?.weaponAffinity;
+        if (spec && _weaponAffinityMatches(spec, action)) return true;
+    }
+    return false;
 }
 
 /**

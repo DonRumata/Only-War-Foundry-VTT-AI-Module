@@ -57,7 +57,9 @@ async function setup() {
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
   sceneId = await h.createTestScene(page, { grid: 1, size: 100 });
   npcTokenId = await h.placeToken(page, sceneId, npcId, { x: 400, y: 500 });
-  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1200, y: 500 });
+  // 12 m away — out of pistol range (10 m) so the assault preset must
+  // move before attacking; the half-move cap keeps it a legal combo.
+  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1600, y: 500 });
 
   await page.evaluate(async (data) => {
     const scene = game.scenes.get(data.sceneId);
@@ -156,6 +158,10 @@ async function testConfirmExecutes() {
   );
   const after = await npcPosition();
   assert.notDeepEqual(after, before, 'confirmed plan moved the token');
+  // Issue #32: document positions are grid-aligned — the move payload
+  // converts serialized cell centres to top-left doc coordinates.
+  assert.equal(after.x % 100, 0, `token x on-grid, got ${after.x}`);
+  assert.equal(after.y % 100, 0, `token y on-grid, got ${after.y}`);
   console.log(`confirm executed: token moved ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
 
   await page.waitForSelector(DIALOG, { state: 'detached', timeout: 5000 });

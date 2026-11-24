@@ -183,11 +183,12 @@ async function testMemoryLifecycle() {
   assert.equal(second.lastKnown[0].tokenUuid, openUuid);
   // Sanitized contract: no actor stats, no current hidden coordinates.
   const expectedKeys = [
-    'dispositionAtDetection', 'elevation', 'lastSeenRound',
+    'dispositionAtDetection', 'elevation', 'firstSeenRound', 'lastSeenRound',
     'lastSeenTurn', 'sceneId', 'tokenUuid', 'x', 'y'
   ];
   assert.deepEqual(Object.keys(second.lastKnown[0]).sort(), expectedKeys);
   assert.deepEqual(second.knownFields, expectedKeys);
+  assert.equal(second.lastKnown[0].firstSeenRound, 1, 'initial sighting is preserved');
   assert.notEqual(second.lastKnown[0].x, 1750, 'stale position, not the live one');
 
   // Expiry: entry seen in round 1 survives rounds ≤4, forgotten at round 5.
@@ -241,12 +242,12 @@ async function cleanup() {
     await testMemoryLifecycle();
     await testScoreDeterminism();
     console.log('perception.test.mjs PASSED');
-    process.exit(0);
   } catch (err) {
     console.error('perception.test.mjs FAILED:', err);
     try { await h.screenshot(page, 'perception-failure'); } catch { /* ignore */ }
-    process.exit(1);
+    process.exitCode = 1;
   } finally {
     await cleanup().catch(() => {});
   }
+  process.exit(process.exitCode ?? 0);
 })();

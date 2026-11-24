@@ -27,15 +27,20 @@
  *   the GM replans or cancels. Closing the window without a decision
  *   cancels — never confirms.
  */
-import { MODULE_ID } from "../constants.js";
+import { MODULE_ID, MORALE_TIERS } from "../constants.js";
+import { planIntentOf } from "../layers.js";
 import { isModuleEnabled } from "../module-state.js";
 import { STALE_REASONS } from "../planner.js";
+import { buildLayerTrace, renderTrace } from "../trace.js";
 import {
+    getCenterOnBot,
     getExecutionMode,
     getPreviewTimeoutSeconds,
+    getTraceMode,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "../settings.js";
+import { centerOnToken } from "./plan-overlay.js";
 
 /** GM decisions accepted by {@link resolvePreview}. */
 export const PREVIEW_DECISIONS = Object.freeze({
@@ -95,6 +100,7 @@ const STALE_WATCH_HOOKS = Object.freeze([
     "deleteToken",
     "updateActor",
     "updateCombatant",
+    "deleteCombatant",
     "updateCombat",
     "deleteCombat",
     "createWall",
@@ -234,7 +240,16 @@ export function buildPreviewViewModel(plan, context = {}) {
     const steps = rawSteps.map(step => ({
         id: step?.id ?? null,
         type: step?.type ?? null,
-        name: step?.input?.name ?? null
+        name: step?.input?.name ?? null,
+        // Issue #38: a delay step explains its wait condition — the reason
+        // and the `until` signal it holds for. Localized in
+        // `localizePreviewViewModel` — the base model stays i18n-free.
+        detail: step?.type === "delay"
+            ? {
+                reason: step?.input?.reason ?? null,
+                until: step?.input?.until ?? null
+            }
+            : null
     }));
 
     // Merge the projected resource deltas of all steps into one summary.
@@ -334,6 +349,19 @@ export function buildPreviewViewModel(plan, context = {}) {
             || a.factor.localeCompare(b.factor));
 
     const rawDiagnostics = plan?.diagnostics ?? {};
+    // Issue #26 intent telegraphing: the compact step-type chain of the
+    // plan (`move → attack`) plus the morale tiers the L2 layer stamped
+    // on the diagnostics — `localizePreviewViewModel` turns both into
+    // display strings.
+    const intent = planIntentOf(plan);
+    const rawMorale = rawDiagnostics.morale;
+    const morale = rawMorale?.enabled === true && rawMorale?.tier != null
+        ? {
+            tier: MORALE_TIERS.includes(rawMorale.tier) ? rawMorale.tier : null,
+            effectiveTier: MORALE_TIERS.includes(rawMorale.effectiveTier)
+                ? rawMorale.effectiveTier : null
+        }
+        : null;
     const diagnostics = {
         enabled: context.diagnosticsEnabled === true,
         rejected: (Array.isArray(rawDiagnostics.rejected) ? rawDiagnostics.rejected : [])
@@ -348,9 +376,20 @@ export function buildPreviewViewModel(plan, context = {}) {
         candidatesCount: _finiteOr(rawDiagnostics.candidatesCount, 0),
         chosenStep: rawDiagnostics.chosenStep ?? null
     };
+    // Issue #27: the "How it decided" trace block — the materialized
+    // per-layer entries (or the on-the-fly derivation for pre-#27
+    // plans); `aiTraceVerbose` picks the compact/full render mode at
+    // display time. Entries stay raw here; `localizePreviewViewModel`
+    // renders them into display lines.
+    const trace = Array.isArray(rawDiagnostics.trace)
+        ? rawDiagnostics.trace
+        : buildLayerTrace(rawDiagnostics);
 
     const maxReplans = Number.isFinite(context.maxReplans) ? context.maxReplans : 1;
     const replanCount = _finiteOr(plan?.replanCount, 0);
+    // A commitment replay carries no scoring — the preview marks it
+    // instead of showing a misleading bare 0 (smoke finding).
+    const commitmentReplay = plan?.breakdown?.reason === "commitment";
 
     return {
         planId: plan?.id ?? null,
@@ -358,15 +397,21 @@ export function buildPreviewViewModel(plan, context = {}) {
             ?? plan?.operationId ?? null,
         npc,
         preset: plan?.preset ?? null,
-        score: Number.isFinite(plan?.score) ? plan.score : null,
-        hasScore: Number.isFinite(plan?.score),
+        score: commitmentReplay ? null
+            : (Number.isFinite(plan?.score) ? plan.score : null),
+        hasScore: !commitmentReplay && Number.isFinite(plan?.score),
+        commitmentReplay,
         target,
         action,
         route,
         steps,
         resources,
         breakdown,
+        intent,
+        morale,
         diagnostics,
+        trace,
+        traceMode: context.traceMode ?? getTraceMode(),
         replan: {
             allowed: replanCount < maxReplans,
             count: replanCount,
@@ -463,7 +508,19 @@ export function localizePreviewViewModel(vm, i18n = null) {
             : vm.action,
         steps: (vm.steps ?? []).map(step => ({
             ...step,
-            label: _label(i18nSource, `OWAI.Preview.Step.${step.type}`, step.type ?? "?")
+            label: _label(i18nSource, `OWAI.Preview.Step.${step.type}`, step.type ?? "?"),
+            detailLabel: step.detail
+                ? (i18nSource?.format?.("OWAI.Delay.Detail", {
+                    reason: _label(
+                        i18nSource,
+                        `OWAI.Delay.Reason.${step.detail.reason}`,
+                        step.detail.reason ?? "—"),
+                    until: _label(
+                        i18nSource,
+                        `OWAI.Delay.Until.${step.detail.until}`,
+                        step.detail.until ?? "—")
+                }) ?? null)
+                : null
         })),
         resources: (vm.resources ?? []).map(entry => ({
             ...entry,
@@ -473,6 +530,27 @@ export function localizePreviewViewModel(vm, i18n = null) {
             ...entry,
             label: _label(i18nSource, `OWAI.Preview.Factor.${entry.factor}`, entry.factor)
         })),
+        // Issue #26: localized intent chain + morale tier labels.
+        intentLabel: (vm.intent?.steps ?? []).length
+            ? vm.intent.steps
+                .map(type => _label(i18nSource, `OWAI.Preview.Step.${type}`, type))
+                .join(" → ")
+            : null,
+        morale: vm.morale
+            ? {
+                ...vm.morale,
+                tierLabel: vm.morale.tier
+                    ? _label(i18nSource, `OWAI.Morale.${vm.morale.tier}`, vm.morale.tier)
+                    : null,
+                effectiveTierLabel: vm.morale.effectiveTier
+                        && vm.morale.effectiveTier !== vm.morale.tier
+                    ? _label(
+                        i18nSource,
+                        `OWAI.Morale.${vm.morale.effectiveTier}`,
+                        vm.morale.effectiveTier)
+                    : null
+            }
+            : vm.morale,
         staleLabel: vm.stale
             ? (i18nSource?.format?.("OWAI.Preview.Stale", {
                 reason: _label(i18nSource, STALE_REASON_LABEL_KEYS[vm.stale] ?? "", vm.stale)
@@ -480,7 +558,13 @@ export function localizePreviewViewModel(vm, i18n = null) {
             : null,
         timeoutLabel: vm.timeoutSeconds
             ? (i18nSource?.format?.("OWAI.Preview.Timeout", { seconds: vm.timeoutSeconds }) ?? null)
-            : null
+            : null,
+        // Issue #27: rendered per-layer trace lines for the "How it
+        // decided" collapsible block (compact/full per traceMode).
+        traceLines: renderTrace(vm.trace ?? [], {
+            i18n: i18nSource,
+            mode: vm.traceMode
+        })
     };
 }
 
@@ -597,6 +681,122 @@ export function createPreviewController({
             globalThis.ui?.notifications?.[type]?.(message);
         } catch(err) {
             // Notifications are best-effort.
+        }
+    }
+
+    /**
+     * Plan-overlay service: session override first, then the registry
+     * (issue #29 — the GM-only canvas visualization of the previewed
+     * plan). Absent services degrade to no-ops.
+     * @param {object} session
+     * @returns {object|null}
+     */
+    function _overlay(session) {
+        return _service("planOverlay", session?.overlay);
+    }
+
+    /**
+     * (Re)draw the GM-only plan overlay for a session — the route, the
+     * serialized templates and the target highlight (issue #29). Called
+     * on open, after a replan and when a stale banner appears, so the
+     * canvas picture always matches the dialog.
+     * @param {object} session
+     */
+    function _showOverlay(session) {
+        try {
+            _overlay(session)?.showPlan?.(session.plan, {
+                combat: session.combat,
+                combatant: session.combatant,
+                operationId: session.operationId,
+                stale: session.stale ?? null
+            });
+        } catch(err) {
+            // The overlay is decorative — never block the preview on it.
+        }
+    }
+
+    /**
+     * Clear the plan overlay of a resolved/dropped session.
+     * @param {object} session
+     */
+    function _clearOverlay(session) {
+        try {
+            _overlay(session)?.clearPlan?.(session.operationId);
+        } catch(err) {
+            // Overlay cleanup is best-effort.
+        }
+    }
+
+    /**
+     * Token placeable of a serialized token id/uuid on the viewed canvas.
+     * @param {string|null} idOrUuid
+     * @returns {object|null}
+     */
+    function _canvasToken(idOrUuid) {
+        if (!idOrUuid) return null;
+        try {
+            const tokens = globalThis.canvas?.tokens;
+            if (!tokens) return null;
+            const id = String(idOrUuid).split(".").pop();
+            return tokens.get?.(id)
+                ?? (tokens.placeables ?? []).find(t => t?.id === id)
+                ?? null;
+        } catch(_err) {
+            return null;
+        }
+    }
+
+    /**
+     * Serialized token reference of a plan's first attack/test step.
+     * @param {object|null} plan
+     * @returns {string|null}
+     */
+    function _planTargetRef(plan) {
+        const attack = (plan?.steps ?? [])
+            .find(step => step?.type === "attack" || step?.type === "test");
+        return attack?.input?.targetTokenId
+            ?? attack?.input?.targetTokenUuid ?? null;
+    }
+
+    /**
+     * Mark the turn like a real player's (smoke request): the acting bot
+     * is controlled and its attack target joins the GM's target set, so
+     * the canvas reads exactly like a manual attack setup.
+     * @param {object} session
+     */
+    function _applyTargeting(session) {
+        if (globalThis.game?.user?.isGM !== true) return;
+        try {
+            const bot = _canvasToken(session.combatant?.tokenId
+                ?? _tokenDoc(session.combatant?.token)?.id);
+            if (bot && !bot.controlled) {
+                bot.control?.({ releaseOthers: true });
+            }
+            const target = _canvasToken(_planTargetRef(session.plan));
+            if (target) {
+                target.setTarget?.(true, { releaseOthers: true });
+            }
+            session._targeted = target ?? null;
+            session._controlled = bot ?? null;
+        } catch(_err) {
+            // Canvas marking is best-effort.
+        }
+    }
+
+    /**
+     * Release the selection/target marks of a resolved session.
+     * @param {object} session
+     */
+    function _releaseTargeting(session) {
+        try {
+            session?._targeted?.setTarget?.(false);
+            session?._controlled?.release?.();
+        } catch(_err) {
+            // Best-effort cleanup.
+        }
+        if (session) {
+            session._targeted = null;
+            session._controlled = null;
         }
     }
 
@@ -729,6 +929,17 @@ export function createPreviewController({
         session.resolved = decision;
         _cancelTimeout(session);
         pending.delete(session.operationId);
+        _clearOverlay(session);
+        // Smoke finding: on confirm the execution record owns the same
+        // placeables — releasing the session handle here would clear the
+        // target off the GM's damage card mid-adjudication. On cancel
+        // (dialog close, timeout, stale) the marks die immediately.
+        if (decision !== PREVIEW_DECISIONS.confirm) {
+            _releaseTargeting(session);
+        } else {
+            session._targeted = null;
+            session._controlled = null;
+        }
         const dialog = session.dialog;
         session.dialog = null;
         try {
@@ -766,14 +977,29 @@ export function createPreviewController({
         }
         const operations = _operations(session);
         if (operations && typeof operations.transitionOperation === "function") {
-            try {
-                await operations.transitionOperation(
-                    session.combat, session.operationId, "awaiting-preview", "executing"
-                );
-            } catch(err) {
-                // Non-fatal: the plan executes under the same operation id.
+            const transition = await operations.transitionOperation(
+                session.combat, session.operationId, "awaiting-preview", "executing"
+            ).catch(() => null);
+            // The operation already left `awaiting-preview` elsewhere
+            // (authority abort, another client, a stale pass): executing
+            // would run the steps under a dead operation and lose the
+            // turn advance — drop the session instead.
+            if (transition?.ok === false) {
+                _drop(session, PREVIEW_DECISIONS.cancel);
+                return {
+                    ok: false,
+                    decision: PREVIEW_DECISIONS.confirm,
+                    reason: transition?.reason ?? "transition-failed"
+                };
             }
         }
+        // Lock the session before the long `executePlan` await: disarm the
+        // auto-cancel timer and mark it resolved so a stale-watch pass or
+        // the timeout callback can no longer cancel the operation
+        // mid-flight — that raced `completeTurn` would win the operation
+        // and lose the turn advance.
+        _cancelTimeout(session);
+        session.resolved = "executing";
         const executor = _service("executor", session.executor);
         let result = null;
         if (executor && typeof executor.executePlan === "function") {
@@ -877,6 +1103,10 @@ export function createPreviewController({
         session.stale = null;
         _scheduleTimeout(session);
         _render(session);
+        _showOverlay(session);
+        // The replanned attack may aim at a different token — refresh the
+        // GM's selection/target marks.
+        _applyTargeting(session);
         log(`preview ${session.operationId} replanned -> ${planned.plan.id}`);
         return { ok: true, decision: PREVIEW_DECISIONS.replan, plan: planned.plan };
     }
@@ -930,6 +1160,7 @@ export function createPreviewController({
             planner: payload.planner,
             operations: payload.operations,
             authority: payload.authority,
+            overlay: payload.overlay,
             timeoutSeconds: Number.isFinite(timeoutSeconds) ? timeoutSeconds : 0,
             timeoutId: null,
             stale: null,
@@ -939,6 +1170,13 @@ export function createPreviewController({
         pending.set(operationId, session);
         _scheduleTimeout(session);
         _present(session);
+        _showOverlay(session);
+        // Issue #32: pan the GM view onto the acting bot.
+        if (getCenterOnBot()) centerOnToken(_tokenDoc(session.combatant?.token));
+        // Smoke request: the acting bot is selected and its attack
+        // target joins the GM's target set — the canvas reads like a
+        // player's turn.
+        _applyTargeting(session);
         log(`preview ${operationId}: plan ${plan.id} timeout=${session.timeoutSeconds}s`);
         return { ok: true, operationId, session };
     }
@@ -992,6 +1230,7 @@ export function createPreviewController({
             return;
         }
         _render(session);
+        _showOverlay(session);
         log(`preview ${session.operationId} stale: ${session.stale}`);
     }
 
@@ -1151,6 +1390,78 @@ export function registerPreviewUI(api = null) {
                     )).catch(err => {
                         console.error(`${MODULE_ID} | preview decision failed`, err);
                     });
+                });
+                // Debug helper (diagnostics mode): copy the route
+                // waypoint list to the clipboard. `data-clipboard` keeps
+                // it out of the resolvePreview decision path.
+                html.find("[data-clipboard='route']").on("click", event => {
+                    event.preventDefault();
+                    const points = this.viewModel?.route?.points ?? [];
+                    const text = points.map(p => `(${p.x}, ${p.y})`).join("\n");
+                    if (!text) return;
+                    const done = globalThis.game?.clipboard?.copyPlainText?.(text)
+                        ?? globalThis.navigator?.clipboard?.writeText?.(text);
+                    Promise.resolve(done).then(() => {
+                        globalThis.ui?.notifications?.info?.(
+                            globalThis.game?.i18n?.localize?.(
+                                "OWAI.Notifications.RouteCopied") ?? "Route copied");
+                    }).catch(() => {});
+                });
+                // Debug helper (diagnostics mode): copy the full plan
+                // export — bot identity, turn context, steps, scores,
+                // rejected candidates and layer trace (smoke finding).
+                html.find("[data-clipboard='info']").on("click", event => {
+                    event.preventDefault();
+                    const session = this.session ?? {};
+                    const plan = session.plan ?? {};
+                    const snapshot = plan.snapshot ?? {};
+                    const diagnostics = plan.diagnostics ?? {};
+                    const payload = {
+                        module: MODULE_ID,
+                        exportedAt: new Date().toISOString(),
+                        combat: {
+                            id: session.combat?.id ?? snapshot.combatId ?? null,
+                            round: snapshot.round ?? session.combat?.round ?? null,
+                            turn: snapshot.turn ?? session.combat?.turn ?? null
+                        },
+                        bot: {
+                            combatantId: session.combatant?.id ?? snapshot.combatantId ?? null,
+                            name: this.viewModel?.npc?.name
+                                ?? session.combatant?.name ?? null,
+                            preset: this.viewModel?.npc?.presetLabel ?? null
+                        },
+                        operation: {
+                            id: session.operationId ?? null,
+                            phase: session.operation?.phase ?? null,
+                            revision: session.operation?.revision ?? null
+                        },
+                        plan: {
+                            id: plan.id ?? null,
+                            variant: plan.variant ?? null,
+                            score: plan.breakdown?.score ?? plan.score ?? null,
+                            steps: (plan.steps ?? []).map(step => ({
+                                id: step.id ?? null,
+                                type: step.type ?? null,
+                                cost: step.cost ?? null,
+                                input: step.input ?? null
+                            }))
+                        },
+                        breakdown: plan.breakdown ?? null,
+                        targets: diagnostics.targets ?? [],
+                        rejected: diagnostics.rejected ?? [],
+                        ranking: diagnostics.ranking ?? [],
+                        layers: (diagnostics.layers ?? [])
+                            .map(layer => layer?.code ?? layer),
+                        trace: diagnostics.trace ?? null
+                    };
+                    const text = JSON.stringify(payload, null, 2);
+                    const done = globalThis.game?.clipboard?.copyPlainText?.(text)
+                        ?? globalThis.navigator?.clipboard?.writeText?.(text);
+                    Promise.resolve(done).then(() => {
+                        globalThis.ui?.notifications?.info?.(
+                            globalThis.game?.i18n?.localize?.(
+                                "OWAI.Notifications.InfoCopied") ?? "Info copied");
+                    }).catch(() => {});
                 });
             }
 

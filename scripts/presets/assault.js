@@ -54,7 +54,40 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 0,
     // Issue #16: assault accepts risky lanes — danger only mildly deters.
-    danger: -0.5
+    danger: -0.5,
+    // Issue #37: signature weapons and a ready alternative are worth a
+    // real pull; lying down mid-charge is not the assault answer.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 0,
+    readyWeapon: 2,
+    // Issue #39: assault shrugs off shooting into a friendly melee more
+    // than other presets, but still avoids free attacks on the way out;
+    // closing into contact and avenging hits are core doctrine.
+    alliedEngagement: -2,
+    // Smoke: a re-charge away from a live engagement provokes a free
+    // attack and ping-pongs the bot between targets — price the exit
+    // like the free swing it draws, not like a casual reposition.
+    leaveMeleeEngage: -10,
+    engageDenial: 4,
+    unpin: 4,
+    grudge: 4,
+    ev: 1,
+    // Smoke finding: assault keeps swinging at the target it already
+    // attacks — the sticky pull must outbid the charge differential that
+    // otherwise ping-pongs it between near-equal hostiles; ganging up on
+    // an ally-engaged target is core melee doctrine.
+    stickyTarget: 8,
+    outnumber: 4,
+    // Smoke: closing on a known pure shooter denies its fire too — a
+    // modest tie-up pull, secondary to the charge doctrine itself.
+    tieUp: 2,
+    // Smoke: assault still prefers a covered approach over a naked
+    // sprint when intel is thin — a mild pull, far below charge doctrine.
+    seek: 1.5,
+    // Run mechanic (smoke): burning the whole turn on a sprint to close
+    // on the enemy fits assault doctrine — a mild pull below charge.
+    run: 1.5
 });
 
 /**
@@ -91,7 +124,11 @@ export function assaultPresetDefinition() {
         weights: { ...ASSAULT_WEIGHTS },
         evaluate: evaluateAssault,
         allowNoTarget: true,
-        allowNoAction: true
+        allowNoAction: true,
+        // Smoke finding: assault doctrine closes with the enemy — with
+        // zero intel (no LOS, memory or relay) the squad's radio puts
+        // rough unattackable approach markers on the nearest hostiles.
+        seekContacts: true
     };
 }
 

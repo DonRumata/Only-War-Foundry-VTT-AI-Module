@@ -98,7 +98,27 @@ export const HOLD_WEIGHTS = Object.freeze({
     reload: 3,
     overwatch: 0.5,
     // Issue #16: hold bots prefer cells the enemy covers least.
-    danger: -2
+    danger: -2,
+    // Issue #37: pinned hold bots hug the ground — drop-prone is the
+    // strongest pull here; ready weapon and signature weapons follow.
+    weaponAffinity: 1,
+    weaponInertia: 0.15,
+    dropProne: 2,
+    readyWeapon: 2,
+    // Issue #39: the hold doctrine guards allies and hates giving free
+    // attacks — disengaging is the most penalized here; unpinning beats
+    // lying pinned when a clear test is available.
+    alliedEngagement: -6,
+    leaveMeleeEngage: -8,
+    engageDenial: 2,
+    unpin: 3,
+    grudge: 2,
+    ev: 1,
+    // Target inertia for defenders — keep holding the line against the
+    // same enemy rather than spreading attention every round.
+    stickyTarget: 5,
+    outnumber: 3
+
 });
 
 /** Candidate variants whose action produces an attack/test step. */
