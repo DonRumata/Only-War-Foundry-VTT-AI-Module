@@ -302,6 +302,10 @@ adjudicated-manual, adjudicated-skill-test`.
 - Финиш: `operations.completeTurn` + продвижение хода через
   `operationCompleted`-хук или `_advanceForOperation` (сериализованный
   `nextTurn` + verify windows 600/1200/2400, 2 retry).
+- Попадание откладывает `nextTurn`: `executor/damage-wait.js` ждёт
+  применения всех попаданий на связанных карточках. Бот не применяет
+  урон сам. С `damageWaitAutoAdvance: false` после применения ход
+  переводит GM. Сквозная проверка — [сценарий T33](test-scenarios.md#t33-урон-применяет-владелец-цели).
 - Pacing: `turnPacingMs` пауза между шагами и перед nextTurn (0 — выкл).
 - Preview-mode: только preflight + plan + validate → хук
   `only-war-ai.previewRequested`, статус `preview`.
@@ -457,7 +461,7 @@ adjudicated-manual, adjudicated-skill-test`.
 ### Приказы лидера (orders)
 
 - `_orderCandidateOf`: только электнутый лидер, ≥2 живых члена, навык
-  `command`, прошло `ORDER_COOLDOWN_ROUNDS = 5` раундов с `lastOrder`.
+  `command`, прошло `ORDER_COOLDOWN_ROUNDS = 3` раунда с `lastOrder`.
 - Источники приказов: owned `order`-items (тип `veteran` = advanced,
   cost 2 halves), затем speciality-перки с `activation.type ∈ {order,
   generalOrder}` (например `sergeant_charge`), resolved через

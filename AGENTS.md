@@ -12,10 +12,10 @@
 Baseline-спецификация поведения (факторы, веса, pipeline кандидатов,
 жизненный цикл хода) — `docs/behavior.md`; точка отсчёта для слойного
 рефактора #24/#25/#26/#27.
-Карта владения кода (файл → ответственность → симптом отладки) —
-`docs/architecture-map.md`; каталог ручных тест-кейсов для GM —
-`docs/test-scenarios.md`. При изменении факторов/флагов/reason-кодов
-обновляйте `behavior.md` + `architecture-map.md` в том же PR.
+[Карта архитектуры](docs/architecture-map.md) связывает файлы с их
+ответственностью и точками отладки. [Сценарии для GM](docs/test-scenarios.md)
+помогают проверить поведение в Foundry. При изменении факторов, флагов
+или кодов причин обновляйте описание поведения и карту в том же PR.
 
 ## Структура
 
@@ -68,7 +68,7 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
 - Combatant: `lastOrder = { round, orderId, result }` (issue #38) —
   последний успешный приказ лидера; пишет executor только после
   успешного order-теста, читает fireteam (кулдаун
-  `ORDER_COOLDOWN_ROUNDS = 5` раундов).
+  `ORDER_COOLDOWN_ROUNDS = 3` раунда).
 - Combatant: `delaySync = { round, until, count }` (issue #38) —
   буккипинг синхронного удара: счётчик повторных delay-ожиданий одного
   `until`; пишет executor delay-шагом, читает `_syncDelay` (предел —
@@ -134,11 +134,13 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   attack/test шагом (только `executionMode === "automatic"`) GM получает
   whisper-чаткарту с решениями `execute | manual | skill-test | cancel`.
   `damageWaitTimeoutSeconds` (default 120, `0` — ждать бесконечно) —
-  после попавшей атаки бота `combat.nextTurn` ждёт, пока GM бросит
-  карточку урона с attack-карточки и применит её хиты; урон бот никогда
-  не применяет сам. Готовые damage-карточки (граната `skipAttackRoll`,
-  подавление) ждут своего применения; снятие ожидания — применение всех
-  хитов, ручной перевод хода, конец боя или таймаут.
+  после попадания бот ждёт броска урона и применения всех хитов;
+  готовые damage-карточки (граната `skipAttackRoll`, подавление) ждут
+  только применения. Урон применяет система по клику GM или владельца
+  цели с правами на адресное попадание (системный PR #470), не бот.
+  Ожидание также заканчивается при ручном переводе хода, конце боя
+  или таймауте. `damageWaitAutoAdvance` (default `true`) управляет
+  автоматической передачей хода после снятия ожидания.
   `layersCommitment` (default `true` — L1 реализован, issue #25),
   `layersMorale` (default `true` — L2 реализован, issue #26) и
   `layersPersonality`/`layersLookahead` (default `true`, issue #24) —
@@ -517,9 +519,10 @@ operationId дедупликация: повторный вызов возвра
 `nextTurn()` вставляется пауза `turnPacingMs` (deps `pacing`, `0` — без
 паузы). Терминальные статусы
 (`completed`/`partial`/`failed`) закрывают операцию через
-`operations.completeTurn` и переводят ход ровно один раз — хуком
-`only-war-ai.operationCompleted` (#400) либо прямым `combat.nextTurn()`
-fallback; `cancelled` и `preview` документов не трогают. Результат:
+`operations.completeTurn`. Обычно ход переводится сразу через хук
+`only-war-ai.operationCompleted` (#400) либо прямой `combat.nextTurn()`
+fallback. При попадании продвижение откладывает `executor/damage-wait.js`;
+`cancelled` и `preview` не переводят ход. Результат:
 `{status, stepsDone[], failedStep?, reason, operationId, planId,
 replanCount, resourceDelta, chatMessageIds}`.
 

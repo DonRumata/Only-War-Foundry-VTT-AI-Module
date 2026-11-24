@@ -2,15 +2,19 @@
 
 Opt-in AI-модуль для Foundry VTT **v13–v14** для системы *Only War* (`only-war-local`). Репозиторий создан в рамках эпика [#363](https://github.com/DonRumata/Only-War-Foundry-VTT-System/issues/363) системного репозитория.
 
-> Модуль находится в разработке. Текущий каркас (issue #399) содержит manifest, namespace флагов `flags["only-war-ai"]`, pure-resolver эффективной конфигурации, world settings, module API и минимальный UI. Планировщик, перцепция и выполнение хода будут добавлены следующими задачами — модуль **не управляет NPC сам по себе**.
+Модуль планирует и исполняет ходы NPC в бою, только если для них явно
+включён AI. По умолчанию GM видит план и подтверждает его перед исполнением.
 
-## Возможности каркаса
+- [Ручные сценарии для GM](docs/test-scenarios.md)
+- [Карта архитектуры](docs/architecture-map.md) и [контракты API](docs/capabilities.md)
+
+## Возможности
 
 * **Установка поверх `only-war-local`** — на `ready` модуль проверяет `game.system.id` и major-версию публичного API `game.darkHeresy.api` (issue #398). При несовместимости показывает одно GM-уведомление и остаётся выключенным (`api.enabled === false`).
 * **Конфигурация AI на трёх уровнях** — см. ниже.
 * **World settings** (только GM): `executionMode = "automatic"|"preview"` (по умолчанию `preview`) и `diagnosticsEnabled`.
 * **Pure resolver** — детерминированный приоритет Combatant → Token → Actor → disabled.
-* **Module API** — version/capabilities, config resolver и реестр сервисов для будущих planner/executor.
+* **Module API** — версия, возможности, resolver конфигурации и реестр сервисов, включая `planner` и `executor`.
 * **UI**: секция «Only War AI» на листе NPC (чекбокс «AI enabled» + пресет), секция режима в Token Config и пункты контекстного меню Combatant в трекере боя.
 
 ## Конфигурация флагов
@@ -50,8 +54,7 @@ api.version;                    // "1.0" — версия контракта м�
 api.capabilities;               // карта возможностей
 api.presets;                    // ["assault","rangedCover","hold","specOps"]
 api.config.resolveEffectiveConfig(doc);
-api.services.register("planner", impl);  // реестр для следующих подзадач
-api.services.get("planner");
+api.services.get("planner");    // сервис планирования
 api.enabled;                    // false, если проверка совместимости не пройдена
 api.incompatibleReason;         // "wrong-system" | "api-missing" | "version-mismatch" | null
 ```
