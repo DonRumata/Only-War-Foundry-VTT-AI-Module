@@ -58,6 +58,7 @@ import { STALE_REASONS } from "./planner.js";
 import { isModuleEnabled } from "./module-state.js";
 import {
     getAttackAdjudication,
+    getDamageWaitTimeoutSeconds,
     getExecutionMode,
     getPreviewTimeoutSeconds,
     getTurnPacingMs,
@@ -274,6 +275,14 @@ export function createExecutorService({
     };
     /** Adjudication request id → pending `{resolve, request}` pair (#37). */
     const pendingAdjudications = new Map();
+    /**
+     * Deferred turn advances waiting on GM damage adjudication (issue
+     * #56): operationId → `{combat, combatId, operation, watch, expect,
+     * timer, context}` — `watch` holds unsettled damage-card message
+     * ids, `expect` marks a landed attack whose damage card the GM has
+     * not rolled yet.
+     */
+    const pendingDamage = new Map();
     /** Dedup keys of emitted plan-start barks (issue #26). */
     const _barkSeen = new Set();
     let hookSubscribed = false;
@@ -368,6 +377,13 @@ export function createExecutorService({
                     pendingAdjudications.delete(requestId);
                     pending.resolve({ action: "cancel", reason: "turn-stale" });
                 }
+                // Issue #56: a manual turn advance releases the damage
+                // wait — the GM moved the combat on without the card.
+                for (const [opId, entry] of pendingDamage) {
+                    if (entry.combatId && combat?.id
+                        && entry.combatId !== combat.id) continue;
+                    _releaseDamageWait(opId, "turn-advanced");
+                }
             } catch(err) {
                 console.error(`${MODULE_ID} | adjudication cancel failed`, err);
             }
@@ -381,8 +397,29 @@ export function createExecutorService({
                     pendingAdjudications.delete(requestId);
                     pending.resolve({ action: "cancel", reason: "combat-ended" });
                 }
+                for (const opId of [...pendingDamage.keys()]) {
+                    _releaseDamageWait(opId, "combat-ended");
+                }
             } catch(err) {
                 console.error(`${MODULE_ID} | adjudication cancel failed`, err);
+            }
+        });
+        // Issue #56: damage cards are created (GM clicks "Damage" on the
+        // attack card) and updated (each applied hit rewrites the
+        // message) outside the executor — feed both events into the
+        // pending waits.
+        hooks.on("createChatMessage", message => {
+            try {
+                _onDamageMessage(message);
+            } catch(err) {
+                console.error(`${MODULE_ID} | damage-wait create hook failed`, err);
+            }
+        });
+        hooks.on("updateChatMessage", message => {
+            try {
+                _onDamageMessage(message);
+            } catch(err) {
+                console.error(`${MODULE_ID} | damage-wait update hook failed`, err);
             }
         });
         // Issue #37: adjudication card buttons resolve the pending gate —
@@ -767,7 +804,8 @@ export function createExecutorService({
             ok: true,
             delta: outcome.resourceDelta ?? {},
             chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
-            duplicate: outcome.duplicate === true
+            duplicate: outcome.duplicate === true,
+            hits: Number.isFinite(outcome.roll?.hits) ? outcome.roll.hits : null
         };
     }
 
@@ -1505,6 +1543,132 @@ export function createExecutorService({
     }
 
     /**
+     * Read the damage-roll descriptor of a chat message — `null` for
+     * anything that is not an `isDamageRoll` card. The system stores the
+     * whole `rollData` (including the step's `apiOperationId`) under
+     * `flags["only-war-local"].rollData`.
+     * @param {string} id Chat message id.
+     * @returns {object|null}
+     */
+    function _damageRollOf(id) {
+        try {
+            const message = globalThis.game?.messages?.get?.(id);
+            const rollData = message?.getRollData?.() ?? null;
+            return rollData?.flags?.isDamageRoll === true ? rollData : null;
+        } catch(err) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether every hit on a damage card is already applied
+     * (`damage.applied === true`) — the state the system's
+     * `onApplyDamageHitClick` writes back through a message update. A
+     * card without hits settles immediately.
+     * @param {object} rollData Damage-roll descriptor.
+     * @returns {boolean}
+     */
+    function _damageCardSettled(rollData) {
+        const damages = Array.isArray(rollData?.damages) ? rollData.damages : [];
+        return damages.every(damage => damage?.applied === true);
+    }
+
+    /**
+     * Damage-wait registration (issue #56): a landed bot attack defers
+     * `nextTurn` while the GM rolls the damage card and applies its
+     * hits — the bot never applies damage itself. Damage cards already
+     * produced by the step (grenade `skipAttackRoll`, suppression hits)
+     * join the watch directly; an ordinary hit only sets `expect` so the
+     * first card carrying the step's `apiOperationId` links itself in.
+     * Release paths: every watched card applied, a manual turn advance
+     * (`updateCombat`), combat end, or the `damageWaitTimeoutSeconds`
+     * timeout.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @param {object} result Public result summary.
+     * @returns {boolean} `true` when the turn advance is deferred.
+     */
+    function _registerDamageWait(context, run, result) {
+        const watch = new Set();
+        for (const id of result.chatMessageIds ?? []) {
+            const rollData = _damageRollOf(id);
+            if (rollData && !_damageCardSettled(rollData)) watch.add(id);
+        }
+        const expect = run.expectDamage === true && watch.size === 0;
+        if (!watch.size && !expect) return false;
+        const timeout = getDamageWaitTimeoutSeconds();
+        pendingDamage.set(run.operationId, {
+            combat: context.combat ?? null,
+            combatId: context.combat?.id ?? null,
+            operation: context.operation ?? run.operation ?? run.plan?.snapshot ?? null,
+            watch,
+            expect,
+            context,
+            timer: timeout > 0
+                ? setTimeout(
+                    () => _releaseDamageWait(run.operationId, "damage-wait-timeout"),
+                    timeout * 1000)
+                : null
+        });
+        return true;
+    }
+
+    /**
+     * Feed a created/updated chat message into the pending damage waits.
+     * A damage card carrying the step's `apiOperationId`
+     * (`<operationId>.<stepId>`) links itself to the operation's watch;
+     * watched cards settle as their hits get applied. When the entry is
+     * complete — nothing expected and nothing unsettled — the deferred
+     * turn advance fires.
+     * @param {object} message ChatMessage document.
+     * @returns {void}
+     */
+    function _onDamageMessage(message) {
+        if (!pendingDamage.size) return;
+        const rollData = message?.getRollData?.() ?? null;
+        if (rollData?.flags?.isDamageRoll !== true) return;
+        const messageId = message?.id ?? null;
+        if (!messageId) return;
+        const apiOp = typeof rollData.apiOperationId === "string"
+            ? rollData.apiOperationId : null;
+        for (const [opId, entry] of [...pendingDamage]) {
+            const linked = apiOp !== null && apiOp.startsWith(`${opId}.`);
+            if (linked) {
+                entry.expect = false;
+                if (!_damageCardSettled(rollData)) entry.watch.add(messageId);
+            }
+            if (entry.watch.has(messageId) && _damageCardSettled(rollData)) {
+                entry.watch.delete(messageId);
+            }
+            if (entry.expect !== true && entry.watch.size === 0) {
+                _releaseDamageWait(opId, "damage-applied");
+            }
+        }
+    }
+
+    /**
+     * Close a pending damage wait and, unless the combat already moved
+     * on, drive the deferred `nextTurn` through the same serialized
+     * path the operation-completed hook uses.
+     * @param {string} opId Executor operation id.
+     * @param {string} reason Release cause for diagnostics.
+     * @returns {void}
+     */
+    function _releaseDamageWait(opId, reason) {
+        const entry = pendingDamage.get(opId);
+        if (!entry) return;
+        pendingDamage.delete(opId);
+        if (entry.timer) clearTimeout(entry.timer);
+        const combat = entry.combat;
+        if (!combat || combat.ended === true || combat.destroyed === true) return;
+        if (!_isController(entry.context)) return;
+        if (typeof combat.nextTurn !== "function") return;
+        log(`damage wait ${opId} resolved (${reason}); advancing`);
+        _advanceForOperation(combat, entry.operation, entry.context ?? {})
+            .catch(err => console.error(`${MODULE_ID} | damage-wait advance failed`, err));
+    }
+
+    /**
      * Append the executed move to the combatant `moveJournal` flag
      * (issue #25): the bounded (32) own-move journal the L1 layer diffs
      * against `expectedState.self` — a position change with no matching
@@ -1620,23 +1784,45 @@ export function createExecutorService({
         const hit = run.plan?.breakdown?.reason === "commitment";
         try {
             if (hit && record?.status === "active") {
-                // Commitment hit: refresh the expected self position to
-                // where the turn actually ended; steps, ttl and the
-                // recorded threats stay as committed.
-                const position = run.expectedPosition ?? record.expectedState?.self;
-                await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
-                    ...record,
-                    expectedState: {
-                        ...record.expectedState,
-                        self: {
-                            x: position?.x ?? record.expectedState?.self?.x ?? null,
-                            y: position?.y ?? record.expectedState?.self?.y ?? null,
-                            elevation: Number.isFinite(position?.elevation)
-                                ? position.elevation
-                                : _finiteOr(record.expectedState?.self?.elevation, 0)
+                // Exhausted record: a replayed plan whose substantive
+                // steps are all already-satisfied moves contributes
+                // nothing — it used to stay `active` and re-commit the
+                // same skip-everything plan every turn. Stamp it
+                // cancelled so the next turn plans fresh.
+                const substantive = (Array.isArray(record.steps) ? record.steps : [])
+                    .filter(step => step?.type && step.type !== "end-turn");
+                const doneById = new Map(
+                    (result.stepsDone ?? []).map(entry => [entry.stepId, entry]));
+                const exhausted = substantive.length > 0
+                    && substantive.every(step => step.type === "move"
+                        && doneById.get(step.id)?.status === STEP_STATUS.skipped
+                        && doneById.get(step.id)?.reason === EXECUTOR_REASONS.alreadyAtEndpoint);
+                if (exhausted) {
+                    await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
+                        ...record,
+                        status: "cancelled",
+                        cancelledReason: COMMITMENT_REASONS.planExhausted,
+                        cancelledRound: _finiteOr(context.combat?.round, 0)
+                    });
+                } else {
+                    // Commitment hit: refresh the expected self position to
+                    // where the turn actually ended; steps, ttl and the
+                    // recorded threats stay as committed.
+                    const position = run.expectedPosition ?? record.expectedState?.self;
+                    await combatant.setFlag(MODULE_ID, FLAG_KEYS.committedPlan, {
+                        ...record,
+                        expectedState: {
+                            ...record.expectedState,
+                            self: {
+                                x: position?.x ?? record.expectedState?.self?.x ?? null,
+                                y: position?.y ?? record.expectedState?.self?.y ?? null,
+                                elevation: Number.isFinite(position?.elevation)
+                                    ? position.elevation
+                                    : _finiteOr(record.expectedState?.self?.elevation, 0)
+                            }
                         }
-                    }
-                });
+                    });
+                }
             } else if (invalidated && invalidated !== COMMITMENT_REASONS.noCommitment
                 && record?.status === "active") {
                 // Dead plan: stamp the cancellation so the next turn
@@ -1755,7 +1941,7 @@ export function createExecutorService({
         if (!rejected.length) return null;
         const counts = new Map();
         for (const entry of rejected) {
-            const reason = entry?.reason ?? "unknown";
+            const reason = String(entry?.reason ?? "unknown");
             counts.set(reason, (counts.get(reason) ?? 0) + 1);
         }
         return [...counts.entries()]
@@ -1776,10 +1962,15 @@ export function createExecutorService({
     function _report(context, run, result) {
         const i18n = globalThis.game?.i18n;
         const name = run.combatant?.name ?? "NPC";
-        const message = i18n?.format?.("OWAI.Notifications.ExecutorStopped", {
-            name,
-            reason: result.reason ?? "unknown"
-        }) ?? `Only War AI: ${name} stopped (${result.reason})`;
+        let message = `Only War AI: ${name} stopped (${result.reason})`;
+        try {
+            message = i18n?.format?.("OWAI.Notifications.ExecutorStopped", {
+                name,
+                reason: result.reason ?? "unknown"
+            }) ?? message;
+        } catch(err) {
+            // Localization is best-effort diagnostics.
+        }
         try {
             globalThis.ui?.notifications?.warn?.(message);
         } catch(err) {
@@ -1787,29 +1978,32 @@ export function createExecutorService({
         }
         log(`execution ${run.operationId} stopped: ${result.reason}`, run.report ?? "");
         if (diagnostics() && typeof globalThis.ChatMessage !== "undefined") {
-            const rejected = _rejectedSummary(run.report);
-            const detail = rejected
-                ? (i18n?.format?.("OWAI.Chat.ExecutorDiagnosticsDetail", { list: rejected })
-                    ?? ` rejected: ${rejected}`)
-                : "";
-            const content = i18n?.format?.("OWAI.Chat.ExecutorDiagnostics", {
-                name,
-                reason: result.reason ?? "unknown",
-                plan: result.planId ?? "—",
-                detail
-            }) ?? message;
-            // Issue #27: the stopped/cancelled turn whispers its compact
-            // reason trace — "commitment cancelled: gm-intervention;
-            // morale desperate; winner attack-in-place 0.41" — so the GM
-            // reads *why* without opening diagnostics.
-            const traceLine = compactTraceLine(
-                run.report ?? run.plan?.diagnostics, i18n);
-            const trace = traceLine
-                ? (barkText("OWAI.Chat.ExecutorTrace", { line: traceLine })
-                    ?? ` — trace: ${traceLine}`)
-                : "";
-            const whisper = gmWhisper();
+            // The whole diagnostics-card block is guarded: a broken i18n
+            // or trace formatter must never crash the executor — the
+            // turn is already finished when this runs.
             try {
+                const rejected = _rejectedSummary(run.report);
+                const detail = rejected
+                    ? (barkText("OWAI.Chat.ExecutorDiagnosticsDetail", { list: rejected })
+                        ?? ` rejected: ${rejected}`)
+                    : "";
+                const content = barkText("OWAI.Chat.ExecutorDiagnostics", {
+                    name,
+                    reason: result.reason ?? "unknown",
+                    plan: result.planId ?? "—",
+                    detail
+                }) ?? message;
+                // Issue #27: the stopped/cancelled turn whispers its compact
+                // reason trace — "commitment cancelled: gm-intervention;
+                // morale desperate; winner attack-in-place 0.41" — so the GM
+                // reads *why* without opening diagnostics.
+                const traceLine = compactTraceLine(
+                    run.report ?? run.plan?.diagnostics, i18n);
+                const trace = traceLine
+                    ? (barkText("OWAI.Chat.ExecutorTrace", { line: traceLine })
+                        ?? ` — trace: ${traceLine}`)
+                    : "";
+                const whisper = gmWhisper();
                 Promise.resolve(globalThis.ChatMessage.create({
                     content: `<p>${content}${trace}</p>`,
                     whisper,
@@ -2018,6 +2212,12 @@ export function createExecutorService({
                     });
                     _mergeDelta(resourceDelta, outcome.delta);
                     if (outcome.chatMessageIds) chatMessageIds.push(...outcome.chatMessageIds);
+                    // A landed attack expects the GM to roll and apply a
+                    // damage card before the turn advances — the bot
+                    // never applies damage itself (damage-wait below).
+                    if (Number.isFinite(outcome.hits) && outcome.hits > 0) {
+                        run.expectDamage = true;
+                    }
                     if (irreversible && !outcome.skipped) irreversibleSpent = true;
                     // Issue #33: accumulate this turn's spent budget so a
                     // later replan only offers the remainder.
@@ -2108,7 +2308,12 @@ export function createExecutorService({
             chatMessageIds,
             diagnostics: run.report ?? run.plan?.diagnostics
         });
-        await _finish(context, run, result, true);
+        // Damage-wait: when the turn produced a landed attack the GM
+        // still has to roll the damage card and apply its hits — the
+        // operation completes but `nextTurn` waits for that adjudication
+        // (manual turn advance or the timeout releases the wait).
+        const waiting = _registerDamageWait(context, run, result);
+        await _finish(context, run, result, !waiting);
         if (status !== EXECUTOR_STATUS.completed) _report(context, run, result);
         log(`execution ${run.operationId}: ${status} reason=${reason} steps=${stepsDone.length}`);
         return result;

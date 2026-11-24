@@ -651,7 +651,16 @@ export const COMMITMENT_REASONS = Object.freeze({
     targetGone: "target-gone",
     moraleChanged: "morale-changed",
     threatDrift: "threat-drift",
-    l0Veto: "l0-veto"
+    // A replayed attack step whose firing point no longer sees the live
+    // target — the world moved (or the record always lacked LOS); the
+    // bot replans instead of replaying a shot through a wall.
+    losBroken: "los-broken",
+    l0Veto: "l0-veto",
+    // Executor-side stamp: every substantive step of the replayed
+    // record resolved to a no-op (a move-only plan whose endpoint is
+    // already reached) — the record is closed so the next turn plans
+    // fresh instead of re-committing an exhausted route forever.
+    planExhausted: "plan-exhausted"
 });
 
 /**
@@ -808,6 +817,25 @@ function _tokenPosition(doc) {
         x: Number.isFinite(x) ? x : null,
         y: Number.isFinite(y) ? y : null
     };
+}
+
+/**
+ * Centre point of a token document — `center` when the document exposes
+ * it, otherwise the top-left position plus half a footprint (default
+ * 100px cells when the live grid size is unknown).
+ * @param {object|null} doc
+ * @param {number} [gridSize] Scene grid size in pixels.
+ * @returns {{x: number|null, y: number|null}}
+ */
+function _tokenCenter(doc, gridSize = 100) {
+    const center = doc?.center ?? doc?.object?.center;
+    if (center && Number.isFinite(center.x) && Number.isFinite(center.y)) {
+        return { x: center.x, y: center.y };
+    }
+    const pos = _tokenPosition(doc);
+    if (!Number.isFinite(pos.x) || !Number.isFinite(pos.y)) return pos;
+    const size = Number.isFinite(gridSize) && gridSize > 0 ? gridSize : 100;
+    return { x: pos.x + (size / 2), y: pos.y + (size / 2) };
 }
 
 /**
@@ -1152,6 +1180,42 @@ export function validateCommitment(record, live = {}) {
             });
         }
     }
+    // Stale attack (smoke finding): a committed attack whose firing
+    // point — the last move destination or the recorded self position —
+    // can no longer see the live target position is replayed verbatim
+    // otherwise, walking the bot into a wall it cannot shoot through.
+    if (typeof live.losCheck === "function") {
+        const attackStep = steps.find(
+            step => step?.type === "attack" || step?.type === "test");
+        const targetRef = attackStep?.input?.targetTokenId
+            ?? attackStep?.input?.targetTokenUuid ?? null;
+        const targetDoc = targetRef && typeof live.resolveToken === "function"
+            ? live.resolveToken(targetRef) : null;
+        if (attackStep && targetDoc) {
+            const moveStep = [...steps].reverse()
+                .find(step => step?.type === "move");
+            const origin = moveStep?.input?.to ?? moveStep?.input?.destination
+                ?? expected?.self ?? liveSelf ?? null;
+            const pos = _tokenCenter(targetDoc, live.gridSize);
+            if (Number.isFinite(origin?.x) && Number.isFinite(origin?.y)
+                && Number.isFinite(pos.x) && Number.isFinite(pos.y)) {
+                let open = true;
+                try {
+                    open = live.losCheck(
+                        { center: { x: origin.x, y: origin.y }, document: null },
+                        { center: { x: pos.x, y: pos.y }, document: null }) !== false;
+                } catch(err) {
+                    open = true;
+                }
+                if (!open) {
+                    return fail(COMMITMENT_REASONS.losBroken, {
+                        step: attackStep.id ?? null,
+                        targetId: targetRef
+                    });
+                }
+            }
+        }
+    }
     return { valid: true, reason: null, accepted };
 }
 
@@ -1204,8 +1268,15 @@ function _commitmentLiveView({ combat, combatant, context, selfStatuses }) {
             ? context.positionTolerance : COMMITMENT_POSITION_TOLERANCE_PX,
         moveTolerancePx: Number.isFinite(context?.moveTolerancePx)
             ? context.moveTolerancePx : gridSize,
+        gridSize,
         resolveToken: tokenId => _findTokenDoc(tokenId, combat, scene),
-        isTokenAlive: doc => _committedTokenAlive(doc, combat)
+        isTokenAlive: doc => _committedTokenAlive(doc, combat),
+        // Wall-geometry probe for the committed-attack staleness check —
+        // absent when no perception service was injected, the check then
+        // degrades to the other invalidators.
+        losCheck: typeof context?.perception?.hasLineOfSight === "function"
+            ? (from, to) => context.perception.hasLineOfSight(from, to)
+            : null
     };
 }
 

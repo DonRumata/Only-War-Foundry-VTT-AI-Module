@@ -38,6 +38,7 @@ import {
     ATTACK_ADJUDICATION_MODES,
     DEFAULT_AI_DIFFICULTY,
     DEFAULT_ATTACK_ADJUDICATION,
+    DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS,
     DEFAULT_LAYER_FLAGS,
     DEFAULT_PREFERRED_COHESION,
     DEFAULT_PREVIEW_TIMEOUT_SECONDS,
@@ -99,6 +100,19 @@ export function registerSettings() {
         config: true,
         type: Number,
         default: DEFAULT_PREVIEW_TIMEOUT_SECONDS
+    });
+
+    // Issue #56: bound of the post-attack damage adjudication wait —
+    // a landed bot attack defers `nextTurn` while the GM rolls and
+    // applies the damage card; `0` waits until the turn is advanced
+    // manually.
+    game.settings.register(MODULE_ID, SETTING_KEYS.damageWaitTimeoutSeconds, {
+        name: "OWAI.Settings.DamageWaitTimeout.Name",
+        hint: "OWAI.Settings.DamageWaitTimeout.Hint",
+        scope: "world",
+        config: true,
+        type: Number,
+        default: DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS
     });
 
     game.settings.register(MODULE_ID, SETTING_KEYS.turnPacingMs, {
@@ -304,6 +318,24 @@ export function getPreviewTimeoutSeconds() {
         return Number.isFinite(value) && value >= 0 ? value : DEFAULT_PREVIEW_TIMEOUT_SECONDS;
     } catch(_err) {
         return DEFAULT_PREVIEW_TIMEOUT_SECONDS;
+    }
+}
+
+/**
+ * Bound of the post-attack damage adjudication wait in seconds (issue
+ * #56). A landed bot attack defers `combat.nextTurn` while the GM rolls
+ * the damage card and applies its hits; `0` disables the timeout so the
+ * turn waits until the card settles or the GM advances it manually.
+ * Damaged or missing values fall back to
+ * {@link DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS}.
+ * @returns {number}
+ */
+export function getDamageWaitTimeoutSeconds() {
+    try {
+        const value = game.settings.get(MODULE_ID, SETTING_KEYS.damageWaitTimeoutSeconds);
+        return Number.isFinite(value) && value >= 0 ? value : DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS;
+    } catch(_err) {
+        return DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS;
     }
 }
 

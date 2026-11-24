@@ -81,6 +81,11 @@
             {{localize "OWAI.Preview.Route.Cost"}}: {{route.cost}}
             {{#if route.approximate}} — {{localize "OWAI.Preview.Route.Approximate"}}{{/if}}
         </p>
+        {{#if diagnostics.enabled}}
+        <button type="button" class="ow-ai-copy-route" data-clipboard="route">
+            <i class="fas fa-copy"></i> {{localize "OWAI.Preview.Route.Copy"}}
+        </button>
+        {{/if}}
         {{else}}
         <p class="notes">{{localize "OWAI.Preview.Route.Empty"}}</p>
         {{/if}}

@@ -492,7 +492,7 @@ function _renderEntry(entry, i18n) {
             const result = _label(i18n,
                 entry.mistake ? "OWAI.Trace.EasySlip.Mistake" : "OWAI.Trace.EasySlip.Held",
                 entry.mistake ? "picked a lower score" : "held the best pick");
-            return `${prefix}${_format(i18n, "OWAI.Trace.EasySlip", {
+            return `${prefix}${_format(i18n, "OWAI.Trace.EasySlip.Result", {
                 result,
                 chance: entry.chance ?? "—"
             }, `easy slip: ${result} (p=${entry.chance ?? "?"})`)}`;

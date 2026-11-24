@@ -793,3 +793,99 @@ test("issue #33: context.spent reduces the remaining turn budget", async () => {
         (sum, step) => sum + (step.cost?.halves ?? 0), 0);
     assert.ok(halves <= 1, `at most one half action remains, got ${halves}`);
 });
+
+test("a bot already inside melee reach swings in place instead of charging", async () => {
+    // The injected measure claims the enemy is 3 units away while the
+    // centre-to-centre distance is a single cell (1.5 units): the
+    // inconsistent metric used to dress the same in-place swing as a
+    // charge. `alreadyEngaged` reads the endpoint-consistent measure.
+    const world = makeWorld({ enemies: [{ x: 100, y: 0 }] });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: [{
+            tokenId: world.enemies[0].token.id,
+            tokenUuid: `Scene.${world.scene.id}.Token.${world.enemies[0].token.id}`,
+            x: world.enemies[0].token.x,
+            y: world.enemies[0].token.y,
+            elevation: 0,
+            distance: 3,
+            canAttack: true,
+            source: "injected"
+        }],
+        actions: [{
+            id: "knife", type: "attack", name: "Knife",
+            itemUuid: `Actor.${world.actor.id}.Item.w1`, itemId: "w1",
+            class: "melee", range: 2, cost: 1
+        }],
+        moves: [{
+            key: "m1", x: 200, y: 0, i: 2, j: 0, cost: 2, distance: 1.5,
+            waypoints: [{ x: 100, y: 0 }, { x: 200, y: 0 }]
+        }]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "melee attack exists");
+    assert.notEqual(attack.input.mode, "charge",
+        "an adjacent enemy is attacked in place, never charged");
+    assert.ok(!result.plan.steps.some(step => step.type === "move"),
+        "no reposition step rides along at melee contact");
+});
+
+test("a move-attack endpoint without LOS is rejected instead of walking blind", async () => {
+    const world = makeWorld({ enemies: [{ x: 5000, y: 0 }] });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        perception: { hasLineOfSight: () => false },
+        targets: [{
+            tokenId: world.enemies[0].token.id,
+            tokenUuid: `Scene.${world.scene.id}.Token.${world.enemies[0].token.id}`,
+            x: world.enemies[0].token.x,
+            y: world.enemies[0].token.y,
+            elevation: 0,
+            canAttack: true,
+            source: "injected"
+        }],
+        actions: [{
+            id: "lasgun", type: "attack", name: "Lasgun",
+            itemUuid: `Actor.${world.actor.id}.Item.w1`, itemId: "w1",
+            class: "ranged", range: 30, cost: 1
+        }],
+        moves: [
+            {
+                key: "far", x: 4800, y: 0, i: 48, j: 0, cost: 48, distance: 3,
+                waypoints: [{ x: 4800, y: 0 }]
+            },
+            {
+                key: "near", x: 1000, y: 0, i: 10, j: 0, cost: 10, distance: 60,
+                waypoints: [{ x: 1000, y: 0 }]
+            }
+        ]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(!result.plan.steps.some(step => step.type === "attack"),
+        "a blind firing cell never produces a move-attack");
+    assert.ok(result.plan.diagnostics?.rejected?.some(
+        r => r.reason === "no-los-endpoint"), "rejection is traced");
+});
+
+test("blast aim probes LOS to the exact aim point, never a shifted corner", async () => {
+    const seen = [];
+    const { world, context } = makeBlastContext({
+        blastTokens: [{ tokenUuid: "enemy-uuid", x: 300, y: 0, disposition: 1 }]
+    });
+    context.perception = {
+        hasLineOfSight: (from, to) => {
+            seen.push({ from, to });
+            return true;
+        }
+    };
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(seen.length > 0, "the aim point was probed");
+    assert.ok(seen.every(call => call.to && call.to.center),
+        "aim probes arrive as centre points — bare {x,y} was treated as a top-left corner and measured into the wall");
+});

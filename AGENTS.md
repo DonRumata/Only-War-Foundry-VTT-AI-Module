@@ -126,6 +126,12 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   `auto` — бросок через системный API сразу, `gm-confirm` — перед каждым
   attack/test шагом (только `executionMode === "automatic"`) GM получает
   whisper-чаткарту с решениями `execute | manual | skill-test | cancel`.
+  `damageWaitTimeoutSeconds` (default 120, `0` — ждать бесконечно) —
+  после попавшей атаки бота `combat.nextTurn` ждёт, пока GM бросит
+  карточку урона с attack-карточки и применит её хиты; урон бот никогда
+  не применяет сам. Готовые damage-карточки (граната `skipAttackRoll`,
+  подавление) ждут своего применения; снятие ожидания — применение всех
+  хитов, ручной перевод хода, конец боя или таймаут.
   `layersCommitment` (default `true` — L1 реализован, issue #25),
   `layersMorale` (default `true` — L2 реализован, issue #26) и
   `layersPersonality`/`layersLookahead` (default `true`, issue #24) —

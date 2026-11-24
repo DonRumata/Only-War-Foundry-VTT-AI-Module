@@ -105,9 +105,10 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     weaponInertia: 0.15,
     dropProne: 1,
     readyWeapon: 2,
-    // Issue #39: spec-ops is disciplined fire — strong shooting-into-
-    // melee avoidance, mild engage pull and a real grudge memory.
-    alliedEngagement: -14,
+    // Issue #39: spec-ops is disciplined fire — real shooting-into-
+    // melee avoidance (−6, roughly the −20 rules penalty), mild engage
+    // pull and a real grudge memory.
+    alliedEngagement: -6,
     leaveMeleeEngage: -6,
     engageDenial: 1,
     unpin: 4,
@@ -156,7 +157,8 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         cover: 2,
         exposure: -1,
         holdPosition: -2,
-        flankAngle: 8
+        flankAngle: 8,
+        flankProgress: 6
     }),
     assault: Object.freeze({
         attackNow: 8,
@@ -496,6 +498,37 @@ function _flankAngle(candidate, context, minAngleDeg) {
  * @param {object} context
  * @returns {number}
  */
+/**
+ * `flankProgress` factor: how much closer the candidate endpoint lands
+ * to the team's flank maneuver point (`context.team.flankPoint`)
+ * relative to the current position — the move that actually runs the
+ * maneuver, not just the firing angle `flankAngle` rewards.
+ * @param {object} candidate
+ * @param {object} context
+ * @returns {number}
+ */
+function _flankProgress(candidate, context) {
+    const point = context.team?.flankPoint ?? null;
+    const self = context.selfPos;
+    const endpoint = _candidateEndpoint(candidate, context);
+    if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
+        || !Number.isFinite(self?.x) || !Number.isFinite(self?.y) || !endpoint) {
+        return 0;
+    }
+    const base = _dist(self, point);
+    if (!(base > 0)) return 0;
+    return Math.round(_clamp01((base - _dist(endpoint, point)) / base) * 1e4) / 1e4;
+}
+
+/**
+ * Cohesion-restoration progress of the candidate endpoint toward the
+ * team's regroup point (or centre): 1 when the endpoint lands on it,
+ * 0 when it keeps or extends the distance. Feeds the
+ * `cohesionRestore` factor for `regroup`/`support` tasks (issue #56).
+ * @param {object} candidate Scored candidate `{variant, move?}`.
+ * @param {object} context Evaluation context (`selfPos`, `team`).
+ * @returns {number} 0..1.
+ */
 function _cohesionRestore(candidate, context) {
     const regroupPoint = context.team?.regroupPoint ?? context.team?.center
         ?? context.regroupPoint ?? null;
@@ -831,6 +864,11 @@ export function createSpecOpsTactic(config = {}) {
 export function specOpsVeto({ candidate = {} } = {}) {
     if (!ATTACK_VARIANTS.has(candidate.variant)) return null;
     const target = candidate.target;
+    // A blast aim point on a last-known position is the deliberate
+    // "room clearing" memory-strike — the planner only offers it when
+    // every covered square stays clear of friendlies, so it survives
+    // the hidden-target veto the preset otherwise demands.
+    if (candidate.aim && target?.source === "last-known") return null;
     if (target?.source === "last-known" || target?.hidden === true) {
         return SPEC_OPS_VETO_HIDDEN_TARGET;
     }
@@ -864,6 +902,7 @@ export function evaluateSpecOps({
     const enriched = { ...factors };
     if (task === "flank") {
         enriched.flankAngle = _flankAngle(candidate, context, cfg.flankMinAngleDegrees);
+        enriched.flankProgress = _flankProgress(candidate, context);
     }
     if (task === "regroup") {
         // Issue #24 review: `fanatic.ignoreRegroup` zeroes the regroup
@@ -889,6 +928,7 @@ export function evaluateSpecOps({
                 task: task ?? "solo",
                 reason: task ? null : "no-fireteam",
                 flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
+                flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null,
                 cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null
             }
         }

@@ -12,8 +12,9 @@
  *   their melee reach plus a charge allowance with a linear falloff.
  * - `dangerAt(point)` returns a normalized `0..1` score: the sum of
  *   per-source contributions capped at 1. A ranged emitter contributes
- *   its full normalized strength `min(1, ev / referenceDamage)` whenever
- *   the point sits inside weapon range; melee emitters contribute full
+ *   its full normalized strength `min(1, ev / referenceDamage)` inside
+ *   half its weapon range and decays linearly to zero at the range edge
+ *   (long shots are less threatening); melee emitters contribute full
  *   strength inside melee reach and decay linearly to zero across the
  *   charge allowance. A wall-check LOS probe gates every contribution;
  *   without a probe the threat pessimistically counts (the bot assumes
@@ -191,6 +192,7 @@ function _normalizeThreat(raw, index) {
         id: raw.tokenUuid ?? raw.tokenId ?? raw.id ?? `threat-${index}`,
         tokenId: raw.tokenId ?? null,
         tokenUuid: raw.tokenUuid ?? null,
+        name: raw.name ?? raw.tokenName ?? null,
         x,
         y,
         emitters
@@ -316,13 +318,16 @@ export function buildThreatMap({
             if (distance >= reach + allowance) return 0;
             return strength * (1 - ((distance - reach) / allowance));
         }
-        return emitter.range > 0 && distance <= emitter.range + 1e-9 ? strength : 0;
+        if (!(emitter.range > 0) || distance >= emitter.range) return 0;
+        const half = emitter.range / 2;
+        return distance <= half ? strength
+            : strength * (1 - ((distance - half) / half));
     }
 
     /**
      * Per-source contribution records for `point` (deterministic order).
      * @param {{x: number, y: number}} point
-     * @returns {object[]} `{id, contribution}` entries.
+     * @returns {object[]} `{id, name, contribution}` entries.
      */
     function explain(point) {
         if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)) return [];
@@ -335,6 +340,7 @@ export function buildThreatMap({
             if (contribution > 0 && _losOpen(probe, { x: source.x, y: source.y }, point)) {
                 entries.push({
                     id: source.id,
+                    name: source.name ?? null,
                     contribution: Math.round(contribution * 1e4) / 1e4
                 });
             }
@@ -439,8 +445,9 @@ export function threatSourcesOf(targets, { combat = null, scene = null, findToke
             const single = _normalizeEmitter(profile);
             if (single) emitters = [single];
         }
+        let doc = null;
         if (!emitters.length) {
-            const doc = lookup(target.tokenId ?? target.tokenUuid);
+            doc = lookup(target.tokenId ?? target.tokenUuid);
             const actor = _actorOfTarget(doc);
             emitters = weaponEmitters(actor);
         }
@@ -448,6 +455,7 @@ export function threatSourcesOf(targets, { combat = null, scene = null, findToke
         sources.push({
             tokenId: target.tokenId ?? null,
             tokenUuid: target.tokenUuid ?? null,
+            name: target.name ?? doc?.name ?? null,
             x: target.x,
             y: target.y,
             emitters

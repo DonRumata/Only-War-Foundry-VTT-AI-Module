@@ -94,6 +94,10 @@ export const SETTING_KEYS = Object.freeze({
     diagnosticsEnabled: "diagnosticsEnabled",
     preferredCohesion: "preferredCohesion",
     previewTimeoutSeconds: "previewTimeoutSeconds",
+    // The executor defers `nextTurn` after a landed bot attack while the
+    // GM rolls/applies the damage card; this bounds that wait (`0` —
+    // wait until the card is settled or the turn advances manually).
+    damageWaitTimeoutSeconds: "damageWaitTimeoutSeconds",
     turnPacingMs: "turnPacingMs",
     aiDifficulty: "aiDifficulty",
     threatMapOverlay: "threatMapOverlay",
@@ -311,6 +315,14 @@ export const TRACE_TOP_FACTORS = 3;
 
 /** Default GM preview timeout in seconds (issue #409); 0 disables it. */
 export const DEFAULT_PREVIEW_TIMEOUT_SECONDS = 60;
+
+/**
+ * Default bound of the post-attack damage wait in seconds (issue #56):
+ * after a landed bot attack the executor holds `combat.nextTurn` while
+ * the GM rolls and applies the damage card. `0` waits indefinitely —
+ * a manual turn advance always releases the wait.
+ */
+export const DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS = 120;
 
 /** Execution modes for the world setting. */
 export const EXECUTION_MODES = Object.freeze([

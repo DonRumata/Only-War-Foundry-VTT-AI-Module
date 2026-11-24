@@ -1107,3 +1107,31 @@ test("reactive mode: >1 same-team intervention squeezes the ttl to one round", (
     });
     assert.equal(after.reactive, false);
 });
+
+test("validateCommitment: a committed attack without live LOS is los-broken", () => {
+    const world = makeWorld();
+    const record = committedRecord(world);
+    const base = {
+        combatId: world.combat.id,
+        round: 1,
+        self: { x: 0, y: 0, elevation: 0 },
+        resolveToken: id => id === world.enemyToken.id ? world.enemyToken : null,
+        isTokenAlive: () => true
+    };
+    const verdict = validateCommitment(record, {
+        ...base,
+        losCheck: () => false
+    });
+    assert.equal(verdict.valid, false);
+    assert.equal(verdict.reason, COMMITMENT_REASONS.losBroken);
+    assert.equal(verdict.detail.step, "step-attack-1");
+    // An open lane keeps the record a hit; a probe throwing degrades to open.
+    assert.equal(validateCommitment(record, {
+        ...base,
+        losCheck: () => true
+    }).valid, true);
+    assert.equal(validateCommitment(record, {
+        ...base,
+        losCheck: () => { throw new Error("probe down"); }
+    }).valid, true);
+});

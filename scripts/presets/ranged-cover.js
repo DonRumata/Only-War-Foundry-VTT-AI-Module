@@ -87,8 +87,9 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     dropProne: 1.5,
     readyWeapon: 2,
     // Issue #39 + smoke: a shooter preset — firing into a friendly melee
-    // is flatly wrong; the bot aims or repositions instead (−10).
-    alliedEngagement: -14,
+    // is a real −20 penalty, not a veto (−6): an unengaged comparable
+    // target still wins, but the only available shot is not refused.
+    alliedEngagement: -6,
     leaveMeleeEngage: -6,
     engageDenial: 0,
     unpin: 3,

@@ -92,7 +92,7 @@ function _injectNpcSection(html, actor) {
                 <input type="checkbox" data-ow-ai-field="includeNeutral" ${includeNeutral ? "checked" : ""}>
             </div>
             <div class="form-group">
-                <label>${_localize("OWAI.Sheet.PreferredWeapon")}</label>
+                <label>${_localize("OWAI.Sheet.PreferredWeapon.Label")}</label>
                 <select data-ow-ai-field="preferredWeapon">
                     ${_weaponOptions(actor, preferredWeapon)}
                 </select>

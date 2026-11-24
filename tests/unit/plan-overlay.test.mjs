@@ -188,10 +188,12 @@ test("buildPlanOverlayModel emits route, cone and target from a serialized plan"
 
     // Route: self centre → waypoint centres → destination centre (the
     // `to` doc position duplicates the last waypoint → no extra point).
+    // Serialized route points are cell centres already — the overlay
+    // must not shift them by half a footprint a second time (issue #56).
     assert.deepEqual(model.route.points, [
         { x: 50, y: 50 },
-        { x: 150, y: 50 },
-        { x: 250, y: 50 }
+        { x: 100, y: 0 },
+        { x: 200, y: 0 }
     ]);
     assert.equal(model.route.approximate, false);
 
@@ -204,7 +206,7 @@ test("buildPlanOverlayModel emits route, cone and target from a serialized plan"
     assert.equal(cone.arc, 30);
     assert.equal(cone.rangeUnits, 9);
     assert.ok(Math.abs(cone.radiusPx - 600) < 1e-6);
-    assert.deepEqual(cone.origin, { x: 250, y: 50 });
+    assert.deepEqual(cone.origin, { x: 200, y: 0 });
 
     // Target highlight uses the resolved token bounds.
     assert.equal(model.target.tokenId, "enemy1");
@@ -521,7 +523,7 @@ test("buildPlanOverlayModel emits an attack ray from origin to target centre", (
     });
     // From the move destination centre to the target bounds centre.
     assert.deepEqual(model.attackRay, {
-        from: { x: 250, y: 50 },
+        from: { x: 200, y: 0 },
         to: { x: 350, y: 50 }
     });
     assert.equal(model.sceneId, "scene-1");

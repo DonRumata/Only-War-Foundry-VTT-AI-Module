@@ -943,7 +943,10 @@ function _bestBlastAim({
         if (requireLos && perception && typeof perception.hasLineOfSight === "function") {
             let los = true;
             try {
-                los = perception.hasLineOfSight(tokenDoc, point) === true;
+                // The aim point is a pixel centre — wrap it so the probe
+                // does not treat it as a top-left corner and measure
+                // into the wall half a cell away.
+                los = perception.hasLineOfSight(tokenDoc, { center: point }) === true;
             } catch(err) {
                 los = true;
             }
@@ -1120,7 +1123,8 @@ function _bestConeAim({
             for (const entry of covered) {
                 let los = true;
                 try {
-                    los = perception.hasLineOfSight(tokenDoc, { x: entry.x, y: entry.y }) === true;
+                    los = perception.hasLineOfSight(tokenDoc,
+                        { center: { x: entry.x, y: entry.y } }) === true;
                 } catch(err) {
                     los = true;
                 }
@@ -2926,6 +2930,21 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
                 }
             }
         }
+        // Spec-ops flank task: the maneuver anchor is the team's
+        // `flankPoint`, not the attack target — merge cells on the way
+        // to it or the flanker never sees a route off the frontal axis.
+        const flankPoint = context.team?.task === "flank"
+            ? context.team?.flankPoint : null;
+        if (Number.isFinite(flankPoint?.x) && Number.isFinite(flankPoint?.y)) {
+            const seen = new Set(raw.map(entry =>
+                `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`));
+            for (const entry of find({ target: flankPoint })) {
+                const key = `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                raw.push({ ...entry, distance: null });
+            }
+        }
     }
     if (raw === null) {
         // Fallback without navigation: staying put plus a straight-line
@@ -3002,6 +3021,9 @@ function _resolveMoves({ tokenDoc, target, range, bandRange = null,
  * @param {object|null} [input.orderBoost] `{character, pressured}` — the
  *   `order` factor grows +0.5 in `disciplined`/`elite` teams and +0.5
  *   under morale pressure (issue #38, graceful #26 hook).
+ * @param {Map<string,object>|null} [input.shooterProfiles] tokenUuid →
+ *   `{threat, distance}` of visible enemies — feeds the `counterThreat`
+ *   factor weighting safer firing angles.
  * @returns {object}
  */
 function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
@@ -3899,15 +3921,23 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
+        // Services resolve ahead of L1: the committed-attack staleness
+        // check (los-broken) needs the perception probe inside the live
+        // view, and navigation feeds the flank move probe further down.
+        const perception = _service("perception", context.perception);
+        const navigation = _service("navigation", context.navigation);
+        const commitmentContext = perception
+            ? { ...context, perception } : context;
         // Issue #24/#25 L1 commitment: a valid committed plan (flag
         // record or injected `context.commitment`) short-circuits the
         // funnel — its serialized steps execute verbatim and no scoring
         // runs. The layer validates the record's `expectedState` against
         // live state (ttl, own-move journal, gm-intervention, target,
-        // morale tier, threat drift, cheap L0) and reports the stable
-        // invalidator codes on the trace.
+        // morale tier, threat drift, attack LOS, cheap L0) and reports
+        // the stable invalidator codes on the trace.
         const commitment = applyCommitmentLayer({
-            combat, combatant, context, flags: layerFlags, diagnostics,
+            combat, combatant, context: commitmentContext,
+            flags: layerFlags, diagnostics,
             selfStatuses
         });
         // Bookkeeping for the executor and the #27 trace: which record
@@ -3931,7 +3961,8 @@ export function createPlannerService({
                     score: 0,
                     breakdown: {
                         reason: "commitment",
-                        source: commitment.decision.source
+                        source: commitment.decision.source,
+                        recordId: commitment.record?.id ?? null
                     },
                     target: null
                 },
@@ -3992,8 +4023,6 @@ export function createPlannerService({
         const planContext = isProne
             ? { ...context, moveBudget: _halveMoveBudget(context.moveBudget ?? { mode: "full" }) }
             : context;
-        const perception = _service("perception", context.perception);
-        const navigation = _service("navigation", context.navigation);
         // Prime the per-actor movement-rate cache: findCandidates is
         // synchronous and resolves {mode} budgets only against prefetched
         // rates (issue #398 system API or actor.system.movement).
@@ -4025,7 +4054,7 @@ export function createPlannerService({
                 || personality.character === "rabble"
         });
         diagnostics.metrics.targetsEvaluated = targets.length;
-        diagnostics.targets = targets.map((t) => ({
+        diagnostics.targets = targets.map(t => ({
             id: t.tokenId ?? t.token?.id ?? null,
             source: t.source ?? "self",
             canAttack: t.canAttack !== false,
@@ -4251,8 +4280,15 @@ export function createPlannerService({
         });
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
+            // Memory contacts are investigated at weapon range, not
+            // hugged: the shortest-range `approachRange` used to walk a
+            // rifleman right onto the remembered square (smoke finding —
+            // the spec-ops bot kept hugging a stale ghost).
             const moves = _resolveMoves({
-                tokenDoc, target, range: approachRange, bandRange,
+                tokenDoc, target,
+                range: _isMemorySource(target.source) && bandRange > 0
+                    ? bandRange : approachRange,
+                bandRange,
                 selfPos, targetPos: targetPosOf(target),
                 grid, navigation, perception, context: planContext
             }).filter(_withinRemaining);
@@ -4390,8 +4426,18 @@ export function createPlannerService({
                     // reposition while keeping or increasing the distance
                     // to the target.
                     const chargeVeto = isPinned ? "pinned" : (isProne ? "prone" : null);
+                    // `alreadyEngaged` measures contact the way the move
+                    // endpoints do (centre-to-centre `_pixelDistance`) —
+                    // `target.distance` may arrive from a different
+                    // measure and read an adjacent enemy as out of reach,
+                    // which used to turn the same in-place swing into a
+                    // spurious "charge" (smoke finding).
+                    const selfTargetDistance = _pixelDistance(selfPos, target, grid);
+                    const alreadyEngaged = melee === true
+                        && Number.isFinite(selfTargetDistance)
+                        && selfTargetDistance <= range + 1e-9;
                     let inPlace = false;
-                    if (distance <= range + 1e-9) {
+                    if (distance <= range + 1e-9 || alreadyEngaged) {
                         candidates.push({ target, action, move: null, variant: "attack-in-place" });
                         inPlace = true;
                         attackFound = true;
@@ -4414,7 +4460,8 @@ export function createPlannerService({
                     }
                     let attackMoveFound = false;
                     // A charge exists to close distance вЂ” when a melee
-                    // attack is already possible in place, repositioning
+                    // attack is already possible in place (which
+                    // `alreadyEngaged` feeds), repositioning
                     // move-attacks are only generated for ranged actions.
                     if (!melee || !inPlace) {
                         for (const move of moves) {
@@ -4423,6 +4470,29 @@ export function createPlannerService({
                             // Moving into melee reach is a charge; any
                             // other move inside weapon range is move+attack.
                             const variant = melee ? "charge" : "move-attack";
+                            // Endpoint LOS (smoke finding): a move-attack
+                            // whose firing cell cannot see the target is
+                            // wasted motion — navigation may have priced
+                            // `move.los`; when it did not, probe the
+                            // endpoint directly. Melee charges reach
+                            // around corners by contact, so the gate
+                            // stays on ranged variants only.
+                            if (variant === "move-attack" && move.los !== true
+                                && perception && typeof perception.hasLineOfSight === "function") {
+                                let endpointLos = true;
+                                try {
+                                    endpointLos = perception.hasLineOfSight(
+                                        { center: { x: move.x, y: move.y }, document: null },
+                                        { center: { x: target.x, y: target.y }, document: null }
+                                    ) === true;
+                                } catch(err) {
+                                    endpointLos = true;
+                                }
+                                if (!endpointLos) {
+                                    rejectOnce(`move-attack|${tag}`, "no-los-endpoint");
+                                    continue;
+                                }
+                            }
                             // Issue #15 action budget: a full-cost action
                             // cannot follow a half move — move+full_auto
                             // or move+allOut are illegal. The `charge`

@@ -1292,6 +1292,22 @@ export function registerPreviewUI(api = null) {
                         console.error(`${MODULE_ID} | preview decision failed`, err);
                     });
                 });
+                // Debug helper (diagnostics mode): copy the route
+                // waypoint list to the clipboard. `data-clipboard` keeps
+                // it out of the resolvePreview decision path.
+                html.find("[data-clipboard='route']").on("click", event => {
+                    event.preventDefault();
+                    const points = this.viewModel?.route?.points ?? [];
+                    const text = points.map(p => `(${p.x}, ${p.y})`).join("\n");
+                    if (!text) return;
+                    const done = globalThis.game?.clipboard?.copyPlainText?.(text)
+                        ?? globalThis.navigator?.clipboard?.writeText?.(text);
+                    Promise.resolve(done).then(() => {
+                        globalThis.ui?.notifications?.info?.(
+                            globalThis.game?.i18n?.localize?.(
+                                "OWAI.Notifications.RouteCopied") ?? "Route copied");
+                    }).catch(() => {});
+                });
             }
 
             /** @inheritdoc */

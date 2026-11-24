@@ -826,3 +826,50 @@ test("explicit caller assignments and context.tactic override the spec-ops tacti
     assert.equal(off.teamPlan.tactic, null);
     assert.equal(off.teamPlan.diagnostics.tactic, null);
 });
+
+test("specOpsVeto lets the blast memory-strike through on a last-known contact", () => {
+    // Point attacks on remembered targets stay vetoed; a blast aim point
+    // is the deliberate room-clearing strike the planner already vetted.
+    const point = specOpsVeto({
+        candidate: {
+            variant: "attack-in-place",
+            target: { source: "last-known" }
+        }
+    });
+    assert.equal(point, SPEC_OPS_VETO_HIDDEN_TARGET);
+    const blast = specOpsVeto({
+        candidate: {
+            variant: "attack-in-place",
+            aim: { x: 300, y: 0 },
+            target: { source: "last-known" }
+        }
+    });
+    assert.equal(blast, null);
+});
+
+test("flank task scores endpoint progress toward the flankPoint", () => {
+    const context = {
+        selfPos: { x: 0, y: 0 },
+        team: { task: "flank", flankPoint: { x: 400, y: 0 }, center: { x: 0, y: 0 } }
+    };
+    const closing = evaluateSpecOps({
+        candidate: {
+            variant: "approach",
+            move: { x: 300, y: 0, distance: 1.5 },
+            target: { x: 600, y: 0, distance: 9 }
+        },
+        context
+    });
+    const statics = evaluateSpecOps({
+        candidate: {
+            variant: "approach",
+            move: { x: 0, y: 0, distance: 9 },
+            target: { x: 600, y: 0, distance: 9 }
+        },
+        context
+    });
+    assert.ok(closing.breakdown.team.flankProgress > 0.5,
+        "closing on the flank point reports progress");
+    assert.equal(statics.breakdown.team.flankProgress, 0,
+        "staying put reports none");
+});

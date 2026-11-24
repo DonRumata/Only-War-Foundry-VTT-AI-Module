@@ -205,14 +205,17 @@ test("weaponEmitters derives ranged and melee emitters from actor items", () => 
     assert.deepEqual(weaponEmitters(null), []);
 });
 
-test("buildThreatMap dangerAt covers ranged emitters in range only", () => {
+test("buildThreatMap dangerAt covers ranged emitters with a range falloff", () => {
     const map = buildThreatMap({
         threats: [{ x: 3000, y: 0, ev: 10, range: 30 }],
         grid: GRID,
         los: false
     });
-    // 2000 px = 30 m — right at the weapon's reach.
-    assert.equal(map.dangerAt({ x: 1000, y: 0 }), 1);
+    // 1000 px = 15 m — inside the full-strength half of the 30 m reach.
+    assert.equal(map.dangerAt({ x: 2000, y: 0 }), 1);
+    // 25 m — the far band decays linearly to zero at the reach edge.
+    const far = map.dangerAt({ x: 1340, y: 0 });
+    assert.ok(far > 0.2 && far < 0.5, `expected ~0.33, got ${far}`);
     // 3300 px away = 49.5 m — beyond the 30 m reach.
     assert.equal(map.dangerAt({ x: -300, y: 0 }), 0);
     assert.equal(map.dangerAt({ x: 3000, y: 0 }), 1);
@@ -223,8 +226,8 @@ test("buildThreatMap: a sight-blocking probe zeroes contributions", () => {
     const threats = [{ x: 3000, y: 0, ev: 10, range: 30 }];
     const open = buildThreatMap({ threats, grid: GRID, los: () => true });
     const walled = buildThreatMap({ threats, grid: GRID, los: () => false });
-    assert.equal(open.dangerAt({ x: 1000, y: 0 }), 1);
-    assert.equal(walled.dangerAt({ x: 1000, y: 0 }), 0);
+    assert.equal(open.dangerAt({ x: 2000, y: 0 }), 1);
+    assert.equal(walled.dangerAt({ x: 2000, y: 0 }), 0);
 });
 
 test("buildThreatMap: contributions saturate at 1 and melee falls off", () => {
@@ -236,9 +239,10 @@ test("buildThreatMap: contributions saturate at 1 and melee falls off", () => {
         grid: GRID,
         los: false
     });
-    // Both sources cover the point: 0.5 + 0.8 = 1.3 → capped at 1.
-    assert.equal(two.dangerAt({ x: 1000, y: 0 }), 1);
-    const explain = two.explain({ x: 1000, y: 0 });
+    // Both sources cover the point at full strength: 0.5 + 0.8 = 1.3 →
+    // capped at 1.
+    assert.equal(two.dangerAt({ x: 2500, y: 0 }), 1);
+    const explain = two.explain({ x: 2500, y: 0 });
     assert.equal(explain.length, 2);
 
     const melee = buildThreatMap({
@@ -264,7 +268,7 @@ test("threat-map service: refresh builds the field once per plan", () => {
         los: false
     });
     assert.equal(service.map(), map);
-    assert.equal(service.dangerAt({ x: 1000, y: 0 }), 1);
+    assert.equal(service.dangerAt({ x: 2000, y: 0 }), 1);
     assert.equal(service.dangerAt({ x: -300, y: 0 }), 0);
     // A second refresh swaps the field — one map per plan.
     service.refresh({ threats: [], grid: GRID });
@@ -335,15 +339,16 @@ test("planner: the threat map adds the danger factor to move scoring", async () 
 });
 
 test("planner: danger is reported on a covered endpoint", async () => {
-    // Enemy only 22.5 m away — the stay cell itself is covered.
-    const world = makeWorld({ enemies: [{ x: 1500, y: 0 }] });
+    // Enemy only 15 m away — the stay cell is inside the full-strength
+    // half of the threat's reach.
+    const world = makeWorld({ enemies: [{ x: 1000, y: 0 }] });
     const planner = _plannerWith({ attackNow: 30 });
     const result = await planner.planTurn(world.combat, world.combatant, {
         seed: 3,
         actions: [LASGUN],
         targets: injectedTargets(world),
-        moves: [{ x: 0, y: 0, distance: 22.5, cost: 0, los: true }],
-        threats: [{ x: 1500, y: 0, ev: 10, range: 30 }],
+        moves: [{ x: 0, y: 0, distance: 15, cost: 0, los: true }],
+        threats: [{ x: 1000, y: 0, ev: 10, range: 30 }],
         los: () => true
     });
     assert.equal(result.status, PLANNER_STATUS.ok);

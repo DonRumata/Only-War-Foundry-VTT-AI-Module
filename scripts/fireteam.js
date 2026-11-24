@@ -2341,6 +2341,13 @@ export function createFireteamService({
                     center: leaderPos,
                     character,
                     contacts: teamContacts,
+                    // The tactic's maneuver anchor: a flanker advances on
+                    // `flankPoint` (perpendicular strike position), not
+                    // the target itself — without it the task was a dead
+                    // label and the member wandered (smoke finding).
+                    flankPoint: tactic?.objective?.flankPoint ?? null,
+                    objective: tactic?.objective?.targetId
+                        ?? context.objective?.targetId ?? null,
                     regroupPoint: assignment.task === "regroup"
                         ? (rejoinPoints[0] ?? null) : null
                 }

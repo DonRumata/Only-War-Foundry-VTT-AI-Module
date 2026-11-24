@@ -296,8 +296,9 @@ export function dangerShade(danger) {
  * @param {object} plan Serialized plan (`steps`, `snapshot`).
  * @param {object} [context]
  * @param {object|null} [context.self] Self token bounds `{x, y, w, h}`
- *   (top-left doc coords + pixel size); waypoint/doc positions are
- *   offset by half these bounds so the route draws centre-to-centre.
+ *   (top-left doc coords + pixel size). Serialized waypoints,
+ *   destinations and targetPoints are already cell *centres* — the
+ *   overlay draws them verbatim (see `executor._docPoint`).
  * @param {object|null} [context.selfPos] Raw self position fallback
  *   `{x, y}` used when `self` bounds are unknown.
  * @param {object|null} [context.target] Target token bounds `{x, y, w, h}`.
@@ -307,32 +308,32 @@ export function dangerShade(danger) {
  *   renderer dims the overlay while a stale banner is up.
  * @param {number|null} [context.stepIndex] 1-based plan cursor for the
  *   issue #26 intent badge (defaults to the chosen step / step 1).
+ * @param {boolean|null} [context.attackLos] `false` suppresses the
+ *   attack ray when the shooter has no line of sight to the target
+ *   (resolved by the caller — the model stays pure).
  * @returns {object} `{operationId, planId, stale, self, route, cones,
- *   blasts, target, intent}`.
+ *   blasts, target, intent, attackRay}`.
  */
 export function buildPlanOverlayModel(plan, context = {}) {
     const steps = Array.isArray(plan?.steps) ? plan.steps : [];
     const self = _bounds(context.self);
-    const half = self ? { x: self.w / 2, y: self.h / 2 } : { x: 0, y: 0 };
     const selfCenter = _center(self) ?? _point(context.selfPos);
     const pxPerUnit = _finiteOr(context.pxPerUnit, 0);
 
-    // Movement route: serialized waypoints plus the move destination,
-    // drawn centre-to-centre from the self bounds.
+    // Movement route: serialized waypoints plus the move destination —
+    // all of them are already cell centres, drawn verbatim.
     const moveStep = steps.find(step => step?.type === "move");
     let route = null;
     if (moveStep) {
         const input = moveStep.input ?? {};
         const points = (Array.isArray(input.waypoints) ? input.waypoints : [])
             .map(_point)
-            .filter(Boolean)
-            .map(point => ({ x: point.x + half.x, y: point.y + half.y }));
+            .filter(Boolean);
         const to = _point(input.to ?? input.destination);
         if (to) {
             const last = points[points.length - 1];
-            const centered = { x: to.x + half.x, y: to.y + half.y };
-            if (!last || last.x !== centered.x || last.y !== centered.y) {
-                points.push(centered);
+            if (!last || last.x !== to.x || last.y !== to.y) {
+                points.push({ x: to.x, y: to.y });
             }
         }
         if (selfCenter && points.length) {
@@ -351,7 +352,7 @@ export function buildPlanOverlayModel(plan, context = {}) {
     // attack happens — the move destination or the self position.
     const attackDocPos = moveStep ? _point(moveStep.input?.to ?? moveStep.input?.destination) : null;
     const attackOrigin = attackDocPos
-        ? { x: attackDocPos.x + half.x, y: attackDocPos.y + half.y }
+        ? { x: attackDocPos.x, y: attackDocPos.y }
         : selfCenter;
 
     const cones = [];
@@ -380,7 +381,7 @@ export function buildPlanOverlayModel(plan, context = {}) {
                 // Issue #54: a blast overwatch step shares the circle
                 // renderer but keeps its own zone identity.
                 kind: step?.type === "overwatch" ? "overwatch" : "blast",
-                point: { x: targetPoint.x + half.x, y: targetPoint.y + half.y },
+                point: { x: targetPoint.x, y: targetPoint.y },
                 radiusUnits,
                 radiusPx: radiusUnits !== null && pxPerUnit > 0
                     ? radiusUnits * pxPerUnit
@@ -403,12 +404,15 @@ export function buildPlanOverlayModel(plan, context = {}) {
         }
     }
 
-    // Target highlight: resolved bounds win, the snapshot position plus
-    // the self footprint is the fallback square.
-    const targetId = plan?.snapshot?.target?.tokenId
+    // Target highlight: the attack step's own target wins, then the
+    // snapshot target, then any step carrying a target reference.
+    const attackStep = steps.find(step => step?.type === "attack" || step?.type === "test");
+    const targetId = attackStep?.input?.targetTokenId
+        ?? plan?.snapshot?.target?.tokenId
         ?? steps.find(step => step?.input?.targetTokenId)?.input?.targetTokenId
         ?? null;
-    const targetUuid = plan?.snapshot?.target?.tokenUuid
+    const targetUuid = attackStep?.input?.targetTokenUuid
+        ?? plan?.snapshot?.target?.tokenUuid
         ?? steps.find(step => step?.input?.targetTokenUuid)?.input?.targetTokenUuid
         ?? null;
     let target = null;
@@ -427,8 +431,11 @@ export function buildPlanOverlayModel(plan, context = {}) {
 
     // Attack ray: the GM must see *who* the shot goes at — a beam from
     // the attack origin (move destination or self) to the target centre.
+    // Only drawn when the plan actually attacks and the caller has not
+    // flagged the shot as having no line of sight.
     const targetCenter = target ? _center(target.bounds) : null;
-    const attackRay = attackOrigin && targetCenter
+    const attackRay = attackStep && context.attackLos !== false
+        && attackOrigin && targetCenter
         ? { from: { x: attackOrigin.x, y: attackOrigin.y },
             to: { x: targetCenter.x, y: targetCenter.y } }
         : null;
@@ -526,8 +533,16 @@ export function dangerCells(map, {
     const explain = typeof map.explain === "function" ? map.explain : null;
     const ranked = [...cells].sort((a, b) => (b.danger - a.danger)
         || (a.y - b.y) || (a.x - b.x));
-    for (const cell of ranked.slice(0, Math.max(0, labelCount))) {
+    // Greedy spatial spread: saturated maps used to stack every label in
+    // the top-left corner because the y/x tiebreak picked adjacent
+    // cells. Require a minimum centre distance between labels instead.
+    const minGap = span * 3;
+    for (const cell of ranked) {
+        if (labels.length >= Math.max(0, labelCount)) break;
         const center = { x: cell.x + (cell.w / 2), y: cell.y + (cell.h / 2) };
+        if (labels.some(l => Math.hypot(l.x - center.x, l.y - center.y) < minGap)) {
+            continue;
+        }
         let top = null;
         if (explain) {
             try {
@@ -675,6 +690,38 @@ export function createPlanOverlayService({
             if (doc?.id === wanted) return doc;
         }
         return null;
+    }
+
+    /**
+     * Line of sight from the attack origin (the move destination or the
+     * self token) to the plan target. `null` when the plan does not
+     * attack or LOS cannot be probed — the model only suppresses the
+     * attack ray on an explicit `false`.
+     * @param {object} plan Serialized planner plan.
+     * @param {object} context `showPlan` context.
+     * @param {object|null} targetDoc Resolved target token document.
+     * @returns {boolean|null}
+     */
+    function _attackLos(plan, context, targetDoc) {
+        const steps = Array.isArray(plan?.steps) ? plan.steps : [];
+        const attackStep = steps.find(
+            step => step?.type === "attack" || step?.type === "test");
+        if (!attackStep) return null;
+        const perception = _service("perception");
+        if (typeof perception?.hasLineOfSight !== "function") return null;
+        const moveStep = steps.find(step => step?.type === "move");
+        const origin = moveStep?.input?.to ?? moveStep?.input?.destination ?? null;
+        const from = origin && Number.isFinite(origin.x) && Number.isFinite(origin.y)
+            ? { center: { x: origin.x, y: origin.y }, document: null }
+            : (_tokenDoc(context.combatant?.token)
+                ?? { center: context.selfPos ?? null, document: null });
+        const to = targetDoc ?? plan?.snapshot?.target ?? null;
+        if (!from || !to) return null;
+        try {
+            return perception.hasLineOfSight(from, to) === true;
+        } catch(err) {
+            return null;
+        }
     }
 
     // --- Plan layer --------------------------------------------------------
@@ -880,6 +927,7 @@ export function createPlanOverlayService({
             self: _tokenBounds(context.combatant?.token),
             selfPos: context.selfPos ?? null,
             target: _tokenBounds(targetDoc),
+            attackLos: _attackLos(plan, context, targetDoc),
             pxPerUnit: _pxPerUnit(),
             operationId: context.operationId ?? null,
             stale: context.stale ?? null,
@@ -1012,18 +1060,36 @@ export function createPlanOverlayService({
         if (typeof PIXI.Text === "function") {
             for (const label of labels) {
                 const top = label.top;
+                // Keep labels short: the contributor id is a full token
+                // uuid — useless on canvas. A readable name tail plus
+                // the contribution share fits a cell.
+                const name = top
+                    ? String(top.name ?? top.id ?? "").split(".").pop().slice(0, 12)
+                    : null;
                 const text = top
-                    ? `${top.id}:${top.contribution}`
+                    ? `${name}:${_finiteOr(top.contribution, 0).toFixed(2)}`
                     : `${Math.round(label.danger * 100)}%`;
                 try {
                     const node = new PIXI.Text(text, {
-                        fontSize: 12,
+                        fontSize: 10,
                         fill: 0xffffff,
                         stroke: 0x000000,
-                        strokeThickness: 2
+                        strokeThickness: 3
                     });
                     node.anchor?.set?.(0.5);
                     node.position?.set?.(label.x, label.y);
+                    if (typeof PIXI.Graphics === "function") {
+                        const pad = 3;
+                        const bg = new PIXI.Graphics();
+                        bg.beginFill(0x000000, 0.55);
+                        bg.drawRect(
+                            label.x - (node.width / 2) - pad,
+                            label.y - (node.height / 2) - pad,
+                            node.width + (pad * 2),
+                            node.height + (pad * 2));
+                        bg.endFill();
+                        layer.addChild(bg);
+                    }
                     layer.addChild(node);
                 } catch(err) {
                     // Labels are optional decoration.

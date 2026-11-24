@@ -810,3 +810,186 @@ test("an aborted authority signal cancels execution without writes", async () =>
         clearRolls();
     }
 });
+
+test("a landed attack defers nextTurn until the GM applies the damage card", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    rolls.outcome = {
+        status: "ok",
+        chatMessageIds: ["attack-card-1"],
+        resourceDelta: { ammo: -1 },
+        roll: { hits: 2 }
+    };
+    // No wait timeout inside the test — the card settles manually.
+    game.settings._values.set("only-war-ai.damageWaitTimeoutSeconds", 0);
+    game.settings._values.set("only-war-ai.turnPacingMs", 0);
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const createHook = Hooks._calls.filter(c => c.event === "createChatMessage").at(-1).fn;
+    const updateHook = Hooks._calls.filter(c => c.event === "updateChatMessage").at(-1).fn;
+    const operationId = `op-${++_opId}`;
+    try {
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: operationId, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world, { melee: false })
+        });
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(world.nextTurnCalls.count, 0,
+            "turn waits for the GM damage adjudication");
+
+        // GM rolls the damage card off the attack card — it carries the
+        // step-scoped apiOperationId and an unapplied hit.
+        const attackStepId = result.stepsDone.find(s => s.type === "attack")?.stepId;
+        const apiOpId = `${operationId}.${attackStepId}`;
+        const damageMessage = {
+            id: "dmg-card-1",
+            getRollData: () => ({
+                flags: { isDamageRoll: true },
+                apiOperationId: apiOpId,
+                damages: [{ applied: false }]
+            })
+        };
+        createHook(damageMessage);
+        assert.equal(world.nextTurnCalls.count, 0,
+            "an unsettled damage card still holds the turn");
+
+        // GM applies the hit — the card settles and the deferred advance fires.
+        damageMessage.getRollData = () => ({
+            flags: { isDamageRoll: true },
+            apiOperationId: apiOpId,
+            damages: [{ applied: true }]
+        });
+        updateHook(damageMessage);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        game.settings._values.delete("only-war-ai.damageWaitTimeoutSeconds");
+        game.settings._values.delete("only-war-ai.turnPacingMs");
+        clearRolls();
+    }
+});
+
+test("a missed attack does not hold the turn for damage adjudication", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    rolls.outcome = {
+        status: "ok",
+        chatMessageIds: ["attack-card-1"],
+        resourceDelta: { ammo: -1 },
+        roll: { hits: 0 }
+    };
+    game.settings._values.set("only-war-ai.turnPacingMs", 0);
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    try {
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world, { melee: false })
+        });
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(world.nextTurnCalls.count, 1,
+            "a whiffed shot advances without the damage wait");
+    } finally {
+        game.settings._values.delete("only-war-ai.turnPacingMs");
+        clearRolls();
+    }
+});
+
+test("an exhausted committed plan is cancelled instead of replaying no-op moves", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const planning = await planner.planTurn(world.combat, world.combatant, planContext(world));
+        assert.equal(planning.status, "ok");
+        // A committed record whose only substantive step is the move the
+        // token already finished last turn (top-left 0,0 = centre 50,50).
+        const record = {
+            id: "rec-exhausted",
+            status: "active",
+            combatId: world.combat.id,
+            combatantId: world.combatant.id,
+            createdRound: 1,
+            createdTurn: 0,
+            ttl: 2,
+            source: "commitment",
+            steps: [
+                {
+                    id: "step-move-1", type: "move", cost: { movement: 1 },
+                    input: { to: { x: 50, y: 50 }, waypoints: [{ x: 50, y: 50 }] },
+                    preconditions: ["turn"], projectedResourceDelta: {}
+                },
+                {
+                    id: "step-end-2", type: "end-turn", cost: {},
+                    input: { reason: "committed" },
+                    preconditions: ["turn"], projectedResourceDelta: {}
+                }
+            ],
+            expectedState: {
+                self: { x: 50, y: 50, elevation: 0 },
+                morale: null,
+                threats: []
+            }
+        };
+        world.combatant.flags["only-war-ai"] = {
+            ...(world.combatant.flags["only-war-ai"] ?? {}),
+            committedPlan: record
+        };
+        const plan = {
+            ...planning.plan,
+            breakdown: { reason: "commitment", source: "commitment" },
+            steps: foundry.utils.deepClone(record.steps)
+        };
+        const result = await executor.executePlan(plan, {
+            combat: world.combat,
+            combatant: world.combatant,
+            operationId: `op-${++_opId}`
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        const moveStep = result.stepsDone.find(s => s.stepId === "step-move-1");
+        assert.equal(moveStep.reason, "already-at-endpoint");
+        // The dead record is stamped cancelled — the next turn plans
+        // fresh instead of replaying the exhausted route again.
+        const stored = world.combatant.getFlag("only-war-ai", "committedPlan");
+        assert.equal(stored.status, "cancelled");
+        assert.equal(stored.cancelledReason, "plan-exhausted");
+    } finally {
+        clearRolls();
+    }
+});
+
+test("broken i18n/chat helpers never crash the executor diagnostics card", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const originalFormat = game.i18n.format;
+    const originalChatMessage = globalThis.ChatMessage;
+    game.i18n.format = () => { throw new Error("broken i18n"); };
+    globalThis.ChatMessage = { create: async () => ({ id: "msg-1" }) };
+    game.settings._values.set("only-war-ai.diagnosticsEnabled", true);
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        // A missing system rolls API stops the turn with `partial`, which
+        // runs the diagnostics-chat block through the broken formatter.
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.partial);
+        assert.equal(result.reason, "system-api-missing");
+        assert.equal(world.nextTurnCalls.count, 1,
+            "the diagnostics crash never blocks the turn advance");
+    } finally {
+        game.i18n.format = originalFormat;
+        globalThis.ChatMessage = originalChatMessage;
+        game.settings._values.delete("only-war-ai.diagnosticsEnabled");
+    }
+});
