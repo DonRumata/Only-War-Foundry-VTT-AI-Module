@@ -91,9 +91,8 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   context, snapshot, result}]` (issue #27) — bounded (8) журнал
   replay-захватов: санитизированный `planContext` + AI-флаги + snapshot
   + отпечаток результата (`steps`, `winner`, `trace`); пишет executor
-  при `aiCaptureContext`/`context.capture`, только controller. Каждая
-  запись — готовая фикстура `replayPlan` (tests/unit/replay-helpers.mjs):
-  JSON → `planTurn` → идентичный план и трасс.
+  при `aiCaptureContext`/`context.capture`, только controller. Обычный
+  захват не гарантирует идентичный офлайн-replay.
 - Combatant: `morale` (issue #26) — рекорд позы файртимы; evaluated
   форма `{tier, pending, counters, losses, seenEnemies, leaderId,
   combatId, round, state, schema}` пишется только controller'ом на всех
@@ -448,8 +447,8 @@ replay-захват; полный контракт — `docs/layers.md` (раз�
 - Replay: `buildCaptureEntry`/`appendCaptureEntry`/`sanitizeCaptureContext`
   — санитизированный bounded (8) журнал `captureJournal` на комбатанте
   (записываемые AI-флаги + planContext + snapshot + отпечаток плана);
-  `tests/unit/replay-helpers.mjs` `replayPlan(capture)` перепрогоняет
-  `planTurn` детерминированно (JSON → идентичные steps/score/trace).
+  `replayPlan(capture)` проверяется на фикстурах с явными целями,
+  действиями и маршрутами; см. [ограничения](docs/layers.md#replay-захват).
   Трасс никогда не влияет на выбор плана: это только диагностическая
   поверхность.
 

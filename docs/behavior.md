@@ -703,5 +703,5 @@ GM-прозрачность при наслоении L0–L4: трасс — р
 - **Replay**: `aiCaptureContext` (default off; `context.capture`) —
   executor журналит bounded (8) sanitized-запись `planContext`+флаги+
   snapshot+отпечаток в `captureJournal` комбатанта (controller-only);
-  `tests/unit/replay-helpers.mjs` `replayPlan` перепрогоняет `planTurn`
-  из JSON-записи к идентичному плану и трассу.
+  `replayPlan` проверяет воспроизводимость фикстур с явными входными
+  данными; см. [ограничения replay](layers.md#replay-захват).

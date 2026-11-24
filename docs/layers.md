@@ -343,11 +343,13 @@ bounded `CAPTURE_JOURNAL_MAX = 8`, только controller, best-effort
 lastAttacker/reactionUsed/aim/personality/fireteam/lastOrder/delaySync/
 gmControlled), `result` — `{planId, score, winner, steps, trace}`.
 
-`tests/unit/replay-helpers.mjs` `replayPlan(capture)` — pure-хелпер:
-JSON-запись → восстановленные combat/combatant/scene/flags → тот же
-`planTurn` → идентичные `steps`/`score`/`trace`/`layers` (seeded
-детерминизм). Готовый сценарий — `tests/unit/replay.test.mjs`
-(executor → журнал → JSON → replay).
+`replayPlan(capture)` восстанавливает тестовые документы и вызывает
+`planTurn` с сохранённым `context`. Равенство шагов, оценки и трасса
+проверяется в [`tests/unit/replay.test.mjs`](../tests/unit/replay.test.mjs)
+на фикстурах с явными `targets`, `actions` и `moves`. Обычный захват
+из Foundry полезен для диагностики (`result.steps`, `result.trace`),
+но не гарантирует совпадение плана: replay не восстанавливает цели из
+`snapshot.targets` и не воссоздаёт живые сервисы системы и сцены.
 
 ## Флаги и деградация
 

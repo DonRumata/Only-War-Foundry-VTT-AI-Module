@@ -421,7 +421,7 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Безопасность: перед каждым шагом `validateSnapshot`; stale → один
   replan; повторный stale — hold-and-report. Без контроллера — `not-controller`.
 - Продвижение хода: сериализовано по боевому `id`, ключи `(round,turn)`,
-  верификация + bounded retry — двойных `nextTurn` и гонок нет.
+  проверка результата и ограниченное число повторных попыток.
 - После попадания ход ждёт применения всех хитов. Карточки связываются
   по `apiOperationId`; бот не применяет урон. При
   `damageWaitAutoAdvance: false` после снятия ожидания ход передаёт GM.
@@ -541,9 +541,9 @@ execute: расхождение — `stale-state` (перемещение, см�
   compact|full (`aiTraceVerbose`, default compact) в превью-блоке
   «Как думал» и однострочным GM-шёпотом при отказе/отмене хода.
   Replay-захват `aiCaptureContext` (default off): bounded (8) журнал
-  `captureJournal` на комбатанте — sanitized `planContext`+snapshot,
-  готовые фикстуры детерминированного replay `planTurn` (офлайн,
-  идентичные план и трасс). Трасс — только диагностика, на выбор
+  `captureJournal` на комбатанте — sanitized `planContext`+snapshot.
+  Ограничения офлайн-replay описаны в [документе о слоях](layers.md#replay-захват).
+  Трасс — только диагностика, на выбор
   плана не влияет.
 
 ## 3. Что боты умеют — по пресетам
