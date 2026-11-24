@@ -1,3 +1,5 @@
 node_modules/
 *.log
 *.tmp
+tests/foundry-e2e/reports/
+tests/foundry-e2e/screenshots/

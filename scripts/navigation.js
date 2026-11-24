@@ -1612,7 +1612,7 @@ export function validateEndpointOnContext(context, destination) {
 }
 
 /**
- * All standable cells reachable within the budget, deterministically
+ * Geometric shortlist of standable cells, deterministically
  * ordered by (cost, i, j).
  * @param {object} context
  * @param {number} budgetCells
@@ -1621,7 +1621,7 @@ export function validateEndpointOnContext(context, destination) {
  * @param {number} [options.maxVisited] Flood-fill expansion bound.
  * @returns {object} `{status, reason?, cells, visitedNodes, limited}`.
  */
-export function findReachableOnContext(context, budgetCells, options = {}) {
+function _geometricReachable(context, budgetCells, options = {}) {
     if (context?.status !== NAVIGATION_STATUS.ok) {
         return _failure(context?.reason ?? NAVIGATION_REASONS.sceneUnavailable);
     }
@@ -1661,6 +1661,28 @@ export function findReachableOnContext(context, budgetCells, options = {}) {
 }
 
 /**
+ * Return only endpoints with a verified, affordable route. The flood fill
+ * alone cannot account for path-dependent platform costs such as terrain.
+ * @param {object} context
+ * @param {number} budgetCells
+ * @param {object} [options] Reachable-cell and search bounds.
+ * @returns {object}
+ */
+export function findReachableOnContext(context, budgetCells, options = {}) {
+    const reachable = _geometricReachable(context, budgetCells, options);
+    if (reachable.status !== NAVIGATION_STATUS.ok || !context.measureCost) return reachable;
+    let visitedNodes = reachable.visitedNodes;
+    const cells = [];
+    for (const cell of reachable.cells) {
+        const route = planRouteOnContext(context, cell, budgetCells, options);
+        visitedNodes += route.visitedNodes ?? 0;
+        if (route.exact) cells.push({ ...cell, cost: route.cost, costCells: route.costCells });
+    }
+    cells.sort((a, b) => (a.cost - b.cost) || (a.i - b.i) || (a.j - b.j));
+    return _deepFreeze({ ...reachable, cells, visitedNodes });
+}
+
+/**
  * Destination candidates for presets: reachable cells scored by proximity
  * to `options.target` plus optional line-of-sight and cover terms. LOS
  * prefers the `perception` service when one is supplied via
@@ -1697,7 +1719,7 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
             ? { x: options.target.x, y: options.target.y }
             : null);
 
-    const reachable = findReachableOnContext(context, budgetCells, { limit: options.limit });
+    const reachable = _geometricReachable(context, budgetCells, options);
     if (reachable.status !== NAVIGATION_STATUS.ok) return reachable;
 
     const size = context.grid.size;
@@ -1731,11 +1753,14 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
     const selected = [];
     // The geometric flood fill is only a shortlist. Do not pass a cell
     // on to the planner unless its measured route really reaches it.
-    for (const candidate of candidates.slice(0, Math.max(0, count))) {
+    let visitedNodes = reachable.visitedNodes;
+    for (const candidate of candidates.slice(0, Math.max(0, 3 * count))) {
+        if (selected.length >= count) break;
         const route = planRouteOnContext(context, { i: candidate.i, j: candidate.j },
             budgetCells, options);
-        if (route.status === NAVIGATION_STATUS.ok) {
-            selected.push({ ...candidate, cost: route.cost, waypoints: route.waypoints });
+        visitedNodes += route.visitedNodes ?? 0;
+        if (route.exact) {
+            selected.push({ ...candidate, cost: route.cost, costCells: route.costCells, waypoints: route.waypoints });
         }
     }
     return _deepFreeze({
@@ -1743,7 +1768,7 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
         reason: null,
         candidates: selected,
         evaluated: candidates.length,
-        visitedNodes: reachable.visitedNodes,
+        visitedNodes,
         sceneId: context.sceneId
     });
 }

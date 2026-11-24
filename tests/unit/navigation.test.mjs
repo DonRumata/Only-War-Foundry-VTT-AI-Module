@@ -755,10 +755,20 @@ test("movement candidates carry measured costs and only executable routes", () =
         measureCost: points => (points.length - 1) * 2
     });
     const result = findCandidatesOnContext(context, 3, {
-        target: { x: 350, y: 50 }, count: 4
+        target: { x: 350, y: 50 }, count: 2
     });
     assert.deepEqual(result.candidates.map(move => [move.j, move.cost]), [[1, 2], [0, 0]]);
     assert.ok(result.candidates.every(move => move.waypoints.at(-1).j === move.j));
+});
+
+test("findReachable exposes measured costs, not unaffordable geometric cells", () => {
+    const context = contextFor(mockToken(), {
+        rows: 1, cols: 5, distance: 1,
+        measureCost: points => (points.length - 1) * 2
+    });
+    const result = findReachableOnContext(context, 3);
+    assert.deepEqual(result.cells.map(({ j, cost }) => [j, cost]), [[0, 0], [1, 2]]);
+    assert.deepEqual(findReachableOnContext(context, 3), result);
 });
 
 test("A* core: deterministic order and visited bound", () => {

@@ -296,6 +296,10 @@ export function createBookkeeping({
      * @returns {Promise<void>}
      */
     async function _finish(context, run, result, advanceTurn = true) {
+        // Completing the operation emits a hook that can immediately call nextTurn.
+        // Finish embedded combatant writes first: otherwise Foundry can
+        // restore the prior turn while applying the combatant update.
+        await _syncCommitment(context, run, result);
         const operations = _operations(context);
         const payload = {
             completed: result.status === EXECUTOR_STATUS.completed,
@@ -320,10 +324,6 @@ export function createBookkeeping({
                 console.error(`${MODULE_ID} | completeTurn failed`, err);
             }
         }
-        // Issue #25: persist commitment bookkeeping before the turn
-        // moves on — the record/journal must reflect this turn's moves
-        // when the next combatant plans.
-        await _syncCommitment(context, run, result);
         // The selection/target marks put down at `_execute` deliberately
         // survive `_finish`: the GM still needs the target mark while
         // applying the damage card. They are released on the combat

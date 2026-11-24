@@ -34,7 +34,8 @@ const npcActorIds = [];
 const enemyActorIds = [];
 let sceneId;
 let combatId;
-let previousMode;
+let priorSceneId;
+let previousSettings;
 
 async function setup() {
     browser = await chromium.connectOverCDP(h.CDP_URL);
@@ -74,7 +75,17 @@ async function setup() {
         enemyActorIds.push(await h.createTestActor(page, 'npc', `AI Perf Enemy ${i + 1}`));
     }
 
-    sceneId = await h.createTestScene(page, { grid: 1, size: 100 });
+    priorSceneId = await page.evaluate(() => canvas.scene?.id);
+    sceneId = await page.evaluate(async () => {
+        const scene = await Scene.create({
+            name: `AI performance ${Date.now()}`, active: false, navigation: false,
+            width: 2000, height: 2000, padding: 0, tokenVision: false,
+            grid: { type: 1, size: 100, distance: 1 }
+        });
+        await scene.view();
+        return scene.id;
+    });
+    await page.waitForFunction(id => canvas.ready && canvas.scene?.id === id, sceneId);
     const npcTids = [];
     const enemyTids = [];
     for (const [i, actorId] of npcActorIds.entries()) {
@@ -92,7 +103,14 @@ async function setup() {
         for (const tid of data.npcTids) await scene.tokens.get(tid).update({ disposition: -1 });
         for (const tid of data.enemyTids) await scene.tokens.get(tid).update({ disposition: 1 });
     }, { sceneId, npcTids, enemyTids });
-    combatId = await h.createCombat(page, [...npcTids, ...enemyTids]);
+    combatId = await page.evaluate(async (tokenIds) => {
+        const combat = await Combat.create({ scene: canvas.scene.id, active: false });
+        await combat.createEmbeddedDocuments('Combatant', tokenIds.map((tokenId, i) => ({
+            tokenId, sceneId: canvas.scene.id, initiative: tokenIds.length - i
+        })));
+        combat.getTimeDelta = () => 0;
+        return combat.id;
+    }, [...npcTids, ...enemyTids]);
 
     // Two fireteams (5+5) — temporary memberships on the combatant flags.
     const teamOf = await page.evaluate(async (data) => {
@@ -122,6 +140,8 @@ async function instrument() {
     await page.evaluate((combatIdArg) => {
         window.__owaiCombatId = combatIdArg;
         const api = game.modules.get('only-war-ai').api;
+        const hookIds = [];
+        const on = (event, fn) => hookIds.push([event, Hooks.on(event, fn)]);
         const perf = window.__owaiPerf = {
             enabled: true,
             plans: [],
@@ -138,11 +158,12 @@ async function instrument() {
             const t0 = performance.now();
             const res = await originalPlanTurn.call(planner, combat, combatant, ctx);
             const ms = performance.now() - t0;
-            if (perf.enabled) {
+            if (perf.enabled && combat?.id === combatIdArg) {
                 const plan = res?.plan ?? null;
                 const steps = Array.isArray(plan?.steps) ? plan.steps : [];
                 perf.plans.push({
                     combatantId: combatant?.id ?? null,
+                    operationId: ctx.operationId ?? ctx.operation?.id ?? null,
                     ms: Math.round(ms * 100) / 100,
                     status: res?.status ?? null,
                     reason: res?.reason ?? null,
@@ -165,13 +186,10 @@ async function instrument() {
         perf.claims = [];
         operations.claimTurn = async (combat, combatant, opts) => {
             const res = await originalClaim.call(operations, combat, combatant, opts);
-            perf.claims.push({
-                combatantId: combatant?.id ?? null,
-                turn: combat?.turn ?? null,
-                round: combat?.round ?? null,
-                ok: res?.ok ?? null,
-                reason: res?.reason ?? null,
-                operationId: res?.operation?.id ?? null
+            if (combat?.id === combatIdArg) perf.claims.push({
+                combatantId: combatant?.id ?? null, turn: combat?.turn ?? null,
+                round: combat?.round ?? null, ok: res?.ok ?? null,
+                reason: res?.reason ?? null, operationId: res?.operation?.id ?? null
             });
             return res;
         };
@@ -182,7 +200,7 @@ async function instrument() {
             const t0 = performance.now();
             const res = await originalRunPlan.call(executor, context);
             const ms = performance.now() - t0;
-            if (perf.enabled) {
+            if (perf.enabled && context?.combat?.id === combatIdArg) {
                 perf.runs.push({
                     combatantId: context?.combatant?.id ?? context?.operation?.combatantId ?? null,
                     operationId: res?.operationId ?? context?.operation?.id ?? null,
@@ -201,14 +219,22 @@ async function instrument() {
         const events = ['createToken', 'updateToken', 'updateCombatant', 'updateCombat',
             'updateActor', 'updateItem', 'createChatMessage'];
         for (const event of events) {
-            Hooks.on(event, () => {
+            on(event, () => {
                 perf.docUpdates[event] += 1;
                 perf.docUpdates.total += 1;
             });
         }
         perf.nextTurnCalls = [];
         perf.combatUpdates = [];
-        Hooks.on('updateCombat', (doc, change, options, userId) => {
+        perf.trackerOrder = [];
+        let lastPosition = null;
+        on('updateCombat', (doc, change, options, userId) => {
+            if (doc?.id !== combatIdArg) return;
+            const position = `${doc.round}:${doc.turn}:${doc.combatant?.id}`;
+            if (doc.started && position !== lastPosition) {
+                perf.trackerOrder.push(doc.combatant?.id);
+                lastPosition = position;
+            }
             perf.combatUpdates.push({
                 at: Date.now(), turn: doc?.turn ?? null,
                 keys: Object.keys(change ?? {}).join(','),
@@ -216,7 +242,8 @@ async function instrument() {
             });
         });
         perf.preCombatUpdates = [];
-        Hooks.on('preUpdateCombat', (doc, change, options, userId) => {
+        on('preUpdateCombat', (doc, change, options, userId) => {
+            if (doc?.id !== combatIdArg) return;
             perf.preCombatUpdates.push({
                 at: Date.now(), turn: change?.turn,
                 round: change?.round,
@@ -243,6 +270,13 @@ async function instrument() {
                 }
             };
         }
+        window.__owaiPerfRestore = () => {
+            perf.enabled = false;
+            planner.planTurn = originalPlanTurn;
+            operations.claimTurn = originalClaim;
+            executor.runPlan = originalRunPlan;
+            for (const [event, id] of hookIds) Hooks.off(event, id);
+        };
     }, combatId);
 }
 
@@ -289,9 +323,6 @@ async function runCycle() {
             const combat = game.combats.get(data.combatId);
             const api = game.modules.get('only-war-ai').api;
             const authority = api.services.get('authority');
-            // The live tab may be throttled: drain pending debounced claims
-            // directly instead of relying on the scheduler timer.
-            await authority?.flush?.();
             const current = combat?.combatant ?? null;
             let enabled = false;
             try {
@@ -300,24 +331,16 @@ async function runCycle() {
             const terminal = perf.runs.filter((run) =>
                 ['completed', 'partial', 'failed', 'cancelled'].includes(run.status));
             const op = combat?.getFlag('only-war-ai', 'operation') ?? null;
-            const opTerminal = op && ['completed', 'failed', 'cancelled'].includes(op.phase);
-            // A stuck turn: the current combatant's operation is already
-            // terminal for THIS turn index but the tracker did not advance.
-            const stuckDone = !!(current && opTerminal
-                && op.combatantId === current.id
-                && op.turn === combat.turn
-                && op.round === combat.round);
             return {
                 turn: combat?.turn ?? null,
                 round: combat?.round ?? null,
                 currentId: current?.id ?? null,
                 currentEnabled: enabled,
-                stuckDone,
                 runCount: perf.runs.length,
                 terminalCount: terminal.length,
                 combatantIds: [...new Set(terminal.map((r) => r.combatantId))],
                 diag: {
-                    operation: combat?.getFlag('only-war-ai', 'operation') ?? null,
+                    operation: op,
                     nextTurnCalls: perf.nextTurnCalls,
                     combatUpdates: perf.combatUpdates?.slice(-15),
                     claims: perf.claims,
@@ -336,8 +359,13 @@ async function runCycle() {
                 }
             };
         }, { combatId });
-        if (state.combatantIds.length >= NPC_COUNT || state.terminalCount >= NPC_COUNT) break;
-        if (state.round >= 2) break;
+        if (state.currentId && !state.currentEnabled && state.round === 1 && state.turn === NPC_COUNT
+            && state.combatantIds.length === NPC_COUNT) {
+            return { elapsedMs: Date.now() - start, lastTurn: state.turn, stallDumps };
+        }
+        if (state.round > 1 || state.turn > NPC_COUNT) {
+            throw new Error(`AI skipped the first manual turn: ${JSON.stringify(state.diag)}`);
+        }
         if (state.currentId !== lastCurrentId) {
             console.log(`  turn ${state.turn} -> combatant ${state.currentId} ai=${state.currentEnabled} runs=${state.terminalCount}`);
             lastCurrentId = state.currentId;
@@ -350,17 +378,10 @@ async function runCycle() {
             console.error(`[stall] ${JSON.stringify(state.diag)}`);
             lastProgress = Date.now();
         }
-        // Manually advance turns that belong to non-AI combatants, plus
-        // turns whose operation is already terminal but the tracker did not
-        // advance on its own (live-sync stalls observed in this world).
-        if (state.currentId && (!state.currentEnabled || state.stuckDone)) {
-            await page.evaluate((cid) => game.combats.get(cid).nextTurn(), combatId);
-            await page.waitForTimeout(300);
-        }
         lastTurn = state.turn;
         await page.waitForTimeout(500);
     }
-    return { elapsedMs: Date.now() - start, lastTurn, stallDumps };
+    throw new Error(`Timed out at turn ${lastTurn} without auto-handoff: ${JSON.stringify(stallDumps.at(-1))}`);
 }
 
 /** Collect counters, write the JSON report, return the summary. */
@@ -384,7 +405,9 @@ async function collectReport(elapsedMs, teamPlans) {
         npcs: npcCombatantIds.map((cid) => {
             const plans = perf.plans.filter((p) => p.combatantId === cid);
             const runs = perf.runs.filter((r) => r.combatantId === cid);
-            const planningMs = plans.reduce((n, p) => n + (p.ms ?? 0), 0);
+            const opIds = new Set(runs.map(run => run.operationId).filter(Boolean));
+            const planningMs = perf.plans.filter(plan => opIds.has(plan.operationId))
+                .reduce((n, p) => n + (p.ms ?? 0), 0);
             const turnMs = runs.reduce((n, r) => n + (r.ms ?? 0), 0);
             return {
                 combatantId: cid,
@@ -407,6 +430,7 @@ async function collectReport(elapsedMs, teamPlans) {
             };
         }),
         allRuns: perf.runs,
+        trackerOrder: perf.trackerOrder,
         allPlans: perf.plans.map((p) => ({ ...p, stepTypes: undefined }))
     };
     fs.mkdirSync(REPORT_DIR, { recursive: true });
@@ -449,17 +473,25 @@ function printFailureReport(report, why) {
 
 async function cleanup() {
     try {
-        if (previousMode !== undefined) {
-            await page.evaluate(async (mode) => {
-                await game.settings.set('only-war-ai', 'executionMode', mode);
-            }, previousMode);
-        }
+        await page.evaluate(() => {
+            window.__owaiPerfRestore?.();
+            delete window.__owaiPerfRestore;
+            delete window.__owaiPerf;
+            delete window.__owaiCombatId;
+        });
     } catch { /* best-effort */ }
-    await h.closeAllWindows(page);
     if (combatId) await h.deleteCombat(page, combatId);
+    if (sceneId) await page.evaluate(async (id) => {
+        const messages = game.messages.filter(message => message.speaker?.scene === id).map(message => message.id);
+        if (messages.length) await ChatMessage.deleteDocuments(messages);
+    }, sceneId);
+    if (priorSceneId) await page.evaluate(id => game.scenes.get(id)?.view(), priorSceneId);
     if (sceneId) await h.deleteScene(page, sceneId);
     for (const id of npcActorIds) await h.deleteActor(page, id);
     for (const id of enemyActorIds) await h.deleteActor(page, id);
+    if (previousSettings) await page.evaluate(async (settings) => {
+        for (const [key, value] of Object.entries(settings)) await game.settings.set('only-war-ai', key, value);
+    }, previousSettings);
 }
 
 (async () => {
@@ -467,10 +499,18 @@ async function cleanup() {
     let report = null;
     try {
         await setup();
-        previousMode = await page.evaluate(async () => {
-            const mode = game.settings.get('only-war-ai', 'executionMode');
-            await game.settings.set('only-war-ai', 'executionMode', 'automatic');
-            return mode;
+        previousSettings = await page.evaluate(async () => {
+            // Landed attacks still go through the real system pipelines.
+            // Use the ordinary damage-wait timeout to release them.
+            const settings = { executionMode: 'automatic', attackAdjudication: 'auto',
+                turnPacingMs: 0, damageWaitTimeoutSeconds: 1, damageWaitAutoAdvance: true,
+                diagnosticsEnabled: false };
+            const previous = {};
+            for (const [key, value] of Object.entries(settings)) {
+                previous[key] = game.settings.get('only-war-ai', key);
+                await game.settings.set('only-war-ai', key, value);
+            }
+            return previous;
         });
         await instrument();
         const teamPlans = await buildTeamPlans();
@@ -490,6 +530,10 @@ async function cleanup() {
         const ran = report.npcs.filter((n) => n.status && n.status !== 'none');
         assert.equal(ran.length, NPC_COUNT,
             `only ${ran.length}/${NPC_COUNT} NPCs completed a turn`);
+        assert.deepEqual(report.allRuns.map(run => run.combatantId).sort(), [...npcCombatantIds].sort(),
+            'Every AI NPC must be called exactly once');
+        assert.deepEqual(report.trackerOrder.slice(0, -1), npcCombatantIds,
+            'Tracker must not skip, revisit or reorder any AI turn');
         const badRuns = report.npcs.filter((n) => !['completed', 'partial'].includes(n.status));
         assert.equal(badRuns.length, 0,
             `NPCs with non-terminal turns: ${badRuns.map((n) => `${n.combatantId}:${n.status}:${n.reason}`).join(', ')}`);

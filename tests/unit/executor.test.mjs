@@ -901,7 +901,13 @@ test("a missed attack does not hold the turn for damage adjudication", async () 
 
 test("an exhausted committed plan is cancelled instead of replaying no-op moves", async () => {
     const world = makeWorld();
-    const { api, planner } = makeApi();
+    const { api, planner, operations } = makeApi();
+    const complete = operations.completeTurn;
+    let commitmentAtHandoff;
+    operations.completeTurn = async (...args) => {
+        commitmentAtHandoff = world.combatant.getFlag("only-war-ai", "committedPlan")?.status;
+        return complete(...args);
+    };
     mockRolls();
     try {
         const executor = createExecutorService({ api, getMode: () => "automatic" });
@@ -959,6 +965,8 @@ test("an exhausted committed plan is cancelled instead of replaying no-op moves"
         const stored = world.combatant.getFlag("only-war-ai", "committedPlan");
         assert.equal(stored.status, "cancelled");
         assert.equal(stored.cancelledReason, "plan-exhausted");
+        assert.equal(commitmentAtHandoff, "cancelled",
+            "operationCompleted may hand off immediately; embedded writes must already be done");
     } finally {
         clearRolls();
     }
