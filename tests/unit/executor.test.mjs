@@ -1,0 +1,995 @@
+/**
+ * Unit tests for the executor service (issue #407): step-by-step plan
+ * execution through mocked Foundry/system APIs — happy path, per-step
+ * snapshot validation, the single-replan policy, operation-id idempotency,
+ * controller/config gating and terminal turn advancement.
+ */
+import test from "node:test";
+import assert from "node:assert/strict";
+
+import { createModuleApi } from "../../scripts/api.js";
+import { createExecutorService, EXECUTOR_STATUS } from "../../scripts/executor.js";
+import { createPlannerService } from "../../scripts/planner.js";
+import {
+    makeActor,
+    makeCombatant,
+    makeScene,
+    makeToken
+} from "./fixtures.mjs";
+
+let _opId = 0;
+let _combatId = 0;
+
+/**
+ * Minimal Combat fixture: `id`, `round`, `turn`, the `combatants`
+ * collection, a `scene` reference and a `combatant` getter.
+ * @param {object} [options]
+ * @param {number} [options.round]
+ * @param {number} [options.turn]
+ * @param {object[]} [options.combatants]
+ * @returns {object}
+ */
+function makeCombat({ round = 1, turn = 0, combatants = [] } = {}) {
+    const collection = new Map(combatants.map(c => [c.id, c]));
+    collection.contents = combatants;
+    const combat = {
+        documentName: "Combat",
+        id: `combat-${++_combatId}`,
+        round,
+        turn,
+        combatants: collection,
+        turns: combatants,
+        scene: null,
+        ended: false,
+        get combatant() {
+            return this.turns[this.turn] ?? null;
+        }
+    };
+    return combat;
+}
+
+/**
+ * Build a small combat world: an AI-enabled NPC at (0, 0) and a hostile
+ * enemy combatant. The NPC token gets `move`/`update` spies; the combat
+ * gets a `nextTurn` spy.
+ * @param {object} [options]
+ * @param {{x: number, y: number}} [options.enemy] Enemy placement.
+ * @param {string} [options.preset] Actor AI preset.
+ * @param {boolean} [options.enabled] Actor AI config flag.
+ * @returns {object}
+ */
+function makeWorld({ enemy = { x: 300, y: 0 }, preset = "assault", enabled = true } = {}) {
+    const scene = makeScene({ grid: "square" });
+    const actor = makeActor({ enabled, preset });
+    actor.system = { wounds: { value: 12, max: 14 } };
+    actor.items = [{
+        id: "w1",
+        uuid: `Actor.${actor.id}.Item.w1`,
+        name: "Lasgun",
+        type: "weapon",
+        system: { class: "ranged", range: 30, damage: "1d10+3" }
+    }];
+    const token = makeToken({ actor });
+    token.x = 0;
+    token.y = 0;
+    token.elevation = 0;
+    token.disposition = -1;
+    const moveCalls = [];
+    const updateCalls = [];
+    token.move = async (waypoints, options) => {
+        moveCalls.push({ waypoints, options });
+        const last = waypoints.at(-1);
+        token.x = last.x;
+        token.y = last.y;
+        return true;
+    };
+    token.update = async data => {
+        updateCalls.push(data);
+        if (Number.isFinite(data.x)) token.x = data.x;
+        if (Number.isFinite(data.y)) token.y = data.y;
+        return token;
+    };
+    const combatant = makeCombatant({ actor, token });
+    combatant.tokenId = token.id;
+    combatant.initiative = 10;
+
+    const enemyActor = makeActor();
+    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.items = [];
+    const enemyToken = makeToken({ actor: enemyActor });
+    enemyToken.x = enemy.x;
+    enemyToken.y = enemy.y;
+    enemyToken.elevation = 0;
+    enemyToken.disposition = 1;
+    const enemyCombatant = makeCombatant({ actor: enemyActor, token: enemyToken });
+    enemyCombatant.tokenId = enemyToken.id;
+
+    const nextTurnCalls = { count: 0 };
+    const combat = makeCombat({ round: 1, turn: 0, combatants: [combatant, enemyCombatant] });
+    combat.scene = scene;
+    combat.nextTurn = async () => {
+        nextTurnCalls.count++;
+        // Mirror Foundry semantics: nextTurn mutates (round, turn) so the
+        // executor's advance verification sees a real transition.
+        combat.turn += 1;
+        return combat;
+    };
+    return {
+        scene,
+        actor,
+        token,
+        combatant,
+        enemy: { actor: enemyActor, token: enemyToken, combatant: enemyCombatant },
+        combat,
+        moveCalls,
+        updateCalls,
+        nextTurnCalls
+    };
+}
+
+/**
+ * Module API with a real planner and an injectable authority mock.
+ * @param {object} [options]
+ * @param {boolean} [options.controller] `authority.isController` result.
+ * @returns {object}
+ */
+function makeApi({ controller = true } = {}) {
+    const api = createModuleApi();
+    const planner = createPlannerService({ api });
+    api.services.register("planner", planner);
+    const completed = [];
+    const operations = {
+        completeTurn: async (combat, id, result) => {
+            completed.push({ id, result });
+            return { ok: true };
+        },
+        transitionOperation: async () => ({ ok: true })
+    };
+    const authority = {
+        isController: () => controller,
+        operations
+    };
+    api.services.register("authority", authority);
+    return { api, planner, operations, authority, completed };
+}
+
+/**
+ * Deterministic planTurn inputs: injected target/action/move lists that
+ * produce a `move → attack → end-turn` plan for {@link makeWorld} (melee
+ * range 2, injected move lands 1.5 units from the enemy).
+ * @param {object} world
+ * @param {object} [options]
+ * @param {boolean} [options.melee] Melee weapon forcing a move-attack.
+ * @returns {object} planContext for executor calls.
+ */
+function planContext(world, { melee = true } = {}) {
+    return {
+        seed: 7,
+        targets: [{
+            tokenId: world.enemy.token.id,
+            tokenUuid: `Scene.${world.scene.id}.Token.${world.enemy.token.id}`,
+            x: world.enemy.token.x,
+            y: world.enemy.token.y,
+            elevation: 0,
+            canAttack: true,
+            source: "injected"
+        }],
+        actions: [{
+            id: "attack-1",
+            type: "attack",
+            name: melee ? "Knife strike" : "Lasgun shot",
+            itemUuid: `Actor.${world.actor.id}.Item.w1`,
+            itemId: "w1",
+            class: melee ? "melee" : "ranged",
+            range: melee ? 2 : 30,
+            damage: 5,
+            cost: 1
+        }],
+        moves: [{
+            key: "m1",
+            x: 200,
+            y: 0,
+            i: 2,
+            j: 0,
+            cost: 2,
+            distance: 1.5,
+            waypoints: [{ x: 100, y: 0 }, { x: 200, y: 0 }]
+        }]
+    };
+}
+
+/**
+ * Install a mocked `game.darkHeresy.api.rolls` recording calls.
+ * @returns {object} Spy state.
+ */
+function mockRolls() {
+    const state = {
+        prepareCalls: [],
+        executeCalls: [],
+        outcome: null,
+        onExecute: null
+    };
+    game.darkHeresy.api.rolls = {
+        prepareAttack: async input => {
+            state.prepareCalls.push(input);
+            return { fingerprint: "fp1", rollData: {}, input };
+        },
+        executeAttack: async (prepared, options) => {
+            state.executeCalls.push({ prepared, options });
+            if (typeof state.onExecute === "function") state.onExecute();
+            return state.outcome ?? {
+                status: "ok",
+                operationId: options?.operationId,
+                chatMessageIds: ["chat-msg-1"],
+                resourceDelta: { ammo: -1 }
+            };
+        }
+    };
+    return state;
+}
+
+/** Remove the mocked rolls API after a test. */
+function clearRolls() {
+    delete game.darkHeresy.api.rolls;
+}
+
+/**
+ * Injected plan whose attack step carries the issue #14 cone contract
+ * (`attackType: "suppressing_fire"`, `template`, `suppressionFire`).
+ * @param {object} world
+ * @param {object} options
+ * @returns {object}
+ */
+function suppressionPlan(world, { operationId = "op-supp" } = {}) {
+    return {
+        id: "plan-suppression",
+        operationId,
+        steps: [
+            {
+                id: "step-attack-1",
+                type: "attack",
+                cost: { actions: 1 },
+                preconditions: ["turn"],
+                input: {
+                    actionId: "supp",
+                    name: "Heavy Bolter",
+                    itemUuid: `Actor.${world.actor.id}.Item.w1`,
+                    targetTokenUuid: `Scene.${world.scene.id}.Token.${world.enemy.token.id}`,
+                    range: 60,
+                    attackType: "suppressing_fire",
+                    suppressionFire: true,
+                    burstMode: "semi_auto",
+                    template: { direction: 15 }
+                }
+            },
+            { id: "step-end-2", type: "end-turn", input: { reason: "done" } }
+        ],
+        snapshot: {
+            self: {
+                tokenId: world.token.id,
+                tokenUuid: `Scene.${world.scene.id}.Token.${world.token.id}`,
+                actorUuid: `Actor.${world.actor.id}`,
+                x: 0,
+                y: 0
+            },
+            revision: "supp-rev"
+        }
+    };
+}
+
+/**
+ * Injected plan with a declare-only `overwatch` step (issue #14).
+ * @param {object} world
+ * @param {object} options
+ * @returns {object}
+ */
+function overwatchPlan(world, { operationId = "op-ow" } = {}) {
+    return {
+        id: "plan-overwatch",
+        operationId,
+        steps: [
+            {
+                id: "step-ow-1",
+                type: "overwatch",
+                cost: { actions: 1 },
+                preconditions: ["turn"],
+                input: {
+                    direction: 45,
+                    arc: 45,
+                    range: 30,
+                    weaponId: "w1",
+                    name: "Lasgun",
+                    attackType: "standard"
+                }
+            },
+            { id: "step-end-2", type: "end-turn", input: { reason: "done" } }
+        ],
+        snapshot: {
+            self: {
+                tokenId: world.token.id,
+                tokenUuid: `Scene.${world.scene.id}.Token.${world.token.id}`,
+                actorUuid: `Actor.${world.actor.id}`,
+                x: 0,
+                y: 0
+            },
+            revision: "ow-rev"
+        }
+    };
+}
+
+/** Stub planner accepting every injected plan as valid. */
+function stubPlanner() {
+    return {
+        validateSnapshot: () => ({ valid: true, reason: null }),
+        shouldReplan: () => ({ replan: false })
+    };
+}
+
+test("suppressing_fire step translates to burst mode + suppressionFire for the system API", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: suppressionPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(rolls.prepareCalls.length, 1);
+        const input = rolls.prepareCalls[0];
+        assert.equal(input.attackType, "semi_auto", "burst mode replaces the canonical attack type");
+        assert.equal(input.suppressionFire, true);
+        assert.equal(input.template.direction, 15, "cone direction forwarded to prepareAttack");
+    } finally {
+        clearRolls();
+    }
+});
+
+test("an overwatch step declares the cone through the overwatch service", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const declarations = [];
+    const overwatch = {
+        declare: async ({ combat, combatant, spec }) => {
+            declarations.push({ combat, combatant, spec });
+            return { ok: true, record: { ...spec, combatantId: combatant.id } };
+        }
+    };
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+    const result = await executor.runPlan({
+        combat: world.combat,
+        combatant: world.combatant,
+        operation,
+        plan: overwatchPlan(world, { operationId: operation.id }),
+        planner: stubPlanner(),
+        overwatch
+    });
+
+    assert.equal(result.status, EXECUTOR_STATUS.completed);
+    assert.equal(declarations.length, 1);
+    assert.equal(declarations[0].combatant.id, world.combatant.id);
+    assert.equal(declarations[0].spec.direction, 45);
+    assert.equal(declarations[0].spec.range, 30);
+    assert.equal(world.nextTurnCalls.count, 1);
+});
+
+test("a missing overwatch service fails the step with system-api-missing", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+    const result = await executor.runPlan({
+        combat: world.combat,
+        combatant: world.combatant,
+        operation,
+        plan: overwatchPlan(world, { operationId: operation.id }),
+        planner: stubPlanner()
+    });
+
+    assert.equal(result.failedStep, "step-ow-1");
+    assert.equal(result.reason, "system-api-missing");
+    assert.equal(result.status, EXECUTOR_STATUS.failed);
+});
+
+test("happy path: move + attack + end-turn executes and advances the turn", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(result.operationId, operation.id);
+        assert.equal(result.stepsDone.length, 3);
+        assert.deepEqual(result.stepsDone.map(s => s.type), ["move", "attack", "end-turn"]);
+
+        // Token moved through the serialized waypoints to the endpoint.
+        // Plan points are cell centres; TokenDocument#move receives
+        // document coordinates (centre − half footprint, issue #32).
+        assert.equal(world.moveCalls.length, 1);
+        assert.equal(world.token.x, 150);
+        assert.equal(world.token.y, -50);
+        const last = world.moveCalls[0].waypoints.at(-1);
+        assert.deepEqual({ x: last.x, y: last.y }, { x: 150, y: -50 });
+
+        // Attack executed exactly once with a step-scoped operation id.
+        assert.equal(rolls.executeCalls.length, 1);
+        assert.equal(rolls.executeCalls[0].options.operationId, `${operation.id}.step-attack-2`);
+
+        // Resources were spent exactly once: movement cost + ammo delta.
+        assert.equal(result.resourceDelta.movement, -2);
+        assert.equal(result.resourceDelta.ammo, -1);
+        assert.deepEqual(result.chatMessageIds, ["chat-msg-1"]);
+
+        // Operation closed and the turn advanced exactly once.
+        assert.equal(completed.length, 1);
+        assert.equal(completed[0].id, operation.id);
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a stale state mid-plan triggers exactly one replan", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    const rolls = mockRolls();
+    let planTurnCalls = 0;
+    const countingPlanner = {
+        ...planner,
+        planTurn: async (...args) => {
+            planTurnCalls++;
+            return planner.planTurn(...args);
+        }
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        // Manual intervention: the token is dragged elsewhere right after
+        // the executor's own move — validation before the attack sees
+        // `token-moved` and replans once on the new snapshot.
+        const baseMove = world.token.move;
+        world.token.move = async (...args) => {
+            const result = await baseMove(...args);
+            world.token.x = 250;
+            return result;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planner: countingPlanner,
+            planContext: planContext(world)
+        });
+
+        assert.equal(planTurnCalls, 2, "expected one original plan + one replan");
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(result.replanCount, 1);
+        assert.equal(rolls.executeCalls.length, 1);
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a GM drag counts its distance toward the replan movement budget", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    const rolls = mockRolls();
+    const seen = [];
+    const countingPlanner = {
+        ...planner,
+        planTurn: async (combat, combatant, ctx) => {
+            if (ctx?.replanCount > 0) seen.push(ctx);
+            return planner.planTurn(combat, combatant, ctx);
+        }
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const baseMove = world.token.move;
+        world.token.move = async (...args) => {
+            const result = await baseMove(...args);
+            // GM drags the token 3 cells further right after the AI move —
+            // the drift joins spent movement before the replan budgets.
+            world.token.x += 300;
+            return result;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planner: countingPlanner,
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.replanCount, 1);
+        assert.equal(seen.length, 1, "exactly one replan context");
+        // Executed move cost (2) + manual drag drift (3 cells) = 5.
+        assert.equal(seen[0].spent.movement, 5);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a second stale stops the turn with hold-and-report diagnostics", async () => {
+    // The enemy is far away so every (re)plan keeps a move step whose mock
+    // re-triggers the external drag — each follow-up validation is stale.
+    const world = makeWorld({ enemy: { x: 3000, y: 0 } });
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    const warnings = [];
+    const originalWarn = ui.notifications.warn;
+    ui.notifications.warn = msg => warnings.push(msg);
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const baseMove = world.token.move;
+        world.token.move = async (...args) => {
+            const result = await baseMove(...args);
+            // Drag the token after every executor move so each follow-up
+            // validation reports `token-moved`.
+            world.token.x += 50;
+            return result;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.partial);
+        assert.equal(result.reason, "replan-limit-exceeded");
+        assert.equal(result.replanCount, 1);
+        assert.ok(result.stepsDone.some(s => s.type === "move" && s.status === "done"));
+        assert.equal(rolls.executeCalls.length, 0, "attack never ran");
+        assert.equal(world.nextTurnCalls.count, 1, "terminal status still ends the turn");
+        assert.ok(warnings.length >= 1, "GM warning was emitted");
+    } finally {
+        ui.notifications.warn = originalWarn;
+        clearRolls();
+    }
+});
+
+test("a non-controller client returns not-controller without touching documents", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi({ controller: false });
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "not-controller");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(world.updateCalls.length, 0);
+        assert.equal(rolls.executeCalls.length, 0);
+        assert.equal(completed.length, 0);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("repeated executePlan with the same operationId returns the stored result", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const planning = await planner.planTurn(world.combat, world.combatant, {
+            ...planContext(world, { melee: false })
+        });
+        assert.equal(planning.status, "ok");
+        const context = {
+            combat: world.combat,
+            combatant: world.combatant,
+            operationId: `op-${++_opId}`
+        };
+        const first = await executor.executePlan(planning.plan, context);
+        const second = await executor.executePlan(planning.plan, context);
+
+        assert.equal(first.status, EXECUTOR_STATUS.completed);
+        assert.strictEqual(second, first, "same stored result is returned");
+        assert.equal(rolls.executeCalls.length, 1, "system API deduped too");
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a move step is skipped when the token already sits on the endpoint", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        // A real plan snapshot with a hand-picked move step back to the
+        // current position — the executor must short-circuit it.
+        const planning = await planner.planTurn(world.combat, world.combatant, planContext(world));
+        assert.equal(planning.status, "ok");
+        const plan = {
+            ...planning.plan,
+            steps: [
+                { id: "step-move-1", type: "move", input: { to: { x: 50, y: 50 } }, projectedResourceDelta: {} },
+                { id: "step-end-turn-2", type: "end-turn", input: {}, projectedResourceDelta: {} }
+            ]
+        };
+        const result = await executor.executePlan(plan, {
+            combat: world.combat,
+            combatant: world.combatant,
+            operationId: `op-${++_opId}`
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        const moveStep = result.stepsDone.find(s => s.type === "move");
+        assert.equal(moveStep.status, "skipped");
+        assert.equal(moveStep.reason, "already-at-endpoint");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(world.updateCalls.length, 0);
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("partial failure after a spent attack never spends resources twice", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        // After the successful attack an external token move makes the
+        // follow-up validation stale; the replanned attack is skipped
+        // because the action budget was already spent.
+        rolls.onExecute = () => {
+            world.token.x = 50;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world, { melee: false })
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.partial);
+        assert.equal(rolls.executeCalls.length, 1, "attack ran exactly once");
+        assert.equal(result.resourceDelta.ammo, -1, "ammo spent once");
+        const skipped = result.stepsDone.filter(s => s.status === "skipped");
+        assert.ok(skipped.some(s => s.reason === "action-budget-spent"));
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a disabled effective config refuses execution without advancing", async () => {
+    const world = makeWorld({ enabled: false });
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "config-disabled");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(rolls.executeCalls.length, 0);
+        // The operation is closed but the turn stays under manual control.
+        assert.equal(completed.length, 1);
+        assert.equal(completed[0].result.advanceTurn, false);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("the master switch refuses execution without advancing", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({
+            api,
+            getMode: () => "automatic",
+            isEnabled: () => false
+        });
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "module-disabled");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(rolls.executeCalls.length, 0);
+        // The operation is closed but the turn stays under manual control.
+        assert.equal(completed.length, 1);
+        assert.equal(completed[0].result.advanceTurn, false);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a missing system rolls API stops safely with system-api-missing", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    clearRolls();
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const result = await executor.runPlan({
+        combat: world.combat,
+        combatant: world.combatant,
+        operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+        planContext: planContext(world)
+    });
+
+    assert.equal(result.status, EXECUTOR_STATUS.partial);
+    assert.equal(result.reason, "system-api-missing");
+    assert.equal(completed.length, 1);
+    assert.equal(world.nextTurnCalls.count, 1, "terminal failure still ends the turn");
+});
+
+test("preview mode plans and validates without any state changes", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "preview" });
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "awaiting-preview" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.preview);
+        assert.equal(result.reason, "preview-mode");
+        assert.ok(result.plan, "computed plan is returned for the GM");
+        assert.equal(world.moveCalls.length, 0);
+        assert.equal(world.updateCalls.length, 0);
+        assert.equal(rolls.executeCalls.length, 0);
+        assert.equal(completed.length, 0);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("an aborted authority signal cancels execution without writes", async () => {
+    const world = makeWorld();
+    const { api, completed } = makeApi();
+    const rolls = mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const signal = { aborted: false };
+        const baseMove = world.token.move;
+        world.token.move = async (...args) => {
+            const result = await baseMove(...args);
+            signal.aborted = true;
+            return result;
+        };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            signal,
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.cancelled);
+        assert.equal(result.reason, "controller-changed");
+        assert.equal(rolls.executeCalls.length, 0);
+        assert.equal(completed.length, 0);
+        assert.equal(world.nextTurnCalls.count, 0);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a landed attack defers nextTurn until the GM applies the damage card", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    rolls.outcome = {
+        status: "ok",
+        chatMessageIds: ["attack-card-1"],
+        resourceDelta: { ammo: -1 },
+        roll: { hits: 2 }
+    };
+    // No wait timeout inside the test — the card settles manually.
+    game.settings._values.set("only-war-ai.damageWaitTimeoutSeconds", 0);
+    game.settings._values.set("only-war-ai.turnPacingMs", 0);
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    const createHook = Hooks._calls.filter(c => c.event === "createChatMessage").at(-1).fn;
+    const updateHook = Hooks._calls.filter(c => c.event === "updateChatMessage").at(-1).fn;
+    const operationId = `op-${++_opId}`;
+    try {
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: operationId, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world, { melee: false })
+        });
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(world.nextTurnCalls.count, 0,
+            "turn waits for the GM damage adjudication");
+
+        // GM rolls the damage card off the attack card — it carries the
+        // step-scoped apiOperationId and an unapplied hit.
+        const attackStepId = result.stepsDone.find(s => s.type === "attack")?.stepId;
+        const apiOpId = `${operationId}.${attackStepId}`;
+        const damageMessage = {
+            id: "dmg-card-1",
+            getRollData: () => ({
+                flags: { isDamageRoll: true },
+                apiOperationId: apiOpId,
+                damages: [{ applied: false }]
+            })
+        };
+        createHook(damageMessage);
+        assert.equal(world.nextTurnCalls.count, 0,
+            "an unsettled damage card still holds the turn");
+
+        // GM applies the hit — the card settles and the deferred advance fires.
+        damageMessage.getRollData = () => ({
+            flags: { isDamageRoll: true },
+            apiOperationId: apiOpId,
+            damages: [{ applied: true }]
+        });
+        updateHook(damageMessage);
+        await new Promise(resolve => setTimeout(resolve, 20));
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        game.settings._values.delete("only-war-ai.damageWaitTimeoutSeconds");
+        game.settings._values.delete("only-war-ai.turnPacingMs");
+        clearRolls();
+    }
+});
+
+test("a missed attack does not hold the turn for damage adjudication", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    rolls.outcome = {
+        status: "ok",
+        chatMessageIds: ["attack-card-1"],
+        resourceDelta: { ammo: -1 },
+        roll: { hits: 0 }
+    };
+    game.settings._values.set("only-war-ai.turnPacingMs", 0);
+    const executor = createExecutorService({ api, getMode: () => "automatic" });
+    try {
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world, { melee: false })
+        });
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(world.nextTurnCalls.count, 1,
+            "a whiffed shot advances without the damage wait");
+    } finally {
+        game.settings._values.delete("only-war-ai.turnPacingMs");
+        clearRolls();
+    }
+});
+
+test("an exhausted committed plan is cancelled instead of replaying no-op moves", async () => {
+    const world = makeWorld();
+    const { api, planner } = makeApi();
+    mockRolls();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const planning = await planner.planTurn(world.combat, world.combatant, planContext(world));
+        assert.equal(planning.status, "ok");
+        // A committed record whose only substantive step is the move the
+        // token already finished last turn (top-left 0,0 = centre 50,50).
+        const record = {
+            id: "rec-exhausted",
+            status: "active",
+            combatId: world.combat.id,
+            combatantId: world.combatant.id,
+            createdRound: 1,
+            createdTurn: 0,
+            ttl: 2,
+            source: "commitment",
+            steps: [
+                {
+                    id: "step-move-1", type: "move", cost: { movement: 1 },
+                    input: { to: { x: 50, y: 50 }, waypoints: [{ x: 50, y: 50 }] },
+                    preconditions: ["turn"], projectedResourceDelta: {}
+                },
+                {
+                    id: "step-end-2", type: "end-turn", cost: {},
+                    input: { reason: "committed" },
+                    preconditions: ["turn"], projectedResourceDelta: {}
+                }
+            ],
+            expectedState: {
+                self: { x: 50, y: 50, elevation: 0 },
+                morale: null,
+                threats: []
+            }
+        };
+        world.combatant.flags["only-war-ai"] = {
+            ...(world.combatant.flags["only-war-ai"] ?? {}),
+            committedPlan: record
+        };
+        const plan = {
+            ...planning.plan,
+            breakdown: { reason: "commitment", source: "commitment" },
+            steps: foundry.utils.deepClone(record.steps)
+        };
+        const result = await executor.executePlan(plan, {
+            combat: world.combat,
+            combatant: world.combatant,
+            operationId: `op-${++_opId}`
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        const moveStep = result.stepsDone.find(s => s.stepId === "step-move-1");
+        assert.equal(moveStep.reason, "already-at-endpoint");
+        // The dead record is stamped cancelled — the next turn plans
+        // fresh instead of replaying the exhausted route again.
+        const stored = world.combatant.getFlag("only-war-ai", "committedPlan");
+        assert.equal(stored.status, "cancelled");
+        assert.equal(stored.cancelledReason, "plan-exhausted");
+    } finally {
+        clearRolls();
+    }
+});
+
+test("broken i18n/chat helpers never crash the executor diagnostics card", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const originalFormat = game.i18n.format;
+    const originalChatMessage = globalThis.ChatMessage;
+    game.i18n.format = () => { throw new Error("broken i18n"); };
+    globalThis.ChatMessage = { create: async () => ({ id: "msg-1" }) };
+    game.settings._values.set("only-war-ai.diagnosticsEnabled", true);
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        // A missing system rolls API stops the turn with `partial`, which
+        // runs the diagnostics-chat block through the broken formatter.
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation: { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" },
+            planContext: planContext(world)
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.partial);
+        assert.equal(result.reason, "system-api-missing");
+        assert.equal(world.nextTurnCalls.count, 1,
+            "the diagnostics crash never blocks the turn advance");
+    } finally {
+        game.i18n.format = originalFormat;
+        globalThis.ChatMessage = originalChatMessage;
+        game.settings._values.delete("only-war-ai.diagnosticsEnabled");
+    }
+});

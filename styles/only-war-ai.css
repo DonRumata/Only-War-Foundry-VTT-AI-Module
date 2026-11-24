@@ -1,0 +1,129 @@
+/* Only War AI — minimal styles for injected sheet sections and config menu. */
+
+.ow-ai-config {
+    border: 1px solid var(--color-border-light-2, #999);
+    border-radius: 4px;
+    margin: 8px 0;
+    padding: 8px;
+}
+
+.ow-ai-config legend {
+    font-weight: bold;
+    padding: 0 6px;
+}
+
+.ow-ai-config .form-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+}
+
+.ow-ai-config .form-group label {
+    flex: 0 0 auto;
+    font-weight: 600;
+}
+
+.ow-ai-config .form-group select {
+    flex: 1;
+}
+
+.ow-ai-config-menu .ow-ai-value {
+    font-family: var(--font-mono, monospace);
+}
+
+.ow-ai-preset-list,
+.ow-ai-override-list {
+    list-style: none;
+    margin: 4px 0;
+    padding-left: 8px;
+}
+
+/* Issue #409 — GM plan preview dialog. */
+
+.ow-ai-preview .ow-ai-preview-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.ow-ai-preview .ow-ai-preview-stale {
+    align-items: center;
+    background: var(--color-level-warning-bg, rgba(200, 150, 30, 0.15));
+    border: 1px solid var(--color-level-warning, #c89b3c);
+    border-radius: 4px;
+    display: flex;
+    gap: 8px;
+    padding: 6px 8px;
+}
+
+.ow-ai-preview .ow-ai-preview-summary .form-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 2px 0;
+}
+
+.ow-ai-preview .ow-ai-preview-summary .form-group label {
+    flex: 0 0 140px;
+    font-weight: 600;
+}
+
+.ow-ai-preview .ow-ai-token-img {
+    border: none;
+    height: 24px;
+    margin-right: 4px;
+    vertical-align: middle;
+    width: 24px;
+}
+
+.ow-ai-preview .ow-ai-preview-body fieldset {
+    border: 1px solid var(--color-border-light-2, #999);
+    border-radius: 4px;
+    margin: 0;
+    padding: 6px 8px;
+}
+
+.ow-ai-preview .ow-ai-preview-body fieldset legend {
+    font-weight: bold;
+    padding: 0 6px;
+}
+
+.ow-ai-preview .ow-ai-route,
+.ow-ai-preview .ow-ai-steps,
+.ow-ai-preview .ow-ai-resources,
+.ow-ai-preview .ow-ai-ranking,
+.ow-ai-preview .ow-ai-preview-breakdown ul,
+.ow-ai-preview .ow-ai-preview-trace ul,
+.ow-ai-preview .ow-ai-preview-diagnostics ul {
+    list-style: none;
+    margin: 4px 0;
+    padding-left: 8px;
+}
+
+.ow-ai-preview .ow-ai-route {
+    counter-reset: ow-ai-route;
+    list-style: decimal;
+    padding-left: 24px;
+}
+
+.ow-ai-preview .ow-ai-preview-breakdown summary,
+.ow-ai-preview .ow-ai-preview-trace summary,
+.ow-ai-preview .ow-ai-preview-diagnostics summary {
+    cursor: pointer;
+    font-weight: 600;
+}
+
+.ow-ai-preview .ow-ai-preview-timeout {
+    margin: 0;
+}
+
+.ow-ai-preview .ow-ai-preview-buttons {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+
+.ow-ai-preview .ow-ai-preview-buttons button[disabled] {
+    opacity: 0.5;
+}

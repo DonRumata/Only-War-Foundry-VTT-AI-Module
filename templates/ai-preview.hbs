@@ -1,0 +1,184 @@
+<div class="ow-ai-preview-body">
+    {{#if stale}}
+    <div class="ow-ai-preview-stale">
+        <i class="fas fa-exclamation-triangle"></i>
+        <span>{{staleLabel}}</span>
+    </div>
+    {{/if}}
+
+    <div class="ow-ai-preview-summary">
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Npc"}}</label>
+            <span class="ow-ai-value">
+                {{#if npc.img}}<img class="ow-ai-token-img" src="{{npc.img}}" alt="">{{/if}}
+                {{npc.name}}
+            </span>
+        </div>
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Preset"}}</label>
+            <span class="ow-ai-value">{{npc.presetLabel}}</span>
+        </div>
+        {{#if npc.personalityLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Personality"}}</label>
+            <span class="ow-ai-value">{{npc.personalityLabel}}</span>
+        </div>
+        {{/if}}
+        {{#if intentLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Intent"}}</label>
+            <span class="ow-ai-value">{{intentLabel}}</span>
+        </div>
+        {{/if}}
+        {{#if morale.tierLabel}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Morale"}}</label>
+            <span class="ow-ai-value">
+                {{morale.tierLabel}}{{#if morale.effectiveTierLabel}} ({{morale.effectiveTierLabel}}){{/if}}
+            </span>
+        </div>
+        {{/if}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Target.Label"}}</label>
+            <span class="ow-ai-value">
+                {{#if target}}
+                {{target.name}}{{#if target.x}} ({{target.x}}, {{target.y}}){{/if}}
+                {{else}}
+                {{localize "OWAI.Preview.Target.None"}}
+                {{/if}}
+            </span>
+        </div>
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Action.Label"}}</label>
+            <span class="ow-ai-value">
+                {{#if action}}
+                {{action.typeLabel}}{{#if action.name}}: {{action.name}}{{/if}}{{#if action.mode}} ({{action.mode}}){{/if}}{{#if action.attackTypeLabel}} ({{action.attackTypeLabel}}){{/if}}
+                {{#if action.targetNumber}} — {{localize "OWAI.Preview.TargetNumber"}}: {{action.targetNumber}}{{/if}}
+                {{else}}
+                {{localize "OWAI.Preview.Action.None"}}
+                {{/if}}
+            </span>
+        </div>
+        {{#if hasScore}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.Score"}}</label>
+            <span class="ow-ai-value">{{score}}</span>
+        </div>
+        {{/if}}
+        {{#if commitmentReplay}}
+        <div class="form-group">
+            <label>{{localize "OWAI.Preview.PlanSource"}}</label>
+            <span class="ow-ai-value">{{localize "OWAI.Preview.CommitmentReplay"}}</span>
+        </div>
+        {{/if}}
+    </div>
+
+    <fieldset>
+        <legend>{{localize "OWAI.Preview.Route.Label"}}</legend>
+        {{#if route}}
+        <ol class="ow-ai-route">
+            {{#each route.points}}
+            <li>({{this.x}}, {{this.y}})</li>
+            {{else}}
+            <li>{{localize "OWAI.Preview.Route.Empty"}}</li>
+            {{/each}}
+        </ol>
+        <p class="notes">
+            {{localize "OWAI.Preview.Route.Cost"}}: {{route.cost}}
+            {{#if route.approximate}} — {{localize "OWAI.Preview.Route.Approximate"}}{{/if}}
+        </p>
+        {{#if diagnostics.enabled}}
+        <button type="button" class="ow-ai-copy-route" data-clipboard="route">
+            <i class="fas fa-copy"></i> {{localize "OWAI.Preview.Route.Copy"}}
+        </button>
+        {{/if}}
+        {{else}}
+        <p class="notes">{{localize "OWAI.Preview.Route.Empty"}}</p>
+        {{/if}}
+    </fieldset>
+
+    <fieldset>
+        <legend>{{localize "OWAI.Preview.Steps"}}</legend>
+        <ul class="ow-ai-steps">
+            {{#each steps}}
+            <li><code>{{this.id}}</code> — {{this.label}}{{#if this.name}}: {{this.name}}{{/if}}{{#if this.detailLabel}} ({{this.detailLabel}}){{/if}}</li>
+            {{/each}}
+        </ul>
+    </fieldset>
+
+    <fieldset>
+        <legend>{{localize "OWAI.Preview.Projected.Label"}}</legend>
+        <ul class="ow-ai-resources">
+            {{#each resources}}
+            <li>{{this.label}}: {{this.value}}</li>
+            {{else}}
+            <li>{{localize "OWAI.Preview.Projected.None"}}</li>
+            {{/each}}
+        </ul>
+    </fieldset>
+
+    <details class="ow-ai-preview-breakdown">
+        <summary>{{localize "OWAI.Preview.Breakdown"}}</summary>
+        <ul>
+            {{#each breakdown}}
+            <li>{{this.label}}: {{this.value}}</li>
+            {{else}}
+            <li>—</li>
+            {{/each}}
+        </ul>
+    </details>
+
+    {{#if traceLines.length}}
+    <details class="ow-ai-preview-trace">
+        <summary>{{localize "OWAI.Preview.Trace"}}</summary>
+        <ul>
+            {{#each traceLines}}
+            <li>{{this}}</li>
+            {{/each}}
+        </ul>
+    </details>
+    {{/if}}
+
+    {{#if diagnostics.enabled}}
+    <details class="ow-ai-preview-diagnostics">
+        <summary>{{localize "OWAI.Preview.Diagnostics"}}</summary>
+        <ul>
+            {{#each diagnostics.rejected}}
+            <li><code>{{this.candidate}}</code> — {{this.reason}}</li>
+            {{else}}
+            <li>—</li>
+            {{/each}}
+        </ul>
+        {{#if diagnostics.ranking}}
+        <ul class="ow-ai-ranking">
+            {{#each diagnostics.ranking}}
+            <li><code>{{this.candidate}}</code> — {{this.score}}</li>
+            {{/each}}
+        </ul>
+        {{/if}}
+    </details>
+    {{/if}}
+
+    {{#if timeoutLabel}}
+    <p class="notes ow-ai-preview-timeout">
+        <i class="fas fa-hourglass-half"></i> {{timeoutLabel}}
+    </p>
+    {{/if}}
+
+    <footer class="ow-ai-preview-buttons">
+        <button type="button" data-action="confirm" {{#if stale}}disabled{{/if}}>
+            <i class="fas fa-check"></i> {{localize "OWAI.Preview.Confirm"}}
+        </button>
+        <button type="button" data-action="replan" {{#unless replan.allowed}}disabled{{/unless}}>
+            <i class="fas fa-sync-alt"></i> {{localize "OWAI.Preview.Replan"}}
+        </button>
+        {{#if diagnostics.enabled}}
+        <button type="button" data-clipboard="info">
+            <i class="fas fa-download"></i> {{localize "OWAI.Preview.ExportInfo"}}
+        </button>
+        {{/if}}
+        <button type="button" data-action="cancel">
+            <i class="fas fa-times"></i> {{localize "OWAI.Preview.Cancel"}}
+        </button>
+    </footer>
+</div>

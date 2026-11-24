@@ -1,0 +1,432 @@
+/**
+ * Only War AI module bootstrap (issue #399).
+ *
+ * Lifecycle:
+ * - `init` registers world settings, the settings menu, the public module API
+ *   (`game.modules.get("only-war-ai").api`) and UI hook points.
+ * - `ready` verifies `game.system.id === "only-war-local"` and the major
+ *   version of `game.darkHeresy.api` (issue #398 contract). On mismatch the
+ *   module shows a single GM notification and stays disabled — it never
+ *   activates NPCs on its own.
+ */
+import { MODULE_ID } from "./constants.js";
+import { createAuthorityService } from "./authority.js";
+import { checkSystemCompatibility, COMPATIBILITY_REASONS } from "./compatibility.js";
+import { createModuleApi } from "./api.js";
+import { createOperationService } from "./operations.js";
+import { createPerceptionService } from "./perception.js";
+import { createNavigationService } from "./navigation.js";
+import { createPlannerService } from "./planner.js";
+import { createExecutorService } from "./executor.js";
+import { createFireteamService } from "./fireteam.js";
+import { createOverwatchService } from "./overwatch.js";
+import { createReactionsService } from "./reactions.js";
+import { createGrudgesService } from "./grudges.js";
+import { createPlanOverlayService } from "./ui/plan-overlay.js";
+import { createThreatMapService } from "./threat-map.js";
+import { registerAssaultPreset } from "./presets/assault.js";
+import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
+import { registerHoldPreset } from "./presets/hold.js";
+import { registerSpecOpsPreset } from "./presets/spec-ops.js";
+import { registerSettings } from "./settings.js";
+import { registerSheetControls } from "./ui/npc-sheet.js";
+import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
+import { registerConfigMenu } from "./ui/config-menu.js";
+import { registerPreviewUI } from "./ui/preview-dialog.js";
+
+Hooks.once("init", () => {
+    console.log(`${MODULE_ID} | Initializing Only War AI`);
+
+    // Publish the API early so macros and follow-up modules can inspect it
+    // even when the compatibility check on `ready` keeps the module disabled.
+    const mod = game.modules.get(MODULE_ID);
+    if (mod) {
+        mod.api = createModuleApi();
+    } else {
+        console.error(`${MODULE_ID} | Module record not found; API not published`);
+    }
+
+    try {
+        _registerAuthorityServices(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register authority services`, err);
+    }
+
+    try {
+        _registerPerceptionService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register perception service`, err);
+    }
+
+    try {
+        _registerNavigationService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register navigation service`, err);
+    }
+
+    try {
+        _registerThreatMapService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register threat-map service`, err);
+    }
+
+    try {
+        _registerPlannerService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register planner service`, err);
+    }
+
+    try {
+        _registerExecutorService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register executor service`, err);
+    }
+
+    try {
+        _registerFireteamService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register fireteam service`, err);
+    }
+
+    try {
+        _registerPlanOverlayService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register plan overlay service`, err);
+    }
+
+    try {
+        _registerOverwatchService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register overwatch service`, err);
+    }
+
+    try {
+        _registerReactionsService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register reactions service`, err);
+    }
+
+    try {
+        _registerGrudgesService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register grudges service`, err);
+    }
+
+    try {
+        _registerPreviewService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register preview UI`, err);
+    }
+
+    try {
+        registerSettings();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register settings`, err);
+    }
+
+    try {
+        registerConfigMenu();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register settings menu`, err);
+    }
+
+    try {
+        registerSheetControls();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register sheet controls`, err);
+    }
+
+    try {
+        registerCombatTrackerControls();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register combat tracker controls`, err);
+    }
+
+    // Hook point for follow-up subtasks and third-party integrations.
+    Hooks.callAll(`${MODULE_ID}.apiReady`, mod?.api);
+});
+
+Hooks.once("ready", () => {
+    const api = game.modules.get(MODULE_ID)?.api;
+    const compatibility = checkSystemCompatibility({
+        systemId: game.system?.id,
+        api: game.darkHeresy?.api
+    });
+
+    if (!compatibility.ok) {
+        if (api) {
+            api._state.enabled = false;
+            api._state.incompatibleReason = compatibility.reason;
+        }
+        _notifyIncompatibleOnce(compatibility);
+        console.warn(
+            `${MODULE_ID} | Disabled: ${compatibility.reason} `
+            + `(expected ${compatibility.expected}, got ${compatibility.actual ?? "none"})`
+        );
+        return;
+    }
+
+    if (api) {
+        api._state.enabled = true;
+        api._state.incompatibleReason = null;
+    }
+
+    // Start the active-GM authority service: watcher hooks, socket protocol
+    // and turn detection only run in a compatible world.
+    try {
+        api?.services?.get?.("authority")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start authority service`, err);
+    }
+
+    // Start the perception service: LOS watchers and combat memory
+    // maintenance only run in a compatible world.
+    try {
+        api?.services?.get?.("perception")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start perception service`, err);
+    }
+
+    // Start the shared GM-only overlay root before the overwatch service
+    // so its layer lifecycle exists when the cone renderer subscribes.
+    try {
+        api?.services?.get?.("planOverlay")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start plan overlay service`, err);
+    }
+
+    // Start the overwatch service: GM-only cone overlays and declaration
+    // expiry only run in a compatible world.
+    try {
+        api?.services?.get?.("overwatch")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start overwatch service`, err);
+    }
+
+    // Start the reactions service: the per-round `reactionUsed` flag
+    // refresh on turn starts only runs in a compatible world.
+    try {
+        api?.services?.get?.("reactions")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start reactions service`, err);
+    }
+
+    // Start the grudges service: the `updateActor` wound tracker feeding
+    // the `lastAttacker` flag only runs in a compatible world.
+    try {
+        api?.services?.get?.("grudges")?.start?.();
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to start grudges service`, err);
+    }
+    console.log(`${MODULE_ID} | Ready`);
+});
+
+/**
+ * Register the `operations` and `authority` services on the module API
+ * (issue #400). The authority service is created lazily at init and only
+ * started on `ready` after the compatibility check.
+ * @param {object} api Module API object.
+ */
+function _registerAuthorityServices(api) {
+    if (!api?.services) return;
+    if (!api.services.has("operations")) {
+        api.services.register("operations", createOperationService({ hooks: Hooks }));
+    }
+    if (!api.services.has("authority")) {
+        api.services.register("authority", createAuthorityService({
+            api,
+            operations: api.services.get("operations")
+        }));
+    }
+}
+
+/**
+ * Register the `perception` service on the module API (issue #401). The
+ * service is created lazily at init and only started on `ready` after the
+ * compatibility check.
+ * @param {object} api Module API object.
+ */
+function _registerPerceptionService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("perception")) {
+        api.services.register("perception", createPerceptionService({ api, hooks: Hooks }));
+    }
+}
+
+/**
+ * Register the `threatMap` service on the module API (issue #16). The
+ * service is pure/read-only — no hooks, no lifecycle — so it is available
+ * immediately for the planner and macros.
+ * @param {object} api Module API object.
+ */
+function _registerThreatMapService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("threatMap")) {
+        api.services.register("threatMap", createThreatMapService({ api }));
+    }
+}
+
+/**
+ * Register the `planner` service on the module API (issue #403). The
+ * service is pure/deterministic — no hooks, no lifecycle — so it is
+ * available immediately for the executor and macros.
+ * @param {object} api Module API object.
+ */
+function _registerPlannerService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("planner")) {
+        const planner = createPlannerService({ api });
+        // Issue #404: replace the assault skeleton with the real preset.
+        registerAssaultPreset(planner);
+        // Issue #405: replace the ranged-cover skeleton with the real preset.
+        registerRangedCoverPreset(planner);
+        // Issue #406: replace the hold skeleton with the real preset.
+        registerHoldPreset(planner);
+        // Issue #412: replace the spec-ops skeleton with the real preset.
+        registerSpecOpsPreset(planner);
+        api.services.register("planner", planner);
+    }
+}
+
+/**
+ * Register the `executor` service on the module API (issue #407). The
+ * service resolves siblings lazily (`api.services.get("authority" |
+ * "planner" | "operations")`), so it registers safely whether or not the
+ * stacked authority branch is present.
+ * @param {object} api Module API object.
+ */
+function _registerExecutorService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("executor")) {
+        api.services.register("executor", createExecutorService({ api }));
+    }
+}
+
+/**
+ * Register the `fireteam` service on the module API (issue #408). Sibling
+ * services (planner, authority) are resolved lazily through the registry,
+ * so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerFireteamService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("fireteam")) {
+        api.services.register("fireteam", createFireteamService({ api }));
+    }
+}
+
+/**
+ * Register the `planOverlay` service on the module API (issues #29/#36):
+ * the shared GM-only canvas layer for preview plans and the danger
+ * heatmap. A GM-restricted keybinding (Alt+M) toggles the heatmap.
+ * @param {object} api Module API object.
+ */
+function _registerPlanOverlayService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("planOverlay")) {
+        api.services.register("planOverlay", createPlanOverlayService({ api, hooks: Hooks }));
+    }
+    try {
+        game.keybindings?.register?.(MODULE_ID, "threatMapOverlay", {
+            name: "OWAI.Keybinding.ThreatMapOverlay.Name",
+            hint: "OWAI.Keybinding.ThreatMapOverlay.Hint",
+            editable: [{ key: "KeyM", modifiers: ["Alt"] }],
+            restricted: true,
+            onDown: () => {
+                api.services.get("planOverlay")?.toggleDanger?.();
+            }
+        });
+    } catch(err) {
+        // Keybinding registration is optional — the world setting and the
+        // service API remain the documented toggles.
+        console.warn(`${MODULE_ID} | Threat-overlay keybinding not registered`, err);
+    }
+}
+
+/**
+ * Register the `overwatch` service on the module API (issue #14):
+ * declare-only overwatch cones and their GM-only rendering. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerOverwatchService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("overwatch")) {
+        api.services.register("overwatch", createOverwatchService({ api }));
+    }
+}
+
+/**
+ * Register the `reactions` service on the module API (issue #37): the
+ * per-round `reactionUsed` flag — `markUsed`/`clear` for the system side
+ * and GM macros, the `updateCombat` refresh on turn starts. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerReactionsService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("reactions")) {
+        api.services.register("reactions", createReactionsService({ api }));
+    }
+}
+
+/**
+ * Register the `grudges` service on the module API (issue #39): the
+ * `lastAttacker` flag — `updateActor` wound tracking with conservative
+ * chat-card attribution feeding the planner's `grudge` factor. Sibling
+ * services are resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerGrudgesService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("grudges")) {
+        api.services.register("grudges", createGrudgesService({ api }));
+    }
+}
+
+/**
+ * Register the `navigation` service on the module API (issue #402). The
+ * service is pure/read-only — no hooks, no lifecycle — so it is available
+ * immediately for the planner and macros.
+ * @param {object} api Module API object.
+ */
+function _registerNavigationService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("navigation")) {
+        api.services.register("navigation", createNavigationService({ api }));
+    }
+}
+
+/**
+ * Register the `preview` service on the module API (issue #409): the GM
+ * preview controller plus its hook subscriptions (`previewRequested`,
+ * `phaseChanged` and the stale-watch document hooks). Sibling services are
+ * resolved lazily, so registration order does not matter.
+ * @param {object} api Module API object.
+ */
+function _registerPreviewService(api) {
+    const controller = registerPreviewUI(api);
+    if (api?.services && !api.services.has("preview")) {
+        api.services.register("preview", controller);
+    }
+}
+
+/**
+ * Show a single GM-facing notification for an incompatible environment.
+ * @param {{reason: string, expected: string, actual: string|null}} compatibility
+ */
+function _notifyIncompatibleOnce(compatibility) {
+    const key = {
+        [COMPATIBILITY_REASONS.wrongSystem]: "OWAI.Notifications.WrongSystem",
+        [COMPATIBILITY_REASONS.apiMissing]: "OWAI.Notifications.ApiMissing",
+        [COMPATIBILITY_REASONS.versionMismatch]: "OWAI.Notifications.VersionMismatch"
+    }[compatibility.reason] ?? "OWAI.Notifications.ApiMissing";
+
+    const message = game.i18n?.format?.(key, {
+        expected: compatibility.expected,
+        actual: compatibility.actual ?? "—"
+    }) ?? `Only War AI disabled (${compatibility.reason})`;
+
+    // `warn` type deduplicates visually; only GMs can act on module problems.
+    ui.notifications?.warn?.(message, { permanent: true, localize: false });
+}
