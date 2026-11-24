@@ -57,7 +57,8 @@ export function createTurnAdvance({
             // Operations without turn coordinates (direct runPlan callers)
             // keep the legacy always-advance semantics.
             if (!Number.isFinite(operation?.round) || !Number.isFinite(operation?.turn)) return true;
-            return combat.round === operation.round && combat.turn === operation.turn;
+            return combat.round === operation.round && combat.turn === operation.turn
+                && (!operation.combatantId || combat.combatant?.id === operation.combatantId);
         };
         if (!onTurn()) return true;
         const id = combat.id ?? "combat";

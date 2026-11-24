@@ -265,7 +265,8 @@ export function createPlannerService({
         if (!config?.enabled) {
             return { status: PLANNER_STATUS.disabled, reason: "config-disabled", plan: null };
         }
-        const presetId = presets.has(config.preset) ? config.preset : FALLBACK_PRESET;
+        const preferredPreset = context.teamTurn ? (context.team?.preset ?? config.preset) : config.preset;
+        const presetId = presets.has(preferredPreset) ? preferredPreset : FALLBACK_PRESET;
         const preset = presets.get(presetId) ?? presets.get(FALLBACK_PRESET);
         const seed = _seedFor(context, combat, combatant);
         // Issue #16 difficulty: `context.difficulty` (validated) overrides
@@ -426,6 +427,21 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
+        const teamTurn = context.teamTurn;
+        const coordinationPlan = (steps, reason) => {
+            diagnostics.chosenStep = steps[0].id;
+            const plan = _assemblePlan({
+                combat, combatant, context, authority, seed, presetId,
+                diagnostics, steps, winner: { score: 0, breakdown: { reason }, target: null },
+                targets: [], actions: []
+            });
+            return { status: PLANNER_STATUS.ok, plan, reason: null };
+        };
+        if (teamTurn?.phase === "wait") {
+            const steps = _stepsFor({ candidate: { variant: "hold" } });
+            steps[0].input.reason = teamTurn.reason;
+            return coordinationPlan(steps, teamTurn.reason);
+        }
         // Services resolve ahead of L1: the committed-attack staleness
         // check (los-broken) needs the perception probe inside the live
         // view, and navigation feeds the flank move probe further down.
@@ -575,6 +591,33 @@ export function createPlannerService({
         const halfMoveLimit = halfMoveRate !== null && isProne
             ? Math.floor(halfMoveRate / 2)
             : halfMoveRate;
+        if (teamTurn?.phase === "movement") {
+            // Re-route to the assignment under today's budget. A charge
+            // cannot be split into free movement now and a roll next turn.
+            const run = teamTurn.mode === "run";
+            const rates = context.rates ?? moveRates;
+            const halves = _finiteOr(context.actionBudget, ACTION_BUDGET_HALVES)
+                - _finiteOr(context.spent?.halves, 0);
+            let budget = run ? rates?.run : (halves >= 2 ? rates?.full : halfMoveLimit);
+            if (isProne && halves >= 2) budget = Math.floor(budget / 2);
+            budget -= _finiteOr(context.spent?.movement, 0);
+            const route = !isPinned && (!run || (!isProne && halves >= 2))
+                && halves >= 1 && Number.isFinite(budget) && budget > 0
+                ? navigation?.planRoute?.(tokenDoc, teamTurn.destination, budget, {
+                    reservations: teamTurn.reservations
+                })
+                : null;
+            if (route?.exact && route.waypoints?.length > 1) {
+                return coordinationPlan(_stepsFor({
+                    candidate: {
+                        variant: run ? "run" : "approach",
+                        move: { ...route.endpoint, cost: route.cost, waypoints: route.waypoints }
+                    },
+                    halfMoveLimit
+                }), "team-movement");
+            }
+            return { status: PLANNER_STATUS.noRoute, plan: null, reason: "team-route-unavailable" };
+        }
 
         const targets = _resolveTargets({
             combat, combatant, tokenDoc, selfPos, sceneId, grid, perception,
@@ -1640,6 +1683,13 @@ export function createPlannerService({
         };
         const scored = [];
         candidates.forEach((candidate, index) => {
+            if (teamTurn?.phase === "draft" && candidate.variant === "charge") return;
+            if (teamTurn?.phase === "action" && (
+                (candidate.move && !candidate.move.stay)
+                || !["attack-in-place", "aim-attack"].includes(candidate.variant)
+                || candidate.action?.type !== teamTurn.type
+                || candidate.target?.tokenId !== teamTurn.targetId
+                || candidate.target?.canAttack !== true)) return;
             const dodge = dodgeChanceOf(candidate.target, candidate.action, dodgeTN);
             const factors = _factorsOf({
                 ...candidate, moveBudget, dangerAt, selfPos, dodge,

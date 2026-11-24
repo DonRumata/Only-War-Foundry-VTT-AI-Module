@@ -1649,7 +1649,7 @@ export function createFireteamService({
                     leaderId,
                     teamId,
                     seed,
-                    targets: Array.isArray(context.targets) ? context.targets : null,
+                    targets: context.tacticTargets ?? (Array.isArray(context.targets) ? context.targets : null),
                     objective: context.objective ?? null,
                     casualties: _finiteOr(context.casualties, 0),
                     scene: context.scene ?? combat?.scene ?? null,
@@ -2017,9 +2017,11 @@ export function createFireteamService({
                         ? context.moraleOutnumberRatio
                         : getMoraleDesperateRatio()
                 });
-                result.wrote = await _writeMoraleRecords(members, record);
-                result.barked = await _barkMoraleChange(previous, record, {
-                    combat, teamId, context });
+                if (!context.readOnly) {
+                    result.wrote = await _writeMoraleRecords(members, record);
+                    result.barked = await _barkMoraleChange(previous, record, {
+                        combat, teamId, context });
+                }
             }
         }
         result.record = record;
@@ -2061,7 +2063,9 @@ export function createFireteamService({
      *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
      *   `preferredCohesion`, `targets`, `actions`, `moves`, `perception`,
      *   `navigation`, `authority`, `planner`, `taskCapacities`,
-     *   `replanCount`.
+     *   `replanCount`. Runtime drafts use `readOnly` (no morale/GM flags,
+     *   independent member LOS) and pass `tacticTargets` only to the
+     *   maneuver selector, not as attackable targets for each member.
      * @returns {Promise<object>} `{status, teamPlan?, reason?, diagnostics?}`.
      */
     async function buildTeamPlan(combat, team, context = {}) {
@@ -2332,6 +2336,9 @@ export function createFireteamService({
                 ...context,
                 seed,
                 replanCount: _finiteOr(context.replanCount, 0),
+                ...(context.readOnly ? {
+                    includeNeutral: resolveConfig(member.combatant)?.includeNeutral === true
+                } : {}),
                 tactic: tactic?.name ?? tactic?.tactic ?? null,
                 team: {
                     teamId,
@@ -2393,11 +2400,13 @@ export function createFireteamService({
                 gmControlledIds.add(member.combatantId);
                 diagnostics.gmControlled = [...gmControlledIds];
                 try {
-                    await member.combatant?.setFlag?.(MODULE_ID, FLAG_KEYS.gmControlled, {
-                        round,
-                        turn: _finiteOr(combat.turn, 0),
-                        reason: "gm-intervention"
-                    });
+                    if (!context.readOnly) {
+                        await member.combatant?.setFlag?.(MODULE_ID, FLAG_KEYS.gmControlled, {
+                            round,
+                            turn: _finiteOr(combat.turn, 0),
+                            reason: "gm-intervention"
+                        });
+                    }
                 } catch(err) {
                     // Flag bookkeeping is best-effort.
                 }
@@ -2445,7 +2454,8 @@ export function createFireteamService({
                 const key = `${assignment.task}|${targetId}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
-            if (!baseTargets && result?.plan) {
+            // One member's LOS is not another member's permission to fire.
+            if (!context.readOnly && !baseTargets && result?.plan) {
                 const shared = _sharedTargets(result.plan);
                 if (shared) baseTargets = shared;
             }

@@ -137,6 +137,8 @@ export function createStepHandlers({
                 stale: prepared?.reason === "stale-state"
             };
         }
+        const team = context.teamCheck?.();
+        if (team?.valid === false) return { ok: false, reason: team.reason };
         let outcome;
         try {
             outcome = await execute(prepared, { operationId: `${operationId}.${step.id}` });
