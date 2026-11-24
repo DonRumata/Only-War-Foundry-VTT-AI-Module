@@ -65,7 +65,10 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     // than other presets, but still avoids free attacks on the way out;
     // closing into contact and avenging hits are core doctrine.
     alliedEngagement: -2,
-    leaveMeleeEngage: -4,
+    // Smoke: a re-charge away from a live engagement provokes a free
+    // attack and ping-pongs the bot between targets — price the exit
+    // like the free swing it draws, not like a casual reposition.
+    leaveMeleeEngage: -10,
     engageDenial: 4,
     unpin: 4,
     grudge: 4,

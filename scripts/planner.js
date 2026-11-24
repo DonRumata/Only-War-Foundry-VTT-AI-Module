@@ -224,11 +224,11 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     weaponInertia: 0.15,
     dropProne: 0,
     readyWeapon: 0,
-    // Issue #39: firing into an ally's melee is a real penalty (−20 by
-    // the rules); the grudge and unpin pulls are the documented defaults,
-    // while disengage/engage awareness stays neutral for skeleton bots.
-    alliedEngagement: -2,
-    leaveMeleeEngage: 0,
+    // Issue #39 + smoke: firing into an ally's melee is a real penalty
+    // (−20 by the rules); walking out of an enemy's reach provokes a free
+    // attack, so even a skeleton bot pays a modest price for the exit.
+    alliedEngagement: -4,
+    leaveMeleeEngage: -3,
     engageDenial: 0,
     unpin: 4,
     grudge: 2,

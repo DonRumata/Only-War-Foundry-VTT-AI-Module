@@ -108,8 +108,8 @@ export const HOLD_WEIGHTS = Object.freeze({
     // Issue #39: the hold doctrine guards allies and hates giving free
     // attacks — disengaging is the most penalized here; unpinning beats
     // lying pinned when a clear test is available.
-    alliedEngagement: -3,
-    leaveMeleeEngage: -5,
+    alliedEngagement: -8,
+    leaveMeleeEngage: -8,
     engageDenial: 2,
     unpin: 3,
     grudge: 2,

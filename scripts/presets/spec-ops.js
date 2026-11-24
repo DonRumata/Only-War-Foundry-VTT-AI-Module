@@ -74,8 +74,10 @@ export const SPEC_OPS_CONFIG = Object.freeze({
 export const SPEC_OPS_WEIGHTS = Object.freeze({
     attackNow: 9,
     attackAfterMove: 7,
-    charge: 3,
-    melee: 0,
+    // Smoke: a lasgun-armed operative has no doctrine for knife charges —
+    // melee is the fallback when nothing fires, never a plan.
+    charge: -3,
+    melee: -4,
     advance: 3,
     threat: 3,
     proximity: 1.5,
@@ -92,9 +94,9 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     meleeEngage: 3,
     area: 5,
     aim: 2,
-    aimAlone: 0.5,
+    aimAlone: 1.5,
     reload: 3,
-    overwatch: 1,
+    overwatch: 2,
     // Issue #16: spec-ops reads the threat map like rangedCover does.
     danger: -2,
     // Issue #37: spec-ops takes cover under fire but keeps moving when it
@@ -105,8 +107,8 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     readyWeapon: 2,
     // Issue #39: spec-ops is disciplined fire — strong shooting-into-
     // melee avoidance, mild engage pull and a real grudge memory.
-    alliedEngagement: -4,
-    leaveMeleeEngage: -2,
+    alliedEngagement: -8,
+    leaveMeleeEngage: -6,
     engageDenial: 1,
     unpin: 4,
     grudge: 3,

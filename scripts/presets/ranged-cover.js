@@ -86,10 +86,10 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     weaponInertia: 0.15,
     dropProne: 1.5,
     readyWeapon: 2,
-    // Issue #39: a shooter preset — firing into a friendly melee is its
-    // worst option (−5); contact engagement neither attracts nor repels.
-    alliedEngagement: -5,
-    leaveMeleeEngage: -3,
+    // Issue #39 + smoke: a shooter preset — firing into a friendly melee
+    // is flatly wrong; the bot aims or repositions instead (−10).
+    alliedEngagement: -10,
+    leaveMeleeEngage: -6,
     engageDenial: 0,
     unpin: 3,
     grudge: 1,
