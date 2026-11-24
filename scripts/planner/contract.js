@@ -220,7 +220,10 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
  */
 export const PRESET_SKELETONS = Object.freeze({
     assault: Object.freeze({
-        weights: Object.freeze({ ...DEFAULT_PRESET_WEIGHTS })
+        weights: Object.freeze({ ...DEFAULT_PRESET_WEIGHTS }),
+        // Smoke finding: assault closes with the enemy — radio-intel
+        // approach markers kick in at zero intel.
+        seekContacts: true
     }),
     rangedCover: Object.freeze({
         weights: Object.freeze({
@@ -260,7 +263,10 @@ export const PRESET_SKELETONS = Object.freeze({
             aim: 2,
             overwatch: 1
         }),
-        allowNoAction: true
+        allowNoAction: true,
+        // Smoke finding: spec-ops seek contact — radio-intel approach
+        // markers kick in at zero intel.
+        seekContacts: true
     })
 });
 
@@ -374,6 +380,14 @@ export const MAX_DODGE_CHANCE = 0.95;
 
 /** Minimum aggregated danger that justifies a free drop-prone turn. */
 export const DROP_PRONE_DANGER = 0.5;
+
+
+/**
+ * Threat margin (0..1) a different charge target must clear over the
+ * enemy already in melee reach before an engaged bot may disengage and
+ * charge it instead (smoke finding).
+ */
+export const CHARGE_SWITCH_MARGIN = 0.25;
 
 
 /** Candidate variants that produce an attack/test step. */

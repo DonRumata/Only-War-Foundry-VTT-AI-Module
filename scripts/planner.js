@@ -68,10 +68,12 @@ import {
     _readyWeaponActions,
     _resolveActions,
     _unpinAction,
+    _weaponJammedOf,
     dodgeChanceOf
 } from "./planner/actions.js";
 import {
     ACTION_BUDGET_HALVES,
+    CHARGE_SWITCH_MARGIN,
     DEFAULT_DODGE_TN,
     DEFAULT_LOOKAHEAD_LAMBDA,
     DEFAULT_LOOKAHEAD_TOP_K,
@@ -450,6 +452,29 @@ export function createPlannerService({
             const steps = commitment.decision.steps;
             diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id
                 ?? steps[0]?.id ?? null;
+            // Preview readability (smoke finding): a replayed commitment
+            // used to leave `snapshot.target` null — the dialog showed an
+            // attack step aimed at "(no target)". Resolve the committed
+            // attack's target token back into a display target; the
+            // recorded expectedState point fills in when the token is
+            // unresolvable.
+            const expectedTarget = commitment.record?.expectedState?.target ?? null;
+            const commitTokenId = steps.find(step =>
+                step?.type === "attack" || step?.type === "test")
+                ?.input?.targetTokenId ?? expectedTarget?.tokenId ?? null;
+            const commitTokenDoc = commitTokenId
+                ? _findToken(commitTokenId, { combat, scene }) : null;
+            const commitTarget = commitTokenId
+                ? {
+                    tokenId: commitTokenId,
+                    tokenUuid: commitTokenDoc?.uuid
+                        ?? expectedTarget?.tokenUuid ?? null,
+                    x: commitTokenDoc?.x ?? expectedTarget?.x ?? null,
+                    y: commitTokenDoc?.y ?? expectedTarget?.y ?? null,
+                    elevation: commitTokenDoc?.elevation ?? 0,
+                    statuses: []
+                }
+                : null;
             const plan = _assemblePlan({
                 combat, combatant, context, authority, seed, presetId,
                 diagnostics, steps, personality: null,
@@ -460,7 +485,7 @@ export function createPlannerService({
                         source: commitment.decision.source,
                         recordId: commitment.record?.id ?? null
                     },
-                    target: null
+                    target: commitTarget
                 },
                 targets: [],
                 actions: []
@@ -541,7 +566,16 @@ export function createPlannerService({
             : halfMoveRate;
 
         const targets = _resolveTargets({
-            combat, combatant, tokenDoc, selfPos, sceneId, grid, perception, context,
+            combat, combatant, tokenDoc, selfPos, sceneId, grid, perception,
+            context: {
+                ...context,
+                // Smoke finding: presets opting into `seekContacts`
+                // (spec-ops, assault) get rough radio-intel approach
+                // markers when no LOS/memory/relay contact exists.
+                seekContacts: context.seekContacts !== undefined
+                    ? context.seekContacts
+                    : preset?.seekContacts === true
+            },
             // Issue #38 review: a `distrustsContacts` trait (loner) or a
             // `rabble` squad character makes the bot ignore shared
             // contacts — willfulness over shared intel.
@@ -606,6 +640,17 @@ export function createPlannerService({
         // types of one weapon must not crowd other weapons out.
         const actionGroups = new Map();
         for (const action of actions) {
+            // Smoke finding: a jammed weapon cannot fire — its attack/test
+            // rows leave the usable pool so the plan falls back to
+            // reload/ready/melee candidates instead of a dead shot.
+            if ((action.type === "attack" || action.type === "test")
+                && _weaponJammedOf(actor, action)) {
+                diagnostics.rejected.push({
+                    candidate: `action|${action.id}`, reason: "weapon-jammed"
+                });
+                recordLayerReason(diagnostics, "L0", "weapon-jammed", `action|${action.id}`);
+                continue;
+            }
             const key = action.itemUuid ?? action.itemId ?? action.name ?? action.id;
             if (!actionGroups.has(key)) actionGroups.set(key, []);
             actionGroups.get(key).push(action);
@@ -774,6 +819,20 @@ export function createPlannerService({
             },
             options: blastOptions
         });
+        // Smoke finding: a bot standing inside an enemy's melee reach does
+        // not charge a *different* target unless the new target is a
+        // substantially greater threat — disengaging earns the adjacent
+        // enemy a free attack and produced the "charges away from the
+        // adjacent foe" behaviour seen in the smoke. `engagedThreat` is
+        // the highest `threat` among known targets already in reach;
+        // -1 means the bot is not engaged at all.
+        const engageReachUnits = Math.max(DEFAULT_MELEE_RANGE,
+            ...usableActions.filter(_isMeleeAction).map(a => _finiteOr(_actionRange(a), 0)));
+        const engagedThreat = targets.reduce((best, other) => {
+            const d = _pixelDistance(selfPos, other, grid);
+            return Number.isFinite(d) && d <= engageReachUnits + 1e-9
+                ? Math.max(best, _finiteOr(other?.threat, 0)) : best;
+        }, -1);
         for (const target of targets.slice(0, _finiteOr(context.maxTargets, DEFAULT_MAX_TARGETS))) {
             const distance = _finiteOr(target.distance, Infinity);
             // Memory contacts are investigated at weapon range, not
@@ -1023,6 +1082,17 @@ export function createPlannerService({
                             // a rejection).
                             if (variant === "charge" && chargeVeto) {
                                 rejectOnce(`charge|${tag}`, chargeVeto);
+                                continue;
+                            }
+                            // Engaged veto (smoke finding): charging a
+                            // different target while already in reach of
+                            // an enemy is only justified when the new
+                            // target is a substantially greater threat —
+                            // the engaged foe would take a free attack.
+                            if (variant === "charge" && engagedThreat >= 0 && !alreadyEngaged
+                                && _finiteOr(target.threat, 0)
+                                    <= engagedThreat + CHARGE_SWITCH_MARGIN) {
+                                rejectOnce(`charge|${tag}`, "already-engaged");
                                 continue;
                             }
                             if (variant === "charge" && chargePeer) continue;
@@ -1611,7 +1681,12 @@ export function createPlannerService({
         // planTurn then short-circuits while the expectation holds.
         // Reactive mode (interventions above the threshold) writes the
         // squeezed ttl=1 — the per-turn baseline during manual chaos.
+        // A bare hold (`[end-turn]`) never commits: the expectedState
+        // would carry no threats to drift-check, so a replayed hold stays
+        // blind to new contacts — a sealed grenadier kept holding for
+        // turns after the door opened (smoke finding).
         const commitmentPayload = layerFlags.commitment === true && steps.length
+            && steps.some(step => step?.type && step.type !== "end-turn")
             ? {
                 source: "planner",
                 ttl: commitment.reactive === true
@@ -2076,6 +2151,7 @@ export function createPlannerService({
 // existing importers (presets, fireteam, executor, tests) keep working.
 export {
     ACTION_BUDGET_HALVES,
+    CHARGE_SWITCH_MARGIN,
     DEFAULT_DODGE_TN,
     DEFAULT_LOOKAHEAD_LAMBDA,
     DEFAULT_LOOKAHEAD_TOP_K,

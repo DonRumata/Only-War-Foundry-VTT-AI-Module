@@ -33,12 +33,14 @@ import { isModuleEnabled } from "../module-state.js";
 import { STALE_REASONS } from "../planner.js";
 import { buildLayerTrace, renderTrace } from "../trace.js";
 import {
+    getCenterOnBot,
     getExecutionMode,
     getPreviewTimeoutSeconds,
     getTraceMode,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "../settings.js";
+import { centerOnToken } from "./plan-overlay.js";
 
 /** GM decisions accepted by {@link resolvePreview}. */
 export const PREVIEW_DECISIONS = Object.freeze({
@@ -1078,6 +1080,8 @@ export function createPreviewController({
         _scheduleTimeout(session);
         _present(session);
         _showOverlay(session);
+        // Issue #32: pan the GM view onto the acting bot.
+        if (getCenterOnBot()) centerOnToken(_tokenDoc(session.combatant?.token));
         log(`preview ${operationId}: plan ${plan.id} timeout=${session.timeoutSeconds}s`);
         return { ok: true, operationId, session };
     }
@@ -1306,6 +1310,62 @@ export function registerPreviewUI(api = null) {
                         globalThis.ui?.notifications?.info?.(
                             globalThis.game?.i18n?.localize?.(
                                 "OWAI.Notifications.RouteCopied") ?? "Route copied");
+                    }).catch(() => {});
+                });
+                // Debug helper (diagnostics mode): copy the full plan
+                // export — bot identity, turn context, steps, scores,
+                // rejected candidates and layer trace (smoke finding).
+                html.find("[data-clipboard='info']").on("click", event => {
+                    event.preventDefault();
+                    const session = this.session ?? {};
+                    const plan = session.plan ?? {};
+                    const snapshot = plan.snapshot ?? {};
+                    const diagnostics = plan.diagnostics ?? {};
+                    const payload = {
+                        module: MODULE_ID,
+                        exportedAt: new Date().toISOString(),
+                        combat: {
+                            id: session.combat?.id ?? snapshot.combatId ?? null,
+                            round: snapshot.round ?? session.combat?.round ?? null,
+                            turn: snapshot.turn ?? session.combat?.turn ?? null
+                        },
+                        bot: {
+                            combatantId: session.combatant?.id ?? snapshot.combatantId ?? null,
+                            name: this.viewModel?.npc?.name
+                                ?? session.combatant?.name ?? null,
+                            preset: this.viewModel?.npc?.presetLabel ?? null
+                        },
+                        operation: {
+                            id: session.operationId ?? null,
+                            phase: session.operation?.phase ?? null,
+                            revision: session.operation?.revision ?? null
+                        },
+                        plan: {
+                            id: plan.id ?? null,
+                            variant: plan.variant ?? null,
+                            score: plan.breakdown?.score ?? plan.score ?? null,
+                            steps: (plan.steps ?? []).map(step => ({
+                                id: step.id ?? null,
+                                type: step.type ?? null,
+                                cost: step.cost ?? null,
+                                input: step.input ?? null
+                            }))
+                        },
+                        breakdown: plan.breakdown ?? null,
+                        targets: diagnostics.targets ?? [],
+                        rejected: diagnostics.rejected ?? [],
+                        ranking: diagnostics.ranking ?? [],
+                        layers: (diagnostics.layers ?? [])
+                            .map(layer => layer?.code ?? layer),
+                        trace: diagnostics.trace ?? null
+                    };
+                    const text = JSON.stringify(payload, null, 2);
+                    const done = globalThis.game?.clipboard?.copyPlainText?.(text)
+                        ?? globalThis.navigator?.clipboard?.writeText?.(text);
+                    Promise.resolve(done).then(() => {
+                        globalThis.ui?.notifications?.info?.(
+                            globalThis.game?.i18n?.localize?.(
+                                "OWAI.Notifications.InfoCopied") ?? "Info copied");
                     }).catch(() => {});
                 });
             }

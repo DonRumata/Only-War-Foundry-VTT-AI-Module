@@ -287,6 +287,37 @@ export function dangerShade(danger) {
     return { color, alpha };
 }
 
+/**
+ * Pan the GM canvas to a token document (issue #32): centres the view
+ * on the acting bot so automated and previewed turns stay watchable
+ * without hunting the token. GM-gated and strictly best-effort — a
+ * missing canvas/grid is a silent no-op. `canvas.pan` is the v13 API;
+ * `animatePan` covers v11/v12.
+ * @param {object|null} tokenDoc Token document or placeable `{x, y,
+ *   width, height}`.
+ * @returns {boolean} Whether a pan was issued.
+ */
+export function centerOnToken(tokenDoc) {
+    if (globalThis.game?.user?.isGM !== true) return false;
+    const doc = tokenDoc?.document ?? tokenDoc;
+    if (!doc || !Number.isFinite(doc.x) || !Number.isFinite(doc.y)) return false;
+    const size = Number(globalThis.canvas?.scene?.grid?.size) || 100;
+    const center = doc.center && Number.isFinite(doc.center.x)
+        ? { x: doc.center.x, y: doc.center.y }
+        : {
+            x: doc.x + ((doc.width ?? 1) * size / 2),
+            y: doc.y + ((doc.height ?? 1) * size / 2)
+        };
+    try {
+        const c = globalThis.canvas;
+        if (typeof c?.pan === "function") { c.pan(center); return true; }
+        if (typeof c?.animatePan === "function") { c.animatePan(center); return true; }
+    } catch(_err) {
+        // Canvas pan is best-effort.
+    }
+    return false;
+}
+
 // --- Plan overlay view-model ------------------------------------------------
 
 /**
@@ -537,6 +568,11 @@ export function dangerCells(map, {
     // the top-left corner because the y/x tiebreak picked adjacent
     // cells. Require a minimum centre distance between labels instead.
     const minGap = span * 3;
+    // Smoke finding: the same dominant emitter printed its tag on every
+    // hot cell ("Acolyte One: 0,85" ×8). Each contributor keeps its name
+    // on the first (hottest) label only; further cells degrade to a
+    // plain danger readout.
+    const seenContributors = new Set();
     for (const cell of ranked) {
         if (labels.length >= Math.max(0, labelCount)) break;
         const center = { x: cell.x + (cell.w / 2), y: cell.y + (cell.h / 2) };
@@ -553,6 +589,11 @@ export function dangerCells(map, {
             } catch(err) {
                 top = null;
             }
+        }
+        if (top) {
+            const key = top.id ?? top.name;
+            if (seenContributors.has(key)) top = null;
+            else seenContributors.add(key);
         }
         labels.push({ x: center.x, y: center.y, danger: cell.danger, top });
     }
@@ -1067,7 +1108,7 @@ export function createPlanOverlayService({
                     ? String(top.name ?? top.id ?? "").split(".").pop().slice(0, 12)
                     : null;
                 const text = top
-                    ? `${name}:${_finiteOr(top.contribution, 0).toFixed(2)}`
+                    ? `${name} ${Math.round(label.danger * 100)}%`
                     : `${Math.round(label.danger * 100)}%`;
                 try {
                     const node = new PIXI.Text(text, {

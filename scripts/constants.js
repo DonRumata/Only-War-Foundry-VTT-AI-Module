@@ -98,6 +98,14 @@ export const SETTING_KEYS = Object.freeze({
     // GM rolls/applies the damage card; this bounds that wait (`0` —
     // wait until the card is settled or the turn advances manually).
     damageWaitTimeoutSeconds: "damageWaitTimeoutSeconds",
+    // When `false` a settled damage wait hands the turn back to manual
+    // GM control instead of driving `nextTurn` — the GM adjudicates and
+    // advances at their own pace (smoke finding: a silently waiting bot
+    // looked stalled because nothing told the GM why the turn held).
+    damageWaitAutoAdvance: "damageWaitAutoAdvance",
+    // Pan the GM canvas to the acting bot when its turn is claimed —
+    // keeps automated turns watchable without hunting the token.
+    centerOnBot: "centerOnBot",
     turnPacingMs: "turnPacingMs",
     aiDifficulty: "aiDifficulty",
     threatMapOverlay: "threatMapOverlay",

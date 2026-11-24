@@ -947,7 +947,12 @@ export function specOpsPresetDefinition() {
         evaluate: evaluateSpecOps,
         veto: specOpsVeto,
         allowNoTarget: true,
-        allowNoAction: true
+        allowNoAction: true,
+        // Smoke finding: spec-ops doctrine seeks contact — with zero
+        // intel (no LOS, memory or relay) the squad's radio puts rough
+        // unattackable approach markers on the nearest hostiles so the
+        // operatives advance instead of idling.
+        seekContacts: true
     };
 }
 

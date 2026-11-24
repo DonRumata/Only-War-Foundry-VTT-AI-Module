@@ -14,6 +14,8 @@ import {
     evaluateFactors,
     mulberry32
 } from "../../scripts/planner.js";
+import { _blastFromSpecial } from "../../scripts/planner/util.js";
+import { _itemSummaries } from "../../scripts/planner/documents.js";
 import { registerAssaultPreset } from "../../scripts/presets/assault.js";
 import {
     freezeDeep,
@@ -830,6 +832,85 @@ test("a bot already inside melee reach swings in place instead of charging", asy
         "an adjacent enemy is attacked in place, never charged");
     assert.ok(!result.plan.steps.some(step => step.type === "move"),
         "no reposition step rides along at melee contact");
+});
+
+test("an engaged bot does not charge a different target (smoke: Alpha Trooper 4)", async () => {
+    // Self at (0,0) adjacent to A at 1.5u; B waits far off with equal
+    // threat. The move endpoint reaches B — before the engaged veto the
+    // planner happily charged past A toward B.
+    const world = makeWorld({ enemies: [{ x: 100, y: 0 }, { x: 2500, y: 0 }] });
+    const [adjacent, distant] = world.enemies;
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: injectedTargets(world),
+        actions: [{
+            id: "knife", type: "attack", name: "Knife",
+            itemUuid: `Actor.${world.actor.id}.Item.w1`, itemId: "w1",
+            class: "melee", range: 2, cost: 1
+        }],
+        moves: [{
+            key: "to-b", x: 2300, y: 0, i: 23, j: 0, cost: 2, distance: 2,
+            waypoints: [{ x: 50, y: 0 }, { x: 2300, y: 0 }]
+        }]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const diagnostics = result.diagnostics ?? result.plan?.diagnostics ?? {};
+    assert.ok(
+        (diagnostics.rejected ?? []).some(entry => entry.reason === "already-engaged"),
+        "charge toward the distant target vetoed with already-engaged"
+    );
+    const attack = result.plan.steps.find(step => step.type === "attack");
+    assert.ok(attack, "the adjacent enemy is still attacked");
+    assert.equal(attack.input.targetTokenId, adjacent.token.id,
+        "the plan targets the adjacent enemy, not the distant one");
+});
+
+test("blast radius parses from the OW special trait string (smoke: grenadier)", () => {
+    // The canonical weapon blast lives in `special` as "Blast (3)" — a
+    // weapon carrying only an empty `blastRadius` field still reads as
+    // an area weapon (the smoke grenade shipped exactly that shape).
+    assert.equal(_blastFromSpecial("Blast (3)"), 3);
+    assert.equal(_blastFromSpecial("Concussive (3), Blast (4), Proven (2)"), 4);
+    assert.equal(_blastFromSpecial("Concussive (3)"), null);
+    assert.equal(_blastFromSpecial(""), null);
+    assert.equal(_blastFromSpecial(null), null);
+    const actor = makeActor();
+    actor.items = [{
+        id: "g1", uuid: "Actor.x.Item.g1", name: "Frag Grenade",
+        type: "weapon",
+        system: { class: "thrown", range: 18, damage: "2d10",
+            clip: { value: 5 }, special: "Blast (3)" }
+    }];
+    const summary = _itemSummaries(actor).find(i => i.id === "g1");
+    assert.equal(summary.blastRadius, 3, "item summary exposes the blast radius");
+});
+
+test("an engaged bot may charge a substantially greater threat", async () => {
+    // Same layout, but B is a marked high-value target — the margin gate
+    // keeps the charge candidate alive.
+    const world = makeWorld({ enemies: [{ x: 100, y: 0, threat: 0.1 },
+        { x: 2500, y: 0, threat: 0.9 }] });
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: injectedTargets(world),
+        actions: [{
+            id: "knife", type: "attack", name: "Knife",
+            itemUuid: `Actor.${world.actor.id}.Item.w1`, itemId: "w1",
+            class: "melee", range: 2, cost: 1
+        }],
+        moves: [{
+            key: "to-b", x: 2300, y: 0, i: 23, j: 0, cost: 2, distance: 2,
+            waypoints: [{ x: 50, y: 0 }, { x: 2300, y: 0 }]
+        }]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    const diagnostics = result.diagnostics ?? result.plan?.diagnostics ?? {};
+    assert.ok(
+        !(diagnostics.rejected ?? []).some(entry => entry.reason === "already-engaged"),
+        "a substantially greater threat clears the engaged veto"
+    );
 });
 
 test("a move-attack endpoint without LOS is rejected instead of walking blind", async () => {

@@ -166,6 +166,11 @@
         <button type="button" data-action="replan" {{#unless replan.allowed}}disabled{{/unless}}>
             <i class="fas fa-sync-alt"></i> {{localize "OWAI.Preview.Replan"}}
         </button>
+        {{#if diagnostics.enabled}}
+        <button type="button" data-clipboard="info">
+            <i class="fas fa-download"></i> {{localize "OWAI.Preview.ExportInfo"}}
+        </button>
+        {{/if}}
         <button type="button" data-action="cancel">
             <i class="fas fa-times"></i> {{localize "OWAI.Preview.Cancel"}}
         </button>

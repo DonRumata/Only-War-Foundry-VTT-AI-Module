@@ -118,7 +118,11 @@ export function assaultPresetDefinition() {
         weights: { ...ASSAULT_WEIGHTS },
         evaluate: evaluateAssault,
         allowNoTarget: true,
-        allowNoAction: true
+        allowNoAction: true,
+        // Smoke finding: assault doctrine closes with the enemy — with
+        // zero intel (no LOS, memory or relay) the squad's radio puts
+        // rough unattackable approach markers on the nearest hostiles.
+        seekContacts: true
     };
 }
 

@@ -257,7 +257,7 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
         // Comms-net hearsay weighs half of a direct memory: the squad
         // still advances on it, but a fresher own sighting always wins.
         lastKnown: _isMemorySource(target?.source)
-            ? (target?.source === "relay" ? 0.5 : 1) : 0,
+            ? (target?.source === "relay" || target?.source === "intel" ? 0.5 : 1) : 0,
         budgetOver,
         attackType: attackDesire,
         // Issue #37 counter-EV (review): the dodge discount scaled by

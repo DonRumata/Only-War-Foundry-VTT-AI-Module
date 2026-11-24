@@ -115,6 +115,28 @@ export function registerSettings() {
         default: DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS
     });
 
+    // Smoke finding: when off, a settled damage wait keeps the turn
+    // under manual GM control — `nextTurn` is only driven by the GM.
+    game.settings.register(MODULE_ID, SETTING_KEYS.damageWaitAutoAdvance, {
+        name: "OWAI.Settings.DamageWaitAutoAdvance.Name",
+        hint: "OWAI.Settings.DamageWaitAutoAdvance.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: true
+    });
+
+    // Issue #32: pan the GM canvas onto the acting bot so automated and
+    // previewed turns stay watchable without hunting the token.
+    game.settings.register(MODULE_ID, SETTING_KEYS.centerOnBot, {
+        name: "OWAI.Settings.CenterOnBot.Name",
+        hint: "OWAI.Settings.CenterOnBot.Hint",
+        scope: "world",
+        config: true,
+        type: Boolean,
+        default: true
+    });
+
     game.settings.register(MODULE_ID, SETTING_KEYS.turnPacingMs, {
         name: "OWAI.Settings.TurnPacing.Name",
         hint: "OWAI.Settings.TurnPacing.Hint",
@@ -336,6 +358,33 @@ export function getDamageWaitTimeoutSeconds() {
         return Number.isFinite(value) && value >= 0 ? value : DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS;
     } catch(_err) {
         return DEFAULT_DAMAGE_WAIT_TIMEOUT_SECONDS;
+    }
+}
+
+/**
+ * Whether a settled damage wait drives `combat.nextTurn` automatically
+ * (`true`, default) or hands the turn back to manual GM control
+ * (`false`) — the GM applies damage and advances at their own pace.
+ * @returns {boolean}
+ */
+export function getDamageWaitAutoAdvance() {
+    try {
+        return game.settings.get(MODULE_ID, SETTING_KEYS.damageWaitAutoAdvance) !== false;
+    } catch(_err) {
+        return true;
+    }
+}
+
+/**
+ * Whether the GM canvas pans to the acting bot when its turn is
+ * claimed (issue #32). Default on; damaged/missing values stay on.
+ * @returns {boolean}
+ */
+export function getCenterOnBot() {
+    try {
+        return game.settings.get(MODULE_ID, SETTING_KEYS.centerOnBot) !== false;
+    } catch(_err) {
+        return true;
     }
 }
 

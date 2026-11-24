@@ -195,6 +195,10 @@ function _normalizeThreat(raw, index) {
         name: raw.name ?? raw.tokenName ?? null,
         x,
         y,
+        // Smoke finding: memory/relay contacts used to shade the danger
+        // field at full strength — a hearsay position is deliberately
+        // weaker (`threatSourcesOf` stamps 1 / 0.5 / 0.25).
+        weight: Math.max(0, Math.min(1, _finiteOr(raw.weight, 1))),
         emitters
     };
 }
@@ -336,7 +340,8 @@ export function buildThreatMap({
             const distance = _distanceUnits({ x: source.x, y: source.y }, point, grid);
             if (!Number.isFinite(distance)) continue;
             const contribution = Math.max(0, ...source.emitters.map(
-                emitter => _emitterContribution(source, emitter, distance)));
+                emitter => _emitterContribution(source, emitter, distance)))
+                * source.weight;
             if (contribution > 0 && _losOpen(probe, { x: source.x, y: source.y }, point)) {
                 entries.push({
                     id: source.id,
@@ -458,10 +463,33 @@ export function threatSourcesOf(targets, { combat = null, scene = null, findToke
             name: target.name ?? doc?.name ?? null,
             x: target.x,
             y: target.y,
+            weight: _threatWeight(target),
             emitters
         });
     }
     return sources;
+}
+
+/**
+ * Danger-field weight of a threat by how the bot knows about it (smoke
+ * finding — last-known/relay contacts used to draw full-strength heat):
+ * a direct sighting counts in full, own last-known memory at half, and
+ * squad hearsay (`team-contact`/`relay`) at a quarter — matching the
+ * scoring convention where relay memory weighs half of direct memory.
+ * An explicit `weight`/`threatProfile.weight` on the target wins.
+ * @param {object} target Normalized planner target with `source`.
+ * @returns {number} 0..1.
+ */
+function _threatWeight(target) {
+    const explicit = target?.threatProfile?.weight ?? target?.weight;
+    if (Number.isFinite(explicit)) return Math.max(0, Math.min(1, explicit));
+    switch (target?.source) {
+        case "last-known": return 0.5;
+        case "team-contact":
+        case "relay":
+        case "intel": return 0.25;
+        default: return 1;
+    }
 }
 
 /**

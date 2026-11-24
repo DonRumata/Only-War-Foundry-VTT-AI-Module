@@ -594,6 +594,41 @@ test("planTurn: a scored plan carries the commitment payload", async () => {
     assert.deepEqual(JSON.parse(JSON.stringify(payload)), payload);
 });
 
+test("planTurn: a bare hold never writes a commitment payload", async () => {
+    // Smoke finding: a sealed grenadier's `[end-turn]` hold committed and
+    // replayed every turn — its empty threat list skipped drift checks,
+    // so new contacts never invalidated it. Hold plans stay uncommitted.
+    const world = makeWorld();
+    world.combatant.actor.flags[MODULE_ID][FLAG_KEYS.actorConfig] =
+        { enabled: true, preset: "hold" };
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 7, targets: [], actions: []
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.steps.every(step => step.type === "end-turn"),
+        "fixture: the plan is a bare hold");
+    assert.equal(result.plan.commitment, null,
+        "a hold plan does not persist a multi-turn commitment");
+});
+
+test("planTurn: a commitment hit restores the committed target", async () => {
+    // Smoke finding: the preview of a replayed commitment showed an
+    // attack step aimed at "(no target)" — the plan's snapshot target
+    // was left null because scoring never ran.
+    const world = makeWorld();
+    seedCommitment(world.combatant, committedRecord(world));
+    const planner = createPlannerService();
+    const result = await planner.planTurn(world.combat, world.combatant,
+        planContext(world));
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.equal(result.plan.breakdown.reason, "commitment");
+    assert.equal(result.plan.target?.tokenId, world.enemyToken.id,
+        "the committed attack's target is restored on the plan");
+    assert.equal(result.plan.snapshot?.target?.tokenId, world.enemyToken.id,
+        "the preview snapshot names the same target");
+});
+
 test("planTurn: gm-intervention misses to normal scoring", async () => {
     const world = makeWorld();
     seedCommitment(world.combatant, committedRecord(world, {

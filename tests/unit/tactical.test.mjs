@@ -22,6 +22,7 @@ import {
     createThreatMapService,
     expectedCounterDamage,
     expectedDamageOf,
+    threatSourcesOf,
     weaponEmitters
 } from "../../scripts/threat-map.js";
 import {
@@ -220,6 +221,32 @@ test("buildThreatMap dangerAt covers ranged emitters with a range falloff", () =
     assert.equal(map.dangerAt({ x: -300, y: 0 }), 0);
     assert.equal(map.dangerAt({ x: 3000, y: 0 }), 1);
     assert.equal(map.dangerAt(null), 0);
+});
+
+test("threat sources: memory/relay contacts shade at reduced weight (smoke)", () => {
+    // Smoke finding: a hearsay contact printed full-strength heat. The
+    // weight ladder mirrors the scoring convention — direct sighting 1,
+    // own memory 0.5, squad relay 0.25.
+    const targets = [
+        { tokenId: "a", tokenUuid: "u-a", x: 3000, y: 0, name: "Vis",
+            source: "visible", damage: 10, range: 30 },
+        { tokenId: "b", tokenUuid: "u-b", x: 3000, y: 0, name: "Mem",
+            source: "last-known", damage: 10, range: 30 },
+        { tokenId: "c", tokenUuid: "u-c", x: 3000, y: 0, name: "Rel",
+            source: "relay", damage: 10, range: 30 }
+    ];
+    const sources = threatSourcesOf(targets, {});
+    assert.equal(sources.length, 3);
+    const map = buildThreatMap({ threats: sources, grid: GRID, los: false });
+    const byId = Object.fromEntries(
+        map.explain({ x: 3000, y: 0 }).map(e => [e.id, e.contribution]));
+    assert.equal(byId["u-a"], 1);
+    assert.equal(byId["u-b"], 0.5);
+    assert.equal(byId["u-c"], 0.25);
+    // An explicit profile weight still wins over the source default.
+    const custom = threatSourcesOf([{ tokenId: "d", tokenUuid: "u-d",
+        x: 3000, y: 0, source: "relay", weight: 0.8, damage: 10, range: 30 }], {});
+    assert.equal(custom[0].weight, 0.8);
 });
 
 test("buildThreatMap: a sight-blocking probe zeroes contributions", () => {

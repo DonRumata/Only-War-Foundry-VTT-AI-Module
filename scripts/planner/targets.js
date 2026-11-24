@@ -39,7 +39,11 @@ import {
  * @returns {boolean}
  */
 export function _isMemorySource(source) {
-    return source === "last-known" || source === "team-contact" || source === "relay";
+    // `intel` — a rough radio marker from the combat tracker (smoke
+    // finding): memory-class for movement and targeting rules — never a
+    // direct attack — but carrying no sighting provenance.
+    return source === "last-known" || source === "team-contact"
+        || source === "relay" || source === "intel";
 }
 
 
@@ -177,6 +181,52 @@ export function _fallbackTargets(combat, combatant, input) {
 
 
 /**
+ * Rough radio-intel contacts (smoke finding): presets opting into
+ * `context.seekContacts` get a destination even at zero intel — the
+ * nearest living hostile combatants are marked unattackable `intel`
+ * targets so the bot advances toward the fight instead of idling.
+ * Positions come straight from the combat tracker (no LOS gate); they
+ * steer approach moves and never attacks. Hidden or defeated hostiles
+ * leak no position.
+ * @param {object} combat
+ * @param {object} combatant Active combatant.
+ * @param {object} input Normalization context (selfPos/grid/options).
+ * @param {number} [limit] Contact cap — deterministic nearest-first.
+ * @returns {object[]} Raw target records for `_normalizeTarget`.
+ */
+export function _intelContacts(combat, combatant, input, limit = 2) {
+    const selfDoc = _tokenDoc(combatant?.token);
+    const selfDisposition = _finiteOr(selfDoc?.disposition ?? combatant?.disposition, 0);
+    const raws = [];
+    for (const other of _list(combat?.combatants)) {
+        if (!other || other === combatant) continue;
+        const doc = _tokenDoc(other.token);
+        const id = other.tokenId ?? doc?.id;
+        if (!doc || !id || id === selfDoc?.id) continue;
+        if (doc.destroyed === true || doc.hidden === true) continue;
+        if (other.defeated === true) continue;
+        if (!_actorOf(other) && !_actorOf(doc)) continue;
+        if (!_hostileTo(selfDisposition, doc.disposition, input.options ?? {})) continue;
+        const position = _tokenPosition(doc);
+        if (!Number.isFinite(position?.x) || !Number.isFinite(position?.y)) continue;
+        raws.push({
+            tokenId: id,
+            tokenUuid: _tokenUuid(doc, input.sceneId),
+            x: position.x,
+            y: position.y,
+            elevation: doc.elevation ?? 0,
+            canAttack: false,
+            distance: _pixelDistance(input.selfPos, position, input.grid),
+            statuses: _statusIds(doc.actor?.statuses, doc.statuses)
+        });
+    }
+    raws.sort((a, b) => (a.distance - b.distance)
+        || String(a.tokenUuid).localeCompare(String(b.tokenUuid)));
+    return raws.slice(0, Math.max(0, limit));
+}
+
+
+/**
  * Resolve target candidates: injected `context.targets`, the perception
  * service snapshot, or the combatant fallback scan. Sorted by tokenUuid
  * for determinism and deduplicated.
@@ -281,6 +331,14 @@ export function _resolveTargets({ combat, combatant, tokenDoc, selfPos, sceneId,
         const existingTs = (_finiteOr(existing.lastSeenRound, 0) * 1e6)
             + _finiteOr(existing.lastSeenTurn, 0);
         if (sharedTs > existingTs) targets[index] = shared;
+    }
+    // Smoke finding: spec-ops/assault presets with zero intel (no LOS,
+    // no memory, no relay) still need a destination — the squad's radio
+    // intel puts unattackable approach markers on the nearest hostiles.
+    if (!targets.length && context.seekContacts === true) {
+        targets = _intelContacts(combat, combatant, input)
+            .map(raw => _normalizeTarget(raw, { ...input, source: "intel" }))
+            .filter(Boolean);
     }
     // Issue #37: read the `reactionUsed` flag off each target's own
     // combatant — a spent-reaction enemy cannot dodge, which raises the

@@ -151,6 +151,20 @@ export function _expectedDamage(value) {
 
 
 /**
+ * Blast radius parsed from an OW weapon `special` trait string —
+ * "Blast (3)" (smoke finding: the canonical blast field lives in the
+ * traits string, not a `blastRadius` data key). `null` when absent.
+ * @param {string|null} special Trait spec text.
+ * @returns {number|null}
+ */
+export function _blastFromSpecial(special) {
+    if (typeof special !== "string" || !special) return null;
+    const match = /blast\s*\(\s*(\d+)\s*\)/i.exec(special);
+    return match ? parseInt(match[1], 10) : null;
+}
+
+
+/**
  * Pixels per scene unit derived from the normalized grid info.
  * @param {object|null} grid Grid info `{size, distance}`.
  * @returns {number}

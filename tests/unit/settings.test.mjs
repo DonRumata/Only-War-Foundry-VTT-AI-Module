@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
     getAIDifficulty,
     getAttackAdjudication,
+    getDamageWaitAutoAdvance,
     getExecutionMode,
     getLayerFlags,
     getPreferredCohesion,
@@ -31,7 +32,7 @@ test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 20);
+    assert.equal(registered.length, 22);
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -227,4 +228,17 @@ test("getLayerFlags honours stored values and rejects damaged ones", async () =>
     assert.equal(getLayerFlags().lookahead, DEFAULT_LAYER_FLAGS.lookahead);
     await game.settings.set(MODULE_ID, SETTING_KEYS.layersCommitment, 1);
     assert.equal(getLayerFlags().commitment, DEFAULT_LAYER_FLAGS.commitment);
+});
+
+test("damageWaitAutoAdvance defaults to true and honours a stored value (smoke)", async () => {
+    _resetMocks();
+    registerSettings();
+    const entry = game.settings._registered.find(e => e.key === SETTING_KEYS.damageWaitAutoAdvance);
+    assert.ok(entry, "damageWaitAutoAdvance registered");
+    assert.equal(entry.data.scope, "world");
+    assert.equal(entry.data.type, Boolean);
+    assert.equal(entry.data.default, true);
+    assert.equal(getDamageWaitAutoAdvance(), true);
+    await game.settings.set(MODULE_ID, SETTING_KEYS.damageWaitAutoAdvance, false);
+    assert.equal(getDamageWaitAutoAdvance(), false);
 });

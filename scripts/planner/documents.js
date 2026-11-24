@@ -19,6 +19,7 @@ import {
     RESOURCE_KEYS
 } from "./contract.js";
 import {
+    _blastFromSpecial,
     _finiteOr,
     _list,
     fnv1a,
@@ -174,7 +175,10 @@ export function _itemSummaries(actor) {
         .map(item => {
             const system = item.system ?? {};
             const clip = system.clip?.value ?? system.ammo?.value;
-            const blast = system.blastRadius ?? system.traits?.blast;
+            // Canonical OW blast lives in the `special` trait string
+            // ("Blast (3)"); explicit fields win when present.
+            const blast = system.blastRadius ?? system.traits?.blast
+                ?? _blastFromSpecial(system.special);
             return {
                 id: item.id ?? null,
                 uuid: typeof item.uuid === "string" ? item.uuid : null,

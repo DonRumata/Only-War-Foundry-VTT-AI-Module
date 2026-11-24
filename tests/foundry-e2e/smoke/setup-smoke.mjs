@@ -80,8 +80,11 @@ const BOTS = [
         name: 'Frag Grenadier', preset: 'rangedCover', team: null,
         personality: ['grenadier'],
         weapons: [
+            // `special: "Blast (3)"` is the canonical OW blast field — the
+            // system reads traits out of this string (`system.blastRadius`
+            // stays empty on compendium items too).
             { name: 'Frag Grenade', class: 'thrown', range: 18, damage: '2d10',
-                blastRadius: 3, clip: { value: 5, max: 5 },
+                blastRadius: 3, special: 'Blast (3)', clip: { value: 5, max: 5 },
                 rateOfFire: { single: 1, burst: 0, full: 0 } }
         ]
     }

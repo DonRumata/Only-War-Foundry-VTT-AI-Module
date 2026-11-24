@@ -7,6 +7,7 @@ import {
     MODULE_ID
 } from "../constants.js";
 import {
+    getDamageWaitAutoAdvance,
     getDamageWaitTimeoutSeconds
 } from "../settings.js";
 
@@ -99,7 +100,30 @@ export function createDamageWait({
                     timeout * 1000)
                 : null
         });
+        // Smoke finding: a silently waiting bot looked stalled — tell the
+        // GM the turn is parked until the damage card is applied (or the
+        // turn is advanced manually).
+        _notify("OWAI.Notifications.DamageWaiting", {
+            name: run.combatant?.name ?? "NPC"
+        });
         return true;
+    }
+
+
+    /**
+     * Localized GM notification — `ui.notifications` is controller-local,
+     * so only the GM client driving the turn sees it.
+     * @param {string} key i18n key.
+     * @param {object} [params] Format parameters.
+     * @returns {void}
+     */
+    function _notify(key, params = {}) {
+        try {
+            const text = globalThis.game?.i18n?.format?.(key, params) ?? key;
+            globalThis.ui?.notifications?.info?.(text);
+        } catch(_err) {
+            // Notifications are best-effort.
+        }
     }
 
 
@@ -154,6 +178,14 @@ export function createDamageWait({
         if (!combat || combat.ended === true || combat.destroyed === true) return;
         if (!_isController(entry.context)) return;
         if (typeof combat.nextTurn !== "function") return;
+        // Manual handoff (smoke finding): `damageWaitAutoAdvance` off
+        // releases the wait without driving `nextTurn` — the GM applied
+        // the card and advances at their own pace.
+        if (!getDamageWaitAutoAdvance()) {
+            log(`damage wait ${opId} resolved (${reason}); manual advance`);
+            _notify("OWAI.Notifications.DamageSettled");
+            return;
+        }
         log(`damage wait ${opId} resolved (${reason}); advancing`);
         _advanceForOperation(combat, entry.operation, entry.context ?? {})
             .catch(err => console.error(`${MODULE_ID} | damage-wait advance failed`, err));

@@ -328,13 +328,22 @@ export function createOverwatchService({ api = null, hooks = null } = {}) {
 
     /**
      * Expiry pass on `updateCombat`: a combatant's overwatch ends the
-     * moment its own turn starts (Only War: until your next turn).
+     * moment its own turn starts (Only War: until your next turn). Only a
+     * real round/turn advance expires a declaration — the module's own
+     * `operation` flag writes fire `updateCombat` too, and re-running the
+     * expiry on every update used to erase a zone declared moments
+     * earlier on the same turn (smoke finding). A record stamped with
+     * the current round is kept for the same reason.
      * @param {object} combat
+     * @param {object} [change] Update diff; non-turn changes are ignored.
      */
-    function _expireOnTurnStart(combat) {
+    function _expireOnTurnStart(combat, change) {
+        if (change && change.turn === undefined && change.round === undefined) return;
         const current = combat?.combatant ?? null;
-        if (!current || !overwatchOf(current)) return;
+        const record = current ? overwatchOf(current) : null;
+        if (!record) return;
         if (!_isController()) return;
+        if (Number.isFinite(record.round) && record.round === combat?.round) return;
         clear(current);
     }
 

@@ -15,6 +15,7 @@ import {
     RANGED_ATTACK_TYPE_ORDER
 } from "./contract.js";
 import {
+    _blastFromSpecial,
     _expectedDamage,
     _finiteOr,
     _list
@@ -134,7 +135,8 @@ export function _normalizeAction(raw, index) {
             : (Number.isFinite(raw.range?.value) ? raw.range.value
                 : (Number.isFinite(raw.system?.range) ? raw.system.range : null)),
         blastRadius: _finiteOr(raw.blastRadius ?? raw.system?.blastRadius
-            ?? raw.traits?.blast ?? raw.system?.traits?.blast, 0),
+            ?? raw.traits?.blast ?? raw.system?.traits?.blast
+            ?? _blastFromSpecial(raw.special ?? raw.system?.special), 0),
         damage: _expectedDamage(raw.damage ?? raw.system?.damage ?? 0),
         requirements: Array.isArray(raw.requirements) ? raw.requirements.slice() : [],
         spray: raw.spray === true || raw.traits?.spray === true,
@@ -165,7 +167,8 @@ export function _fallbackActions(actor) {
             itemId: item.id ?? null,
             class: item.system?.class ?? null,
             range: item.system?.range ?? null,
-            blastRadius: item.system?.blastRadius ?? item.system?.traits?.blast ?? 0,
+            blastRadius: item.system?.blastRadius ?? item.system?.traits?.blast
+                ?? _blastFromSpecial(item.system?.special) ?? 0,
             damage: item.system?.damage ?? 0
         }, index))
         .filter(Boolean);
@@ -220,7 +223,8 @@ export async function _resolveActions(actor, context) {
             melee: action.melee || String(cls ?? "").toLowerCase() === "melee",
             range: action.range ?? (Number.isFinite(item.system?.range) ? item.system.range : null),
             blastRadius: action.blastRadius > 0 ? action.blastRadius
-                : _finiteOr(item.system?.blastRadius ?? item.system?.traits?.blast, 0),
+                : _finiteOr(item.system?.blastRadius ?? item.system?.traits?.blast
+                    ?? _blastFromSpecial(item.system?.special), 0),
             spray: action.spray || /spray/i.test(String(item.system?.special ?? "")),
             rateOfFire: action.rateOfFire ?? item.system?.rateOfFire ?? null,
             damage: action.damage > 0 ? action.damage : _expectedDamage(item.system?.damage ?? 0)
@@ -392,6 +396,24 @@ export function _weaponClipOf(actor, action) {
         && (entry.id === action?.itemId
             || (action?.itemUuid != null && entry.uuid === action.itemUuid)));
     return _itemAmmo(item);
+}
+
+
+/**
+ * Whether the weapon backing a normalized action is jammed (smoke
+ * finding): a jammed gun cannot fire, so attack/test actions behind one
+ * must leave the usable pool — reload/ready fallbacks rescue the turn.
+ * `null`/`false` semantics match `jammed === true` only — an unreadable
+ * item never vetoes.
+ * @param {object|null} actor
+ * @param {object} action Normalized action.
+ * @returns {boolean}
+ */
+export function _weaponJammedOf(actor, action) {
+    const item = _list(actor?.items).find(entry => entry
+        && (entry.id === action?.itemId
+            || (action?.itemUuid != null && entry.uuid === action.itemUuid)));
+    return item?.system?.jammed === true;
 }
 
 

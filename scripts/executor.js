@@ -48,12 +48,16 @@ import {
 } from "./planner.js";
 import {
     getAttackAdjudication,
+    getCenterOnBot,
     getExecutionMode,
     getPreviewTimeoutSeconds,
     getTurnPacingMs,
     isDiagnosticsEnabled,
     logDiagnostics
 } from "./settings.js";
+import {
+    centerOnToken
+} from "./ui/plan-overlay.js";
 import {
     createAdjudication
 } from "./executor/adjudication.js";
@@ -652,6 +656,12 @@ export function createExecutorService({
         let status = EXECUTOR_STATUS.completed;
         let irreversibleSpent = false;
         let skippedIrreversible = false;
+
+        // Issue #32: pan the GM view onto the acting bot before its
+        // first step so automated turns stay watchable.
+        if (getCenterOnBot()) {
+            centerOnToken(_tokenDoc(context.token ?? run.combatant?.token));
+        }
 
         for (;;) {
             const steps = Array.isArray(run.plan?.steps) ? run.plan.steps : [];
