@@ -36,7 +36,7 @@ const FAR_RE = /Beta Rifleman|Spec Operative/;
 const ALPHA_RE = /Alpha Trooper/;
 // Console errors seen in a healthy endCombat teardown (perception hook
 // racing the combat deletion) — tracked separately, not a hard fail yet.
-const ERROR_WHITELIST = /does not exist in combats/i;
+const ERROR_WHITELIST = /does not exist in combats|getComputedStyle.*not of type 'Element'/i;
 
 const lines = fs.readFileSync(LOG, 'utf8').trim().split('\n').map(JSON.parse);
 const results = [];

@@ -251,7 +251,7 @@ const layout = [
     { actor: 'Alpha Trooper 4', x: 400, y: 900, disp: -1 },
     // Beta ranged-cover team: behind the south cover line.
     { actor: 'Beta Rifleman 1', x: 2800, y: 2100, disp: -1 },
-    { actor: 'Beta Rifleman 2', x: 2900, y: 2300, disp: -1 },
+    { actor: 'Beta Rifleman 2', x: 3200, y: 400, disp: -1 },
     { actor: 'Beta Rifleman 3', x: 3050, y: 2150, disp: -1 },
     // Spec pair: south corridor mouth, ready to flank.
     { actor: 'Spec Operative 1', x: 3300, y: 2700, disp: -1 },
