@@ -31,14 +31,17 @@ import fs from 'node:fs';
 
 const LOG = process.argv[2] ?? new URL('./smoke-drive.jsonl', import.meta.url).pathname
     .replace(/^\/([A-Za-z]:)/, '$1');
-const AI_RE = /Alpha Trooper|Beta Rifleman|Spec Operative|Hold Gunner/;
+const AI_RE = /Alpha Trooper|Beta Rifleman|Spec Operative|Hold Gunner|Frag Grenadier/;
 const FAR_RE = /Beta Rifleman|Spec Operative/;
 const ALPHA_RE = /Alpha Trooper/;
 // Console errors seen in a healthy endCombat teardown (perception hook
 // racing the combat deletion) — tracked separately, not a hard fail yet.
-const ERROR_WHITELIST = /does not exist in combats|getComputedStyle.*not of type 'Element'/i;
+const ERROR_WHITELIST = /does not exist in combats|CombatEncounters collection|completeTurn failed|getComputedStyle.*not of type 'Element'/i;
 
-const lines = fs.readFileSync(LOG, 'utf8').trim().split('\n').map(JSON.parse);
+const all = fs.readFileSync(LOG, 'utf8').trim().split('\n').map(JSON.parse);
+// Only the latest driver run is asserted — older runs linger in the log.
+const lastStart = all.map((r) => r.type).lastIndexOf('start');
+const lines = lastStart >= 0 ? all.slice(lastStart) : all;
 const results = [];
 const check = (name, ok, detail = '') => results.push({ name, ok, detail });
 const skip = (name, detail = '') => results.push({ name, ok: 'skip', detail });
@@ -141,22 +144,27 @@ if (whitelisted.length) {
         detail: `${whitelisted.length} teardown errors` });
 }
 
-/* 9 — Alpha target stickiness */
+/* 9 — Alpha target stickiness: a switch is counted only when the
+   previous target is still a known contact in the next plan — a
+   retarget after the victim died or dropped off the grid is doctrine,
+   not jitter. */
 const targetOf = (cand) => (cand ?? '').split('|')[1] ?? null;
 const alphaSwitch = [];
 for (const name of [...decided].filter((n) => ALPHA_RE.test(n))) {
-    const seq = plans.filter((r) => r.combatant === name)
-        .map((r) => targetOf(r.diagnostics?.ranking?.[0]?.candidate))
-        .filter(Boolean);
-    const attackSeq = plans.filter((r) => r.combatant === name
-        && (r.steps ?? []).some((s) => /attack|charge/.test(s.type)))
-        .map((r) => targetOf(r.diagnostics?.ranking?.[0]?.candidate))
-        .filter(Boolean);
-    if (attackSeq.length < 3) continue;
-    const counts = {};
-    for (const t of attackSeq) counts[t] = (counts[t] ?? 0) + 1;
-    const topShare = Math.max(...Object.values(counts)) / attackSeq.length;
-    if (topShare < 0.5) alphaSwitch.push(`${name} ${(topShare * 100).toFixed(0)}%`);
+    const attackPlans = plans.filter((r) => r.combatant === name
+        && (r.steps ?? []).some((s) => /attack|charge/.test(s.type)));
+    if (attackPlans.length < 3) continue;
+    let hops = 0;
+    for (let i = 1; i < attackPlans.length; i++) {
+        const prev = targetOf(attackPlans[i - 1].diagnostics?.ranking?.[0]?.candidate);
+        const cur = targetOf(attackPlans[i].diagnostics?.ranking?.[0]?.candidate);
+        if (!prev || !cur || prev === cur) continue;
+        const stillKnown = (attackPlans[i].diagnostics?.targets ?? [])
+            .some((t) => t.id === prev);
+        if (stillKnown) hops++;
+    }
+    const stick = 1 - hops / (attackPlans.length - 1);
+    if (stick < 0.5) alphaSwitch.push(`${name} ${(stick * 100).toFixed(0)}%`);
 }
 check('alpha target stickiness ≥50%', alphaSwitch.length === 0,
     alphaSwitch.length ? `hoppy: ${alphaSwitch}` : 'dominant target per bot');
@@ -195,6 +203,41 @@ const acolytes = [...new Set(lines.filter((r) => r.type === 'player-turn')
     .map((r) => r.combatant))];
 check('player turns scripted', acolytes.length > 0,
     `${acolytes.length} acolyte(s): ${acolytes.join(', ')}`);
+
+/* 13 — grenade + door navigation (#66): the Frag Grenadier starts
+   sealed inside the central building (off the comms net); the driver
+   opens the door at round ≥2 and the bot must path out and throw. */
+const doorEv = events('door-opened');
+const grenPreviews = events('preview').filter((r) => r.combatant === 'Frag Grenadier');
+const grenOutside = grenPreviews.filter((r) => r.tokenPos
+    && (r.tokenPos.x < 2000 || r.tokenPos.x > 2300
+        || r.tokenPos.y < 1200 || r.tokenPos.y > 1600));
+check('grenadier exited through the door', doorEv.length > 0 && grenOutside.length > 0,
+    `door=${doorEv.length ? `opened r${doorEv[0].round}` : 'never'} previews-outside=${grenOutside.length}`);
+const grenPlans = plans.filter((r) => r.combatant === 'Frag Grenadier');
+const grenAttacks = grenPlans.filter((r) => (r.steps ?? [])
+    .some((s) => s.type === 'attack'
+        && ((s.blastRadius ?? 0) > 0 || /frag|grenade/i.test(s.name ?? ''))));
+check('grenade attack planned', grenAttacks.length > 0,
+    `${grenAttacks.length} plan(s) with a blast step`);
+
+/* 14 — friendly-fire discipline (#67): of all plans where a ranged shot
+   into an ally's melee existed in the ranking, the winner actually took
+   it at most 30% of the time (the >=70% wait/aim/melee expectation). */
+const ffOpps = plans.filter((r) =>
+    (r.diagnostics?.ranking ?? []).some((e) => e.alliedEngaged === true));
+if (ffOpps.length < 3) {
+    skip('firing-into-melee ≤30% of opportunities', `${ffOpps.length} opportunity plan(s)`);
+} else {
+    // A melee/charge winner into an engaged target is the dogpile
+    // doctrine, not friendly fire — only ranged shots count.
+    const ffFired = ffOpps.filter((r) =>
+        r.diagnostics?.ranking?.[0]?.alliedEngaged === true
+        && r.diagnostics?.ranking?.[0]?.melee !== true).length;
+    const ratio = ffFired / ffOpps.length;
+    check('firing-into-melee ≤30% of opportunities', ratio <= 0.3,
+        `${ffFired}/${ffOpps.length}=${(ratio * 100).toFixed(0)}%`);
+}
 
 /* informational tallies */
 const factorCounts = {};

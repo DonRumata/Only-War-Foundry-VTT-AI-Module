@@ -151,11 +151,15 @@ test("netLastKnownPositions shares only within the same net and marks relay", ()
     const shared = perception.netLastKnownPositions(
         world.combat, listener.combatant, "defense", 1);
     const uuids = shared.map(entry => entry.tokenUuid);
-    // Only the living same-net member shares — foreign nets, the dead and
-    // netless combatants never propagate.
-    assert.deepEqual(uuids, [`Scene.${sceneId}.Token.e1`]);
+    // Issue #69: a defeated member still relays its memory — the "last
+    // transmission" decays only via the normal entry TTL. Foreign nets
+    // and netless combatants never propagate.
+    assert.deepEqual(uuids, [
+        `Scene.${sceneId}.Token.e1`, `Scene.${sceneId}.Token.e3`]);
     assert.equal(shared[0].sourceCombatantId, relay.combatant.id);
     assert.equal(shared[0].relay, true);
+    assert.equal(shared[1].sourceCombatantId, dead.combatant.id);
+    assert.equal(shared[1].relay, true);
 });
 
 test("netLastKnownPositions delay withholds fresh sightings for one round", () => {

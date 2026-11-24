@@ -282,6 +282,10 @@ let lastVictim = null;
 let processed = 0;
 let noSessionTicks = 0;
 let lastWaitOpId = null;
+// Grenade+door scenario: the Frag Grenadier starts sealed inside the
+// central building; the driver opens its door at round 2 (a GM-side
+// action — bot-initiated door opening is a separate feature).
+let doorOpened = false;
 
 while (processed < MAX_TURNS) {
     const state = await ev(() => {
@@ -313,6 +317,23 @@ while (processed < MAX_TURNS) {
         break;
     }
 
+    // #66: open the building door once the combat reaches round 2 — the
+    // sealed grenadier must then navigate through it before attacking.
+    if (!doorOpened && state.round >= 2) {
+        doorOpened = true;
+        const opened = await ev(async () => {
+            const scene = game.scenes.find((s) => s.name === 'Smoke Arena') ?? canvas.scene;
+            const door = scene?.walls?.find((w) => (w.door > 0 || w.door?.type > 0));
+            if (!door) return 'no-door';
+            for (const update of [{ ds: 1 }, { 'door.state': 1 }]) {
+                try { await door.update(update); return JSON.stringify(update); }
+                catch (e) { /* try the next door-state schema */ }
+            }
+            return 'update-failed';
+        });
+        log({ type: 'door-opened', round: state.round, result: opened });
+    }
+
     if (state.hasSession && !handledOps.has(state.opId)) {
         await page.waitForTimeout(400);
         const dump = await ev(async (opId) => {
@@ -331,7 +352,13 @@ while (processed < MAX_TURNS) {
                     id: plan.id,
                     winner: plan.winner ?? plan.action?.type ?? null,
                     intent: plan.intent ?? null,
-                    steps: (plan.steps ?? []).map((s) => ({ type: s.type, mode: s.mode, distance: s.distance ?? s.move?.distance ?? null })),
+                    steps: (plan.steps ?? []).map((s) => ({
+                        type: s.type, mode: s.mode,
+                        distance: s.distance ?? s.move?.distance ?? null,
+                        name: s.input?.name ?? null,
+                        blastRadius: s.input?.blastRadius ?? null,
+                        attackType: s.input?.attackType ?? null
+                    })),
                     score: plan.score ?? null,
                     seed: plan.seed ?? null,
                     replanCount: plan.replanCount ?? 0,
@@ -503,20 +530,22 @@ const tail = await ev(() => {
 });
 if (END_COMBAT && tail?.started) {
     // endCombat() resolves only after the "end this encounter?" dialog —
-    // fire without awaiting, then accept the dialog when it appears.
-    await ev(() => {
-        const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
-        combat?.endCombat?.().catch(() => {});
-        return true;
-    });
-    for (let i = 0; i < 20; i++) {
+    // keep re-firing the call and accepting the dialog until the combat
+    // is actually gone: the first invocation can race a pending
+    // combatant update and silently no-op.
+    for (let i = 0; i < 30; i++) {
+        await ev(() => {
+            const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
+            if (combat?.started === true) combat.endCombat?.().catch(() => {});
+            return true;
+        });
         await page.waitForTimeout(600);
+        await acceptDialogs();
         const gone = !(await ev(() => {
             const combat = game.combats?.find((c) => c.name === 'Smoke Combat') ?? game.combat;
             return combat?.started === true;
         }));
         if (gone) { tail.ended = true; break; }
-        await acceptDialogs();
     }
 }
 log({ type: 'driver-done', ...tail });

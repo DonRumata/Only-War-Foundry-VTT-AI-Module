@@ -167,7 +167,8 @@ export const SCORE_FACTORS = Object.freeze([
     "order",
     "ev",
     "stickyTarget",
-    "outnumber"
+    "outnumber",
+    "tieUp"
 ]);
 
 /**
@@ -240,7 +241,10 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     // attacks instead of ping-ponging between near-equal charge options;
     // ganging up on an ally-engaged hostile is the melee doctrine bonus.
     stickyTarget: 4,
-    outnumber: 0
+    outnumber: 0,
+    // Spec-ops doctrine: binding a known pure shooter in melee switches
+    // its gun off — a doctrine bonus, not a universal default.
+    tieUp: 0
 });
 
 /**
@@ -1452,6 +1456,31 @@ function _enemyContacts(targets, threats, pxPerUnit) {
             tokenUuid: target.tokenUuid ?? null });
     }
     return contacts;
+}
+
+/**
+ * Per-target shooter profile derived from the resolved threat emitters
+ * (smoke finding — spec-ops doctrine): `{melee, rangedDamage}` — whether
+ * the enemy fields a melee weapon and the EV of its strongest ranged
+ * emitter. Feeds the `tieUp` factor: a melee candidate against a known
+ * pure shooter binds its gun. Pure snapshot data, like `_enemyContacts`.
+ * @param {object[]} threats Resolved threat sources with `emitters`.
+ * @returns {Map<string, {melee: boolean, rangedDamage: number}>}
+ */
+function _shooterProfiles(threats) {
+    const map = new Map();
+    for (const source of threats ?? []) {
+        const key = source?.tokenUuid ?? source?.id ?? null;
+        if (key == null) continue;
+        const entry = map.get(key) ?? { melee: false, rangedDamage: 0 };
+        for (const emitter of source?.emitters ?? []) {
+            if (emitter?.melee === true) entry.melee = true;
+            else entry.rangedDamage = Math.max(entry.rangedDamage,
+                _finiteOr(emitter?.ev ?? emitter?.damage, 0));
+        }
+        map.set(key, entry);
+    }
+    return map;
 }
 
 /**
@@ -2979,7 +3008,7 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
     lastUsedWeapon = null, traits = [], dodgeTN = null,
     allyEngagedTargets = null, enemies = null, lastAttacker = null,
-    orderBoost = null, lastTarget = null }) {
+    orderBoost = null, lastTarget = null, shooterProfiles = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -3116,6 +3145,15 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
         && allyEngagedTargets != null && typeof allyEngagedTargets.get === "function"
         ? (allyEngagedTargets.get(target.tokenUuid) ?? 0) : 0;
     const outnumber = Math.min(allyCount, 2) / 2;
+    // Spec-ops doctrine (smoke): a melee candidate against a KNOWN pure
+    // shooter binds its gun — the enemy cannot fire while engaged. The
+    // value scales with the target's ranged output so tying up a heavy
+    // gunner outranks grabbing a pistol-wielder; enemies without a
+    // resolved emitter profile stay neutral (0).
+    const shooter = melee === 1 && target?.tokenUuid != null
+        ? shooterProfiles?.get(target.tokenUuid) ?? null : null;
+    const tieUp = shooter && shooter.melee !== true && shooter.rangedDamage > 0
+        ? Math.min(shooter.rangedDamage / 15, 1) : 0;
     return {
         attackNow,
         attackAfterMove,
@@ -3178,7 +3216,8 @@ function _factorsOf({ variant, target, move, action, moveBudget = null, blastHit
                 + (orderBoost?.pressured === true ? 0.5 : 0)
             : 0,
         stickyTarget,
-        outnumber
+        outnumber,
+        tieUp
     };
 }
 
@@ -4189,6 +4228,7 @@ export function createPlannerService({
         // (`alliedEngagement`) and enemy contact reaches for the
         // free-attack factors (`leaveMeleeEngage`/`engageDenial`).
         const enemyContacts = _enemyContacts(targets, threats, pxPerUnit);
+        const shooterProfiles = _shooterProfiles(threats);
         const contactReachPx = new Map();
         for (const contact of enemyContacts) {
             if (contact.tokenUuid != null) contactReachPx.set(contact.tokenUuid, contact.reachPx);
@@ -4799,7 +4839,7 @@ export function createPlannerService({
                 preferredWeapon, lastUsedWeapon,
                 traits: personality.traits, dodgeTN,
                 allyEngagedTargets, enemies: enemyContacts, lastAttacker,
-                lastTarget,
+                lastTarget, shooterProfiles,
                 // Issue #38: disciplined/elite squads and pressured morale
                 // (graceful #26 hook) raise the leader's order utility.
                 orderBoost: {
@@ -4871,7 +4911,12 @@ export function createPlannerService({
         diagnostics.candidatesCount = scored.length;
         diagnostics.ranking = scored.map(entry => ({
             candidate: entry.id,
-            score: entry.score
+            score: entry.score,
+            // Smoke asserts read the winner's engagement context: melee
+            // vs ranged pick and whether the shot fires into an ally's
+            // melee (the −20 friendly-fire lane).
+            melee: entry.factors?.melee === 1,
+            alliedEngaged: entry.factors?.alliedEngagement === 1
         }));
         recordLayerReason(diagnostics, "L4", "scored", {
             candidates: scored.length

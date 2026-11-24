@@ -69,6 +69,21 @@ const BOTS = [
         weapons: [
             { name: 'Lasgun', class: 'basic', range: 30, damage: '1d10+3', clip: { value: 30, max: 30 }, rateOfFire: { single: 1, burst: 3, full: 0 } }
         ]
+    },
+    // Grenade+door scenario (#66): sealed inside the central building.
+    // His only intel is the comms net — relayed contacts pull him toward
+    // the fight, but the closed door blocks his path until the driver
+    // opens it; then he must navigate out and throw the frag (grenade
+    // range is deliberately shorter than the spawn distances so he has
+    // to move first).
+    {
+        name: 'Frag Grenadier', preset: 'rangedCover', team: null,
+        personality: ['grenadier'],
+        weapons: [
+            { name: 'Frag Grenade', class: 'thrown', range: 18, damage: '2d10',
+                blastRadius: 3, clip: { value: 5, max: 5 },
+                rateOfFire: { single: 1, burst: 0, full: 0 } }
+        ]
     }
 ];
 
@@ -171,9 +186,13 @@ const botIds = await page.evaluate(async (data) => {
             await created[w].update({ 'system.magazine': loadedMag.id });
         }
         await actor.setFlag('only-war-ai', 'config', { enabled: true, preset: spec.preset });
-        // All bots share one comms net — relayed sightings reach the
-        // distant squads with a one-round radio delay.
-        await actor.setFlag('only-war-ai', 'commsNet', 'defense');
+        // Bots share one comms net — relayed sightings reach the distant
+        // squads with a one-round radio delay. `comms:false` marks a bot
+        // deliberately off the net (the sealed grenadier keeps zero intel
+        // until its door opens).
+        if (spec.comms !== false) {
+            await actor.setFlag('only-war-ai', 'commsNet', 'defense');
+        }
         if (spec.personality) {
             await actor.setFlag('only-war-ai', 'personality', spec.personality);
         }
@@ -214,9 +233,11 @@ const sceneId = await page.evaluate(async (data) => {
         { c: [2000, 1200, 2000, 1600], move: 20, sight: 20, door: 0 },
         { c: [2000, 1200, 2300, 1200], move: 20, sight: 20, door: 0 },
         { c: [2300, 1200, 2300, 1600], move: 20, sight: 20, door: 0 },
-        { c: [2000, 1600, 2150, 1600], move: 20, sight: 20, door: 0 },
+        { c: [2000, 1600, 2050, 1600], move: 20, sight: 20, door: 0 },
         { c: [2250, 1600, 2300, 1600], move: 20, sight: 20, door: 0 },
-        { c: [2150, 1600, 2250, 1600], move: 0, sight: 20, door: 1, ds: 0 },
+        // Door on the south wall: 2 cells wide so a full-footprint token
+        // (±0.45 corner probes) can actually pass the open leaf.
+        { c: [2050, 1600, 2250, 1600], move: 20, sight: 20, door: 1, ds: 0 },
         // Cover rectangles west of the building.
         { c: [1500, 800, 1500, 1100], move: 20, sight: 20, door: 0 },
         { c: [1500, 1100, 1700, 1100], move: 20, sight: 20, door: 0 },
@@ -242,7 +263,11 @@ const layout = [
     // Players: west edge, spread vertically.
     { actor: 'Acolyte One', x: 300, y: 900, disp: 1 },
     { actor: 'Acolyte Two', x: 300, y: 1400, disp: 1 },
-    { actor: 'Acolyte Three', x: 300, y: 1900, disp: 1 },
+    // Grenade bait: staged far south-west — the south wall cuts the
+    // grenadier's inside LOS and the doorway exit cell is the closest
+    // legal position to her, so the greedy approach scorer must walk
+    // him out through the open door before the frag can reach.
+    { actor: 'Acolyte Three', x: 1500, y: 2350, disp: 1 },
     // Alpha assault team: east, loose wedge behind the ridge cover.
     { actor: 'Alpha Trooper 1', x: 2800, y: 1200, disp: -1 },
     { actor: 'Alpha Trooper 2', x: 2900, y: 1400, disp: -1 },
@@ -257,7 +282,11 @@ const layout = [
     { actor: 'Spec Operative 1', x: 3300, y: 2700, disp: -1 },
     { actor: 'Spec Operative 2', x: 3450, y: 2750, disp: -1 },
     // Hold gunner inside the building.
-    { actor: 'Hold Gunner', x: 2100, y: 1350, disp: -1 }
+    { actor: 'Hold Gunner', x: 2100, y: 1350, disp: -1 },
+    // Grenadier sealed in the same building — the west wall cuts his
+    // inside LOS to the bait, so the only firing position leads through
+    // the doorway.
+    { actor: 'Frag Grenadier', x: 2050, y: 1300, disp: -1 }
 ];
 
 const tokenIds = await page.evaluate(async (data) => {

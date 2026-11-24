@@ -257,6 +257,21 @@ export function createExecutorService({
 } = {}) {
     /** Operation id → {promise, hookAdvanced}: dedup of repeated executions. */
     const executions = new Map();
+    /**
+     * Record an execution with a bounded dedup window (smoke review):
+     * the map is keyed per operation id and would otherwise grow for the
+     * session's lifetime. Insertion-ordered eviction keeps the newest
+     * 256 records — an evicted record only loses the idempotent-replay
+     * guarantee, which matters for at most the last few turns anyway.
+     * @param {string|null} operationId
+     * @param {object} record
+     */
+    const _recordExecution = (operationId, record) => {
+        while (executions.size >= 256) {
+            executions.delete(executions.keys().next().value);
+        }
+        executions.set(operationId, record);
+    };
     /** Adjudication request id → pending `{resolve, request}` pair (#37). */
     const pendingAdjudications = new Map();
     /** Dedup keys of emitted plan-start barks (issue #26). */
@@ -2142,7 +2157,7 @@ export function createExecutorService({
             if (early) return early;
             return _execute(context, run);
         })();
-        executions.set(operationId, record);
+        _recordExecution(operationId, record);
         return record.promise;
     }
 
@@ -2275,7 +2290,7 @@ export function createExecutorService({
             }
             return _execute(context, run);
         })();
-        executions.set(operationId, record);
+        _recordExecution(operationId, record);
         return record.promise;
     }
 

@@ -107,14 +107,19 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     readyWeapon: 2,
     // Issue #39: spec-ops is disciplined fire — strong shooting-into-
     // melee avoidance, mild engage pull and a real grudge memory.
-    alliedEngagement: -8,
+    alliedEngagement: -14,
     leaveMeleeEngage: -6,
     engageDenial: 1,
     unpin: 4,
     grudge: 3,
     ev: 1,
     stickyTarget: 4,
-    outnumber: 2
+    outnumber: 2,
+    // Spec-ops doctrine (smoke): melee is a *denial* tool, not a damage
+    // tool — an operative ties up a known pure shooter (high ranged EV,
+    // no melee emitter) so it cannot fire. `melee` stays negative so the
+    // pull only ever wins against a genuinely dangerous gun.
+    tieUp: 6
 
 });
 
@@ -164,7 +169,8 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         cover: 1,
         holdPosition: -2,
         attackType: 0.2,
-        meleeEngage: 4
+        meleeEngage: 4,
+        tieUp: 4
     }),
     regroup: Object.freeze({
         attackNow: 4,
@@ -193,7 +199,8 @@ export const SPEC_OPS_SOLO_WEIGHTS = Object.freeze({
     holdPosition: 2,
     attackType: 0.1,
     vulnerable: 0.5,
-    meleeEngage: 2
+    meleeEngage: 2,
+    tieUp: 3
 });
 
 /** Candidate variants whose action produces an attack/test step. */

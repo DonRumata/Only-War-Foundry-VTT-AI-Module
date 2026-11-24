@@ -78,7 +78,10 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     // otherwise ping-pongs it between near-equal hostiles; ganging up on
     // an ally-engaged target is core melee doctrine.
     stickyTarget: 8,
-    outnumber: 4
+    outnumber: 4,
+    // Smoke: closing on a known pure shooter denies its fire too — a
+    // modest tie-up pull, secondary to the charge doctrine itself.
+    tieUp: 2
 });
 
 /**

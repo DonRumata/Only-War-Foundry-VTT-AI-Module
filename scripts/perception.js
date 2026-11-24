@@ -1359,10 +1359,13 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
     /**
      * Merged shared contacts of a combatant's comms net (smoke finding):
      * distant squads otherwise hold position forever because they never
-     * see the enemy. Same living/on-scene/AI-enabled gates as
+     * see the enemy. Same on-scene/AI-enabled gates as
      * `teamLastKnownPositions`, plus a radio delay — a member only shares
      * contacts it has held for `delayRounds` or more, so the net spreads
      * sightings turn-by-turn instead of instantly dogpiling the map.
+     * Issue #69: a DEFEATED member's memory still relays — its last
+     * transmission lives until the memory TTL expires it (a dead
+     * observer records nothing new, so the intel decays naturally).
      * Returned teammate entries carry `relay: true` so the planner can
      * weigh relayed intel below own sightings.
      * @param {object} combat Combat document.
@@ -1382,7 +1385,10 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
         for (const other of _combatantList(combat)) {
             if (!other || other === combatant) continue;
             if (ownId !== null && other.id === ownId) continue;
-            if (other.defeated === true || other.destroyed === true) continue;
+            // #69: a destroyed document is gone for good, but a defeated
+            // member still contributes its memory — the "last
+            // transmission" decays via the normal entry TTL.
+            if (other.destroyed === true) continue;
             if (!isAiEnabled(other)) continue;
             if (_commsNetOf(other) !== netId) continue;
             const doc = _tokenDocument(other.token);
@@ -1548,9 +1554,21 @@ export function createPerceptionService({ api = null, hooks = null } = {}) {
             state.pendingCombat = combat;
             return;
         }
+        // Edge case (review #10): a combat bound to another scene than the
+        // viewed canvas must not write sightings from the wrong scene's
+        // tokens — defer until the GM returns to the combat scene.
+        const combatSceneId = combat.scene?.id ?? null;
+        if (combatSceneId && globalThis.canvas.scene.id !== combatSceneId) {
+            state.pendingCombat = combat;
+            return;
+        }
         await expireMemory(combat, combat.round);
         for (const combatant of _combatantList(combat)) {
-            if (!isAiEnabled(combatant) || combatant?.destroyed === true) continue;
+            // Defeated combatants keep their memory (the net still relays
+            // the last transmission) but record nothing new — dead eyes
+            // see nothing.
+            if (!isAiEnabled(combatant) || combatant?.destroyed === true
+                || combatant?.defeated === true) continue;
             // A combatant deleted mid-refresh must not abort the pass —
             // its flag write throws on the destroyed document.
             try {
