@@ -94,20 +94,25 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Стены разделяются по `sense`: `"move"` для маршрутов, `"sight"` для LOS —
   смок (`move:0, sight:20`) проходим и не даёт видеть — поддержано без
   особых настроек.
+- Четыре системных режима движения: `half`, `full`, `charge`, `run`
+  (1×, 2×, 3× и 6× скорректированный бонус Ловкости). `approach` и
+  `seek` расходуют half/full move; `charge` ведёт по прямой к цели,
+  `run` тратит полный ход, без атаки.
 - Gridless-сцены — контролируемый `gridless-unsupported` (не ошибка).
 
 ### Planner (issue #403 + #413)
 
-- Детерминированные кандидаты `attack-in-place | move-attack | charge |
-  approach | hold`; факторный вектор + веса пресета; равные оценки —
-  seeded pick (mulberry32).
+- Детерминированные кандидаты, в том числе `attack-in-place`,
+  `move-attack`, `charge`, `approach`, `seek`, `run`, `hold`: факторный
+  вектор + веса пресета; равные оценки разрешает seeded pick (mulberry32).
 - Типы атаки из `actions.list`: на оружие кандидатизируется до 3 типов в
   курируемом порядке (ranged: `full_auto, semi_auto, standard, ripper_charge,
   called_shot, suppressing_fire`; melee: `allOut, charge, standard, lightning,
   swift, called_shot`); `suppressing_fire` — отдельная роль, проходит всегда
-  (issue #14).
-- Статусы: `stunned` → короткий `end-turn`-план; `pinned` — вето charge и
-  сближающих перемещений; `prone` — бюджет движения пополам, вето charge.
+  (issue #14). Дальние атаки с пустым клипом исключаются (`no-ammo`).
+- Статусы: `stunned` → короткий `end-turn`-план; `pinned` — вето charge,
+  run и сближающих перемещений; `prone` — бюджет движения пополам,
+  вето charge и run.
 - `vulnerable`-фактор за цель pinned/prone/stunned; `engaged`/`meleeEngage`
   за контакт ближнего боя.
 - `validateSnapshot` перед каждым шагом: `turn-stale | token-moved |
@@ -251,6 +256,11 @@ execute: расхождение — `stale-state` (перемещение, см�
   `OWAI.FireteamCharacter.*`), поле ввода черт и resolved-строка в
   NPC-sheet, селект характера в fireteam-секции, `plan.personality` и
   `diagnostics.personality` для диагностики.
+- **Настройка GM**: в секции Only War AI на листе NPC введите id черт через
+  запятую (например `marksman, cautious`). Пустое поле возвращает seeded
+  выбор, если на токене или комбатанте нет override. В превью проверяйте
+  эффективные черты и вклад L3 в оценку: черта меняет предпочтения, но
+  не делает недоступное действие легальным.
 
 #### Экономия действий (issue #15)
 
@@ -281,10 +291,10 @@ execute: расхождение — `stale-state` (перемещение, см�
 - `reload` — `kind:"reload"` записи `actions.list`: шаг `reload` идёт
   через `api.actions.reload` со step-scoped `operationId`
   (идемпотентно); `move-reload` допустим при half-стоимости.
-- `overwatch` — кандидат объявляет зону на видимую угрозу через сервис
-  из #14 (флаг + GM-only отрисовка); реакция остаётся ручной у GM.
-  На last-known контакт зона не объявляется. Issue #54: зона наводится
-  на предсказанные позиции — nav-waypoint `planRoute(threat → self)`
+- `overwatch` — полное действие, объявляет зону на видимую угрозу или
+  свежий `team-contact` через сервис из #14 (флаг + GM-only отрисовка).
+  Своей `last-known` памяти для декларации недостаточно. Issue #54: зона
+  наводится на предсказанные позиции — nav-waypoint `planRoute(threat → self)`
   ближайшей угрозы (~половина её полухода по маршруту — «в проход»),
   lead-точки `min(halfMove, distToSelf)` видимых угроз («на
   опережение»), позиции memory-контактов (валидный якорь зоны, #45);
@@ -294,11 +304,15 @@ execute: расхождение — `stale-state` (перемещение, см�
   Issue #37: бот с потраченной реакцией
   (`flags["only-war-ai"].reactionUsed` текущего раунда) зону не
   декларирует — rejected `reaction-used`.
+  **Для GM:** подтвердите `overwatch` в превью; зона остаётся на сцене до
+  следующего хода владельца, перемещения его токена или конца боя.
+  Обновление флага операции в том же ходу не снимает зону. Вход врага
+  в зону — повод разыграть реакцию вручную, не автоматический бросок.
 - Ориентация конусов (issue #30): spray/suppression наводятся только по
   воспринимаемым якорям — видимая цель на текущую позицию, last-known на
   запомненную точку; невидимые/неизвестные hostile на сцене шаблон не
-  наводят (вето союзников сканирует всю сцену). Overwatch — строго по
-  видимой угрозе, но по её предсказанным позициям (issue #54).
+  наводят (вето союзников сканирует всю сцену). Overwatch наводится на
+  предсказанные позиции угрозы (issue #54).
 - Статусы: pinned запрещает движение, standalone aim, overwatch и
   move-reload — стационарные reload/attack-in-place остаются.
 - Веса пресетов: `aim` (прицельный выстрел), `aimAlone` (standalone aim —
@@ -395,9 +409,15 @@ execute: расхождение — `stale-state` (перемещение, см�
   сериализованным waypoints (fallback `update({x,y})`); `attack`/`test` —
   `prepare*`/`execute*` системного API со step-scoped `operationId`;
   `aim` — флаг aimedUntil на combatant (снимается после выстрела);
-  `reload` — `api.actions.reload`; `overwatch` — заявка конуса через
-  сервис overwatch (флаг Combatant + GM-only конус на сцене, реакция —
+  `reload` — `api.actions.reload`; `overwatch` — заявка зоны через
+  сервис overwatch (флаг Combatant + GM-only зона на сцене, реакция —
   ручная у GM).
+- **Контракт бега с системой:** после фактического `move(run)` модуль
+  ставит `flags["only-war-ai"].running = {combatId, round, operationId}`
+  на актёре комбатанта (синтетическом у unlinked-токена). Система читает
+  этот маркер и включает −20 в дальних атаках по бегущей цели
+  (`rollData.flags.isTargetRunning`). Модуль снимает маркер на следующем
+  ходу бегуна или в конце боя; без маркера «Бег» остаётся ручной опцией.
 - Безопасность: перед каждым шагом `validateSnapshot`; stale → один
   replan; повторный stale — hold-and-report. Без контроллера — `not-controller`.
 - Продвижение хода: сериализовано по боевому `id`, ключи `(round,turn)`,

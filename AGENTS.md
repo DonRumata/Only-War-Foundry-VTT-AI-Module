@@ -41,6 +41,9 @@ major-версию `game.darkHeresy.api` (требуется `"1.x"`); при н
   разрешает атаковать нейтральные токены (владение, казни заложников и
   т.п.); `preferredWeapon` (issue #37) — uuid/id/имя предпочтительного
   оружия, скорится фактором `weaponAffinity`.
+- Actor: `running = { combatId, round, operationId }` — временный
+  маркер выполненного спринта. Система читает его для штрафа −20 в дальних
+  атаках по бегущей цели; у unlinked-токена флаг живёт в ActorDelta.
 - Token: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`.
 - Combatant: `override = { mode: "inherit"|"enabled"|"disabled", preset: string|null }`
   — временный override с наивысшим приоритетом.
@@ -262,9 +265,9 @@ Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
 
 `scripts/planner.js` — сервис `planner` (`api.services`): `planTurn(combat,
 combatant, context)` строит immutable DTO-снапшот и детерминированно выбирает
-план из кандидатов (`attack-in-place`, `move-attack`, `charge`, `approach`,
-`hold`) по взвешенному factor-вектору пресета; равные оценки разрешаются
-mulberry32 по `plan.seed`. План сериализуем (`move`/`attack`/`test`/
+план из кандидатов (в том числе `attack-in-place`, `move-attack`, `charge`,
+`approach`, `seek`, `run`, `hold`) по взвешенному factor-вектору пресета;
+равные оценки разрешаются mulberry32 по `plan.seed`. План сериализуем (`move`/`attack`/`test`/
 `end-turn` шаги), `validateSnapshot` перед каждым state-changing шагом
 сверяет дешёвый fingerprint и выдаёт стабильную причину (`turn-stale`,
 `token-moved`, `target-gone`, `resources-changed`, `collision-changed`,
@@ -272,7 +275,8 @@ mulberry32 по `plan.seed`. План сериализуем (`move`/`attack`/`t
 `maxReplans` (default 1) перепланировок за ход.
 
 Типы атак системного API (`actions.list(actor)` — по записи на attackType
-на оружие): недоступные (`available === false`) отбрасываются; для каждого
+на оружие): недоступные (`available === false`) отбрасываются, L0 ветирует
+оставшиеся дальние атаки с `clip.value === 0` (`no-ammo`); для каждого
 оружия сохраняется до 3 типов в курируемом порядке — melee `[allOut,
 charge, standard, lightning, swift, called_shot]`, ranged `[full_auto,
 semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
@@ -282,6 +286,11 @@ semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
 факторы: `attackType` (привлекательность типа атаки), `vulnerable` (цель
 pinned/prone/stunned), `engaged`/`meleeEngage` (контакт ближнего боя после
 движения) — веса заданы в `scripts/presets/*.js`.
+
+Искать невидимый контакт можно через `seek` (конец ближе, `los:false`).
+Фактор `run` равен 1 только у спринта до `rates.run`, когда спринт
+заканчивается строго ближе обычного `approach` или тот недоступен.
+`run` запрещён при `pinned`/`prone` и тратит оба полудействия.
 
 Тактические факторы (issue #39): `alliedEngagement` — точечная (не
 melee/blast/cone) атака по цели, стоящей в melee-reach союзника из
@@ -313,8 +322,9 @@ min(blastHits/2, 1); веса в пресетах (assault 4, specOps 5, rangedC
 на записи `targets` (видимая цель — живая позиция, last-known —
 запомненная точка); hostile-токены сцены без восприятия шаблон не
 наводят, но по-прежнему срабатывают в вето союзников/нейтралов.
-`overwatch`-кандидат заявляет зону лишь на видимую угрозу
-(`canAttack === true`, не `hidden`), но наводит её на предсказанные
+`overwatch`-кандидат заявляет зону на видимую угрозу
+(`canAttack === true`, не `hidden`) или свежий `team-contact`, но не на
+одну лишь собственную `last-known` позицию. Наведение на предсказанные
 позиции (issue #54): nav-waypoint кратчайшего маршрута ближайшей угрозы
 (`planRoute(threat → self)`, точка ~на половину её полухода), lead-точки
 `min(halfMove, dist)` всех видимых угроз и позиции memory-контактов;
@@ -478,6 +488,10 @@ state-changing шагом `planner.validateSnapshot(plan)`; позиция то�
 из плана без пересчёта пути (fallback `update({x, y})`); `attack`/`test` —
 `game.darkHeresy.api.rolls` (`prepare*` + `execute*(prepared,
 {operationId})`, system PR #440), отсутствие API — `system-api-missing`.
+После фактического перемещения (`move` с `input.mode:"run"`) executor
+ставит `running` на актёре комбатанта. `updateCombat` снимает флаг при
+начале следующего хода бегуна, `deleteCombat` — у оставшихся бегунов
+в этом бою.
 `ready-weapon` — `api.actions.readyWeapon`/`ready`/`equip` (без
 эндпоинта — `system-api-missing`); `drop-prone` — `api.actions.dropProne`
 или fallback `actor.toggleStatusEffect("prone")`. `delay` (issue #38) —

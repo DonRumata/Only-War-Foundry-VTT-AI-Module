@@ -1,24 +1,21 @@
 # Текущее поведение ботов (baseline spec)
 
-Слепок поведения по состоянию на `feature/integration-ai` перед слойным
-рефактором (issue #24). Точка отсчёта для регрессий: если что-то из
-описанного изменилось — это должно быть осознанное решение, а не побочка.
+Исходный слепок `feature/integration-ai` перед слойным рефактором (issue #24)
+с дополнениями из смока `integration/ai-stack`. Точка отсчёта для регрессий:
+изменения поведения должны быть осознанными.
 
 Архитектура и API-границы — `docs/capabilities.md`. Здесь — как бот
 думает: факторы, веса, порядок кандидатов, жизненный цикл хода.
 
 ## 1. Скоринг
 
-`SCORE_FACTORS` (planner.js) — факторы считаются в 0..1:
+`SCORE_FACTORS` (`scripts/planner/contract.js`), большинство факторов в 0..1:
 `attackNow, attackAfterMove, charge, melee, advance, threat, proximity,
 los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
-<<<<<<< HEAD
 danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
-alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge`.
-=======
-danger, weaponAffinity, weaponInertia, dropProne, readyWeapon, ev`.
->>>>>>> feature/action-economy-37
+alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge, order, ev,
+stickyTarget, outnumber, tieUp, seek, run`.
 
 Issue #37: EV-срез уклонения живёт на факторе `ev` — `damageNorm ×
 attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
@@ -71,6 +68,8 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | engageDenial | 4 | 0 | 2 | 1 |
 | unpin | 4 | 3 | 3 | 4 |
 | grudge | 4 | 1 | 2 | 3 |
+| seek | 1.5 | 0 | 0 | 3 |
+| run | 1.5 | 0.5 | 0 | 1 |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -115,12 +114,16 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
   комбатант). Флаг сознательно **не входит** в stale-fingerprint — свежая
   атака по боту не должна форсировать переплан.
 
-## 2. Генерация кандидатов (planner.js:2597–3109)
+## 2. Генерация кандидатов (`planTurn`)
 
 Детерминированный порядок `targets × actions × moves`:
 
 1. Лимиты: `maxTargets 8`, `maxActions 3` **на группу оружия**
    (`itemUuid ?? itemId ?? name ?? id`), `move candidates 8`.
+   До группировки L0 исключает заклинившее оружие (`weapon-jammed`) и
+   оставшиеся в выдаче дальние атаки с `clip.value === 0` (`no-ammo`).
+   Ближние атаки и оружие без отслеживаемого клипа не получают `no-ammo`;
+   `reload`, `ready-weapon` и движение остаются отдельными кандидатами.
 2. На цель: `moves = _resolveMoves()`, `approachMove` — минимальная
    дистанция не-stay. Когда цель дальше самого дальнего оружия,
    `findCandidates` вызывается дважды: на позицию цели (ближайшие
@@ -138,9 +141,27 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    - **Non-blast**: `distance <= range` → `attack-in-place`
      (+ `aim-attack` вариант); иначе `out-of-range`. На каждый ход в
      дистанции: `charge` (melee) / `move-attack` (ranged); full-cost после
-     move → `full-after-move`; дальше `rates.half` → `beyond-half-move` (issue #31); вето `pinned`/`prone`; pinned-ход
-     к цели → `pinned`. Ничего нет → `out-of-range`/`no-route`.
-5. `approach` кандидат; ни атаки, ни approach → `no-route`.
+     move → `full-after-move`; `move-attack` дальше `rates.half` →
+     `beyond-half-move` (issue #31); pinned-ход к цели → `pinned`.
+     Ничего нет → `out-of-range`/`no-route`.
+   - **Charge**: отдельный поиск до `rates.charge` (3× скорректированный
+     бонус Ловкости), запрещён при `pinned`/`prone`. Начальная дистанция
+     до цели — не менее 4 единиц сцены (4 клетки при масштабе Smoke Arena);
+     маршрут прямой с допуском сетки, направлен в цель и заканчивается
+     в пределах melee reach. Причины: `charge-too-close`,
+     `charge-bent-route`, `charge-off-line`. Движение входит в полное
+     действие чарджа.
+5. Перемещения без атаки:
+   - `approach` — обычный подход; ни атаки, ни approach → `no-route`.
+   - `seek` — для невидимого `last-known`/`team-contact`/`relay`/`intel`
+     контакта. Конечная точка строго ближе и скрыта от контакта стеной
+     (`los:false`, не `null`); стоимость как у half/full move. Фактор
+     `seek = 1` отличает поиск укрытого подхода от обычного.
+   - `run` — поиск до `rates.run` (6× скорректированный бонус Ловкости).
+     Кандидат только при свободном полном действии, без `pinned`/`prone`,
+     и если конец спринта строго ближе к цели, чем лучший `approach`
+     (либо `approach` недоступен). Фактор `run = 1`; тратит оба
+     полудействия без последующей атаки.
 6. Cone/spray/suppression pass: `_bestConeAim` → `attack-in-place` с
    `cone`-payload; провал `cone-no-safe-aim`; spray (не suppression)
    перебирает `move-attack` по конечным точкам.
@@ -156,9 +177,10 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    `_bestConeAim` от всех якорей, spray — собственный конус
    `_coneSpecOf` (arc/range оружия), blast — круг-триггер
    `{targetPoint, blastRadius}` на якоре с максимальным покрытием;
-   fallback — bearing на угрозу. Декларация по-прежнему строго по
-   видимой цели — не для memory-only; вето `reaction-used`, когда
-   реакция бота уже потрачена — issue #37).
+   fallback — bearing на угрозу. Для декларации нужна видимая угроза
+   или `team-contact` от живого союзника; своей `last-known` памяти
+   недостаточно. Вето `reaction-used`, когда реакция уже потрачена —
+   issue #37).
 8. Free-action кандидаты (issue #37): `ready-weapon` — явные записи
    `kind:"ready"|"draw"|"equip"` из `actions.list` с собственным `cost`
    (free под Quick Draw; модуль таланты не парсит), иначе — синтез по
@@ -194,8 +216,9 @@ ready-weapon → drop-prone → end-turn` (всегда последний). Att
 `attackType`, `mode:"charge"`, `aim`, `targetPoint` + `blastRadius`
 (blast, issue #29 — зона для оверлея/системного шаблона),
 `template.direction/angle/range` + `covered/suppressionFire/burstMode`
-(cone). `overwatch` несёт `direction`/`arc`/`range` (конусная зона; для
-spray — дуга собственного конуса оружия, issue #54) либо
+(cone). Спринт сериализуется как `move` с `input.mode:"run"` и
+`cost.halves:2`. `overwatch` несёт `direction`/`arc`/`range` (конусная
+зона; для spray — дуга собственного конуса оружия, issue #54) либо
 `shape:"blast"` + `targetPoint`/`blastRadius` (круг-триггер — тот же
 контракт, что у blast-атаки, оверлей рисует круг без нового читателя).
 `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
@@ -222,13 +245,12 @@ actionId:"unpin"}`, `cost.halves:2` — верифицированный кон�
 Токены `blastTokens` без восприятия (нет LOS, нет памяти, `hidden`)
 конус не наводят — они участвуют только в вето союзников/нейтралов.
 Проверка LOS — до якорей, а не до всего покрытия. Без якорей —
-`cone-no-safe-aim`, кандидата нет. `overwatch`-декларация — строго по
-видимой цели (`canAttack === true`, не `hidden`): на last-known зона не
-заявляется — память накрывает spray/blast, а не заявочный конус. Issue
-#54 меняет наведение внутри видимой угрозы, не источник цели: конус
-смотрит на предсказанные позиции (route-waypoint / lead-точки / точки
-memory-контактов — последние валидны как якоря зоны по ревью #45), а
-blast-оружие заявляет круг `{shape:"blast", targetPoint, blastRadius}`
+`cone-no-safe-aim`, кандидата нет. Для `overwatch` нужна видимая
+угроза (`canAttack === true`, не `hidden`) или свежий `team-contact`,
+но не собственная `last-known` память. Issue #54 меняет наведение:
+конус смотрит на предсказанные позиции (route-waypoint / lead-точки /
+точки контактов), а blast-оружие заявляет круг
+`{shape:"blast", targetPoint, blastRadius}`
 вместо сектора; melee-зона досягаемости сознательно пропущена.
 
 ## 5. Executor (executor.js)
@@ -254,6 +276,10 @@ adjudicated-manual, adjudicated-skill-test`.
   `ready-weapon` → `api.actions.readyWeapon`/`ready`/`equip` (без
   endpoint — `system-api-missing`); `drop-prone` → `api.actions.dropProne`
   или fallback `actor.toggleStatusEffect("prone")`; `end-turn` → ok.
+- После исполненного `move` с `input.mode:"run"` executor ставит
+  `flags["only-war-ai"].running` на актёре комбатанта (для unlinked-токена
+  это синтетический актёр). Система учитывает −20 на дальних атаках по
+  нему. Флаг снимается в начале следующего хода бегуна или в конце боя.
 - Issue #37: успешная `attack` записывает `lastUsedWeapon` на combatant
   (controller-only) — planner читает его фактором `weaponInertia`.
 - Attack adjudication (issue #37): в режиме `attackAdjudication
