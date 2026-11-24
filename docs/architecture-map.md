@@ -33,7 +33,7 @@
 | [`settings.js`](../scripts/settings.js), [`constants.js`](../scripts/constants.js), [`config-resolver.js`](../scripts/config-resolver.js) | Настройки мира, ключи флагов и read-only `resolveEffectiveConfig`: Combatant → Token → Actor → disabled. |
 | [`authority.js`](../scripts/authority.js), [`operations.js`](../scripts/operations.js) | `electController`, фильтрация хуков, захват и фазы операции на Combat. Нет активного GM → `waiting-for-gm`. |
 | [`perception.js`](../scripts/perception.js) | `visibleTargets`, `buildPerceptionSnapshot`, память и общие контакты. LOS считается от токена бота, не от видимости GM. |
-| [`navigation.js`](../scripts/navigation.js), [`threat-map.js`](../scripts/threat-map.js) | Поиск маршрута (`searchRoute`), коллизии и стоимость пути; опасность позиции (`dangerAt`) по профилям угроз. |
+| [`navigation.js`](../scripts/navigation.js), [`threat-map.js`](../scripts/threat-map.js) | Поиск обхода (`searchRoute`), коллизии и проверка стоимости маршрута для текущего хода; опасность позиции (`dangerAt`) по профилям угроз. |
 | [`fireteam.js`](../scripts/fireteam.js) | `buildTeamPlan`: подбор лидера и задач, связность, мораль, общий фокус, delay и приказы. |
 | [`reactions.js`](../scripts/reactions.js), [`grudges.js`](../scripts/grudges.js), [`overwatch.js`](../scripts/overwatch.js) | `reactionUsed`, `lastAttacker`, заявка зон (`declare`/`clear`). Overwatch рисуется для GM, но не совершает реакцию сам. |
 | [`ui/preview-dialog.js`](../scripts/ui/preview-dialog.js), [`ui/plan-overlay.js`](../scripts/ui/plan-overlay.js) | `resolvePreview`, устаревание и таймаут; `plan`/`overwatch`/`danger` — клиентские слои GM. Превью плана видит только GM-контроллер. |

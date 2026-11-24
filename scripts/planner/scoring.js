@@ -104,7 +104,9 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
         && canAttack ? 1 : 0;
     const attackAfterMove = (variant === "move-attack" || variant === "charge") && canAttack ? 1 : 0;
     let advance = 0;
-    if (move && !move.stay && Number.isFinite(targetDistance) && targetDistance > 0
+    if (move && !move.stay && Number.isFinite(move.pathProgress)) {
+        advance = Math.max(0, Math.min(1, move.pathProgress));
+    } else if (move && !move.stay && Number.isFinite(targetDistance) && targetDistance > 0
         && Number.isFinite(postDistance)) {
         advance = Math.max(0, Math.min(1, (targetDistance - postDistance) / targetDistance));
     }
