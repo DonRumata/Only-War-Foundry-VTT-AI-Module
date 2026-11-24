@@ -74,6 +74,9 @@ export const GRID_TYPES = Object.freeze({
 /** Default bound for A* expansions / flood-fill visits. */
 export const DEFAULT_SEARCH_LIMIT = 20000;
 
+/** Bound the optional search beyond the current turn's movement budget. */
+const DETOUR_SEARCH_LIMIT = 1024;
+
 /** Default bound for returned reachable cells and candidates. */
 export const DEFAULT_RESULT_LIMIT = 512;
 
@@ -400,8 +403,9 @@ export function cellPathCost(a, b, grid) {
     if (grid?.kind === GRID_KINDS.hex) return hexDistance(a, b, grid.variant ?? "odd-r");
     const di = Math.abs(a.i - b.i);
     const dj = Math.abs(a.j - b.j);
-    return (Math.min(di, dj) * diagonalCostOf(diagonalRuleOf(null, grid)))
-        + Math.abs(di - dj);
+    const rule = diagonalRuleOf(null, grid);
+    if (rule === "illegal") return di + dj;
+    return (Math.min(di, dj) * diagonalCostOf(rule)) + Math.abs(di - dj);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1001,7 +1005,14 @@ export function createGridAdapter(env = {}) {
         const input = points.map(p => ({ x: p.x, y: p.y }));
         try {
             if (typeof tokenDoc?.measureMovementPath === "function") {
-                const result = tokenDoc.measureMovementPath(input);
+                // Like TokenDocument.move, token measurement expects
+                // document top-lefts, not the plan's footprint centres.
+                const size = describe()?.size ?? 100;
+                const dx = (tokenDoc.width ?? 1) * size / 2;
+                const dy = (tokenDoc.height ?? 1) * size / 2;
+                const result = tokenDoc.measureMovementPath(input.map(p => ({
+                    x: p.x - dx, y: p.y - dy
+                })));
                 const cost = result?.cost ?? result?.distance;
                 if (Number.isFinite(cost)) return cost;
             }
@@ -1381,6 +1392,42 @@ function _serializePath(path, context) {
 }
 
 /**
+ * Keep the longest stoppable prefix inside both the grid and platform
+ * movement budgets. A reserved cell may be traversed but not end a turn.
+ * @param {object[]} path Grid offsets including the start.
+ * @param {number} costCells Geometric cost of the original path.
+ * @param {object} context
+ * @param {number} budgetCells
+ * @returns {{waypoints: object[], costCells: number, cost: number}}
+ */
+function _fitRouteToBudget(path, costCells, context, budgetCells) {
+    const waypoints = _serializePath(path, context);
+    const distance = context.grid.distance;
+    const budget = budgetCells * distance;
+    const points = waypoints.map(({ x, y }) => ({ x, y }));
+    const measure = (length, cells) => {
+        const measured = context.measureCost?.(length === points.length ? points : points.slice(0, length));
+        return Number.isFinite(measured) ? measured : cells * distance;
+    };
+    if (waypoints.length < 2) return { waypoints, costCells: 0, cost: 0 };
+    if (costCells <= budgetCells + EPSILON && context.canStop(path.at(-1))) {
+        const cost = measure(waypoints.length, costCells);
+        if (cost <= budget + EPSILON) return { waypoints, costCells, cost };
+    }
+    let best = { waypoints: waypoints.slice(0, 1), costCells: 0, cost: 0 };
+    let cells = 0;
+    for (let index = 1; index < path.length; index++) {
+        cells += cellPathCost(path[index - 1], path[index], context.grid);
+        if (cells > budgetCells + EPSILON) break;
+        if (!context.canStop(path[index])) continue;
+        const cost = measure(index + 1, cells);
+        if (cost > budget + EPSILON) break;
+        best = { waypoints: waypoints.slice(0, index + 1), costCells: cells, cost };
+    }
+    return best;
+}
+
+/**
  * Deterministic revision fingerprint of the inputs that define a route.
  * @param {object} parts
  * @returns {string}
@@ -1397,6 +1444,8 @@ function _revision(parts) {
  * @param {number} budgetCells Maximum path cost in cell units.
  * @param {object} [options]
  * @param {number} [options.maxVisited] A* expansion bound.
+ * @param {boolean} [options.followDetour] Find a complete route around a
+ *   blocking wall before choosing this turn's affordable prefix.
  * @returns {object} PathResult `{status, reason?, path/waypoints, cost,
  *   costCells, budget, budgetCells, endpoint, exact, partial,
  *   visitedNodes, ms, revision, approximations}`.
@@ -1412,6 +1461,12 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
     }
 
     const start = context.origin.offset;
+    const followDetour = options.followDetour === true;
+    const goalPoint = followDetour ? context.toPoint(goal) : null;
+    if (followDetour && (!goalPoint || !context.fitsInside(goal)
+        || !context.moveBlocked(context.origin.point, goalPoint))) {
+        return _failure(NAVIGATION_REASONS.pathNotFound, { sceneId: context.sceneId });
+    }
     const result = searchRoute({
         start,
         goal,
@@ -1419,10 +1474,16 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
         edgeCost: context.edgeCost,
         isOpen: context.isOpen,
         canStand: context.canStand,
-        canStop: context.canStop,
+        // An occupied contact can guide the search, but the fitted
+        // route can never end on its cell.
+        canStop: followDetour
+            ? offset => context.canStop(offset) || (offset.i === goal.i && offset.j === goal.j)
+            : context.canStop,
         heuristic: offset => heuristicCells(offset, goal, context.grid),
-        budget: budgetCells,
-        maxVisited: options.maxVisited ?? DEFAULT_SEARCH_LIMIT
+        budget: followDetour ? Infinity : budgetCells,
+        maxVisited: followDetour
+            ? Math.min(DETOUR_SEARCH_LIMIT, options.maxVisited ?? DETOUR_SEARCH_LIMIT)
+            : (options.maxVisited ?? DEFAULT_SEARCH_LIMIT)
     });
 
     const distance = context.grid.distance;
@@ -1436,6 +1497,7 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
         origin: [start.i, start.j],
         goal: [goal.i, goal.j],
         budget: Math.round(budgetCells * 1000),
+        ...(followDetour ? { followDetour } : {}),
         footprint: [context.footprint.w, context.footprint.h],
         reservations: [...context.reservations].sort()
     });
@@ -1448,68 +1510,42 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
      * @returns {object}
      */
     function _result(path, costCells, meta) {
-        const waypoints = _serializePath(path, context);
-        const points = waypoints.map(w => ({ x: w.x, y: w.y }));
-        const measured = context.measureCost?.(points);
-        const costMeters = Number.isFinite(measured) ? measured : costCells * distance;
+        const fitted = _fitRouteToBudget(path, costCells, context, budgetCells);
+        const { waypoints } = fitted;
+        const trimmed = waypoints.length < path.length;
+        const status = trimmed
+            ? (waypoints.length > 1 ? NAVIGATION_STATUS.partial : NAVIGATION_STATUS.failed)
+            : meta.status;
         const endpoint = waypoints.length ? waypoints[waypoints.length - 1] : null;
         return _deepFreeze({
-            status: meta.status,
-            reason: meta.reason ?? null,
+            status,
+            reason: meta.reason ?? (trimmed ? NAVIGATION_REASONS.budgetExceeded : null),
             path: waypoints,
             waypoints,
-            cost: Math.round(costMeters * 1000) / 1000,
-            costCells: Math.round(costCells * 1000) / 1000,
+            cost: Math.round(fitted.cost * 1000) / 1000,
+            costCells: Math.round(fitted.costCells * 1000) / 1000,
             budget: Math.round(budgetMeters * 1000) / 1000,
             budgetCells: Math.round(budgetCells * 1000) / 1000,
             endpoint,
-            exact: meta.exact === true,
-            partial: meta.status === NAVIGATION_STATUS.partial,
+            exact: !trimmed && meta.exact === true,
+            partial: status === NAVIGATION_STATUS.partial,
             visitedNodes: result.visited,
             ms: Math.round((_now() - started) * 100) / 100,
             revision,
             approximations,
-            sceneId: context.sceneId
+            sceneId: context.sceneId,
+            ...(followDetour && endpoint && costCells > 0 ? {
+                pathProgress: fitted.costCells / costCells,
+                los: context.los(endpoint, goalPoint),
+                cover: estimateCover(endpoint, goalPoint, context)
+            } : {})
         });
     }
 
     if (result.status === "found") {
-        let path = result.path;
-        let costCells = result.cost;
-        // Authoritative re-measure (difficult terrain when supported): if
-        // the measured cost exceeds the budget, truncate to the longest
-        // prefix that still fits — a conservative partial route.
-        const waypoints = _serializePath(path, context);
-        const measured = context.measureCost?.(waypoints.map(w => ({ x: w.x, y: w.y })));
-        if (Number.isFinite(measured) && measured > budgetMeters + EPSILON) {
-            // The platform-measured cost (e.g. difficult terrain) exceeds the
-            // budget even though the geometric cost fits. Keep the longest
-            // prefix whose measured cost still fits.
-            let used = 0;
-            let keep = 1;
-            for (let index = 1; index < path.length; index++) {
-                const prefix = _serializePath(path.slice(0, index + 1), context)
-                    .map(w => ({ x: w.x, y: w.y }));
-                const prefixCost = context.measureCost?.(prefix);
-                if (!Number.isFinite(prefixCost) || prefixCost > budgetMeters + EPSILON) break;
-                used += context.edgeCost(path[index - 1], path[index],
-                    path[index].i !== path[index - 1].i && path[index].j !== path[index - 1].j);
-                keep = index + 1;
-            }
-            path = path.slice(0, keep);
-            costCells = used;
-            if (path.length <= 1) {
-                return _result(path, 0, {
-                    status: NAVIGATION_STATUS.failed,
-                    reason: NAVIGATION_REASONS.budgetExceeded
-                });
-            }
-            return _result(path, costCells, {
-                status: NAVIGATION_STATUS.partial,
-                reason: NAVIGATION_REASONS.budgetExceeded
-            });
-        }
-        return _result(path, costCells, { status: NAVIGATION_STATUS.ok, exact: true });
+        const reason = followDetour && result.cost <= budgetCells + EPSILON && !context.canStop(goal)
+            ? NAVIGATION_REASONS.endpointOccupied : null;
+        return _result(result.path, result.cost, { status: NAVIGATION_STATUS.ok, exact: true, reason });
     }
 
     if (result.status === "limit") {
@@ -1517,6 +1553,10 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
             status: NAVIGATION_STATUS.failed,
             reason: NAVIGATION_REASONS.searchLimit
         });
+    }
+
+    if (followDetour) {
+        return _failure(NAVIGATION_REASONS.pathNotFound, { sceneId: context.sceneId });
     }
 
     // No exact route: return the best standable cell as a partial route.
@@ -1688,16 +1728,14 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
     }
     candidates.sort((a, b) => (b.score - a.score) || (a.i - b.i) || (a.j - b.j));
     const count = Number.isFinite(options.count) ? options.count : DEFAULT_CANDIDATE_COUNT;
-    const selected = candidates.slice(0, Math.max(0, count));
-    // Attach wall-aware waypoints so consumers (planner move steps,
-    // preview routes, fireteam reservations) can serialize an executable
-    // path instead of straight-lining into a wall. Only the selected
-    // destinations get an A* pass — scoring stays flood-fill cheap.
-    for (const candidate of selected) {
+    const selected = [];
+    // The geometric flood fill is only a shortlist. Do not pass a cell
+    // on to the planner unless its measured route really reaches it.
+    for (const candidate of candidates.slice(0, Math.max(0, count))) {
         const route = planRouteOnContext(context, { i: candidate.i, j: candidate.j },
             budgetCells, options);
-        if (route.status === NAVIGATION_STATUS.ok && Array.isArray(route.waypoints)) {
-            candidate.waypoints = route.waypoints;
+        if (route.status === NAVIGATION_STATUS.ok) {
+            selected.push({ ...candidate, cost: route.cost, waypoints: route.waypoints });
         }
     }
     return _deepFreeze({
@@ -1941,7 +1979,7 @@ export function createNavigationService({ api = null, adapter = null } = {}) {
      * @param {*} destination `{x, y}` | `{i, j}` | token-like.
      * @param {*} budget Scene units or `{meters|cells|mode}`.
      * @param {object} [options] Forwarded to the context builder plus
-     *   `{rates, maxVisited, context}`.
+     *   `{rates, maxVisited, context, followDetour}`.
      * @returns {object}
      */
     function planRoute(token, destination, budget, options = {}) {

@@ -117,6 +117,7 @@ import {
     _tokenUuid
 } from "./planner/documents.js";
 import {
+    _resolveDetour,
     _resolveMoves
 } from "./planner/moves.js";
 import {
@@ -1200,8 +1201,20 @@ export function createPlannerService({
                 }
             }
 
-            // A closing approach is a relocation that ends nearer the
-            // target — pinned combatants may only move while keeping or
+            // When no attack is available, a real route around a wall
+            // may start by heading away from the contact (#70).
+            const detourBudget = Math.min(remainingMove ?? totalMoveBudget ?? Infinity,
+                actionBudget < 2 ? (halfMoveLimit ?? Infinity) : Infinity);
+            const detourMove = !attackFound && !isPinned && !Array.isArray(planContext.moves)
+                && actionBudget > 0 && Number.isFinite(detourBudget) && detourBudget > 0
+                ? _resolveDetour({
+                    navigation, tokenDoc, selfPos, targetPos: targetPosOf(target),
+                    grid, budget: detourBudget
+                })
+                : null;
+            if (detourMove) approachMove = detourMove;
+
+            // Pinned combatants may only move while keeping or
             // increasing the distance, exactly like move-attack.
             const approachVetoed = approachMove !== null && isPinned
                 && Number.isFinite(approachMove.distance)
@@ -1231,11 +1244,11 @@ export function createPlannerService({
             // hiding outranks the faster open approach.
             if (_isMemorySource(target.source) && Number.isFinite(distance)) {
                 let seeked = 0;
-                for (const move of moves) {
+                for (const move of detourMove ? [detourMove] : moves) {
                     if (seeked >= SEEK_MAX_CANDIDATES) break;
                     if (move.stay || move.los !== false) continue;
-                    if (!Number.isFinite(move.distance)
-                        || move.distance >= distance - 1e-9) continue;
+                    if (!detourMove && (!Number.isFinite(move.distance)
+                        || move.distance >= distance - 1e-9)) continue;
                     if (isPinned && move.distance < distance) continue;
                     const seekHalves = halfMoveLimit !== null
                         && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1;
@@ -1257,8 +1270,7 @@ export function createPlannerService({
             // window after such a move.
             const runRate = _finiteOr(
                 moveRates?.run ?? context.rates?.run, null);
-            const runNav = navigation
-                || Array.isArray(context.runMoves);
+            const runNav = !detourMove && (navigation || Array.isArray(context.runMoves));
             if (runRate !== null && runRate > 0
                 && !isPinned && !isProne && actionBudget >= 2 && runNav) {
                 const runRemaining = spentMove > 0

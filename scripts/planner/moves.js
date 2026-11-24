@@ -42,6 +42,7 @@ export function _normalizeMove(raw, { selfPos, targetPos, grid, stay = false }) 
         cost: _finiteOr(raw.cost, 0),
         costCells: _finiteOr(raw.costCells, null),
         distance,
+        pathProgress: _finiteOr(raw.pathProgress, null),
         // `los` keeps tri-state: `true` the endpoint sees the target,
         // `false` a wall check proved it hidden, `null` unprobed — the
         // seek variant filters on an explicit `false`.
@@ -51,6 +52,36 @@ export function _normalizeMove(raw, { selfPos, targetPos, grid, stay = false }) 
         stay: stay || !moved,
         waypoints: Array.isArray(raw.waypoints) ? _jsonClone(raw.waypoints) : null
     };
+}
+
+/**
+ * Get the affordable prefix of a known wall detour, not a speculative
+ * move toward an endpoint that merely looks closer across the wall.
+ * @param {object} input
+ * @param {object} input.navigation
+ * @param {object} input.tokenDoc
+ * @param {object} input.selfPos
+ * @param {object} input.targetPos
+ * @param {object} input.grid
+ * @param {number} input.budget Scene units.
+ * @returns {object|null}
+ */
+export function _resolveDetour({ navigation, tokenDoc, selfPos, targetPos, grid, budget }) {
+    try {
+        const route = navigation?.planRoute?.(tokenDoc, targetPos, budget, { followDetour: true });
+        if (!(route?.pathProgress > 0) || !(route.waypoints?.length > 1)) return null;
+        return _normalizeMove({
+            ...route.endpoint,
+            cost: route.cost,
+            costCells: route.costCells,
+            los: route.los,
+            cover: route.cover,
+            pathProgress: route.pathProgress,
+            waypoints: route.waypoints
+        }, { selfPos, targetPos, grid });
+    } catch(_err) {
+        return null;
+    }
 }
 
 

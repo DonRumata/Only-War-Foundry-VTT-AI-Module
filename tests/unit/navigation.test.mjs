@@ -14,6 +14,7 @@ import {
     NAVIGATION_REASONS,
     NAVIGATION_STATUS,
     buildNavigationContext,
+    createGridAdapter,
     createNavigationService,
     diagonalCostOf,
     diagonalRuleOf,
@@ -34,6 +35,9 @@ import {
     validateEndpointOnContext,
     wallBlocks
 } from "../../scripts/navigation.js";
+import { createPlannerService } from "../../scripts/planner.js";
+import { registerRangedCoverPreset } from "../../scripts/presets/ranged-cover.js";
+import { makeActor, makeCombat, makeCombatant } from "./fixtures.mjs";
 
 /* ------------------------------------------------------------------------- */
 /* Mocks                                                                      */
@@ -356,6 +360,51 @@ test("square grid: route detours around a wall", () => {
     assert.deepEqual(_sansTiming(again), _sansTiming(result));
 });
 
+test("planner approaches a remembered contact through a door even when the first move leads away", async () => {
+    const actor = makeActor({ enabled: true, preset: "rangedCover" });
+    const token = mockToken({ id: "bot", x: 200, y: 300, actor });
+    const enemy = mockToken({ id: "outside", x: 100, y: 300 });
+    const door = mockWall([600, 300, 600, 500], { door: 1 });
+    const adapter = mockAdapter({
+        rows: 9, cols: 9, distance: 1, diagonals: "illegal", others: [enemy],
+        walls: [
+            mockWall([200, 200, 600, 200]),
+            mockWall([200, 600, 600, 600]),
+            mockWall([200, 200, 200, 600]),
+            mockWall([600, 200, 600, 300]),
+            door,
+            mockWall([600, 500, 600, 600])
+        ]
+    });
+    const combatant = makeCombatant({ token });
+    const combat = makeCombat({ round: 1, combatants: [combatant] });
+    combat.scene = adapter.scene();
+    const planner = createPlannerService();
+    registerRangedCoverPreset(planner);
+    const context = {
+        seed: 7, personality: false, threatMap: false,
+        navigation: createNavigationService({ adapter }),
+        actions: [{ id: "shot", type: "attack", class: "basic", range: 3, damage: 6 }],
+        rates: { half: 1, full: 2, charge: 3, run: 6 },
+        targets: [{
+            tokenId: enemy.id, x: 150, y: 350, source: "last-known", canAttack: false
+        }]
+    };
+    const closed = context.navigation.planRoute(token, context.targets[0], 2, { followDetour: true });
+    assert.equal(closed.reason, NAVIGATION_REASONS.pathNotFound);
+    door.ds = 1;
+    for (const x of [450, 650]) {
+        const { plan } = await planner.planTurn(combat, combatant, context);
+        const move = plan.steps.find(step => step.type === "move");
+        assert.equal(move?.input.to.x, x, "follow the legal detour instead of hugging the west wall");
+        assert.ok(move.input.waypoints.length > 1);
+        assert.ok(move.cost.movement <= context.rates.full);
+        token.x = x - 50;
+        token.y = move.input.to.y - 50;
+        combat.round++;
+    }
+});
+
 test("square grid: budget exceeded returns best partial waypoint", () => {
     const token = mockToken({ x: 0, y: 0 });
     const context = contextFor(token);
@@ -596,6 +645,35 @@ test("service.planRoute/canReach/validateEndpoint/measurePath", () => {
     assert.equal(measured.cost, 3, "2 cells x 1.5m");
 });
 
+test("measurePath fallback prices orthogonal travel when diagonals are forbidden", () => {
+    const service = serviceFor({ diagonals: "illegal", distance: 2 });
+    const token = mockToken();
+    const start = { i: 0, j: 0 };
+    const straight = service.measurePath(token, [start, { i: 0, j: 2 }]);
+    const offset = service.measurePath(token, [start, { i: 2, j: 1 }]);
+    assert.equal(straight.cost, 4);
+    assert.equal(offset.cost, 6);
+
+    const route = service.planRoute(token, { i: 2, j: 1 }, 6);
+    assert.equal(route.status, "ok");
+    assert.equal(route.cost, offset.cost);
+    assert.equal(route.path.length, 4, "no diagonal edges");
+});
+
+test("Foundry token measurement prices the same document waypoints the executor uses", () => {
+    const scene = { grid: { type: 1, size: 100, distance: 1 }, width: 600, height: 600 };
+    const adapter = createGridAdapter({ canvas: { scene } });
+    const token = mockToken({ width: 2 });
+    token.measureMovementPath = points => {
+        assert.deepEqual(points, [{ x: 0, y: 0 }, { x: 100, y: 0 }]);
+        return { cost: 2 };
+    };
+    // Use a non-default native cost to distinguish it from the fallback.
+    const route = createNavigationService({ adapter }).planRoute(token, { i: 0, j: 1 }, 2);
+    assert.equal(route.status, "ok");
+    assert.equal(route.cost, 2);
+});
+
 test("service.planRoute accepts mode budgets via options.rates", () => {
     const service = serviceFor();
     const token = mockToken({ x: 0, y: 0 });
@@ -653,6 +731,34 @@ test("difficult terrain: measured cost is authoritative for budget", () => {
     assert.equal(flat.terrainSupported, false);
     const approximation = planRouteOnContext(flat, { i: 0, j: 2 }, 5);
     assert.ok(approximation.approximations.includes("difficult-terrain-not-modelled"));
+});
+
+test("difficult terrain also limits partial routes and never stops on an occupied prefix", () => {
+    const token = mockToken();
+    const context = contextFor(token, {
+        rows: 1,
+        cols: 6,
+        distance: 1,
+        others: [mockToken({ x: 200 })],
+        measureCost: points => (points.length - 1) * 2
+    });
+    const route = planRouteOnContext(context, { i: 0, j: 5 }, 4);
+    assert.equal(route.status, "partial");
+    assert.deepEqual([route.endpoint.i, route.endpoint.j], [0, 1]);
+    assert.equal(route.cost, 2);
+});
+
+test("movement candidates carry measured costs and only executable routes", () => {
+    const context = contextFor(mockToken(), {
+        rows: 1,
+        distance: 1,
+        measureCost: points => (points.length - 1) * 2
+    });
+    const result = findCandidatesOnContext(context, 3, {
+        target: { x: 350, y: 50 }, count: 4
+    });
+    assert.deepEqual(result.candidates.map(move => [move.j, move.cost]), [[1, 2], [0, 0]]);
+    assert.ok(result.candidates.every(move => move.waypoints.at(-1).j === move.j));
 });
 
 test("A* core: deterministic order and visited bound", () => {
