@@ -68,6 +68,7 @@ import {
     _readyWeaponActions,
     _resolveActions,
     _unpinAction,
+    _weaponClipOf,
     _weaponJammedOf,
     dodgeChanceOf
 } from "./planner/actions.js";
@@ -658,6 +659,19 @@ export function createPlannerService({
                     candidate: `action|${action.id}`, reason: "weapon-jammed"
                 });
                 recordLayerReason(diagnostics, "L0", "weapon-jammed", `action|${action.id}`);
+                continue;
+            }
+            // An empty clip cannot fire either: clip-0 ranged attacks
+            // leave the usable pool so the plan falls back to
+            // reload/ready/move instead of a dead trigger pull.
+            // `null` ammo (melee, no clip tracked) never vetoes.
+            if ((action.type === "attack" || action.type === "test")
+                && !_isMeleeAction(action)
+                && _weaponClipOf(actor, action) === 0) {
+                diagnostics.rejected.push({
+                    candidate: `action|${action.id}`, reason: "no-ammo"
+                });
+                recordLayerReason(diagnostics, "L0", "no-ammo", `action|${action.id}`);
                 continue;
             }
             const key = action.itemUuid ?? action.itemId ?? action.name ?? action.id;

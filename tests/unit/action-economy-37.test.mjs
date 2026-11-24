@@ -1085,3 +1085,46 @@ test("the module API advertises the issue #37 capabilities", () => {
     assert.equal(api.hasCapability("executor.adjudication"), true);
     assert.deepEqual(api.attackAdjudicationModes, ["auto", "gm-confirm"]);
 });
+
+test("a clip-0 ranged attack leaves the usable pool — ready-weapon beats the dead trigger pull", async () => {
+    // П.33 smoke finding: an empty-clip attack used to stay in the
+    // candidate pool and outbid the ready-weapon fallback on attackNow
+    // weight alone — the bot spent the turn pulling a dead trigger.
+    // The clip gate drops it like `weapon-jammed`, so the synthesized
+    // draw of a loaded sidearm wins the turn instead.
+    const world = makeWorld();
+    world.actor.items = [
+        {
+            id: "w1", uuid: "a.l", type: "weapon", name: "Lasgun",
+            system: { class: "basic", range: 30, clip: { value: 0, max: 30 } }
+        },
+        {
+            id: "w9", uuid: "a.p", type: "weapon", name: "Autopistol",
+            system: { class: "pistol", range: 20, clip: { value: 9, max: 9 } }
+        }
+    ];
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { attackNow: 12, attackAfterMove: 10, readyWeapon: 2 },
+        allowNoAction: true
+    });
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        targets: targetsOf(world),
+        actions: [lasgunAction()],
+        moves: [],
+        actionsApi: { readyWeapon: async () => ({ ok: true }) }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok, JSON.stringify(result));
+    assert.ok(
+        result.plan.diagnostics.rejected.some(entry => entry.reason === "no-ammo"),
+        "clip-0 attack rejected as no-ammo"
+    );
+    assert.equal(
+        result.plan.steps.some(step => step.type === "attack"), false,
+        "no attack step on an empty weapon"
+    );
+    const step = result.plan.steps.find(entry => entry.type === "ready-weapon");
+    assert.ok(step, "ready-weapon step exists");
+    assert.equal(step.input.weaponId, "w9");
+});
