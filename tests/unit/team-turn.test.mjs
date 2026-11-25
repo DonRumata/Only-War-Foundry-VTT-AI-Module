@@ -131,6 +131,7 @@ async function fixture({
     }
     return {
         api, combat, shooter, flanker, target, moves, attacks, turn, calls, route, executor, operations,
+        planContext,
         records: () => combat.getFlag(MODULE_ID, FLAG_KEYS.teamManeuvers),
         setMode: value => { mode = value; },
         setVisible: callback => { visibleTo = callback; },
@@ -198,6 +199,60 @@ test("TeamPlan waits without blocking initiative, then fires only on each member
     ]);
     assert.equal(world.builds(), 1, "the draft does not replay across turns");
     assert.deepEqual(world.records(), []);
+});
+
+test("object assignment metadata survives team-turn compile and execution contexts", async () => {
+    const world = await fixture();
+    const objective = { type: "screen", targetId: world.target.tokenId, lane: "left" };
+    world.planContext.objective = { targetId: world.target.tokenId };
+    world.planContext.assignments = {
+        [world.shooter.id]: { task: "support", role: "suppressor", element: "fire" },
+        [world.flanker.id]: {
+            task: "flank", role: "interdictor", element: "screen", objective
+        }
+    };
+    const planner = world.api.services.get("planner");
+    const originalPlanTurn = planner.planTurn.bind(planner);
+    const contexts = [];
+    planner.planTurn = async (combat, combatant, context) => {
+        contexts.push({
+            combatantId: combatant.id,
+            phase: context?.teamTurn?.phase ?? null,
+            team: context?.team ?? null
+        });
+        return originalPlanTurn(combat, combatant, context);
+    };
+
+    assert.equal((await world.turn()).reason, "team-waiting");
+    const state = world.records()[0];
+    assert.equal(state.objective, world.target.tokenId,
+        "compiled maneuver state keeps the shared target on the legacy scalar channel");
+    const flankerState = state.members.find(member => member.id === world.flanker.id);
+    assert.equal(flankerState.role, "interdictor");
+    assert.equal(flankerState.element, "screen");
+    assert.deepEqual(flankerState.objective, objective);
+    assert.notEqual(flankerState.objective, objective, "compiled state stores a JSON copy");
+    const shooterState = state.members.find(member => member.id === world.shooter.id);
+    assert.equal(shooterState.role, "suppressor");
+    assert.equal(shooterState.element, "fire");
+    assert.equal("objective" in shooterState, false);
+
+    contexts.length = 0;
+    await world.turn(); // the flanker performs its compiled movement
+    const execution = contexts.find(entry => entry.combatantId === world.flanker.id
+        && entry.phase === "movement");
+    assert.ok(execution, "the compiled movement is re-planned with a team context");
+    assert.equal(execution.team.role, "interdictor");
+    assert.equal(execution.team.element, "screen");
+    assert.equal(execution.team.objective, world.target.tokenId,
+        "execution team.objective remains the legacy scalar target id");
+    assert.deepEqual(execution.team.memberObjective, objective);
+    assert.deepEqual(execution.team.assignment, {
+        task: "flank",
+        role: "interdictor",
+        element: "screen",
+        objective
+    });
 });
 
 test("an undersized Spec Ops fireteam previews the world's individual fallback without assigning roles", async () => {

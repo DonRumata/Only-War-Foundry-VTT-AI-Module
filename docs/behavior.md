@@ -455,6 +455,20 @@ adjudicated-manual, adjudicated-skill-test`.
   характеры `[disciplined, shock, elite, rabble]`.
 - `assignTasks`: явный override > regroup-флаг > лидер → assault >
   первый не-лидер → flank (≥2 члена, `allowFlank`) > остальные support.
+  Override обратно совместим: legacy-строка `"support"` читается как
+  `{task:"support"}`, объектная форма — `{task, role?, element?, objective?}`.
+  `role`/`element` — непустые строки, `objective` — member-scoped JSON-only
+  объект; они копируются в assignment, `teamPlan.members[]`, diagnostics,
+  compiled maneuver state и `context.team` исполнения. Неизвестный `task`
+  по-прежнему деградирует в `support`; morale/GM demotion меняет только
+  task/group и сохраняет метаданные. `context.team.objective` остаётся
+  backward-compatible scalar id общей цели (`tactic.objective.targetId` или
+  `context.objective.targetId`); member-scoped polymorphic objective идёт
+  отдельно через `context.team.memberObjective` и канонический
+  `context.team.assignment = {task, role?, element?, objective?}`. Если у
+  member-objective есть `targetId`, он имеет приоритет над shared objective
+  при вычислении `assignedTargetId`. Роли/элементы не входят в ключи
+  reservations (`task|target`) и не меняют barriers.
 - `evaluateCohesion` — мягкая: flank/assault могут отходить как
   `detached-maneuver` (лимит `maxDetachedPhases`, `rejoinAvailable`,
   штраф overshoot×0.25); остальные — `beyond-cohesion` штраф.

@@ -17,6 +17,7 @@ import {
     FIRETEAM_STATUS,
     TEAM_PLAN_REASONS,
     createFireteamService,
+    normalizeFireteamAssignment,
     resolveTeamConfig
 } from "../../scripts/fireteam.js";
 import { createPlannerService } from "../../scripts/planner.js";
@@ -281,6 +282,227 @@ test("assignTasks gives the leader assault, one flanker and the rest support", (
     assert.ok(noFlank.every(a => a.groupId === "main"));
 });
 
+test("assignTasks normalizes legacy strings and object assignments", () => {
+    const members = ["c1", "c2", "c3"].map(id => ({
+        combatantId: id,
+        tokenId: `t-${id}`,
+        defeated: false,
+        enabled: true,
+        position: { x: 0, y: 0 }
+    }));
+    const service = createFireteamService();
+    const objective = {
+        type: "suppress-zone",
+        targetId: "member-target",
+        lane: { id: "left", arc: 45, points: [{ x: 1, y: 2 }] }
+    };
+    const assignments = service.assignTasks(members, {
+        leaderId: "c2",
+        objective: { targetId: "shared-target", flankTargetId: "flank-target" },
+        assignments: {
+            c1: "advance",
+            c2: { task: "flank", role: "suppressor", element: "fire", objective },
+            c3: { task: "not-a-task", role: "cover" }
+        }
+    });
+    const byId = Object.fromEntries(assignments.map(a => [a.combatantId, a]));
+
+    assert.equal(byId.c1.task, "advance", "legacy string form remains explicit");
+    assert.equal("role" in byId.c1, false);
+    assert.equal("objective" in byId.c1, false);
+    assert.equal(byId.c1.assignedTargetId, "shared-target");
+
+    assert.equal(byId.c2.task, "flank");
+    assert.equal(byId.c2.role, "suppressor");
+    assert.equal(byId.c2.element, "fire");
+    assert.deepEqual(byId.c2.objective, objective);
+    assert.notEqual(byId.c2.objective, objective, "objective is cloned before freezing");
+    assert.equal(byId.c2.assignedTargetId, "member-target",
+        "a member objective target id wins over the shared objective and flank target");
+
+    assert.equal(byId.c3.task, "support", "unknown tasks keep the legacy support fallback");
+    assert.equal(byId.c3.role, "cover", "validation does not erase serialized metadata");
+
+    objective.lane.id = "mutated";
+    assert.equal(byId.c2.objective.lane.id, "left");
+    const circular = { type: "bad" };
+    circular.self = circular;
+    assert.equal(normalizeFireteamAssignment({ task: "support", objective: circular }).objective,
+        undefined);
+    assert.deepEqual(normalizeFireteamAssignment("support"), { task: "support" });
+});
+
+test("buildTeamPlan carries object assignments to members, diagnostics and member contexts", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, x: 0, y: 0, initiative: 20 });
+    const flanker = makeMember({ fireteam: { teamId: "alpha" }, x: 100, y: 0, initiative: 10 });
+    const world = makeTeamWorld([leader, flanker]);
+    const objective = { type: "screen", targetId: world.enemyToken.id, lane: { id: "left" } };
+    const contexts = [];
+    const fakePlanner = {
+        planTurn: async (combat, combatant, context) => {
+            contexts.push({ combatantId: combatant.id, team: context.team });
+            const moving = combatant.id === flanker.combatant.id;
+            return {
+                status: "ok",
+                plan: {
+                    id: `plan-${combatant.id}`,
+                    score: 1,
+                    target: null,
+                    snapshot: { targets: [] },
+                    steps: [
+                        ...(moving ? [{
+                            id: "move-1", type: "move",
+                            input: { to: { x: 200, y: 0 }, waypoints: [{ x: 200, y: 0 }] },
+                            cost: { halves: 1, movement: 1 }
+                        }] : []),
+                        { id: "end-1", type: "end-turn", input: {}, cost: {} }
+                    ],
+                    diagnostics: { layers: [] }
+                }
+            };
+        }
+    };
+    const service = createFireteamService({ planner: fakePlanner });
+    const result = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, {
+        seed: 42,
+        objective: { targetId: "shared-target" },
+        targets: [],
+        assignments: {
+            [leader.combatant.id]: { task: "support", role: "suppressor", element: "fire" },
+            [flanker.combatant.id]: {
+                task: "flank", role: "interdictor", element: "screen", objective
+            }
+        }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    const plan = result.teamPlan;
+    const leaderEntry = plan.members.find(m => m.combatantId === leader.combatant.id);
+    const flankerEntry = plan.members.find(m => m.combatantId === flanker.combatant.id);
+    assert.equal(leaderEntry.role, "suppressor");
+    assert.equal(leaderEntry.element, "fire");
+    assert.equal("objective" in leaderEntry, false);
+    assert.equal(flankerEntry.role, "interdictor");
+    assert.equal(flankerEntry.element, "screen");
+    assert.deepEqual(flankerEntry.objective, objective);
+    assert.equal(flankerEntry.assignedTargetId, objective.targetId,
+        "the member objective target id wins assignedTargetId over the shared objective");
+    assert.equal(plan.objective, "shared-target",
+        "the TeamPlan shared objective remains the legacy scalar channel");
+    assert.equal(Object.isFrozen(flankerEntry.objective), true);
+    assert.equal(Object.isFrozen(flankerEntry.objective.lane), true);
+
+    const diagnostic = plan.diagnostics.assignments
+        .find(a => a.combatantId === flanker.combatant.id);
+    assert.equal(diagnostic.role, "interdictor");
+    assert.deepEqual(diagnostic.objective, objective);
+    const roundTrip = JSON.parse(JSON.stringify(plan));
+    assert.deepEqual(roundTrip.members.find(m => m.combatantId === flanker.combatant.id).objective,
+        objective);
+    assert.deepEqual(roundTrip.diagnostics.assignments.find(
+        a => a.combatantId === flanker.combatant.id).objective, objective);
+
+    const flankContext = contexts.find(c => c.combatantId === flanker.combatant.id).team;
+    assert.equal(flankContext.role, "interdictor");
+    assert.equal(flankContext.element, "screen");
+    assert.equal(flankContext.objective, "shared-target",
+        "legacy team.objective remains the scalar shared target id");
+    assert.equal(flankContext.sharedObjective, undefined,
+        "the redundant sharedObjective alias is not part of the clean contract");
+    assert.deepEqual(flankContext.memberObjective, objective);
+    assert.deepEqual(flankContext.assignment, {
+        task: "flank",
+        role: "interdictor",
+        element: "screen",
+        objective
+    });
+    const leaderContext = contexts.find(c => c.combatantId === leader.combatant.id).team;
+    assert.equal(leaderContext.role, "suppressor");
+    assert.equal(leaderContext.objective, "shared-target");
+    assert.equal(leaderContext.memberObjective, null);
+    assert.deepEqual(leaderContext.assignment, {
+        task: "support",
+        role: "suppressor",
+        element: "fire"
+    });
+
+    const barrier = plan.phases.find(phase => phase.name === "action").barrier;
+    assert.deepEqual(barrier.requiredAssignmentIds, [flanker.combatant.id],
+        "roles do not widen or alter synchronization barriers");
+});
+
+test("target-conflict retry keeps object assignment metadata in the member context", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, initiative: 20 });
+    const flanker = makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 10 });
+    const world = makeTeamWorld([leader, flanker]);
+    const primary = world.enemyToken.id;
+    const secondary = "target-secondary";
+    const objective = { type: "screen", targetId: primary, lane: "left" };
+    const calls = [];
+    const fakePlanner = {
+        planTurn: async (combat, combatant, context) => {
+            calls.push({
+                combatantId: combatant.id,
+                replanCount: context.replanCount,
+                team: context.team
+            });
+            const targetId = context.replanCount
+                ? (context.targets?.[0]?.tokenId ?? secondary)
+                : primary;
+            return {
+                status: "ok",
+                plan: {
+                    id: `plan-${combatant.id}-${calls.length}`,
+                    score: 1,
+                    target: { tokenId: targetId },
+                    snapshot: { targets: context.targets ?? [] },
+                    steps: [{ id: "end-1", type: "end-turn", input: {}, cost: {} }],
+                    diagnostics: { layers: [] }
+                }
+            };
+        }
+    };
+    const service = createFireteamService({ planner: fakePlanner });
+    const result = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, {
+        seed: 5,
+        personality: false,
+        objective: { targetId: "shared-target" },
+        targets: [
+            { tokenId: primary, x: 2000, y: 0, canAttack: true },
+            { tokenId: secondary, x: 2100, y: 0, canAttack: true }
+        ],
+        assignments: {
+            [leader.combatant.id]: { task: "flank", role: "cover" },
+            [flanker.combatant.id]: {
+                task: "flank", role: "interdictor", element: "screen", objective
+            }
+        }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    const flankCalls = calls.filter(call => call.combatantId === flanker.combatant.id);
+    assert.equal(flankCalls.length, 2, "the capacity loser is retargeted once");
+    assert.equal(flankCalls[1].replanCount, 1);
+    assert.equal(flankCalls[1].team.role, "interdictor");
+    assert.equal(flankCalls[1].team.element, "screen");
+    assert.equal(flankCalls[1].team.objective, "shared-target",
+        "target-conflict replans keep the legacy scalar shared objective");
+    assert.deepEqual(flankCalls[1].team.memberObjective, objective);
+    assert.deepEqual(flankCalls[1].team.assignment, {
+        task: "flank",
+        role: "interdictor",
+        element: "screen",
+        objective
+    });
+    const entry = result.teamPlan.members.find(m => m.combatantId === flanker.combatant.id);
+    assert.equal(entry.role, "interdictor");
+    assert.deepEqual(entry.objective, objective);
+});
+
 test("evaluateCohesion is a soft constraint with legal detached maneuvers", () => {
     const service = createFireteamService();
     const center = { x: 0, y: 0 };
@@ -356,8 +578,10 @@ test("evaluateCohesion is a soft constraint with legal detached maneuvers", () =
 test("reserveResources never assigns one target twice beyond task capacity", () => {
     const service = createFireteamService();
     const assignments = [
-        { combatantId: "a", task: "flank", groupId: "flank-1", assignedTargetId: "T1" },
-        { combatantId: "b", task: "flank", groupId: "flank-1", assignedTargetId: "T1" },
+        { combatantId: "a", task: "flank", groupId: "flank-1", assignedTargetId: "T1",
+            role: "flank-left", element: "left", objective: { type: "screen" } },
+        { combatantId: "b", task: "flank", groupId: "flank-1", assignedTargetId: "T1",
+            role: "flank-right", element: "right", objective: { type: "interdict" } },
         { combatantId: "c", task: "assault", groupId: "main", assignedTargetId: "T1" }
     ];
     const plans = new Map([
@@ -372,10 +596,23 @@ test("reserveResources never assigns one target twice beyond task capacity", () 
     // flank capacity 1: only the first flanker keeps the target.
     assert.equal(flankReservations.length, 1);
     assert.equal(flankReservations[0].memberId, "a");
+    assert.deepEqual(flankReservations.map(t => t.key), ["flank|T1"],
+        "reservation keys stay task|target and never include role/element");
     const targetConflicts = result.conflicts.filter(c => c.type === "target");
     assert.equal(targetConflicts.length, 1);
+    assert.equal(targetConflicts[0].key, "flank|T1");
     assert.equal(targetConflicts[0].loserId, "b");
     assert.equal(targetConflicts[0].winnerId, "a");
+    const plainAssignments = assignments.map(({ role, element, objective, ...rest }) => rest);
+    const plainResult = service.reserveResources(plainAssignments, plans, {
+        taskCapacities: { flank: 1, assault: 2 }
+    });
+    assert.deepEqual(
+        result.targets.map(({ key, task, targetId, memberId }) => ({ key, task, targetId, memberId })),
+        plainResult.targets.map(({ key, task, targetId, memberId }) => ({ key, task, targetId, memberId })),
+        "role/element metadata does not change target reservations");
+    assert.deepEqual(result.conflicts, plainResult.conflicts,
+        "role/element metadata does not change reservation conflicts");
     // Endpoint collision: identical endpoint reserved once.
     const endpointConflicts = result.conflicts.filter(c => c.type === "endpoint");
     assert.equal(endpointConflicts.length, 1);
@@ -438,7 +675,7 @@ test("buildTeamPlan produces a phased TeamPlan with barrier and assignments", as
     const result = await service.buildTeamPlan(world.combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
-    }, { seed: 42, targets: injectedTargets(world) });
+    }, { seed: 42, personality: false, targets: injectedTargets(world) });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     const plan = result.teamPlan;
 

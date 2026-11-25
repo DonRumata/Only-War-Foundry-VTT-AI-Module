@@ -267,6 +267,8 @@
   "OWAI.Preview.Team.Label": "План отряда",
   "OWAI.Preview.Team.Scope": "Предварительные задания. Подтверждение относится только к текущему NPC.",
   "OWAI.Preview.Team.Active": "Текущий ход",
+  "OWAI.Preview.Team.Role": "Роль",
+  "OWAI.Preview.Team.Element": "Элемент",
   "OWAI.Preview.Team.Required": "Обязательно до совместного действия",
   "OWAI.Preview.Team.Halves": "Полудействия",
   "OWAI.Preview.Team.Rejoin": "Маршрут воссоединения",

@@ -163,6 +163,15 @@ function _finiteOr(value, fallback) {
 }
 
 /**
+ * JSON round-trip helper for serializable preview metadata.
+ * @param {*} value
+ * @returns {*}
+ */
+function _jsonClone(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+/**
  * Find a combatant of the combat by its own id.
  * @param {object} combat
  * @param {string|null} combatantId
@@ -447,6 +456,9 @@ function _teamPreview(plan, combat, scene) {
         members: state.members.map(member => ({
             name: (_findCombatant(combat, member.id)?.name ?? name(member.tokenId)) || member.id,
             task: member.task, group: member.groupId,
+            role: member.role ?? null,
+            element: member.element ?? null,
+            objective: member.objective ? _jsonClone(member.objective) : null,
             active: member.id === plan.snapshot?.combatantId,
             waitsForMovement: state.required.includes(member.id) && Boolean(member.move),
             move: member.move,

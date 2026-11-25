@@ -823,7 +823,7 @@ test("one good flank attack cannot validate another required flanker", async () 
         assignments: {
             [leader.combatant.id]: "support",
             [good.combatant.id]: "flank",
-            [frontOn.combatant.id]: "flank"
+            [frontOn.combatant.id]: { task: "flank", role: "interdictor" }
         }
     });
     assert.equal(teamPlan.tactic, "covering-advance");

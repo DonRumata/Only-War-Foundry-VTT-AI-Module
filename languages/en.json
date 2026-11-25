@@ -267,6 +267,8 @@
   "OWAI.Preview.Team.Label": "Fireteam plan",
   "OWAI.Preview.Team.Scope": "Projected assignments. Confirmation only applies to the current NPC.",
   "OWAI.Preview.Team.Active": "Current turn",
+  "OWAI.Preview.Team.Role": "Role",
+  "OWAI.Preview.Team.Element": "Element",
   "OWAI.Preview.Team.Required": "Required before the coordinated action",
   "OWAI.Preview.Team.Halves": "Half actions",
   "OWAI.Preview.Team.Rejoin": "Return route",
