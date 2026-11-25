@@ -133,7 +133,8 @@ export const SCORE_FACTORS = Object.freeze([
     "freeAttackCost",
     "disengage",
     "recoverCover",
-    "recoverRedirect"
+    "recoverRedirect",
+    "laneCoverage"
 ]);
 
 
@@ -236,7 +237,10 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     // bit-for-bit unchanged. The defaults keep the experimental channel
     // visible in skeleton breakdowns without pricing doctrine.
     recoverCover: 3,
-    recoverRedirect: 1
+    recoverRedirect: 1,
+    // Chokepoint-defense (issue #91): zero in the universal skeleton —
+    // only an active TeamPlan lane overlay prices future overwatch posts.
+    laneCoverage: 0
 });
 
 

@@ -62,6 +62,10 @@ import {
     PEEL_WITHDRAWAL_NAME,
     evaluatePeelCascade
 } from "../tactics/peel-withdrawal.js";
+import {
+    CHOKEPOINT_TACTIC_NAME,
+    evaluateChokepointCascade
+} from "./chokepoint-defense.js";
 
 export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
@@ -73,6 +77,7 @@ export const SPEC_OPS_TACTICS = Object.freeze([
     SUPPRESS_AND_BOUND,
     INTERDICTION_TACTIC,
     PEEL_WITHDRAWAL_NAME,
+    CHOKEPOINT_TACTIC_NAME,
     "flank-and-fix",
     "coordinated-assault",
     "covering-advance",
@@ -934,6 +939,10 @@ export function specOpsFlankFallback(members, tactic, failure) {
  *   (issue #88 pincer morale gate; `context.moraleTier` is the fallback).
  * @param {object|null} [input.moraleInfo] Full morale evaluation for the
  *   stateless peel trigger.
+ * @param {object|null} [input.focusObjective] Concentrate-fire objective
+ *   visible to cascade gates.
+ * @param {object} [input.memberProfiles] Per-member tactical capability profiles.
+ * @param {object[]} [input.teamContacts] Shared team-contact memory entries.
  * @param {object} [input.config] `SpecOpsConfig` overrides.
  * @returns {object} `{name, reason, assignments, allowFlank, regroup,
  *   objective, maxDetachedPhases, breakdown}`; `name: null` means the
@@ -951,7 +960,10 @@ export function selectSpecOpsTactic({
     config = null,
     character = null,
     moraleTier = null,
-    moraleInfo = null
+    moraleInfo = null,
+    focusObjective = null,
+    memberProfiles = {},
+    teamContacts = []
 } = {}) {
     const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
@@ -1036,6 +1048,38 @@ export function selectSpecOpsTactic({
         return finish("regroup-fallback", "overwhelming-threat",
             { regroup: true, assignments: all("regroup") });
     }
+
+    const planningCombat = combat ?? context.combat ?? null;
+    const geometryContext = {
+        ...context, scene: context.scene ?? scene ?? planningCombat?.scene, combat: planningCombat
+    };
+    // Issue #91: spec-ops participates in chokepoint-defense only for an
+    // explicit defensive posture/anchor. The evaluation runs after
+    // peel/regroup/casualty precedence and before every open-battle attack
+    // maneuver; `preset-anchor-gate` keeps centroid-only open fights on
+    // the legacy cascade.
+    const defense = evaluateChokepointCascade({
+        members: available,
+        leaderId,
+        targets,
+        objective: objective ?? null,
+        casualties: casualtyCount,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        context: geometryContext,
+        character: character ?? context.character ?? null,
+        focusObjective: focusObjective ?? null,
+        memberProfiles: memberProfiles ?? {},
+        teamContacts: teamContacts ?? []
+    }, { presetId: SPEC_OPS_PRESET_ID });
+    breakdown.chokepoint = {
+        selected: defense.active === true,
+        reason: defense.reason ?? null,
+        ...(defense.breakdown ?? {})
+    };
+    if (defense.descriptor) {
+        return { ...defense.descriptor, breakdown: { ...breakdown } };
+    }
     if (!enemyCount) {
         // No attackable contact: last-known/search objective or a bare
         // advance — covering advance keeps overwatch while moving.
@@ -1044,10 +1088,6 @@ export function selectSpecOpsTactic({
             { assignments: _coveringAssignments(available) });
     }
 
-    const planningCombat = combat ?? context.combat ?? null;
-    const geometryContext = {
-        ...context, scene: context.scene ?? scene ?? planningCombat?.scene, combat: planningCombat
-    };
     const positioned = available.map(member => ({
         ...member,
         position: specOpsTokenCenter(_tokenDoc(member.combatant?.token),
@@ -1417,6 +1457,14 @@ export function evaluateSpecOps({
         effective.attackAfterMove = (cfg.assaultWeight / SPEC_OPS_CONFIG.assaultWeight) * overlay.attackAfterMove;
     }
     if (task === "regroup") effective.cohesionRestore = cfg.cohesionWeight;
+    const laneDefense = context.tactic === "chokepoint-defense"
+        && context.team?.memberObjective?.type === "defend"
+        && context.team?.role === "overwatch-lane";
+    if (laneDefense) {
+        enriched.suppression = candidate.action?.attackType === "suppressing_fire" ? 1 : 0;
+        effective.laneCoverage = Math.max(_finiteOr(effective.laneCoverage, 0), 3);
+        effective.suppression = Math.max(_finiteOr(effective.suppression, 0), 3);
+    }
     const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,

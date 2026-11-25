@@ -492,7 +492,9 @@ execute: расхождение — `stale-state` (перемещение, см�
   сохраняет более высокий приоритет, `null`/`false` отключают тактику. specOps
   использует прежний `specOpsTactic`; rangedCover теперь тоже имеет
   зарегистрированный maneuver-selector. assault (issue #88) регистрирует
-  loose-pincer selector; hold без тактики получает null/fallback.
+  loose-pincer selector; hold (issue #91) регистрирует chokepoint-defense.
+  Все selector'ы деградируют explainable `name:null`, когда их входные
+  gates не выполнены.
 - Pincer / двойной охват (issue #88): чистое ядро `presets/pincer.js` —
   два знаковых манёвренных пункта (`elements.left/right.point`), проверка
   расхождения маршрутов (угол/пересечения/коридор, синхронные
@@ -532,6 +534,34 @@ execute: расхождение — `stale-state` (перемещение, см�
   pincer не перетираются silently; GM/morale demotion снимает peel role и
   peel objective. Пороги `peel*` — экспериментальные world settings с
   pure-core defaults и context overrides.
+- Chokepoint-defense (issue #91): командная оборона подхода к anchor через
+  чистое stateless ядро `presets/chokepoint-defense.js` и serializable
+  TeamPlan contract. Fireteam собирает per-member profiles (range,
+  suppression capability, reaction), threat routes/memory, leader/character
+  и lane hints из committed plans; selector возвращает objective
+  `{type:"defend", anchor, lanePoint, lanes, counterattack}` и object
+  assignments `overwatch-lane`/`reserve`/`leader`. `assignTasks`
+  нормализует эти объекты в legacy execution shape без расширения
+  reservation key: member-scoped `objective.targetId` конкретнее shared
+  target-каналов, role/element остаются metadata. Member context получает
+  root `objective`, `team.defenseObjective`, `team.defense.lane`,
+  `team.memberObjective` и descriptor assignment; вне активного
+  `chokepoint-defense` lane-scoring инертен.
+  Planner использует lane только как soft positioning и overwatch evidence:
+  `laneCoverage` — новый score factor с baseline weight 0; hold overlay даёт
+  watcher `laneCoverage ≥5`, `overwatch ≥3`, `suppression ≥4`, а
+  rangedCover/specOps — conservative `laneCoverage/suppression ≥3`.
+  `planner/zones.js` добавляет lane chokepoint как overwatch anchor
+  `kind:"lane"`, фильтрует generic anchors по `lane.threatIds`, сохраняет
+  обязательный LOS filter и сериализует lane metadata в
+  `overwatch.input.lane`. Suppression cone никогда не создаётся по пустому
+  synthetic anchor: без live/memory lane-threat anchor кандидат отклоняется
+  `lane-threat-anchor-missing`. Counterattack reserve gate активируется
+  только для live visible vulnerable intruder внутри kill zone и даёт
+  reserve `task:"assault"`+target objective; hold-radius veto остаётся
+  жёстким. Module bootstrap регистрирует hold selector в общем tactics
+  service; fallback fireteam registry поддерживает specOps/hold для
+  headless direct use.
 - Recover-pinned overlay (issue #90): priority overlay командного
   вытаскивания pinned-бойца поверх всех четырёх пресетов — не манёвр и не
   новый task-тип. Чистое stateless ядро `tactics/recover-pinned.js`

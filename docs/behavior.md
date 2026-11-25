@@ -16,7 +16,7 @@ vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
 danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
 alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge, order, ev,
 stickyTarget, outnumber, tieUp, seek, run, withdrawal,
-coveringWithdrawal, freeAttackCost, disengage`.
+coveringWithdrawal, freeAttackCost, disengage, laneCoverage`.
 
 Issue #37: EV-срез уклонения живёт на факторе `ev` — `damageNorm ×
 attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
@@ -28,7 +28,9 @@ attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
 
 Preset-only: `rangeBand`, `aimOpportunity` (rangedCover/hold);
 `insideZone, returnToZone, moveToLos, escapeMelee, searchMove,
-anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
+anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps);
+`laneCoverage` и локальный `suppression` используются только активным
+`chokepoint-defense`-контекстом (issue #91).
 `withdrawal/freeAttackCost/disengage` создаются только для objective-driven
 peel-отхода, `coveringWithdrawal` — только для cover-роли; вне этих ролей
 веса равны нулю и факторы инертны.
@@ -77,6 +79,7 @@ peel-отхода, `coveringWithdrawal` — только для cover-роли; 
 | withdrawal/coveringWithdrawal/freeAttackCost/disengage | 0 | 0 | 0 | 0 |
 | recoverCover | 3 | 6 | 5 | 5 |
 | recoverRedirect | 2 | 2 | 2 | 2 |
+| laneCoverage | 0 | 0 (+3 в lane-defense) | 0 (+5 у overwatch-lane) | 0 (+3 в lane-defense) |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -169,6 +172,39 @@ revалидирует exact route/endpoint/threat-crossing и получает v
 selector-режима (suppression/direct/overwatch/melee). GM/morale-демоции
 снимают peel role и peel-objective точечно; манёвр stateless переоценивается
 на следующем раунде.
+
+Chokepoint-defense (issue #91): оборонительный командный манёвр удержания
+подхода к anchor, не новый preset и не новый task-тип. Чистое ядро
+`presets/chokepoint-defense.js` оценивается каскадом после peel/regroup и
+потерь, но до открытых манёвров: hold участвует по hold-anchor или
+conservative centroid-fallback; rangedCover/specOps — только по
+explicit/hold defend-anchor (`preset-anchor-gate` не даёт центроиду
+захватывать открытый бой); assault не участвует. Ядро строит lanes из
+route/memory подходов к anchor, сворачивает bearing/geometry в максимум три
+lane, отбрасывает memory-only lane без live weight и деградирует честными
+причинами (`no-defense-anchor`, `no-perceived-threat`, `no-overwatcher`,
+`defense-bypassed`, `defense-outflanked`, `objective-complete`,
+`objective-mismatch`). Lane id — quantized geometry hash плюс sticky hints
+из сериализованных committed overwatch steps (`input.lane`), без нового
+persisted state. Assignments имеют object form: watcher —
+`task:"support", role:"overwatch-lane", element:laneId`, objective
+`{type:"defend", laneId, lanePoint, post}`; reserve — `role:"reserve"`;
+leader-marker не является mutex. Кап watcher'ов оставляет минимум один
+reserve. Каждый раунд пересматривается counterattack только против live
+visible vulnerable цели внутри kill zone; memory никогда не запускает
+counterattack, а активный reserve получает `task:"assault"` и objective
+`targetId` без снятия hold-radius veto. В planner lane виден только при
+`context.tactic === "chokepoint-defense"`: chokepoint становится
+высокоприоритетным overwatch-anchor kind `lane`, generic anchors фильтруются
+по `lane.threatIds`, LOS-фильтр сохраняется, overwatch остаётся declare-only.
+Suppression предпочтителен, когда legal/safe и реально покрывает live/memory
+lane-threat anchor, но никогда не стреляет в пустую synthetic lane geometry;
+fallback — overwatch/direct/hold. Позиционирование к post мягкое через
+`laneCoverage` (hold watcher ≥5, rangedCover/specOps lane-defense ≥3,
+`overwatch` у hold watcher ≥3) — невозможный same-turn reposition+overwatch
+не моделируется. Explicit objective/assignments/`context.tactic`, peel,
+regroup, recover и focus сохраняют precedence; recover считает
+`overwatch-lane` maneuver-critical ролью при выборе доноров.
 
 Recover-pinned overlay (issue #90): командное вытаскивание
 подавленного бойца — priority overlay поверх текущей тактики, не самостоятельный

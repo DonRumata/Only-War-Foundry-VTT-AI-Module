@@ -177,6 +177,12 @@ import {
     _overwatchAnchors,
     _overwatchZone
 } from "./planner/zones.js";
+import {
+    compactLaneMetadata,
+    defenseLaneOf,
+    laneCoverageScore,
+    laneIncludesTarget
+} from "./tactics/lane-coverage.js";
 
 
 /**
@@ -1074,6 +1080,19 @@ export function createPlannerService({
         const viewerDisposition = _finiteOr(
             _tokenDoc(combatant?.token)?.disposition ?? combatant?.disposition, 0);
         const pxPerUnit = _pxPerUnit(grid);
+        // Issue #91: the TeamPlan defense contract is plain data. The
+        // assigned lane narrows cone orientation honestly (never the
+        // threat pool), steers overwatch at the lane chokepoint and feeds
+        // the soft laneCoverage positioning factor below.
+        const defenseLane = defenseLaneOf(context);
+        const defenseLaneMeta = compactLaneMetadata(defenseLane);
+        const laneThreatTarget = defenseLane
+            ? (targets.find(target => laneIncludesTarget(target, defenseLane)
+                && target?.canAttack === true && target?.hidden !== true)
+                ?? targets.find(target => laneIncludesTarget(target, defenseLane)
+                    && target?.hidden !== true)
+                ?? threatTarget)
+            : threatTarget;
         // Issue #39: the same scene token scan backs two pure factor
         // inputs — hostiles engaged in melee with an ally
         // (`alliedEngagement`) and enemy contact reaches for the
@@ -1735,13 +1754,26 @@ export function createPlannerService({
         for (const action of usableActions) {
             const spec = _coneSpecOf(action);
             if (!spec) continue;
+            // Issue #91 lane suppression contract: suppression is never
+            // fired at the synthetic lane geometry. It requires a live or
+            // memory lane-threat anchor; unknown/empty lanes therefore
+            // honestly produce no suppression template. Ordinary spray
+            // cones keep the normal perceived-target anchors.
+            const actionConeAnchors = defenseLane && spec.suppression === true
+                ? coneAnchors.filter(anchor => laneIncludesTarget(anchor, defenseLane))
+                : coneAnchors;
+            if (defenseLane && spec.suppression === true
+                && defenseLane.threatIds.length && !actionConeAnchors.length) {
+                rejectL0(`cone|${action.id}`, "lane-threat-anchor-missing");
+                continue;
+            }
             const range = _actionRange(action);
             const aimInput = {
                 tokenDoc,
                 rangePx: range * pxPerUnit,
                 angleDeg: spec.angle,
                 tokens: blastTokens,
-                anchors: coneAnchors,
+                anchors: actionConeAnchors,
                 viewerDisposition,
                 options: blastOptions,
                 perception
@@ -1878,19 +1910,28 @@ export function createPlannerService({
         // bot's stale own memory (own `last-known` stays excluded).
         if (!isPinned) {
             const owWeapons = _overwatchWeapons(usableActions);
-            const owGate = threatTarget
-                && (threatTarget.canAttack === true
-                    || threatTarget.source === "team-contact")
-                && threatTarget.hidden !== true;
+            const owTarget = defenseLane ? laneThreatTarget : threatTarget;
+            // A defense lane is already the TeamPlan's bounded threat
+            // assessment: its chokepoint may steer a declare-only watch
+            // zone even when this member only has squad memory of the
+            // lane threat. Own-memory-only solo behaviour is unchanged.
+            const owGate = defenseLane
+                ? Boolean(defenseLaneMeta && owTarget && owTarget.hidden !== true)
+                : threatTarget
+                    && (threatTarget.canAttack === true
+                        || threatTarget.source === "team-contact")
+                    && threatTarget.hidden !== true;
             // Anchors are computed once — only while an overwatch
             // candidate is actually built, and the route probe stays
             // limited to the single nearest threat (issue #54 bound).
             const owAnchors = owWeapons.length && owGate
                 ? _overwatchAnchors({
-                    targets, threatTarget, selfPos, pxPerUnit,
-                    navigation, combat, scene, tokenDoc, perception
+                    targets, threatTarget: owTarget, selfPos, pxPerUnit,
+                    navigation, combat, scene, tokenDoc, perception,
+                    lane: defenseLane
                 })
                 : [];
+            let laneOwDiagnostics = null;
             for (const { action: owAction, kind } of owWeapons) {
                 if (selfReactionUsed) {
                     // Issue #37: the reaction slot is spent — a
@@ -1902,19 +1943,46 @@ export function createPlannerService({
                 if (!owGate || ACTION_BUDGET_HALVES > actionBudget) continue;
                 const zone = _overwatchZone({
                     kind, action: owAction, anchors: owAnchors,
-                    threatTarget, selfPos, pxPerUnit, tokenDoc,
+                    threatTarget: owTarget, selfPos, pxPerUnit, tokenDoc,
                     tokens: blastTokens, viewerDisposition,
-                    options: blastOptions
+                    options: blastOptions,
+                    fallbackPoint: defenseLane?.chokepoint ?? null
                 });
                 if (!zone) continue;
+                laneOwDiagnostics = {
+                    laneId: defenseLane?.id ?? null,
+                    anchors: owAnchors.map(anchor => ({
+                        x: anchor.x,
+                        y: anchor.y,
+                        kind: anchor.kind,
+                        tokenUuid: anchor.tokenUuid ?? null,
+                        tokenId: anchor.tokenId ?? null
+                    })),
+                    laneAnchorKept: owAnchors.some(anchor => anchor.kind === "lane"),
+                    orientation: Number.isFinite(zone.direction)
+                        && Number.isFinite(defenseLane?.bearingDeg)
+                        ? Math.abs(zone.direction - defenseLane.bearingDeg) <= 1e-6
+                            ? "lane-bearing" : "anchor-sweep"
+                        : "weapon-zone"
+                };
                 candidates.push({
                     variant: "overwatch",
                     action: owAction,
-                    target: threatTarget,
+                    target: owTarget,
                     move: null,
                     direction: zone.direction ?? null,
-                    zone
+                    zone,
+                    lane: defenseLaneMeta,
+                    laneDiagnostics: laneOwDiagnostics
                 });
+            }
+            if (defenseLane) {
+                diagnostics.laneOverwatch = laneOwDiagnostics ?? {
+                    laneId: defenseLane.id ?? null,
+                    anchors: [],
+                    laneAnchorKept: false,
+                    orientation: "unavailable"
+                };
             }
         }
 
@@ -2128,7 +2196,21 @@ export function createPlannerService({
                     : 0,
                 redirectTarget: recoverRedirectTarget,
                 redirectSuppress: recoverInjection?.role === "cover-fire"
-                    && recoverInjection?.preferSuppression === true
+                    && recoverInjection?.preferSuppression === true,
+                // Issue #91: soft lane positioning. This is candidate
+                // metadata, not a fake reposition+overwatch action; it is
+                // exactly zero outside an active chokepoint-defense lane.
+                laneCoverage: defenseLane
+                    ? laneCoverageScore({
+                        move: candidate.move,
+                        selfPos,
+                        context,
+                        actions: usableActions,
+                        tokenDoc,
+                        perception,
+                        grid
+                    })
+                    : 0
             });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed

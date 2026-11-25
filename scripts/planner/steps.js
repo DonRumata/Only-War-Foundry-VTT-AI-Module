@@ -186,7 +186,8 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                         arc: zone?.arc ?? OVERWATCH_CONE_DEG,
                         range: _actionRange(action)
                     }),
-                targetTokenUuid: target?.tokenUuid ?? null
+                targetTokenUuid: target?.tokenUuid ?? null,
+                ...(candidate.lane ? { lane: candidate.lane } : {})
             },
             preconditions: ["turn"],
             projectedResourceDelta: {}

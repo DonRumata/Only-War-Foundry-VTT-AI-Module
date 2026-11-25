@@ -57,6 +57,9 @@ import {
 import {
     evaluatePeelCascade
 } from "../tactics/peel-withdrawal.js";
+import {
+    evaluateChokepointCascade
+} from "./chokepoint-defense.js";
 
 /** Preset id registered in the planner preset registry. */
 export const RANGED_COVER_PRESET_ID = "rangedCover";
@@ -629,6 +632,16 @@ export function selectRangedCoverTactic(input = {}) {
         context: geometryContext
     });
     if (peel.descriptor) return peel.descriptor;
+    // Issue #91: an explicit defensive anchor/posture outranks the
+    // offensive suppress-and-bound maneuver. The preset gate below keeps
+    // centroid-only open battles on the legacy cascade unchanged.
+    const defense = evaluateChokepointCascade({
+        ...input,
+        scene,
+        combat,
+        context: geometryContext
+    }, { presetId: RANGED_COVER_PRESET_ID });
+    if (defense.descriptor) return defense.descriptor;
     const targets = (input.targets ?? context.targets ?? []).map(target => {
         const center = specOpsTargetCenter(target, geometryContext);
         return center ? { ...target, x: center.x, y: center.y } : target;
@@ -648,6 +661,11 @@ export function selectRangedCoverTactic(input = {}) {
             selected: false,
             reason: peel.reason ?? null,
             rejections: [...(peel.rejections ?? [])]
+        },
+        chokepoint: {
+            selected: false,
+            reason: defense.reason ?? null,
+            ...(defense.breakdown ?? {})
         },
         suppression: {
             reason: suppression.reason,
@@ -767,6 +785,14 @@ export function evaluateRangedCover({
         ...(task ? RANGED_COVER_TASK_WEIGHTS[task] : {}),
         ...(RANGED_COVER_ROLE_WEIGHTS[role] ?? {})
     };
+    const laneDefense = context.tactic === "chokepoint-defense"
+        && context.team?.memberObjective?.type === "defend"
+        && context.team?.role === "overwatch-lane";
+    if (laneDefense) {
+        enriched.suppression = candidate.action?.attackType === "suppressing_fire" ? 1 : 0;
+        effective.laneCoverage = Math.max(_finiteOr(effective.laneCoverage, 0), 3);
+        effective.suppression = Math.max(_finiteOr(effective.suppression, 0), 3);
+    }
     const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,

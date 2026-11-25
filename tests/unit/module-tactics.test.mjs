@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 
 import "../../scripts/module.js";
 
-test("init registers the tactics service with specOps and rangedCover selectors", () => {
+test("init registers the tactics service with all preset maneuver selectors", () => {
     game.modules.set("only-war-ai", {});
     const init = Hooks._calls.find(call => call.type === "once" && call.event === "init");
     assert.ok(init, "module init hook is registered");
@@ -33,4 +33,11 @@ test("init registers the tactics service with specOps and rangedCover selectors"
     assert.equal(assault[0].kind, "maneuver");
     const fallthrough = tactics.resolveTactic("assault", {});
     assert.equal(fallthrough?.name ?? null, null);
+    // Issue #91: hold joins the registry through chokepoint-defense; empty
+    // input honestly degrades instead of committing a defensive scheme.
+    const hold = tactics.listTacticSelectors("hold");
+    assert.equal(hold.length, 1);
+    assert.equal(hold[0].kind, "maneuver");
+    assert.equal(typeof hold[0].select, "function");
+    assert.equal(tactics.resolveTactic("hold", {})?.name ?? null, null);
 });

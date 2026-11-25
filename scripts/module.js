@@ -34,6 +34,7 @@ import {
     registerRangedCoverTacticSelector
 } from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
+import { registerHoldTacticSelector } from "./presets/chokepoint-defense.js";
 import {
     registerSpecOpsPreset,
     registerSpecOpsTacticSelector
@@ -308,8 +309,8 @@ function _registerPlannerService(api) {
  * Register the per-preset `tactics` registry on the module API (issue #92).
  * The registry is pure/deterministic and has no lifecycle. specOps,
  * rangedCover and assault (issue #88 loose pincer) register their baseline
- * maneuver selectors; hold resolves to null until its tactic increment
- * registers a selector here.
+ * maneuver selectors; hold registers chokepoint-defense (issue #91). Every
+ * selector still degrades to an explainable null maneuver outside its gates.
  * @param {object} api Module API object.
  */
 function _registerTacticsService(api) {
@@ -319,6 +320,7 @@ function _registerTacticsService(api) {
         registerSpecOpsTacticSelector(tactics);
         registerRangedCoverTacticSelector(tactics);
         registerAssaultTacticSelector(tactics);
+        registerHoldTacticSelector(tactics);
         api.services.register("tactics", tactics);
     }
 }

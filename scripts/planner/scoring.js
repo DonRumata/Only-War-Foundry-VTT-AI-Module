@@ -111,6 +111,8 @@ import {
  *   preference of the cover-fire donor (issue #90): a suppressing-fire
  *   candidate on the redirect target keeps the full factor while other
  *   attack types score a reduced share.
+ * @param {number|null} [input.laneCoverage] Soft post/lane coverage score
+ *   of the candidate endpoint (`0..1`, issue #91); inert at weight zero.
  * @returns {object}
  */
 export function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
@@ -120,7 +122,7 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
     orderBoost = null, lastTarget = null, shooterProfiles = null,
     withdrawal = null, coveringWithdrawal = null, freeAttackCost = null,
     disengage = null, recoverCover = null, redirectTarget = null,
-    redirectSuppress = null }) {
+    redirectSuppress = null, laneCoverage = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -385,7 +387,13 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
                     && [target.tokenId, target.tokenUuid, target.actorId]
                         .some(id => id != null && String(id) === String(redirectTarget))))
             ? (redirectSuppress === true && action?.attackType !== "suppressing_fire" ? 0.8 : 1)
-            : 0
+            : 0,
+        // Chokepoint-defense (issue #91): precomputed endpoint/post lane
+        // coverage. The value is exactly zero unless a TeamPlan injected a
+        // defense lane, so solo presets and all non-defense tactics remain
+        // bit-for-bit unchanged.
+        laneCoverage: Number.isFinite(laneCoverage)
+            ? Math.max(0, Math.min(1, laneCoverage)) : 0
     };
 }
 

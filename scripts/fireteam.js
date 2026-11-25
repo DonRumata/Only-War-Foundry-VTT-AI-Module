@@ -61,6 +61,14 @@ import {
     fnv1a,
     stableStringify
 } from "./planner.js";
+import {
+    _actionRange,
+    _isMeleeAction,
+    _resolveActions
+} from "./planner/actions.js";
+import {
+    reactionUsed
+} from "./reactions.js";
 import { emitBarkOnce } from "./barks.js";
 import {
     getAIDifficulty,
@@ -107,6 +115,10 @@ import {
     buildRecoverPinnedOverlay,
     RECOVER_PINNED_ROLES
 } from "./tactics/recover-pinned.js";
+import {
+    CHOKEPOINT_TACTIC_NAME,
+    registerHoldTacticSelector
+} from "./presets/chokepoint-defense.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
 export const FIRETEAM_STATUS = Object.freeze({
@@ -499,6 +511,7 @@ export function normalizeFireteamAssignment(value) {
     const element = _markerString(source.element);
     if (role) normalized.role = role;
     if (element) normalized.element = element;
+    if (source.leader === true) normalized.leader = true;
     const objective = _jsonObject(source.objective);
     if (objective) normalized.objective = objective;
     return normalized;
@@ -644,6 +657,80 @@ function _orderCandidateOf({ member, memberCount, combat, context }) {
  * @param {object} input.context `buildTeamPlan` context.
  * @param {object|null} input.perception Perception service.
  * @returns {object[]|null} Sorted `{tokenUuid, ...entry}` records.
+ */
+/**
+ * Read-only member capability profiles for defensive tactic selectors
+ * (issue #91). The helper adapts Document data once per TeamPlan into
+ * plain DTOs; tactic cores never receive or retain Document references.
+ * Action probing uses the same normalized action pipeline as the planner,
+ * with failures degrading to the weapon-item fallback rather than breaking
+ * the team plan.
+ * @param {object} input
+ * @param {object[]} input.members Member entries of `collectMembers`.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context Caller context.
+ * @param {object|null} input.perception Perception service.
+ * @returns {Promise<object>} combatantId → serializable member profile.
+ */
+async function _memberDefenseProfiles({ members, combat, context, perception }) {
+    const profiles = {};
+    const round = _finiteOr(combat?.round, null);
+    for (const member of members ?? []) {
+        const token = _tokenDoc(member.combatant?.token);
+        const actor = member.combatant?.actor ?? token?.actor ?? null;
+        let actions = [];
+        try {
+            actions = await _resolveActions(actor, {
+                ...context,
+                combatant: member.combatant,
+                token
+            });
+        } catch(_err) {
+            actions = [];
+        }
+        const attacks = actions.filter(action => action?.type === "attack");
+        const ranged = attacks.filter(action => !_isMeleeAction(action) && _actionRange(action) > 0);
+        const suppressionActions = ranged.filter(action => {
+            if (action.attackType === "suppressing_fire") return true;
+            const rof = action.rateOfFire ?? {};
+            return [rof.semi, rof.full, rof.burst, rof.auto, action.rateOfFire]
+                .some(value => Number.isFinite(value) && value > 0);
+        });
+        let visibleTargetIds = null;
+        if (perception && typeof perception.visibleTargets === "function" && token) {
+            try {
+                visibleTargetIds = (perception.visibleTargets(token, {
+                    combat,
+                    includeNeutral: resolveConfig(member.combatant)?.includeNeutral === true
+                }) ?? []).flatMap(target => [target.tokenId, target.tokenUuid, target.actorId])
+                    .filter(id => id !== null && id !== undefined)
+                    .map(String);
+            } catch(_err) {
+                visibleTargetIds = null;
+            }
+        }
+        profiles[member.combatantId] = {
+            bestRangeM: ranged.reduce((best, action) => Math.max(best, _actionRange(action)), 0),
+            suppressionCapable: suppressionActions.length > 0,
+            suppressionRangeM: suppressionActions.reduce(
+                (best, action) => Math.max(best, _actionRange(action)), 0),
+            meleeOnly: attacks.length > 0 && ranged.length === 0,
+            reactionUsed: reactionUsed(_readFlag(member.combatant, FLAG_KEYS.reactionUsed), round),
+            visibleTargetIds
+        };
+    }
+    return profiles;
+}
+
+/**
+ * Shared squad contacts of one TeamPlan. Returns null when sharing is
+ * disabled/unavailable; callers normalize to an empty list at use sites.
+ * @param {object} input
+ * @param {object[]} input.members Fireteam member entries.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context `buildTeamPlan` context.
+ * @param {object|null} input.perception Perception service.
+ * @returns {object[]|null}
  */
 function _teamContacts({ members, combat, context, perception }) {
     if (context?.shareContacts === false) return null;
@@ -996,6 +1083,7 @@ export function createFireteamService({
     // mutable state.
     const _fallbackTactics = createTacticRegistry();
     registerSpecOpsTacticSelector(_fallbackTactics);
+    registerHoldTacticSelector(_fallbackTactics);
 
     /**
      * Tactic registry used for preset maneuvers: explicit dependency first,
@@ -2550,9 +2638,8 @@ export function createFireteamService({
      * descriptor `{name, reason, assignments, allowFlank, regroup, objective,
      * maxDetachedPhases, breakdown}`; `null`/`false` explicitly disables the
      * hook. Without an explicit override the per-preset tactic registry is
-     * consulted — specOps is just the registered baseline maneuver, while
-     * assault/rangedCover/hold currently have no selectors and fall back to
-     * the default fireteam policy.
+     * consulted; selectors that do not pass their gates return an
+     * explainable null maneuver and the default fireteam policy applies.
      * @param {object} input
      * @param {object[]} input.members Filtered member entries.
      * @param {string|null} input.leaderId Elected leader combatant id.
@@ -2565,6 +2652,8 @@ export function createFireteamService({
      *   forwarded to tactic selectors (interdiction memory rejection).
      * @param {object|null} [input.focusObjective] Concentrate-fire objective
      *   selected before the maneuver registry.
+     * @param {object[]} [input.teamContacts] Shared team-contact memory entries.
+     * @param {object} [input.memberProfiles] Per-member tactical capability profiles.
      * @param {*} [input.moraleTier] Committed team morale tier forwarded to
      *   the tactic selectors (issue #88 pincer morale gate).
      * @param {object|null} [input.moraleInfo] Full morale evaluation forwarded
@@ -2574,7 +2663,8 @@ export function createFireteamService({
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context,
-        focusObjective = null, character = null, moraleTier = null, moraleInfo = null,
+        focusObjective = null, character = null, teamContacts = [], memberProfiles = {},
+        moraleTier = null, moraleInfo = null,
         casualtyDetail = null }) {
         const targets = context.tacticTargets ?? (Array.isArray(context.targets)
             ? context.targets
@@ -2654,6 +2744,9 @@ export function createFireteamService({
             moraleInfo: selectorContext.moraleInfo,
             targets,
             objective: context.objective ?? focusObjective ?? null,
+            focusObjective,
+            teamContacts: Array.isArray(teamContacts) ? teamContacts : [],
+            memberProfiles: memberProfiles ?? {},
             casualties,
             scene,
             combat,
@@ -3085,7 +3178,8 @@ export function createFireteamService({
      * unnecessary.
      */
     const RECOVER_CRITICAL_ROLES = new Set([
-        "suppressor", "bound", "flanker", "fixer", INTERDICT_ROLE, "withdraw", "cover", "focus"
+        "suppressor", "bound", "flanker", "fixer", INTERDICT_ROLE, "withdraw", "cover", "focus",
+        "overwatch-lane"
     ]);
 
     /**
@@ -3508,6 +3602,21 @@ export function createFireteamService({
         });
         diagnostics.morale = moraleInfo.diagnostics;
 
+        // Issue #91: squad memory and member capability profiles are
+        // collected before tactic selection, not after assignments. The
+        // chokepoint lane inference must see the same read-only threat and
+        // reaction/suppression evidence that member planners receive; the
+        // pure selector itself never probes documents.
+        const perception = _service("perception", context.perception);
+        const teamContacts = _teamContacts({ members, combat, context, perception });
+        const memberDefenseProfiles = await _memberDefenseProfiles({
+            members, combat, context, perception
+        });
+        diagnostics.defenseInputs = _jsonClone({
+            teamContactCount: Array.isArray(teamContacts) ? teamContacts.length : 0,
+            memberProfiles: memberDefenseProfiles
+        });
+
         // Concentrate-fire pre-pass (issue #85): focus selection is an
         // objective overlay, not a maneuver. It must run before the preset
         // tactic registry so specOps `flank-and-fix`/coordinated assault sees
@@ -3544,6 +3653,8 @@ export function createFireteamService({
             context,
             focusObjective: selectedFocus,
             character,
+            teamContacts: Array.isArray(teamContacts) ? teamContacts : [],
+            memberProfiles: memberDefenseProfiles,
             moraleTier: moraleInfo.tier,
             moraleInfo,
             casualtyDetail: {
@@ -3876,9 +3987,9 @@ export function createFireteamService({
         // contact one member saw propagates to the whole squad. The
         // planner dedups freshness against the member's own last-known
         // entries (fresher wins, own wins at equal ts).
-        const perception = _service("perception", context.perception);
-        const teamContacts = _teamContacts({ members, combat, context, perception });
-
+        // `perception`/`teamContacts` were collected before tactic
+        // selection (issue #91) and are reused verbatim here so every
+        // member receives the identical merged contact list.
         const reservedTargets = new Map();
         const routeLocks = [...(context.reservations ?? [])];
         const plans = new Map();
@@ -3905,6 +4016,10 @@ export function createFireteamService({
         const peelStranded = new Set((tacticName === PEEL_WITHDRAWAL_NAME
             ? (tactic?.breakdown?.stranded ?? []) : [])
             .map(entry => String(entry.combatantId ?? entry)));
+        const chokepointObjective = tacticName === CHOKEPOINT_TACTIC_NAME
+            ? _jsonClone(tactic?.objective ?? null) : null;
+        const chokepointLanes = new Map((chokepointObjective?.lanes ?? [])
+            .map(lane => [String(lane.id), lane]));
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
@@ -3913,9 +4028,14 @@ export function createFireteamService({
             // flank element selects its side's point; legacy single-point
             // objectives resolve exactly as before.
             const flankAnchor = _memberFlankAnchor(assignment, tactic?.objective ?? null);
+            const defenseLaneId = assignment.objective?.laneId ?? null;
+            const defenseLane = chokepointObjective && defenseLaneId !== null
+                ? chokepointLanes.get(String(defenseLaneId)) ?? null
+                : null;
             const memberContext = {
                 ...context,
                 seed,
+                ...(chokepointObjective ? { objective: _jsonClone(chokepointObjective) } : {}),
                 reservations: routeLocks.slice(),
                 replanCount: _finiteOr(context.replanCount, 0),
                 ...(context.readOnly ? {
@@ -3928,6 +4048,14 @@ export function createFireteamService({
                     groupId: assignment.groupId,
                     role: assignment.role ?? null,
                     element: assignment.element ?? null,
+                    ...(chokepointObjective ? {
+                        defense: {
+                            anchor: _jsonClone(chokepointObjective.anchor ?? null),
+                            laneId: defenseLaneId,
+                            lane: defenseLane ? _jsonClone(defenseLane) : null
+                        },
+                        defenseObjective: _jsonClone(chokepointObjective)
+                    } : {}),
                     ...(assignment.role === "suppressor" && suppressionCone
                         ? { suppressionCone: _jsonClone(suppressionCone) } : {}),
                     ...(assignment.role !== "suppressor" && suppressionZones.length

@@ -1323,9 +1323,12 @@ function _focusCount(target, members, profiles, grid) {
         const bestRange = _finiteOr(profile.bestRangeM, 0);
         if (!(bestRange > 0)) continue;
         if (_distM(member.position, target, grid) > bestRange + EPSILON) continue;
-        const visible = Array.isArray(profile.visibleTargetIds)
-            ? profile.visibleTargetIds.includes(target.tokenId)
-                || profile.visibleTargetIds.includes(target.tokenUuid)
+        const visibleIds = Array.isArray(profile.visibleTargetIds)
+            ? new Set(profile.visibleTargetIds.map(String)) : null;
+        const visible = visibleIds
+            ? [target.tokenId, target.tokenUuid, target.actorId]
+                .filter(id => id !== null && id !== undefined)
+                .some(id => visibleIds.has(String(id)))
             : true;
         if (visible) count += 1;
     }
@@ -1789,4 +1792,129 @@ export function selectChokepointDefense(input = {}) {
  */
 export function createChokepointDefenseTactic(config = {}) {
     return input => selectChokepointDefense({ ...input, config });
+}
+
+/**
+ * Prepare the registry input for chokepoint evaluation. A concentrate-fire
+ * objective inherited only as the selector fallback is an overlay target,
+ * not an explicit non-defense order: it must not produce
+ * `objective-mismatch` while a configured hold anchor exists. Explicit
+ * caller objectives keep their full precedence and still gate the tactic.
+ * @param {object} input Fireteam selector input.
+ * @returns {object} Pure-core input.
+ */
+export function prepareChokepointInput(input = {}) {
+    const context = input.context ?? {};
+    const inheritedFocus = input.focusObjective
+        && input.objective === input.focusObjective
+        && (context.objective === null || context.objective === undefined);
+    if (!inheritedFocus) return input;
+    return {
+        ...input,
+        objective: null,
+        context: { ...context, objective: null }
+    };
+}
+
+/**
+ * Preset-specific anchor gate. `hold` is the defensive core preset and may
+ * use the honest centroid fallback; ranged-cover additionally accepts an
+ * explicit positional objective, while spec-ops participates only in an
+ * explicit defensive posture/anchor and never lets the centroid turn an
+ * open battle into a defense scheme.
+ * @param {string|null} presetId
+ * @param {string|null} anchorSource
+ * @returns {boolean}
+ */
+export function chokepointAnchorAllowed(presetId, anchorSource) {
+    if (!anchorSource) return false;
+    if (presetId === "hold") return true;
+    const explicit = new Set([
+        "defend-objective", "hold", "leader-hold", "member-hold"
+    ]);
+    if (presetId === "rangedCover") {
+        return explicit.has(anchorSource) || anchorSource === "objective-point";
+    }
+    if (presetId === "specOps") return explicit.has(anchorSource);
+    return false;
+}
+
+/**
+ * Evaluate chokepoint-defense through the preset participation gate.
+ * The returned shape mirrors {@link evaluateChokepointDefense}; a pure-core
+ * activation rejected by the preset gate degrades to the stable integration
+ * reason `preset-anchor-gate` with the original anchor source preserved in
+ * the breakdown.
+ * @param {object} input Fireteam selector input.
+ * @param {object} [options]
+ * @param {string} [options.presetId]
+ * @returns {object} `{active, reason, descriptor, breakdown}`.
+ */
+export function evaluateChokepointCascade(input = {}, { presetId = "hold" } = {}) {
+    const evaluation = evaluateChokepointDefense(prepareChokepointInput(input));
+    if (!evaluation.active) return evaluation;
+    const source = evaluation.breakdown?.anchorSource
+        ?? evaluation.descriptor?.breakdown?.anchorSource ?? null;
+    if (chokepointAnchorAllowed(presetId, source)) return evaluation;
+    return {
+        active: false,
+        reason: "preset-anchor-gate",
+        descriptor: null,
+        breakdown: {
+            ...(evaluation.breakdown ?? {}),
+            anchorSource: source,
+            presetId,
+            selected: false,
+            reason: "preset-anchor-gate"
+        }
+    };
+}
+
+/**
+ * Hold-preset maneuver cascade (issue #91). Chokepoint-defense is the only
+ * hold maneuver of the first iteration: peel-withdrawal deliberately does
+ * NOT auto-activate for hold teams (issue #89 preset distribution — a hold
+ * order is a stand-your-ground doctrine, withdrawal stays an explicit
+ * caller tactic or the individual disengage/withdraw candidate of the
+ * planner). When the defense gates do not open the cascade returns the
+ * explainable `name:null` record instead of throwing or silently hiding
+ * the degradation reason — assignment construction then remains the
+ * ordinary default-support path.
+ * @param {object} input Fireteam selector input.
+ * @returns {object} Serializable tactic/cascade record.
+ */
+export function selectHoldTactic(input = {}) {
+    const defense = evaluateChokepointCascade(input, { presetId: "hold" });
+    if (defense.descriptor) return defense.descriptor;
+    return {
+        name: null,
+        reason: defense.reason ?? "no-maneuver",
+        assignments: {},
+        breakdown: {
+            chokepoint: {
+                selected: false,
+                reason: defense.reason ?? null,
+                ...(defense.breakdown ?? {})
+            }
+        }
+    };
+}
+
+/**
+ * Register the hold cascade in the tactic registry. The selector occupies
+ * the ordinary maneuver slot with the same default priority as the other
+ * preset cascades; explicit `context.tactic` still bypasses the registry.
+ * @param {object} tactics Tactic registry service.
+ * @returns {object} Registry record.
+ */
+export function registerHoldTacticSelector(tactics) {
+    if (!tactics || typeof tactics.registerTacticSelector !== "function") {
+        throw new Error("[only-war-ai] Hold tactic requires a tactic registry");
+    }
+    return tactics.registerTacticSelector({
+        presetId: "hold",
+        kind: "maneuver",
+        priority: 100,
+        select: selectHoldTactic
+    });
 }
