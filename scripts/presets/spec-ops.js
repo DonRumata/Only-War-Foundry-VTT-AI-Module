@@ -34,9 +34,13 @@
  *   the preset never fires blind (`hidden-target`).
  */
 import { evaluateFactors } from "../planner.js";
+import {
+    SPEC_OPS_CONFIG,
+    SPEC_OPS_PRESET_ID,
+    resolveSpecOpsConfig
+} from "./spec-ops-config.js";
 
-/** Preset id registered in the planner preset registry. */
-export const SPEC_OPS_PRESET_ID = "specOps";
+export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
 /** Rejection reason produced by {@link specOpsVeto}. */
 export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
@@ -48,22 +52,6 @@ export const SPEC_OPS_TACTICS = Object.freeze([
     "covering-advance",
     "regroup-fallback"
 ]);
-
-/**
- * World-configurable spec-ops defaults (issue #412 `SpecOpsConfig`).
- * `maxDetachedRounds` bounds flank detachment phases; `highThreatRatio`
- * (enemies per member) switches the team to `regroup-fallback`.
- */
-export const SPEC_OPS_CONFIG = Object.freeze({
-    flankMinAngleDegrees: 60,
-    maxDetachedRounds: 2,
-    highThreatRatio: 2,
-    supportWeight: 6,
-    flankWeight: 8,
-    assaultWeight: 7,
-    cohesionWeight: 10,
-    fallbackPreset: "hold"
-});
 
 /**
  * Data-driven weights for the spec-ops preset — the solo/balanced base.
@@ -729,7 +717,7 @@ export function selectSpecOpsTactic({
     context = {},
     config = null
 } = {}) {
-    const cfg = { ...SPEC_OPS_CONFIG, ...(config ?? context.specOpsConfig ?? {}) };
+    const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
         .filter(m => m && m.combatantId && m.defeated !== true && m.enabled !== false)
         .sort((a, b) => String(a.combatantId).localeCompare(String(b.combatantId)));
@@ -754,7 +742,7 @@ export function selectSpecOpsTactic({
         allowFlank: extra.allowFlank === true,
         regroup: extra.regroup === true,
         objective: extra.objective ?? null,
-        maxDetachedPhases: _finiteOr(cfg.maxDetachedRounds, 2),
+        maxDetachedPhases: cfg.maxDetachedRounds,
         breakdown: { ...breakdown, ...(extra.breakdown ?? {}) }
     });
 
@@ -771,7 +759,7 @@ export function selectSpecOpsTactic({
         return finish("regroup-fallback", "casualties",
             { regroup: true, assignments: all("regroup") });
     }
-    if (pressure >= _finiteOr(cfg.highThreatRatio, 2)) {
+    if (pressure >= cfg.highThreatRatio) {
         return finish("regroup-fallback", "overwhelming-threat",
             { regroup: true, assignments: all("regroup") });
     }
@@ -849,15 +837,12 @@ export function specOpsTactic(input = {}) {
 }
 
 /**
- * Bind a tactic factory to a fixed `SpecOpsConfig` (world-configurable
- * values are injected by the GM through `context.specOpsConfig` anyway,
- * so this is mostly for tests and macros).
+ * Bind a tactic factory with explicit overrides for tests and macros.
  * @param {object} [config] `SpecOpsConfig` overrides.
  * @returns {Function} Tactic factory `(input) => descriptor`.
  */
 export function createSpecOpsTactic(config = {}) {
-    const merged = { ...SPEC_OPS_CONFIG, ...config };
-    return input => selectSpecOpsTactic({ ...input, config: merged });
+    return input => selectSpecOpsTactic({ ...input, config });
 }
 
 /**
@@ -905,7 +890,8 @@ export function evaluateSpecOps({
         && SPEC_OPS_TASK_WEIGHTS[context.team.task]
         ? context.team.task
         : null;
-    const cfg = { ...SPEC_OPS_CONFIG, ...(context.specOpsConfig ?? {}) };
+    const cfg = task && context.specOpsConfig
+        ? resolveSpecOpsConfig(context.specOpsConfig) : SPEC_OPS_CONFIG;
     const enriched = { ...factors };
     if (task === "flank") {
         enriched.flankAngle = _flankAngle(candidate, context, cfg.flankMinAngleDegrees);
@@ -922,6 +908,12 @@ export function evaluateSpecOps({
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
+    if (task === "support") effective.cover = cfg.supportWeight;
+    if (task === "flank") effective.flankAngle = cfg.flankWeight;
+    if (task === "assault") {
+        effective.attackAfterMove = (cfg.assaultWeight / SPEC_OPS_CONFIG.assaultWeight) * overlay.attackAfterMove;
+    }
+    if (task === "regroup") effective.cohesionRestore = cfg.cohesionWeight;
     const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,

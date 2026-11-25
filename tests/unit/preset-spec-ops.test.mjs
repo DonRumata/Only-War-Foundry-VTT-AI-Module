@@ -568,6 +568,21 @@ test("evaluateSpecOps solo fallback reports no-fireteam", () => {
     assert.equal(result.breakdown.weights.holdPosition, 2);
 });
 
+test("directional weights change the corresponding task factors without changing defaults", () => {
+    const cases = [
+        ["support", "supportWeight", "cover", 6],
+        ["flank", "flankWeight", "flankAngle", 8],
+        ["assault", "assaultWeight", "attackAfterMove", 8],
+        ["regroup", "cohesionWeight", "cohesionRestore", 10]
+    ];
+    for (const [task, field, factor, original] of cases) {
+        const context = { team: { task } };
+        assert.equal(evaluateSpecOps({ context }).breakdown.weights[factor], original);
+        const custom = evaluateSpecOps({ context: { ...context, specOpsConfig: { [field]: 0 } } });
+        assert.equal(custom.breakdown.weights[factor], 0, `${field} can disable the factor`);
+    }
+});
+
 test("specOpsVeto refuses hidden and last-known attack targets", () => {
     const attack = { variant: "attack-in-place", action: { id: "a" } };
     assert.equal(

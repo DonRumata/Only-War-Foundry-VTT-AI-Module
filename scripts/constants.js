@@ -98,6 +98,14 @@ export const SETTING_KEYS = Object.freeze({
     executionMode: "executionMode",
     diagnosticsEnabled: "diagnosticsEnabled",
     preferredCohesion: "preferredCohesion",
+    specOpsFlankMinAngleDegrees: "specOpsFlankMinAngleDegrees",
+    specOpsMaxDetachedRounds: "specOpsMaxDetachedRounds",
+    specOpsHighThreatRatio: "specOpsHighThreatRatio",
+    specOpsSupportWeight: "specOpsSupportWeight",
+    specOpsFlankWeight: "specOpsFlankWeight",
+    specOpsAssaultWeight: "specOpsAssaultWeight",
+    specOpsCohesionWeight: "specOpsCohesionWeight",
+    specOpsFallbackPreset: "specOpsFallbackPreset",
     previewTimeoutSeconds: "previewTimeoutSeconds",
     // The executor defers `nextTurn` after a landed bot attack while the
     // GM rolls/applies the damage card; this bounds that wait (`0` —

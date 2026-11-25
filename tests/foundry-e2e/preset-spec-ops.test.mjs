@@ -116,7 +116,43 @@ async function testSpecOpsFlankAndFix() {
   }, targets);
   assert.equal(again.teamPlan.id, plan.id, 'identical input yields identical plan');
 
-  return { combatantIds, plan };
+  return { combatantIds, plan, targets };
+}
+
+async function testWorldSettings({ targets }) {
+  const field = 'specOpsFlankMinAngleDegrees';
+  const previous = await page.evaluate(async key => {
+    await game.settings.sheet.render({ force: true });
+    return game.settings.get('only-war-ai', key);
+  }, field);
+  const angle = previous === 150 ? 180 : 150;
+  const settings = page.locator('#settings-config');
+  try {
+    await settings.locator('button[data-tab="only-war-ai"]').click();
+    await settings.locator(`[name="only-war-ai.${field}"]`).evaluate((input, value) => {
+      input.value = String(value);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    }, angle);
+    await settings.locator('button[type="submit"]').click();
+    await page.waitForFunction(({ field, angle }) => game.settings.get('only-war-ai', field) === angle,
+      { field, angle });
+    await page.reload();
+    await page.waitForFunction(() => globalThis.game?.ready && globalThis.canvas?.ready);
+    await page.evaluate(id => game.scenes.get(id).view(), sceneId);
+    await page.waitForFunction(id => canvas.ready && canvas.scene?.id === id, sceneId);
+    const tactic = await page.evaluate(async ({ combatId, targets }) => {
+      const fireteam = game.modules.get('only-war-ai').api.services.get('fireteam');
+      const result = await fireteam.buildTeamPlan(game.combats.get(combatId), 'alpha',
+        { seed: 21, targets, readOnly: true });
+      return result.teamPlan?.tactic;
+    }, { combatId, targets });
+    assert.equal(tactic, 'covering-advance', 'the saved angle rejects the previous flank');
+    console.log('world settings UI saved the flank angle, which changed TeamPlan after reload');
+  } finally {
+    await page.evaluate(({ field, previous }) => game.settings.set('only-war-ai', field, previous),
+      { field, previous });
+  }
 }
 
 async function testLeaderLossDeterministicSuccessor(state) {
@@ -156,18 +192,20 @@ async function cleanup() {
 }
 
 (async () => {
+  let failed = false;
   try {
     await setup();
     const state = await testSpecOpsFlankAndFix();
+    await testWorldSettings(state);
     await testLeaderLossDeterministicSuccessor(state);
     console.log('preset-spec-ops.test.mjs PASSED');
-    process.exit(0);
   } catch (err) {
+    failed = true;
     console.error('preset-spec-ops.test.mjs FAILED:', err);
     try { await h.screenshot(page, 'preset-spec-ops-failure'); } catch { /* ignore */ }
-    process.exit(1);
   } finally {
     try { await cleanup(); } catch { /* ignore */ }
     // CDP: browser.close() would tear down the shared context — the connection ends with the process.
   }
+  process.exit(failed ? 1 : 0);
 })();

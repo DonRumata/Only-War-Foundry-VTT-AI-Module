@@ -138,6 +138,7 @@ import {
 import {
     _stepsFor
 } from "./planner/steps.js";
+import { SPEC_OPS_FALLBACK_PRESETS } from "./presets/spec-ops-config.js";
 import {
     _allyEngagedTargets,
     _enemyContacts,
@@ -265,7 +266,9 @@ export function createPlannerService({
         if (!config?.enabled) {
             return { status: PLANNER_STATUS.disabled, reason: "config-disabled", plan: null };
         }
-        const preferredPreset = context.teamTurn ? (context.team?.preset ?? config.preset) : config.preset;
+        const fallbackPreset = SPEC_OPS_FALLBACK_PRESETS.includes(context.fallbackPreset)
+            ? context.fallbackPreset : null;
+        const preferredPreset = (context.teamTurn ? context.team?.preset : fallbackPreset) ?? config.preset;
         const presetId = presets.has(preferredPreset) ? preferredPreset : FALLBACK_PRESET;
         const preset = presets.get(presetId) ?? presets.get(FALLBACK_PRESET);
         const seed = _seedFor(context, combat, combatant);
@@ -2032,6 +2035,7 @@ export function createPlannerService({
             actorUuid: snapshot.self.actorUuid,
             tokenUuid: snapshot.self.tokenUuid,
             preset: presetId,
+            ...(context.fallbackPreset === presetId ? { fallbackPreset: presetId } : {}),
             seed,
             replanCount,
             difficulty: _difficultyOf(context),

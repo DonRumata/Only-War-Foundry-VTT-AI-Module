@@ -740,6 +740,7 @@ export function factorDelta(winner, runnerUp, weights = {}, max = TRACE_TOP_FACT
 export const CAPTURE_CONTEXT_KEYS = Object.freeze([
     "seed",
     "replanCount",
+    "fallbackPreset",
     "targets",
     "actions",
     "moves",

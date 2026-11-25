@@ -7,6 +7,8 @@ import { movementCells } from "../navigation.js";
 import { isLiveOperation, readOperation } from "../operations.js";
 import { isDeadOrDefeated, isHiddenToken } from "../perception.js";
 import { _collisionRevision } from "../planner/documents.js";
+import { SPEC_OPS_PRESET_ID } from "../presets/spec-ops-config.js";
+import { getSpecOpsConfig } from "../settings.js";
 import { _docPoint, _findCombatant, _tokenDoc } from "./util.js";
 
 const MAX_MANEUVER_ROUNDS = 2;
@@ -174,6 +176,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             tacticReason: draft.diagnostics?.tactic?.reason ?? null,
             preferredCohesion: draft.diagnostics?.preferredCohesion,
             character: draft.character, teamPreset: draft.teamPreset,
+            ...(draft.specOpsConfig ? { specOpsConfig: draft.specOpsConfig } : {}),
             round: context.combat.round, turn: context.combat.turn,
             expiresRound: context.combat.round + MAX_MANEUVER_ROUNDS,
             controllerId: context.operation.controllerId, collision: _collisionRevision(context.combat.scene),
@@ -199,7 +202,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         const previous = statesOf(combat).find(state => state?.teamId === cfg.teamId) ?? null;
         let state = previous;
         let preflight = [];
-        const base = {
+        let base = {
             ...plannerContext, includeNeutral: resolveConfig(combatant)?.includeNeutral === true,
             layers: { ...plannerContext.layers, commitment: false }
         };
@@ -215,7 +218,15 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         if (!state) {
             const entries = fireteam.collectMembers(combat, cfg.teamId).filter(member =>
                 member.enabled && !member.defeated && Number.isFinite(member.initiative));
-            if (entries.length < 2) return null;
+            const teamPreset = cfg.teamPreset ?? entries.find(member => member.team?.teamPreset)?.team.teamPreset
+                ?? (entries.length && entries.every(member => member.preset === SPEC_OPS_PRESET_ID)
+                    ? SPEC_OPS_PRESET_ID : null);
+            const fallback = () => teamPreset === SPEC_OPS_PRESET_ID
+                ? planner.planTurn(combat, combatant, {
+                    ...base, fallbackPreset: getSpecOpsConfig(base.specOpsConfig).fallbackPreset
+                })
+                : null;
+            if (entries.length < 2) return fallback();
             const targets = new Map();
             for (const member of entries) {
                 for (const target of visible(context, member.combatant, base)) {
@@ -230,9 +241,10 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             }))?.teamPlan;
             if (!ownsTurn(context, combatant)) return null;
             state = compile(draft, entries, context);
-            if (!state) return null;
+            if (!state) return fallback();
             preflight = Object.values(draft.memberPlans).map(memberPlan => memberPlan.snapshot);
         }
+        if (state.specOpsConfig) base = { ...base, specOpsConfig: state.specOpsConfig };
         const stopped = stateReason(state, context);
         if (stopped) return wait(stopped, "interrupt");
         const active = state.members.find(member => member.id === combatant.id);

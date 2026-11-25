@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { createModuleApi } from "../../scripts/api.js";
-import { FLAG_KEYS, MODULE_ID } from "../../scripts/constants.js";
+import { FLAG_KEYS, MODULE_ID, SETTING_KEYS } from "../../scripts/constants.js";
 import { createExecutorService } from "../../scripts/executor.js";
 import { createFireteamService } from "../../scripts/fireteam.js";
 import { createOperationService, readOperation } from "../../scripts/operations.js";
@@ -146,6 +146,28 @@ test("TeamPlan waits without blocking initiative, then fires only on each member
     ]);
     assert.equal(world.builds(), 1, "the draft does not replay across turns");
     assert.deepEqual(world.records(), []);
+});
+
+test("an undersized Spec Ops fireteam previews the world's individual fallback without assigning roles", async () => {
+    const world = await fixture({ mode: "preview" });
+    const key = SETTING_KEYS.specOpsFallbackPreset;
+    const previous = game.settings.get(MODULE_ID, key);
+    game.settings.set(MODULE_ID, key, "assault");
+    try {
+        await world.shooter.setFlag(MODULE_ID, FLAG_KEYS.fireteam, {
+            teamId: "alpha", teamPreset: "specOps"
+        });
+        world.flanker.defeated = true;
+        const result = await world.turn();
+        assert.equal(result.status, "preview");
+        assert.equal(result.plan.preset, "assault");
+        assert.equal(result.plan.teamTurn, undefined);
+        assert.equal(world.builds(), 0);
+        assert.deepEqual(world.moves, []);
+        assert.equal(world.combat.combatant, world.shooter);
+    } finally {
+        game.settings.set(MODULE_ID, key, previous);
+    }
 });
 
 test("a route blocked after the wait cancels the maneuver without moving or attacking", async () => {

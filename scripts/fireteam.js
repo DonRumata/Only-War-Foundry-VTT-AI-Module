@@ -66,6 +66,7 @@ import {
     getAIDifficulty,
     getMoraleDesperateRatio,
     getPreferredCohesion,
+    getSpecOpsConfig,
     logDiagnostics
 } from "./settings.js";
 import { weaponEmitters } from "./threat-map.js";
@@ -1656,10 +1657,7 @@ export function createFireteamService({
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context }) {
         let source = context.tactic;
         if (source === undefined) {
-            const specOpsTeam = teamPreset === SPEC_OPS_PRESET_ID
-                || (teamPreset === null && members.length > 0
-                    && members.every(m => m.preset === SPEC_OPS_PRESET_ID));
-            if (specOpsTeam) source = specOpsTactic;
+            if (teamPreset === SPEC_OPS_PRESET_ID) source = specOpsTactic;
         }
         if (source === undefined || source === null || source === false) return null;
         if (typeof source === "function") {
@@ -2081,7 +2079,7 @@ export function createFireteamService({
      * @param {object} [context] Optional overrides/services: `seed`,
      *   `objective`, `assignments`, `allowFlank`, `regroup`, `tactic`,
      *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
-     *   `preferredCohesion`, `targets`, `actions`, `moves`, `perception`,
+     *   `preferredCohesion`, `specOpsConfig`, `targets`, `actions`, `moves`, `perception`,
      *   `navigation`, `authority`, `planner`, `taskCapacities`,
      *   `replanCount`. Runtime drafts use `readOnly` (no morale/GM flags,
      *   independent member LOS) and pass `tacticTargets` only to the
@@ -2181,7 +2179,10 @@ export function createFireteamService({
         const teamPreset = context.teamPreset ?? teamRef.teamPreset
             ?? members.map(m => m.team?.teamPreset)
                 .find(p => AI_PRESETS.includes(p))
-            ?? null;
+            ?? (members.every(m => m.preset === SPEC_OPS_PRESET_ID) ? SPEC_OPS_PRESET_ID : null);
+        if (teamPreset === SPEC_OPS_PRESET_ID) {
+            context = { ...context, specOpsConfig: getSpecOpsConfig(context.specOpsConfig) };
+        }
         // Issue #19: the shared team character — explicit context, then
         // the team reference, then the first member flag in the
         // deterministic member order.
@@ -2692,6 +2693,7 @@ export function createFireteamService({
             leaderId: election.combatantId,
             teamPreset: teamPreset && AI_PRESETS.includes(teamPreset)
                 ? teamPreset : null,
+            ...(teamPreset === SPEC_OPS_PRESET_ID ? { specOpsConfig: context.specOpsConfig } : {}),
             character,
             tactic: diagnostics.tactic?.name ?? null,
             objective: tactic?.objective?.targetId ?? context.objective?.targetId ?? null,
