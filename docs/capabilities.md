@@ -121,6 +121,14 @@ execute: расхождение — `stale-state` (перемещение, см�
   вето charge и run.
 - `vulnerable`-фактор за цель pinned/prone/stunned; `engaged`/`meleeEngage`
   за контакт ближнего боя.
+- Сужение пула атак (epic #84): опциональные `context.attackTargetIds` /
+  `context.excludedAttackTargetIds` ограничивают только direct-attack
+  кандидатов (включая blast memory-strike и наведение attack-конусов);
+  осведомлённость — движение, threat-map, melee-engagement, nearest
+  threat, overwatch, commitment-угрозы — читает полный пул восприятия.
+  Точное строковое совпадение по `tokenId`/`tokenUuid`/`actorId`; сужение
+  не ослабляет `canAttack`/memory-правила и не входит в
+  snapshot/validate; без полей поведение бит-в-бит прежнее.
 - `validateSnapshot` перед каждым шагом: `turn-stale | token-moved |
   target-gone | resources-changed | collision-changed | statuses-changed |
   combat-ended`. `shouldReplan` — не более `maxReplans` (1) за ход.

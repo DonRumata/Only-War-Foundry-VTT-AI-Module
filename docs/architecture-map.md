@@ -50,7 +50,7 @@
 | Файл | Где искать |
 |---|---|
 | [`planner/actions.js`](../scripts/planner/actions.js) | `_resolveActions`: нормализация `actions.list`, стоимость и варианты оружия. |
-| [`planner/targets.js`](../scripts/planner/targets.js) | `_resolveTargets`: видимые цели, память и связи между токенами в ближнем бою. |
+| [`planner/targets.js`](../scripts/planner/targets.js) | `_resolveTargets`: видимые цели, память и связи между токенами в ближнем бою; `_attackPoolSpec`/`_attackPoolAllows` — сужение пула атак epic #84. |
 | [`planner/moves.js`](../scripts/planner/moves.js) | `_resolveMoves`: маршрутные кандидаты с учётом сетки, дистанции и бюджета. |
 | [`planner/zones.js`](../scripts/planner/zones.js) | `_bestBlastAim`, `_bestConeAim` и якоря зоны overwatch. |
 | [`planner/scoring.js`](../scripts/planner/scoring.js) | `_factorsOf`, `evaluateFactors`, `_applyLookahead`: признаки, веса и оценка ответа противника. |

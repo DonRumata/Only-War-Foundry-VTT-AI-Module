@@ -250,6 +250,38 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
 
 Варианты атаки: `attack-in-place | move-attack | charge | aim-attack`.
 
+### Сужение пула атак (epic #84)
+
+`context.targets` — всегда ПОЛНЫЙ пул восприятия и угроз; сужать его ради
+фокус-цели нельзя. Опциональные `context.attackTargetIds` (allow-list) и
+`context.excludedAttackTargetIds` (deny-list) сужают только генерацию
+direct-attack кандидатов: `attack-in-place`, `aim-attack`, `move-attack`,
+`charge`, blast memory-strike и наведение attack-конусов
+(spray/suppression). Движение (approach/seek/run/detour), threat-map,
+`_enemyContacts` и melee-engagement (`already-engaged`), `_nearestThreat`,
+overwatch-якоря и гейт декларации, lookahead, commitment-угрозы
+`expectedState.threats` и snapshot/diagnostics продолжают читать полный
+пул. Правила `canAttack`/hidden/intel/memory не ослабляются: allow-list
+никогда не делает memory/team-contact цель атакуемой — сужение только
+убирает, ничего не добавляя. Совпадение id — точное строковое равенство с
+`tokenId`, `tokenUuid` или `actorId` нормализованной цели
+(`_normalizeTarget` кросс-заполняет `tokenId` из хвоста uuid, поэтому
+голый id токена и полный `Scene.<id>.Token.<tokenId>` совпадают с одной
+целью; `targetId` в смысле concentrate-fire — `tokenId ?? tokenUuid` —
+покрыт этими ключами); числовые id приводятся к строкам, прочие записи
+игнорируются. Сужение активно, когда allow-list — массив (даже пустой —
+тогда прямых атак нет вовсе) либо deny-list несёт хотя бы один валидный
+id; без полей, с не-массивом или с одним пустым deny-list поведение
+бит-в-бит legacy, включая диагностику. Каждая исключённая цель даёт одну
+запись `attack-pool-excluded` в rejected; сводка — JSON-safe
+`diagnostics.attackPool` (`mode`, `allow`, `deny`, `eligibleCount`,
+`excludedCount`, `excludedTargets` ≤ 8). Это планирующий ввод, а не
+состояние документов: в snapshot, stale-fingerprint и validateSnapshot
+поля не входят; в replay-захват (`CAPTURE_CONTEXT_KEYS`) они попадают как
+и прочие inputs — для идентичного офлайн-replay. Friendly-fire вето
+союзников/нейтралов и подсчёт покрытия шаблонов по сцене не меняются:
+exclusion касается цели-кандидата, а не «вредоносности» всплеска шаблона.
+
 ## 3. Сериализация шагов (`_stepsFor`)
 
 Порядок шагов плана: `aim → move → attack|test → reload → overwatch →

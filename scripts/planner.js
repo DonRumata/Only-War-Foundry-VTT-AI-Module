@@ -144,6 +144,9 @@ import {
 import { SPEC_OPS_FALLBACK_PRESETS } from "./presets/spec-ops-config.js";
 import {
     _allyEngagedTargets,
+    _attackPoolAllows,
+    _attackPoolDiagnostics,
+    _attackPoolSpec,
     _enemyContacts,
     _isMemorySource,
     _nearestThreat,
@@ -247,7 +250,11 @@ export function createPlannerService({
      *   `collisionRevision`, `maxTargets`, `maxActions`,
      *   `approximateMoves`, `selfStatuses`, `difficulty`,
      *   `personality` (trait list or `false` to disable, issue #19),
-     *   `team` (`{task, character, center, regroupPoint, ...}`).
+     *   `team` (`{task, character, center, regroupPoint, ...}`),
+     *   `attackTargetIds`/`excludedAttackTargetIds` (epic #84 — narrow
+     *   the direct-attack pool by tokenId/tokenUuid/actorId while the
+     *   full perception pool keeps feeding movement, threat reads and
+     *   overwatch; see `_attackPoolSpec`).
      * @returns {Promise<object>} `{status, plan?, reason?, diagnostics?}`.
      */
     async function planTurn(combat, combatant, context = {}) {
@@ -729,6 +736,19 @@ export function createPlannerService({
             lastSeenRound: t.lastSeenRound ?? null,
             via: t.sourceCombatantId ?? null
         }));
+        // Epic #84 minimal split awareness/attack pools: `targets` above
+        // is ALWAYS the full perception/threat pool — movement, threat
+        // reads, engagement, nearest-threat, overwatch anchors,
+        // lookahead, the commitment threat fingerprint and this snapshot
+        // all keep using it. `attackTargetIds`/`excludedAttackTargetIds`
+        // are planning-time doctrine inputs (never document state): they
+        // gate only the direct attack candidate generation below and
+        // never enter the snapshot, the stale fingerprint or validation.
+        // Without the inputs the spec is inactive and every code path
+        // below behaves bit-for-bit as before.
+        const attackPool = _attackPoolSpec(context);
+        const attackPoolDiagnostics = _attackPoolDiagnostics(attackPool, targets);
+        if (attackPoolDiagnostics) diagnostics.attackPool = attackPoolDiagnostics;
         // Issue #16 threat map: one aggregated danger field built once per
         // plan from the resolved enemies' weapon loadouts (weapon EV +
         // range emitters). `context.threatMap` injects a ready map or a
@@ -1013,10 +1033,18 @@ export function createPlannerService({
             // Tracker-only intel steers movement but is not a sighting.
             const rememberedTarget = _isMemorySource(target.source) && target.source !== "intel"
                 ? target.tokenUuid : null;
-            const memoryStrike = rememberedTarget
+            // Epic #84: pool-excluded targets generate no direct attack
+            // candidates at all — blast memory-strikes included — while
+            // their approach/seek/run movement below is untouched. The
+            // narrowing only removes: a memory/intel contact inside the
+            // pool still fails the `canAttack` gate as before.
+            const inAttackPool = _attackPoolAllows(attackPool, target);
+            const memoryStrike = inAttackPool && rememberedTarget
                 && usableActions.some(action => _actionBlastRadius(action) > 0
                     && !_isMeleeAction(action));
-            if (target.canAttack !== true && !memoryStrike) {
+            if (!inAttackPool) {
+                rejectL0(`attack|${target.tokenUuid}`, "attack-pool-excluded");
+            } else if (target.canAttack !== true && !memoryStrike) {
                 rejectL0(`attack|${target.tokenUuid}`, "target-not-attackable");
             } else if (!usableActions.length) {
                 rejectL0(`attack|${target.tokenUuid}`, "no-action");
@@ -1447,9 +1475,13 @@ export function createPlannerService({
         // remembered point. Hostiles present on the scene but unknown to
         // the bot (no LOS, no memory) never steer the template; the
         // friendly/neutral veto still scans every scene token for safety.
+        // Epic #84: attack-cone anchors follow the narrowed attack pool —
+        // an excluded contact never steers an attack template — while the
+        // overwatch anchors further below keep reading the full pool.
         const coneAnchors = targets
             .filter(target => target?.hidden !== true
-                && Number.isFinite(target?.x) && Number.isFinite(target?.y))
+                && Number.isFinite(target?.x) && Number.isFinite(target?.y)
+                && _attackPoolAllows(attackPool, target))
             .map(target => ({
                 tokenUuid: target.tokenUuid ?? null,
                 tokenId: target.tokenId ?? null,
