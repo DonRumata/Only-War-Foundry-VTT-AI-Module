@@ -48,6 +48,11 @@ import {
     SPEC_OPS_PRESET_ID,
     resolveSpecOpsConfig
 } from "./spec-ops-config.js";
+import {
+    INTERDICTION_TACTIC,
+    INTERDICT_ROLE,
+    selectInterdiction
+} from "./interdiction.js";
 
 export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
@@ -57,6 +62,7 @@ export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
 /** Bounded team maneuvers the tactic selector may commit to. */
 export const SPEC_OPS_TACTICS = Object.freeze([
     SUPPRESS_AND_BOUND,
+    INTERDICTION_TACTIC,
     "flank-and-fix",
     "coordinated-assault",
     "covering-advance",
@@ -188,6 +194,26 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         threat: 3,
         holdPosition: 0,
         cohesionRestore: 10
+    })
+});
+
+/**
+ * Per-role additive deltas merged over the task overlay when the fireteam
+ * injects `context.team.role` (issue #87). Only `interdictor` exists in
+ * v1: the additive reading of the spec table (`charge +3` lifts the
+ * assault overlay 5 → 8, `tieUp +4` lifts 4 → 8) — the role sharpens the
+ * assault task it rides on, it never replaces it. `screenProgress` is a
+ * preset-only factor only the interdictor carries: when the charge is
+ * illegal the screen point must still beat chaotic approaches.
+ */
+export const SPEC_OPS_ROLE_WEIGHTS = Object.freeze({
+    interdictor: Object.freeze({
+        charge: 3,
+        tieUp: 4,
+        meleeEngage: 2,
+        stickyTarget: 2,
+        screenProgress: 8,
+        holdPosition: -4
     })
 });
 
@@ -637,6 +663,40 @@ export function specOpsFlankProgress(candidate, context) {
 }
 
 /**
+ * Interdictor screen point of the evaluation context (issue #87): the
+ * explicit team field first, then the member objective's serialized
+ * geometry — the team-turn compile path carries only the objective.
+ * @param {object} context Evaluation context (`team`).
+ * @returns {{x: number, y: number}|null}
+ */
+export function specOpsScreenPoint(context = {}) {
+    if (context.team?.role !== INTERDICT_ROLE) return null;
+    const point = context.team?.screenPoint
+        ?? context.team?.memberObjective?.screenPoint ?? null;
+    return _isPoint(point) ? { x: point.x, y: point.y } : null;
+}
+
+/**
+ * `screenProgress` factor (issue #87): how much closer the candidate
+ * endpoint lands to the interdictor's screen point relative to the
+ * current position — the mirror of `_flankProgress` for the screen
+ * fallback geometry. Zero without a screen point, so the factor never
+ * competes with a legal charge.
+ * @param {object} candidate
+ * @param {object} context
+ * @returns {number}
+ */
+function _screenProgress(candidate, context) {
+    const point = specOpsScreenPoint(context);
+    const self = specOpsTokenCenter(context.token, context.scene, context.selfPos);
+    const endpoint = candidate.move && !candidate.move.stay ? candidate.move : self;
+    if (!_isPoint(point) || !_isPoint(self) || !endpoint) return 0;
+    const base = _dist(self, point);
+    if (!(base > 0)) return 0;
+    return Math.round(_clamp01((base - _dist(endpoint, point)) / base) * 1e4) / 1e4;
+}
+
+/**
  * Cohesion-restoration progress of the candidate endpoint toward the
  * team's regroup point (or centre): 1 when the endpoint lands on it,
  * 0 when it keeps or extends the distance. Feeds the
@@ -824,6 +884,8 @@ export function specOpsFlankFallback(members, tactic, failure) {
  * @param {string|null} [input.leaderId] Elected leader combatant id.
  * @param {object[]|null} [input.targets] Normalized shared target list.
  * @param {object|null} [input.objective] Shared objective `{targetId, x, y}`.
+ * @param {object|null} [input.character] Party character reference used
+ *   by interdiction target validation (memory-source rejection).
  * @param {number} [input.casualties] Defeated teammates this round.
  * @param {object|null} [input.scene] Planning scene.
  * @param {object|null} [input.combat] Combat document for geometry lookup.
@@ -843,7 +905,8 @@ export function selectSpecOpsTactic({
     scene = null,
     combat = null,
     context = {},
-    config = null
+    config = null,
+    character = null
 } = {}) {
     const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
@@ -973,10 +1036,15 @@ export function selectSpecOpsTactic({
             breakdown: { ...breakdown }
         };
     }
+    // The base maneuver is the ordinary flank/assault/covering cascade of
+    // the squad. It is computed first so the interdiction pass below can
+    // compose over it; when interception degrades the base descriptor is
+    // returned unchanged apart from the recorded degradation breakdown.
+    let base;
     if (flank) {
         breakdown.flank = { side: flank.side, flankerId: flank.flanker.combatantId };
         const targetId = _objectiveTargetId(objective, hostiles);
-        return finish("flank-and-fix",
+        base = finish("flank-and-fix",
             frontalBlocked ? "frontal-blocked-flank-open" : "outnumbered-flank-open",
             {
                 allowFlank: true,
@@ -991,21 +1059,81 @@ export function selectSpecOpsTactic({
                     }
                 }
             });
-    }
-    if (enemyCount <= memberCount) {
+    } else if (enemyCount <= memberCount) {
         // Parity or superiority: a synchronized assault — unless the only
         // corridor is blocked and no flank route exists.
-        if (frontalBlocked) {
-            return finish("covering-advance", "frontal-blocked-no-flank",
-                { assignments: _coveringAssignments(available) });
-        }
-        return finish("coordinated-assault",
-            enemyCount < memberCount ? "superiority" : "parity",
-            { assignments: all("assault") });
+        base = frontalBlocked
+            ? finish("covering-advance", "frontal-blocked-no-flank",
+                { assignments: _coveringAssignments(available) })
+            : finish("coordinated-assault",
+                enemyCount < memberCount ? "superiority" : "parity",
+                { assignments: all("assault") });
+    } else {
+        // Outnumbered below the regroup threshold with no flank route.
+        base = finish("covering-advance", "outnumbered-no-flank",
+            { assignments: _coveringAssignments(available) });
     }
-    // Outnumbered below the regroup threshold with no flank route.
-    return finish("covering-advance", "outnumbered-no-flank",
-        { assignments: _coveringAssignments(available) });
+
+    // Issue #87: interdiction-screen is evaluated after suppression and
+    // before committing to the attack maneuver it screens. The pure core
+    // picks at most two interdictors out of the base assignments; a
+    // degradation stays visible in the breakdown while the cascade
+    // continues with the base maneuver unchanged. `positionIsCenter` is
+    // already true here — the selector normalized every position to the
+    // token centre the pure geometry expects.
+    const interdiction = selectInterdiction({
+        // `collectMembers` copies `system.wounds.value` — damage TAKEN —
+        // into `hp`, but the survival model reads the remaining health.
+        // Correct the shadowing field here; the pure core performs the
+        // same conversion on the actor-derived fallback path.
+        members: positioned.map(member => {
+            const wounds = member?.combatant?.actor?.system?.wounds
+                ?? member?.actor?.system?.wounds ?? null;
+            const remaining = wounds && Number.isFinite(wounds.max) && Number.isFinite(wounds.value)
+                ? wounds.max - wounds.value : null;
+            return remaining === null ? member : { ...member, hp: remaining };
+        }),
+        targets: centerTargets,
+        leaderId: leader?.combatantId ?? leaderId,
+        character: character ?? context.character ?? null,
+        round: _finiteOr(planningCombat?.round, null),
+        grid: geometryContext.scene?.grid ?? null,
+        walls,
+        base: { name: base.name, assignments: base.assignments },
+        config: {
+            confidenceMin: cfg.interdictConfidenceMin,
+            minRangedEV: cfg.interdictMinRangedEV,
+            chargerConfidenceMin: cfg.interdictChargerConfidenceMin,
+            ...(context.interdiction ?? {})
+        }
+    });
+    const interdictionBreakdown = interdiction.breakdown?.interdiction ?? null;
+    breakdown.interdiction = interdictionBreakdown;
+    if (!interdiction.name) {
+        return { ...base, breakdown: { ...base.breakdown, interdiction: interdictionBreakdown } };
+    }
+    // Composite descriptor: the interdiction objective carries the
+    // interception geometry (`type`/`targetId`/`screenPoint`/`protectId`/
+    // `mode`) and, when the base maneuver was a flank, the flank proof
+    // fields the fireteam needs downstream. The base `targetId` never
+    // overrides the interception target — the fireteam treats it as
+    // role-scoped.
+    const baseObjective = base.objective && typeof base.objective === "object" ? base.objective : {};
+    const flankFields = {};
+    for (const key of ["flankTargetId", "flankSide", "flankPoint"]) {
+        if (baseObjective[key] !== undefined && baseObjective[key] !== null) {
+            flankFields[key] = baseObjective[key];
+        }
+    }
+    return {
+        ...interdiction,
+        allowFlank: base.allowFlank === true,
+        ...(base.flankMinAngleDegrees !== undefined
+            ? { flankMinAngleDegrees: base.flankMinAngleDegrees } : {}),
+        objective: { ...flankFields, ...interdiction.objective },
+        maxDetachedPhases: cfg.maxDetachedRounds,
+        breakdown: { ...breakdown, baseTactic: base.name }
+    };
 }
 
 /**
@@ -1085,6 +1213,12 @@ export function evaluateSpecOps({
     if (context.team?.role === "suppressor") {
         enriched.suppression = suppressionFactorOf(candidate);
     }
+    if (context.team?.role === INTERDICT_ROLE) {
+        // Issue #87: the screen pull only exists for the interdictor. It
+        // is zero without a screen point, so a legal charge never has to
+        // compete with the fallback geometry.
+        enriched.screenProgress = _screenProgress(candidate, context);
+    }
     if (task === "flank") {
         const { angle } = _flankGeometry(candidate, context);
         const minAngle = context.team.flankMinAngleDegrees ?? cfg.flankMinAngleDegrees;
@@ -1103,6 +1237,14 @@ export function evaluateSpecOps({
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
     if (context.team?.role === "suppressor") effective.suppression = 8;
+    if (context.team?.role === INTERDICT_ROLE) {
+        // Issue #87 role overlay: additive deltas over the task weights —
+        // the interdictor sharpens its assault task (`charge` 5 → 8,
+        // `tieUp` 4 → 8) instead of replacing it.
+        for (const [key, delta] of Object.entries(SPEC_OPS_ROLE_WEIGHTS.interdictor)) {
+            effective[key] = (effective[key] ?? 0) + delta;
+        }
+    }
     if (task === "support") effective.cover = cfg.supportWeight;
     if (task === "flank") effective.flankAngle = cfg.flankWeight;
     if (task === "assault") {
@@ -1125,7 +1267,9 @@ export function evaluateSpecOps({
                 flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null,
                 cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null,
                 suppression: context.team?.role === "suppressor"
-                    ? (enriched.suppression ?? 0) : null
+                    ? (enriched.suppression ?? 0) : null,
+                screenProgress: context.team?.role === INTERDICT_ROLE
+                    ? (enriched.screenProgress ?? 0) : null
             }
         }
     };

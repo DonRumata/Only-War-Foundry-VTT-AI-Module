@@ -73,9 +73,29 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
+Роль `interdictor` (issue #87) читается как аддитивный overlay
+`SPEC_OPS_ROLE_WEIGHTS` поверх задачи assault: `charge +3` (5→8),
+`tieUp +4` (4→8), `meleeEngage +2`, `stickyTarget +2`,
+preset-only фактор `screenProgress 8` (прогресс endpoint к точке экрана
+`team.screenPoint` — зеркало `flankProgress`, без жёсткого вето) и
+`holdPosition −4`. Каскад манёвров: suppress-and-bound (#86) оценивается
+первым; при его деградации чистое ядро `presets/interdiction.js` пробует
+interdiction-screen до флангов/штурма — чистый стрелок противника
+(триггер A, confidence `rangedEV/(rangedEV+meleeEV) ≥ 0.7` и
+`rangedEV ≥ 6`) или ближнебоевой чарджер, угрожающий стрелкам отряда
+(триггер B, приоритет строго выше A). Выбранный интердиктор получает
+object assignment `{task:"assault", role:"interdictor", objective}` —
+objective несёт `targetId/screenPoint/protectId`; остальные члены
+сохраняют задачи базового манёвра (`breakdown.baseTactic`). Цель
+перехвата исключается из огневого пула остальных членов командным
+каналом `excludedTargets` → `excludedAttackTargetIds` (pool угроз не
+сужается) и никогда не становится целью concentrate-fire — фокус
+перевычисляется с учётом исключений. Деградация честно пишется в
+`breakdown.interdiction.rejected`, каскад продолжается базовым манёвром.
 Конфиг specOps: `flankMinAngleDegrees 60, maxDetachedRounds 2,
 highThreatRatio 2, supportWeight 6, flankWeight 8, assaultWeight 7,
-cohesionWeight 10, fallbackPreset "hold"`.
+cohesionWeight 10, interdictConfidenceMin 0.7, interdictMinRangedEV 6,
+interdictChargerConfidenceMin 0.5, fallbackPreset "hold"`.
 GM может менять эти параметры в настройках мира **Only War AI** (поля
 «Спецназ: …»). Угол проверяется из фактической позиции планируемой
 атаки, а не из расчётной точки. Без допустимой позиции и пути к ней

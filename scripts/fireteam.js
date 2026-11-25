@@ -87,6 +87,11 @@ import {
     specOpsTokenCenter
 } from "./presets/spec-ops.js";
 import {
+    INTERDICTION_TACTIC,
+    INTERDICT_OBJECTIVE_TYPE,
+    INTERDICT_ROLE
+} from "./presets/interdiction.js";
+import {
     SUPPRESS_AND_BOUND,
     pointInSuppressionZone
 } from "./tactics/suppress-and-bound.js";
@@ -192,6 +197,29 @@ function _clearSuppressionGeometry(assignment) {
     if (!assignment || !["suppressor", "bound"].includes(assignment.role)) return;
     delete assignment.role;
     delete assignment.element;
+}
+
+/**
+ * Targeted interdiction demotion policy (issue #87): once an interdictor
+ * assignment is demoted by GM intervention/morale, the screen role no
+ * longer exists and its geometry must not keep steering the member. The
+ * whole member objective goes with the role — unlike the suppression
+ * cone metadata it is not inert: its `targetId` both pins
+ * `assignedTargetId` onto an enemy the demoted member is now
+ * command-denied and feeds `screenPoint` movement scoring. The target
+ * pin is cleared with it so the demoted member rejoins the shared focus
+ * pool as ordinary support. The gate deliberately requires genuine
+ * interdiction geometry (`objective.type === "interdict"`): object-form
+ * assignments are a public caller contract, so an arbitrary injected
+ * role label with foreign objective metadata passes through untouched.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearInterdictionGeometry(assignment) {
+    if (!assignment || assignment.role !== INTERDICT_ROLE) return;
+    if (assignment.objective?.type !== INTERDICT_OBJECTIVE_TYPE) return;
+    delete assignment.role;
+    delete assignment.objective;
+    assignment.assignedTargetId = null;
 }
 
 /**
@@ -2061,7 +2089,19 @@ export function createFireteamService({
                     seen: target?.seen,
                     los: target?.los,
                     canAttack: target?.canAttack,
-                    attackable: target?.attackable
+                    attackable: target?.attackable,
+                    // Issue #87: the interdiction shooter projection reads
+                    // per-class EVs and the charge rate. Explicitly
+                    // injected fields win; otherwise derive them from the
+                    // live actor so visible contacts carry the profile
+                    // the trigger gates need. Extra keys are inert for
+                    // the concentrate-fire selector.
+                    ...(target?.emitters !== undefined ? { emitters: target.emitters }
+                        : actor ? { emitters: weaponEmitters(actor) } : {}),
+                    ...(Number.isFinite(target?.rangedEV) ? { rangedEV: target.rangedEV } : {}),
+                    ...(Number.isFinite(target?.meleeEV) ? { meleeEV: target.meleeEV } : {}),
+                    chargeRate: _finiteOr(target?.chargeRate,
+                        _finiteOr(actor?.system?.movement?.charge, null))
                 };
             }).filter(entry => entry.tokenId || entry.tokenUuid);
         }
@@ -2104,7 +2144,11 @@ export function createFireteamService({
                 statuses: _mergeStatusIds(other.actor?.statuses, doc.statuses, doc.actor?.statuses),
                 reactionUsed: _readFlag(other, FLAG_KEYS.reactionUsed) ?? null,
                 threatEv: _threatEvOf(null, actor),
-                allyEngaged: null
+                allyEngaged: null,
+                // Issue #87: visible live hostiles carry their shooter
+                // projection for the interdiction trigger gates.
+                ...(actor ? { emitters: weaponEmitters(actor) } : {}),
+                chargeRate: _finiteOr(actor?.system?.movement?.charge, null)
             });
         }
         return targets;
@@ -2351,23 +2395,32 @@ export function createFireteamService({
      * @param {number} input.seed Plan seed.
      * @param {object} input.combat Combat document.
      * @param {object} input.context `buildTeamPlan` context.
+     * @param {object|null} [input.character] Party character reference
+     *   forwarded to tactic selectors (interdiction memory rejection).
      * @param {object|null} [input.focusObjective] Concentrate-fire objective
      *   selected before the maneuver registry.
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context,
-        focusObjective = null }) {
+        focusObjective = null, character = null }) {
         const selectorInput = {
             members,
             leaderId,
             teamId,
             seed,
-            targets: context.tacticTargets ?? (Array.isArray(context.targets) ? context.targets : null),
+            // Issue #87: without injected contacts the selector still sees
+            // the live visible hostiles — the scan carries positions,
+            // wounds, emitter projections and charge rates. Injected
+            // callers keep exact control of the contact list.
+            targets: context.tacticTargets ?? (Array.isArray(context.targets)
+                ? context.targets
+                : _convergentTargets({ members, combat, context })),
             objective: context.objective ?? focusObjective ?? null,
             casualties: _finiteOr(context.casualties, 0),
             scene: context.scene ?? combat?.scene ?? null,
             combat,
-            context
+            context,
+            character
         };
         const source = context.tactic;
         if (source !== undefined) {
@@ -2959,10 +3012,18 @@ export function createFireteamService({
             seed,
             combat,
             context,
-            focusObjective: selectedFocus
+            focusObjective: selectedFocus,
+            character
         });
         const tacticName = tactic?.name ?? tactic?.tactic ?? null;
-        if (teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+        // Issue #87: the interdiction screen is a composite maneuver — its
+        // breakdown records the base attack maneuver it screens, and the
+        // flank doctrine/proof machinery applies when that base is a
+        // flank-and-fix.
+        const baseTacticName = tactic?.breakdown?.baseTactic ?? null;
+        const isFlankManeuver = tacticName === "flank-and-fix"
+            || (tacticName === INTERDICTION_TACTIC && baseTacticName === "flank-and-fix");
+        if (teamPreset === SPEC_OPS_PRESET_ID && isFlankManeuver
             && Number.isFinite(tactic.flankMinAngleDegrees)) {
             // Factories can bind a stricter doctrine than the saved
             // setting; publish precisely the cutoff used by the draft.
@@ -2984,12 +3045,55 @@ export function createFireteamService({
             context.maxDetachedPhases ?? tactic?.maxDetachedPhases,
             DEFAULT_MAX_DETACHED_PHASES);
 
+        // Issue #87: interdiction exclusions are objective constraints,
+        // not scoring weights. The concentrate-fire focus is recomputed
+        // with the interception targets removed from candidacy whenever
+        // the tactic carries exclusions — a screened target can never
+        // stay the team's focus, and only the exclusion channels (never
+        // target-pool narrowing) carry the ban into every member's
+        // attack pool below.
+        const tacticExclusions = Array.isArray(tactic?.excludedTargets)
+            ? tactic.excludedTargets.filter(entry =>
+                entry && ((entry.targetId !== null && entry.targetId !== undefined)
+                    || (typeof entry.tokenUuid === "string" && entry.tokenUuid)))
+            : [];
+        const exclusionIds = _uniqueIdList(tacticExclusions.flatMap(entry =>
+            [entry.targetId, entry.tokenUuid]));
+        if (convergence && exclusionIds.length) {
+            const refocus = _focusSelection({
+                members,
+                combat,
+                context: {
+                    ...context,
+                    excludeTargetIds: _uniqueIdList([
+                        ...(Array.isArray(context.excludeTargetIds) ? context.excludeTargetIds : []),
+                        ...exclusionIds
+                    ])
+                },
+                teamPreset,
+                casualties: allMembers.filter(member => member.defeated === true).length
+            });
+            convergence = refocus.focus;
+            diagnostics.focus = _jsonClone({
+                ...refocus.result.diagnostics,
+                focus: convergence,
+                candidates: refocus.result.candidates,
+                interdictionExclusions: exclusionIds
+            });
+        }
+
         // Objective precedence is explicit caller order → independent tactic
         // objective → focus. A tactic that merely inherits the focus target
         // (specOps does) keeps the focus assignment metadata; a tactic that
         // deliberately binds another target wins and the focus overlay stays
-        // diagnostic-only for this draft.
-        const tacticTargetId = tactic?.objective?.targetId ?? null;
+        // diagnostic-only for this draft. The interdiction objective is
+        // role-scoped (issue #87): its `targetId` is the interception target
+        // of the interdictor alone, so the shared focus channel must not
+        // collapse onto it — non-interdictor members keep engaging the
+        // recomputed focus or the remaining enemies.
+        const interdictObjective = tactic?.objective?.type === INTERDICT_OBJECTIVE_TYPE
+            ? tactic.objective : null;
+        const tacticTargetId = interdictObjective ? null : (tactic?.objective?.targetId ?? null);
         const tacticInheritsFocus = Boolean(convergence && tacticTargetId
             && _idListsOverlap([tacticTargetId], _focusIdentityIds(convergence)));
         if (convergence && tacticTargetId && !tacticInheritsFocus) convergence = null;
@@ -3002,9 +3106,15 @@ export function createFireteamService({
             : null;
         const sharedObjective = context.objective
             ?? (tactic?.objective
-                ? (tacticInheritsFocus && focusObjectiveFields
-                    ? { ...tactic.objective, ...focusObjectiveFields }
-                    : tactic.objective)
+                ? (interdictObjective
+                    ? {
+                        ...tactic.objective,
+                        targetId: convergence?.targetId ?? null,
+                        ...(focusObjectiveFields ?? {})
+                    }
+                    : (tacticInheritsFocus && focusObjectiveFields
+                        ? { ...tactic.objective, ...focusObjectiveFields }
+                        : tactic.objective))
                 : (convergence
                     ? {
                         targetId: convergence.targetId,
@@ -3051,6 +3161,7 @@ export function createFireteamService({
                 assignment.task = "support";
                 assignment.groupId = "main";
                 _clearSuppressionGeometry(assignment);
+                _clearInterdictionGeometry(assignment);
             }
         }
         diagnostics.gmControlled = [...gmControlledIds];
@@ -3078,6 +3189,7 @@ export function createFireteamService({
                 assignment.task = to;
                 assignment.groupId = "main";
                 _clearSuppressionGeometry(assignment);
+                _clearInterdictionGeometry(assignment);
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
@@ -3090,7 +3202,7 @@ export function createFireteamService({
         const leader = members.find(m => m.combatantId === election.combatantId);
         const leaderPos = leader?.position ?? null;
         const scene = context.scene ?? combat.scene ?? null;
-        const flankRules = teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+        const flankRules = teamPreset === SPEC_OPS_PRESET_ID && isFlankManeuver
             ? {
                 flankCenter: specOpsTokenCenter(_tokenDoc(leader?.combatant?.token), scene, leaderPos),
                 flankMinAngleDegrees: context.specOpsConfig.flankMinAngleDegrees
@@ -3175,6 +3287,12 @@ export function createFireteamService({
                     // the target itself — without it the task was a dead
                     // label and the member wandered (smoke finding).
                     flankPoint: tactic?.objective?.flankPoint ?? null,
+                    // Issue #87: the interdictor's screen anchor travels
+                    // with the team context so the movement generator can
+                    // merge screen-point candidates and `screenProgress`
+                    // can score the approach.
+                    screenPoint: assignment.role === INTERDICT_ROLE
+                        ? (assignment.objective?.screenPoint ?? null) : null,
                     regroupPoint: assignment.task === "regroup"
                         ? (rejoinPoints[0] ?? null) : null
                 }
@@ -3187,6 +3305,26 @@ export function createFireteamService({
             const focusPoolOverrides = _focusAttackPoolOverrides(
                 member.combatantId, convergence, context, assignment);
             Object.assign(memberContext, focusPoolOverrides);
+            // Issue #87: interdiction exclusions join the attack-pool
+            // deny-list additively — caller exclusions stay preserved and
+            // the threat pool is never narrowed. The interdictor's own
+            // interception target is the one exclusion that does not apply
+            // to them: they exist to charge and tie up exactly that enemy.
+            if (exclusionIds.length) {
+                const ownInterception = assignment?.role === INTERDICT_ROLE
+                    ? _uniqueIdList([assignment?.objective?.targetId, assignment?.objective?.targetUuid])
+                    : [];
+                const denyIds = ownInterception.length
+                    ? exclusionIds.filter(id => !_idListsOverlap([id], ownInterception))
+                    : exclusionIds;
+                if (denyIds.length) {
+                    memberContext.excludedAttackTargetIds = _uniqueIdList([
+                        ...(Array.isArray(memberContext.excludedAttackTargetIds)
+                            ? memberContext.excludedAttackTargetIds : []),
+                        ...denyIds
+                    ]);
+                }
+            }
             if (Object.hasOwn(focusPoolOverrides, "attackTargetIds")) {
                 // Provenance for executor target-gone replans: the derived
                 // focus allow-list must not strand the member on a dead
@@ -3260,18 +3398,39 @@ export function createFireteamService({
                         reason: "gm-intervention"
                     });
                     diagnostics.gmDemotions = gmDemotions;
+                    // Issue #87: capture the interception ids before the
+                    // geometry clear — a demoted interdictor becomes an
+                    // ordinary member and the command denial now applies
+                    // to them as well.
+                    const lostInterception = assignment.role === INTERDICT_ROLE
+                        ? _uniqueIdList([assignment.objective?.targetId, assignment.objective?.targetUuid])
+                            .filter(id => exclusionIds.some(ex => String(ex) === String(id)))
+                        : [];
                     assignment.task = "support";
                     assignment.groupId = "main";
                     _clearSuppressionGeometry(assignment);
+                    _clearInterdictionGeometry(assignment);
                     try {
                         const retry = await memberPlanner.planTurn(combat,
                             member.combatant, {
                                 ...memberContext,
                                 replanCount: _finiteOr(context.replanCount, 0) + 1,
+                                ...(lostInterception.length ? {
+                                    excludedAttackTargetIds: _uniqueIdList([
+                                        ...(Array.isArray(memberContext.excludedAttackTargetIds)
+                                            ? memberContext.excludedAttackTargetIds : []),
+                                        ...lostInterception
+                                    ])
+                                } : {}),
                                 team: {
                                     ...memberContext.team,
                                     task: "support",
                                     groupId: "main",
+                                    role: assignment.role ?? null,
+                                    element: assignment.element ?? null,
+                                    memberObjective: assignment.objective
+                                        ? _jsonClone(assignment.objective) : null,
+                                    screenPoint: null,
                                     assignment: _assignmentDescriptor(assignment)
                                 }
                             });

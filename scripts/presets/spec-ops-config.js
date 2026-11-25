@@ -12,10 +12,18 @@ export const SPEC_OPS_CONFIG = Object.freeze({
     flankWeight: 8,
     assaultWeight: 7,
     cohesionWeight: 10,
+    // Issue #87: interdiction-screen trigger gates. `confidenceMin` is the
+    // pure-shooter ratio `rangedEV / (rangedEV + meleeEV)`, `minRangedEV`
+    // the damage floor of trigger A and `chargerConfidenceMin` the
+    // melee-orientation ratio of trigger B.
+    interdictConfidenceMin: 0.7,
+    interdictMinRangedEV: 6,
+    interdictChargerConfidenceMin: 0.5,
     fallbackPreset: FALLBACK_PRESET
 });
 
 const weightRange = Object.freeze({ min: 0, max: 20, step: 0.5 });
+const ratioRange = Object.freeze({ min: 0, max: 1, step: 0.05 });
 export const SPEC_OPS_NUMERIC_RANGES = Object.freeze({
     flankMinAngleDegrees: Object.freeze({ min: 1, max: 180, step: 1 }),
     maxDetachedRounds: Object.freeze({ min: 0, max: 10, step: 1 }),
@@ -23,7 +31,10 @@ export const SPEC_OPS_NUMERIC_RANGES = Object.freeze({
     supportWeight: weightRange,
     flankWeight: weightRange,
     assaultWeight: weightRange,
-    cohesionWeight: weightRange
+    cohesionWeight: weightRange,
+    interdictConfidenceMin: ratioRange,
+    interdictMinRangedEV: Object.freeze({ min: 0, max: 30, step: 0.5 }),
+    interdictChargerConfidenceMin: ratioRange
 });
 
 /**

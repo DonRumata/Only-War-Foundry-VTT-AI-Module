@@ -197,6 +197,24 @@ export function _resolveMoves({ tokenDoc, target, range, bandRange = null,
                 raw.push({ ...entry, distance: null });
             }
         }
+        // Issue #87: the interdictor's screen anchor is the team's
+        // `screenPoint` (falling back to the serialized member objective
+        // on the team-turn compile path). Merging cells toward it lets
+        // `screenProgress` pick a legal endpoint when the charge lane is
+        // blocked — added candidates never replace the charge probes.
+        const screenPoint = context.team?.role === "interdictor"
+            ? (context.team?.screenPoint ?? context.team?.memberObjective?.screenPoint ?? null)
+            : null;
+        if (Number.isFinite(screenPoint?.x) && Number.isFinite(screenPoint?.y)) {
+            const seen = new Set(raw.map(entry =>
+                `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`));
+            for (const entry of find({ target: screenPoint })) {
+                const key = `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                raw.push({ ...entry, distance: null });
+            }
+        }
     }
     if (raw === null) {
         // Fallback without navigation: staying put plus a straight-line

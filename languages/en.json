@@ -51,6 +51,7 @@
   "OWAI.Task.assault": "Assault",
   "OWAI.Task.regroup": "Regroup",
   "OWAI.Tactic.flank-and-fix": "Flank and fix",
+  "OWAI.Tactic.interdiction-screen": "Interdiction screen",
   "OWAI.Tactic.coordinated-assault": "Coordinated assault",
   "OWAI.Tactic.covering-advance": "Covering advance",
   "OWAI.Tactic.regroup-fallback": "Regroup / fallback",

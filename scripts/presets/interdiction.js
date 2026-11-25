@@ -468,9 +468,19 @@ export function memberCombatProfile(member) {
     const fullMove = _finiteOr(member?.fullMove,
         _finiteOr(movement?.full,
             Number.isFinite(chargeRate) ? (chargeRate * 2) / 3 : null));
+    // Wounds semantics follow the system truth (issues #87/#93, mirroring
+    // `concentrate-fire.normalizeFocusWounds`): `system.wounds.value` is
+    // damage TAKEN and `max` the capacity, so the actor-derived remainder
+    // is `max − value`. A value-only record is a legacy injection read as
+    // the remainder directly. Explicit member `hp`/`wounds` fields still
+    // win — tests inject the remainder there.
+    const systemWounds = actor?.system?.wounds ?? null;
+    const derivedWounds = systemWounds && Number.isFinite(systemWounds.max)
+        && Number.isFinite(systemWounds.value)
+        ? systemWounds.max - systemWounds.value
+        : _finiteOr(systemWounds?.value, 0);
     const wounds = _finiteOr(member?.hp,
-        _finiteOr(member?.wounds,
-            _finiteOr(actor?.system?.wounds?.value, 0)));
+        _finiteOr(member?.wounds, derivedWounds));
     return {
         meleeEV,
         rangedEV,
