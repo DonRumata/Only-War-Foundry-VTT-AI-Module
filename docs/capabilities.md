@@ -204,19 +204,42 @@ execute: расхождение — `stale-state` (перемещение, см�
   `hard` — дополнительно lookahead по умолчанию. `plan.difficulty` и
   `diagnostics.difficulty/easyPick` отражают выбор. Настройка — точка
   опоры для личностей ботов (issue #19).
-- **Fireteam kill-EV конвергенция**: `buildTeamPlan` суммирует ожидаемый
-  урон членов, чьё оружие достаёт до цели (ranged — по дальности, melee —
-  reach + полоса), и сравнивает с `wounds` цели (из snapshot/инъекции).
-  Семантика wounds — *оставшийся* запас здоровья (issue #93): система
-  считает `system.wounds.value` нанесённым уроном, поэтому объект
-  `{value, max}` читается как `max − value`; plain-число инъекции уже
-  считается эффективным запасом.
-  `killEV ≥ wounds` → конвергентный объект: `teamPlan.convergence
-  {targetId, targetUuid, killEV, wounds, margin, capableMembers}`,
-  общий `assignedTargetId` всем способным, flank-группа не выделяется
-  (если не задана явно). Цель без читаемых wounds не конвергентна;
-  приоритет — `context.objective`/тактика/`context.assignments`,
-  отключение — `context.convergence === false`.
+- **Fireteam concentrate-fire / kill-EV конвергенция** (issues #16/#85):
+  `buildTeamPlan` нормализует видимых hostile в pure selector
+  `scripts/presets/concentrate-fire.js`. Семантика wounds — *оставшийся*
+  запас здоровья: `system.wounds.value` — нанесённый урон, поэтому объект
+  `{value, max}` читается как `max − value`; plain-число и value-only
+  инъекции уже считаются эффективным запасом. Живой scan требует, чтобы
+  хотя бы один живой enabled член видел цель через perception; injected
+  memory/relay/hidden контакты кандидатами не являются. Команда читает
+  statuses, `reactionUsed`, threat EV из weapon emitters, melee gang-up и
+  `lastTarget` hysteresis; killEV считается per member/per target по
+  дальности лучшего emitter.
+  Гарантированный kill остаётся legacy-режимом `mode:"kill"`: все capable
+  members получают цель, cap/exclusions нет, flank не выделяется (если не
+  задан явно), а `diagnostics.convergence` остаётся backward-compatible
+  alias. Scored `mode:"focus"` выбирает приоритетную цель по угрозе,
+  уязвимости, потраченной реакции, friendly-fire/gang-up доктрине пресета,
+  exposure и hysteresis. Descriptor — backward-compatible superset:
+  `targetId, targetUuid, killEV, wounds, margin, capableMembers` плюс
+  `mode, focusScore, focusCap, assignedMembers, excludedMembers,
+  woundsKnown, breakdown, runnerUp` (и `actorId` для planner identity).
+  Objective precedence: explicit `context.objective` → independent
+  `tactic.objective` → focus; focus выбирается до registry и подаётся в
+  specOps как входной objective. Назначенные члены получают additive
+  `role:"focus"` только если role не задана; member-scoped objective target
+  сильнее focus. Отключение — `context.convergence === false`,
+  `context.killEV === false` или `context.focus === false`;
+  `excludeTargetIds` убирает candidacy, но не threat mass. Диагностика —
+  JSON-safe `diagnostics.focus` с coefficients, candidates, visibility и
+  assignment/exclusion summary.
+- **Focus attack pools**: назначенные члены сохраняют полный
+  threat/engagement `targets` и получают direct-attack `attackTargetIds`;
+  capable overflow сохраняет полный pool и получает focus target в
+  `excludedAttackTargetIds`. Caller allow-list является hard constraint и
+  пересекается с focus, caller deny-list сохраняется; member-objective
+  redirect важнее focus pool. Target-conflict и target-gone replan не наследуют
+  derived focus allow-list.
 
 #### Личности ботов (issue #19)
 

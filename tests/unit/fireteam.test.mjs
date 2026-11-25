@@ -22,6 +22,7 @@ import {
 } from "../../scripts/fireteam.js";
 import { createPlannerService } from "../../scripts/planner.js";
 import { createTacticRegistry } from "../../scripts/tactics/registry.js";
+import { selectSpecOpsTactic } from "../../scripts/presets/spec-ops.js";
 import {
     makeActor,
     makeCombatant,
@@ -1025,4 +1026,460 @@ test("collectMembers exposes combat turnIndex and hasActed without changing orde
         assert.equal(member.turnIndex, null);
         assert.equal(member.hasActed, false);
     }
+});
+
+/* ------------------------------------------------------------------ */
+/* Concentrate-fire integration (issue #85)                           */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Build a team world with several injected-focus hostiles.
+ * @param {number} memberCount Living team size.
+ * @param {object[]} specs Enemy extras (`x`, `y`, `wounds`, `items`).
+ * @returns {object}
+ */
+function makeFocusWorld(memberCount, specs) {
+    const members = Array.from({ length: memberCount }, (_, index) => makeMember({
+        fireteam: { teamId: "alpha" },
+        x: index * 100,
+        y: 0,
+        initiative: 20 - index
+    }));
+    const scene = makeScene({ grid: "square" });
+    const enemies = specs.map((spec, index) => {
+        const actor = makeActor();
+        actor.system = { wounds: { value: 0, max: spec.wounds ?? 100 } };
+        actor.items = spec.items ?? [];
+        const token = makeToken({ actor });
+        token.x = spec.x ?? 2000;
+        token.y = spec.y ?? index * 200;
+        token.elevation = 0;
+        token.disposition = 1;
+        const combatant = makeCombatant({ actor, token });
+        combatant.tokenId = token.id;
+        return { actor, token, combatant };
+    });
+    const combat = makeCombat({
+        round: 2,
+        turn: 0,
+        combatants: [...members.map(member => member.combatant),
+            ...enemies.map(enemy => enemy.combatant)]
+    });
+    combat.scene = scene;
+    combat.ended = false;
+    return { scene, combat, members, enemies };
+}
+
+/**
+ * Injected visible target entries matching {@link makeFocusWorld} enemies.
+ * @param {object} world
+ * @param {object[]} [overrides] Per-enemy target overrides.
+ * @returns {object[]}
+ */
+function focusTargets(world, overrides = []) {
+    return world.enemies.map((enemy, index) => ({
+        tokenId: enemy.token.id,
+        tokenUuid: `Scene.${world.scene.id}.Token.${enemy.token.id}`,
+        actorId: enemy.actor.id,
+        x: enemy.token.x,
+        y: enemy.token.y,
+        wounds: 100,
+        threatEv: 5,
+        statuses: [],
+        reactionUsed: null,
+        allyEngaged: false,
+        source: "visible",
+        canAttack: true,
+        ...(overrides[index] ?? {})
+    }));
+}
+
+/**
+ * Capture member planner contexts while returning minimal valid plans.
+ * @returns {{planner: object, calls: object[]}}
+ */
+function captureFireteamPlanner() {
+    const calls = [];
+    return {
+        calls,
+        planner: {
+            planTurn: async (combat, combatant, context) => {
+                calls.push({
+                    combatantId: combatant.id,
+                    context,
+                    attackTargetIds: Array.isArray(context.attackTargetIds)
+                        ? [...context.attackTargetIds] : context.attackTargetIds,
+                    excludedAttackTargetIds: Array.isArray(context.excludedAttackTargetIds)
+                        ? [...context.excludedAttackTargetIds] : context.excludedAttackTargetIds,
+                    targetCount: Array.isArray(context.targets) ? context.targets.length : null,
+                    replanCount: context.replanCount
+                });
+                const attackId = Array.isArray(context.attackTargetIds)
+                    && context.attackTargetIds.length
+                    ? context.attackTargetIds[0] : null;
+                return {
+                    status: "ok",
+                    plan: {
+                        id: `plan-${combatant.id}-${calls.length}`,
+                        score: 1,
+                        target: attackId ? { tokenId: attackId } : null,
+                        snapshot: { targets: context.targets ?? [] },
+                        steps: [{ id: "end-1", type: "end-turn", input: {}, cost: {} }],
+                        diagnostics: { layers: [] }
+                    }
+                };
+            }
+        }
+    };
+}
+
+test("concentrate-fire: scored focus assigns capacity, roles and split attack pools", async () => {
+    const world = makeFocusWorld(3, [{}, {}, {}].map((_, index) => ({ y: index * 200 })));
+    const focusId = world.enemies[0].token.id;
+    const otherId = world.enemies[1].token.id;
+    const targets = focusTargets(world, [
+        { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+        { threatEv: 5 },
+        { threatEv: 2 }
+    ]);
+    const capture = captureFireteamPlanner();
+    const service = createFireteamService({ planner: capture.planner });
+    const result = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: world.members[0].combatant.id
+    }, {
+        seed: 17,
+        teamPreset: "rangedCover",
+        targets
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    const focus = result.teamPlan.convergence;
+    assert.ok(focus, "a positive scored focus is selected");
+    assert.equal(focus.mode, "focus");
+    assert.equal(focus.targetId, focusId);
+    assert.equal(focus.wounds, 100);
+    assert.ok(focus.focusScore > 0);
+    assert.equal(focus.capableMembers.length, 3);
+    assert.equal(focus.focusCap, 2, "rangedCover keeps one capable member outside the focus");
+    assert.equal(focus.assignedMembers.length, 2);
+    assert.equal(focus.excludedMembers.length, 1);
+    assert.equal(result.teamPlan.diagnostics.convergence, null,
+        "the legacy convergence diagnostic alias remains kill-mode-only");
+    assert.equal(result.teamPlan.diagnostics.focus.coefficients.focusCapShare, 0.75);
+    assert.ok(result.teamPlan.diagnostics.focus.candidates.some(c => c.targetId === focusId));
+    assert.deepEqual(JSON.parse(JSON.stringify(focus)), focus);
+
+    const assigned = new Set(focus.assignedMembers);
+    const excluded = new Set(focus.excludedMembers);
+    for (const entry of result.teamPlan.members) {
+        if (assigned.has(entry.combatantId)) {
+            assert.equal(entry.assignedTargetId, focusId);
+            assert.equal(entry.role, "focus");
+        } else if (excluded.has(entry.combatantId)) {
+            assert.equal(entry.assignedTargetId, null,
+                "capable overflow receives no focus assignedTargetId");
+            assert.notEqual(entry.role, "focus");
+        }
+    }
+    for (const call of capture.calls) {
+        assert.equal(call.targetCount, 3,
+            "every member keeps the full threat/awareness pool");
+        if (assigned.has(call.combatantId)) {
+            assert.ok(call.attackTargetIds.includes(focusId));
+            assert.ok(!call.attackTargetIds.includes(otherId),
+                "the focus allow-list narrows only direct attacks");
+        } else if (excluded.has(call.combatantId)) {
+            assert.equal(call.attackTargetIds, undefined);
+            assert.ok(call.excludedAttackTargetIds.includes(focusId),
+                "overflow receives the focus target as a deny-list entry");
+        }
+    }
+});
+
+test("concentrate-fire: injected visibility gate rejects hidden and memory-only hostiles", async () => {
+    const world = makeFocusWorld(3, [{}, {}, {}, {}].map((_, index) => ({ y: index * 200 })));
+    const hiddenId = world.enemies[0].token.id;
+    const visibleId = world.enemies[1].token.id;
+    const memoryId = world.enemies[3].token.id;
+    const targets = focusTargets(world, [
+        { threatEv: 30, statuses: ["pinned", "stunned"], reactionUsed: true, visible: false },
+        { threatEv: 10 },
+        { threatEv: 5 },
+        { threatEv: 30, statuses: ["pinned"], reactionUsed: true, source: "last-known" }
+    ]);
+    const capture = captureFireteamPlanner();
+    const service = createFireteamService({ planner: capture.planner });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 3,
+        teamPreset: "rangedCover",
+        targets
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence?.targetId, visibleId,
+        "the strongest hostiles are ignored when no living member currently sees them");
+    assert.ok(result.teamPlan.diagnostics.focus.unseenTargetIds.includes(hiddenId));
+    assert.ok(result.teamPlan.diagnostics.focus.unseenTargetIds.includes(memoryId));
+    assert.ok(!result.teamPlan.diagnostics.focus.candidates.some(c => c.targetId === hiddenId));
+    assert.ok(!result.teamPlan.diagnostics.focus.candidates.some(c => c.targetId === memoryId));
+});
+
+test("concentrate-fire: live scan without perception visibility selects no focus", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, initiative: 20 });
+    const second = makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 15 });
+    const world = makeTeamWorld([leader, second]);
+    const service = createFireteamService({ planner: captureFireteamPlanner().planner });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 5,
+        perception: { hasLineOfSight: () => false }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence, null);
+    assert.equal(result.teamPlan.diagnostics.focus.visibleTargets, 0);
+    assert.equal(result.teamPlan.diagnostics.focus.reason, "no-candidates");
+});
+
+test("concentrate-fire: kill mode remains the legacy whole-team convergence", async () => {
+    const world = makeFocusWorld(3, [{}]);
+    const targetId = world.enemies[0].token.id;
+    const capture = captureFireteamPlanner();
+    const service = createFireteamService({ planner: capture.planner });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 5,
+        teamPreset: "assault",
+        targets: focusTargets(world, [{ wounds: 10, threatEv: 8 }])
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    const focus = result.teamPlan.convergence;
+    assert.equal(focus.mode, "kill");
+    assert.equal(focus.targetId, targetId);
+    assert.equal(focus.assignedMembers.length, 3);
+    assert.deepEqual(focus.excludedMembers, []);
+    assert.equal(result.teamPlan.diagnostics.convergence.targetId, targetId,
+        "kill mode keeps the backward-compatible diagnostics alias");
+    assert.equal(result.teamPlan.members.every(m => m.assignedTargetId === targetId), true);
+    assert.equal(result.teamPlan.members.every(m => m.role !== "focus"), true,
+        "legacy kill convergence does not invent focus roles");
+    for (const call of capture.calls) {
+        assert.ok(call.attackTargetIds.includes(targetId));
+    }
+});
+
+test("concentrate-fire: caller attack pools are hard constraints and deny-lists survive", async () => {
+    const world = makeFocusWorld(3, [{}, {}, {}].map((_, index) => ({ y: index * 200 })));
+    const focusId = world.enemies[0].token.id;
+    const otherId = world.enemies[1].token.id;
+    const targets = focusTargets(world, [
+        { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+        { threatEv: 5 },
+        { threatEv: 2 }
+    ]);
+    const positive = captureFireteamPlanner();
+    const service = createFireteamService({ planner: positive.planner });
+    const allowed = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 17,
+        teamPreset: "rangedCover",
+        targets,
+        attackTargetIds: [focusId, "caller-other"],
+        excludedAttackTargetIds: ["caller-denied"]
+    });
+    assert.equal(allowed.status, FIRETEAM_STATUS.ok);
+    const focus = allowed.teamPlan.convergence;
+    for (const call of positive.calls) {
+        if (focus.assignedMembers.includes(call.combatantId)) {
+            assert.ok(call.attackTargetIds.includes(focusId));
+            assert.ok(!call.attackTargetIds.includes("caller-other"),
+                "focus intersection narrows the caller allow-list to the focus target");
+        }
+        if (focus.excludedMembers.includes(call.combatantId)) {
+            assert.ok(call.excludedAttackTargetIds.includes("caller-denied"),
+                "the caller deny-list is preserved");
+            assert.ok(call.excludedAttackTargetIds.includes(focusId));
+        }
+    }
+
+    const negative = captureFireteamPlanner();
+    const negativeService = createFireteamService({ planner: negative.planner });
+    const blocked = await negativeService.buildTeamPlan(world.combat, "alpha", {
+        seed: 17,
+        teamPreset: "rangedCover",
+        targets,
+        attackTargetIds: [otherId]
+    });
+    assert.equal(blocked.status, FIRETEAM_STATUS.ok);
+    const blockedFocus = blocked.teamPlan.convergence;
+    for (const call of negative.calls) {
+        if (blockedFocus.assignedMembers.includes(call.combatantId)) {
+            assert.deepEqual(call.attackTargetIds, [],
+                "a caller allow-list outside the focus stays an active empty intersection");
+        }
+    }
+});
+
+test("concentrate-fire: assault doctrine treats an engaged ally as gang-up", async () => {
+    const world = makeFocusWorld(3, [{}, {}].map((_, index) => ({ y: index * 200 })));
+    const gangUpId = world.enemies[0].token.id;
+    const capture = captureFireteamPlanner();
+    const service = createFireteamService({ planner: capture.planner });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 11,
+        teamPreset: "assault",
+        targets: focusTargets(world, [
+            { threatEv: 10, allyEngaged: true },
+            { threatEv: 10 }
+        ])
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence?.targetId, gangUpId);
+    assert.equal(result.teamPlan.diagnostics.focus.coefficients.gangUp, true);
+    assert.equal(result.teamPlan.diagnostics.focus.coefficients.focusCapShare, 1);
+    assert.equal(result.teamPlan.convergence.breakdown.friendlyFireTerm, 0.75);
+});
+
+test("concentrate-fire: specOps registry receives the selected focus objective", async () => {
+    const world = makeFocusWorld(3, [{}, {}].map((_, index) => ({ y: index * 200 })));
+    const focusId = world.enemies[0].token.id;
+    const targets = focusTargets(world, [
+        { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+        { threatEv: 5 }
+    ]);
+    const capture = captureFireteamPlanner();
+    const registry = createTacticRegistry();
+    let selectorInput = null;
+    registry.registerTacticSelector({
+        presetId: "specOps",
+        select: input => {
+            selectorInput = input;
+            return selectSpecOpsTactic(input);
+        }
+    });
+    const service = createFireteamService({ planner: capture.planner, tactics: registry });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 19,
+        teamPreset: "specOps",
+        targets
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence?.targetId, focusId);
+    assert.equal(selectorInput?.objective?.targetId, focusId,
+        "focus selection happens before the preset maneuver selector");
+    assert.equal(result.teamPlan.tactic, "coordinated-assault");
+    assert.equal(result.teamPlan.objective, focusId,
+        "the fallback objective chain keeps coordinated assault on the same target");
+});
+
+test("concentrate-fire: selection is deterministic across target-list shuffles", async () => {
+    const world = makeFocusWorld(3, [{}, {}, {}].map((_, index) => ({ y: index * 200 })));
+    const targets = focusTargets(world, [
+        { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+        { threatEv: 5 },
+        { threatEv: 2 }
+    ]);
+    const run = async list => {
+        const capture = captureFireteamPlanner();
+        const service = createFireteamService({ planner: capture.planner });
+        const result = await service.buildTeamPlan(world.combat, "alpha", {
+            seed: 23,
+            teamPreset: "rangedCover",
+            targets: list
+        });
+        assert.equal(result.status, FIRETEAM_STATUS.ok);
+        return JSON.parse(JSON.stringify(result.teamPlan.convergence));
+    };
+    const forward = await run(targets);
+    const repeated = await run([...targets]);
+    const shuffled = await run([...targets].reverse());
+    assert.deepEqual(repeated, forward);
+    assert.deepEqual(shuffled, forward);
+});
+
+test("concentrate-fire: target-conflict retry drops the derived focus allow-list", async () => {
+    const world = makeFocusWorld(2, [{}, {}].map((_, index) => ({ y: index * 200 })));
+    const focusId = world.enemies[0].token.id;
+    const otherId = world.enemies[1].token.id;
+    const calls = new Map();
+    const planner = {
+        planTurn: async (combat, combatant, context) => {
+            const list = calls.get(combatant.id) ?? [];
+            list.push({
+                attackTargetIds: Array.isArray(context.attackTargetIds)
+                    ? [...context.attackTargetIds] : context.attackTargetIds,
+                role: context.team?.role ?? null,
+                replanCount: context.replanCount
+            });
+            calls.set(combatant.id, list);
+            // The stub deliberately ignores the focus allow-list on the first
+            // pass so both assault members collide on the non-focus target.
+            const targetId = context.replanCount
+                ? (context.targets?.[0]?.tokenId ?? focusId)
+                : otherId;
+            return {
+                status: "ok",
+                plan: {
+                    id: `plan-${combatant.id}-${list.length}`,
+                    score: 1,
+                    target: { tokenId: targetId },
+                    snapshot: { targets: context.targets ?? [] },
+                    steps: [{ id: "end-1", type: "end-turn", input: {}, cost: {} }],
+                    diagnostics: { layers: [] }
+                }
+            };
+        }
+    };
+    const service = createFireteamService({ planner });
+    const assignments = Object.fromEntries(world.members.map(member => [
+        member.combatant.id, "assault"
+    ]));
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 29,
+        teamPreset: "assault",
+        targets: focusTargets(world, [
+            { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+            { threatEv: 5 }
+        ]),
+        assignments,
+        taskCapacities: { assault: 1 }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence?.targetId, focusId);
+    const retried = [...calls.values()].filter(list => list.length > 1);
+    assert.equal(retried.length, 1, "the non-focus target collision replans once");
+    const [first, retry] = retried[0];
+    assert.ok(first.attackTargetIds.includes(focusId),
+        "the first pass carries the derived focus allow-list");
+    assert.equal(retry.attackTargetIds, undefined,
+        "target-conflict retry is no longer assigned-narrowed");
+    assert.equal(retry.role, "focus", "focus metadata survives the retry");
+    assert.equal(retry.replanCount, first.replanCount + 1);
+});
+
+test("concentrate-fire: a redirecting member objective wins over focus pools", async () => {
+    const world = makeFocusWorld(3, [{}, {}, {}].map((_, index) => ({ y: index * 200 })));
+    const focusId = world.enemies[0].token.id;
+    const otherId = world.enemies[1].token.id;
+    const leaderId = world.members[0].combatant.id;
+    const targets = focusTargets(world, [
+        { threatEv: 20, statuses: ["pinned"], reactionUsed: true },
+        { threatEv: 5 },
+        { threatEv: 2 }
+    ]);
+    const capture = captureFireteamPlanner();
+    const service = createFireteamService({ planner: capture.planner });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 31,
+        teamPreset: "rangedCover",
+        targets,
+        assignments: {
+            [leaderId]: {
+                task: "assault",
+                objective: { type: "screen", targetId: otherId }
+            }
+        }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.convergence?.targetId, focusId);
+    const leaderCall = capture.calls.find(call => call.combatantId === leaderId);
+    assert.equal(leaderCall.attackTargetIds, undefined,
+        "the explicit member objective is not narrowed back to the focus target");
+    assert.equal(result.teamPlan.members.find(m => m.combatantId === leaderId).assignedTargetId,
+        otherId, "member objective precedence over the shared focus is preserved");
 });

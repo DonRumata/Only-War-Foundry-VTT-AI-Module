@@ -612,6 +612,17 @@ export function createExecutorService({
             }
             let replanned = null;
             const replanContext = _planContext(context, context.operation, run.replanCount, run);
+            // Issue #85: a fireteam-derived focus allow-list is a heuristic
+            // commitment, not a permanent hard constraint. When the focus
+            // target is gone the replan must reopen the legal target pool;
+            // a caller-supplied hard allow-list is restored unchanged.
+            if (failReason === STALE_REASONS.targetGone
+                && replanContext.focusAttackPool?.allow === true) {
+                const fallback = replanContext.focusAttackPool.fallbackAttackTargetIds;
+                if (Array.isArray(fallback)) replanContext.attackTargetIds = [...fallback];
+                else delete replanContext.attackTargetIds;
+                delete replanContext.focusAttackPool;
+            }
             try {
                 replanned = await planner.planTurn(
                     context.combat,

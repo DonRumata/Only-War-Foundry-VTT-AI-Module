@@ -754,10 +754,11 @@ test("fireteam: scan convergence reads live wounds as max − value (issue #93)"
     // No injected targets — the combat scan reads the enemy actor's
     // wounds. only-war counts `wounds.value` as damage taken: a fresh
     // enemy (value 0, max 10) owns a pool of 10 and converges.
+    const perception = { hasLineOfSight: () => true };
     const fresh = await service.buildTeamPlan(world.combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
-    }, { seed: 5 });
+    }, { seed: 5, perception });
     assert.equal(fresh.status, FIRETEAM_STATUS.ok);
     assert.ok(fresh.teamPlan.convergence, "a fresh enemy converges through the scan path");
     assert.equal(fresh.teamPlan.convergence.wounds, 10);
@@ -767,7 +768,7 @@ test("fireteam: scan convergence reads live wounds as max − value (issue #93)"
     const hurt = await service.buildTeamPlan(world.combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
-    }, { seed: 5 });
+    }, { seed: 5, perception });
     assert.equal(hurt.teamPlan.convergence.wounds, 2,
         "damage already taken shrinks the convergence pool");
     assert.ok(hurt.teamPlan.convergence.margin
@@ -780,7 +781,7 @@ test("fireteam: scan convergence reads live wounds as max − value (issue #93)"
     const dead = await service.buildTeamPlan(world.combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
-    }, { seed: 5 });
+    }, { seed: 5, perception });
     assert.equal(dead.teamPlan.convergence, null);
 });
 

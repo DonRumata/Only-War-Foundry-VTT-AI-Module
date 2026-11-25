@@ -515,13 +515,57 @@ adjudicated-manual, adjudicated-skill-test`.
   переходах. Клетки, занятые другим назначением, нельзя использовать даже
   для прохода. После перепланирования конфликтующие маршруты не принимаются.
 - Лидер: flagged > инициатива > HP > seeded-хэш > id.
-- `buildTeamPlan`: фазы 0 movement → 1 action → 2 regroup; конвергенция
-  фокус-файра когда Σ EV ≥ wounds цели (#16); командный манёвр резолвится
-  через per-preset tactic registry (issue #92; explicit `context.tactic`
-  по-прежнему выше, specOps зарегистрирован базовым селектором);
-  `leader-lost` инвалидирует план.
+- `buildTeamPlan`: фазы 0 movement → 1 action → 2 regroup; концентрация
+  огня (#85) резолвится до per-preset tactic registry, поэтому specOps
+  получает уже выбранный `objective.targetId`; explicit `context.tactic`
+  по-прежнему выше реестра, `leader-lost` инвалидирует план.
 - `collectMembers` дополнительно отдаёт тактикам `turnIndex` из
   `combat.turns` и `hasActed` для текущего раунда (`turn:null` — false).
+
+### Концентрация огня (issue #85)
+
+`scripts/presets/concentrate-fire.js` остаётся чистым селектором; fireteam
+лишь обогащает вход документами боя. Кандидатом может стать только живая
+видимая hostile-цель: для scan-пути хотя бы один живой enabled член должен
+иметь LOS через perception, а в injected `context.targets` memory/relay
+(`last-known`, `team-contact`, `relay`, `intel`) и явно невидимые/
+неатакуемые записи отбрасываются. Это не ограничивает morale headcount или
+плановое восприятие — gate касается только выбора focus.
+
+Wounds читаются по исправленной семантике: объект `{value,max}` даёт
+эффективный запас `max − value`; plain number и value-only инъекции — уже
+эффективный запас. Scan-путь не предлагает цель с неположительным запасом
+как новую (она считается уже лежащей), но injected critical-target может
+быть передан явно. Kill-EV считается per member/per target через лучший
+достижимый weapon emitter; отсутствие LOS не обнуляет killEV, а лишь не
+даёт преимущества `losCapable` при детерминированном ранжировании.
+
+Режим `kill` — legacy-случай гарантированного добивания: все capable
+members назначаются, cap/exclusions нет, `diagnostics.convergence`
+сохраняется как backward-compatible alias. Режим `focus` — scored выбор
+(угроза, уязвимые статусы, потраченная реакция, friendly-fire/gang-up,
+exposure и hysteresis). Прежде всего действует приоритет objective:
+`context.objective` → независимый `tactic.objective` → focus. Если тактика
+лишь наследует focus target, она сохраняет `assignedMembers`/`mode`; если
+она связывает другую цель, focus остаётся только в диагностике.
+`assignedMembers` получают shared `assignedTargetId` и, если role ещё не
+задана, additive `role:"focus"`; capable overflow не получает
+`assignedTargetId`. Member-scoped `assignment.objective.targetId` сильнее
+focus: redirect не перетирается и не сужается обратно.
+
+Minimal split awareness действует и здесь: `context.targets` члена
+остаётся полным reservation-filtered threat/engagement pool. Assigned
+members получают `attackTargetIds` с identity ключами focus
+(`targetId/tokenUuid/actorId`), overflow — focus в
+`excludedAttackTargetIds`. Caller allow-list — hard constraint и
+пересекается с focus (пустое пересечение остаётся активным пустым
+allow-list); caller deny-list всегда сохраняется и дополняется для
+overflow. Per-task target reservation не вытесняет назначенных focus
+members, потому что ёмкость уже задана `focusCap`. Target-conflict и target-gone replan
+сохраняют team/assignment metadata, но восстанавливают исходный caller
+allow-list (обычно отсутствует) вместо derived focus allow-list; deny-list
+остаётся в силе. Полный scored result, coefficients, candidate list,
+assignment/exclusion и visibility summary лежат в `diagnostics.focus`.
 
 ### Исполнение TeamPlan в бою
 
