@@ -6,9 +6,9 @@
  *   inside a fireteam (`context.team` injected by `buildTeamPlan`) each
  *   member's individual evaluation is biased by its temporary task
  *   (`support`/`advance`/`flank`/`assault`/`regroup`); the shared TeamPlan
- *   itself is assembled by `fireteam.buildTeamPlan` fed with the
- *   deterministic tactic factory {@link specOpsTactic} (or
- *   {@link selectSpecOpsTactic} via `context.tactic`).
+ *   itself is assembled by `fireteam.buildTeamPlan`; the deterministic
+ *   {@link specOpsTactic} factory is registered as the preset maneuver in
+ *   the per-preset tactic registry (explicit `context.tactic` still wins).
  * - The tactic selector is a pure, deterministic situation assessment:
  *   member count, attackable contacts, casualties, threat pressure and
  *   flank geometry (maneuver hints). It proposes a serializable tactic;
@@ -34,6 +34,7 @@
  */
 import { evaluateFactors } from "../planner.js";
 import { _findToken, _tokenDoc, _tokenPosition } from "../planner/documents.js";
+import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
 import {
     SPEC_OPS_CONFIG,
     SPEC_OPS_PRESET_ID,
@@ -1066,16 +1067,36 @@ export function registerSpecOpsPreset(planner) {
 }
 
 /**
+ * Register the baseline spec-ops maneuver selector on a tactic registry
+ * (issue #92). The selector remains the exact {@link specOpsTactic} factory:
+ * the registry only supplies the deterministic per-preset dispatch point.
+ * @param {object} tactics Tactic registry service.
+ * @returns {object} The frozen registration record.
+ */
+export function registerSpecOpsTacticSelector(tactics) {
+    if (!tactics || typeof tactics.registerTacticSelector !== "function") {
+        throw new Error("[only-war-ai] Spec-ops tactic requires a tactic registry");
+    }
+    return tactics.registerTacticSelector({
+        presetId: SPEC_OPS_PRESET_ID,
+        kind: "maneuver",
+        priority: DEFAULT_TACTIC_PRIORITY,
+        select: specOpsTactic
+    });
+}
+
+/**
  * Convenience wrapper (issue #412): build the shared TeamPlan for a
- * spec-ops fireteam through `fireteam.buildTeamPlan` with the spec-ops
- * tactic factory. Without a fireteam service the caller should fall back
- * to an individual `planner.planTurn` — the solo preset behaviour keeps
+ * spec-ops fireteam through `fireteam.buildTeamPlan`. The default maneuver
+ * comes from the tactic registry; explicit `context.tactic` keeps its
+ * caller-override meaning. Without a fireteam service the caller should fall
+ * back to an individual `planner.planTurn` — the solo preset behaviour keeps
  * the NPC functional (`no-fireteam` diagnostics).
  * @param {object|null} fireteam Fireteam service.
  * @param {object} combat Combat document.
  * @param {object|string} team Team reference (see `buildTeamPlan`).
  * @param {object} [context] `buildTeamPlan` context; `tactic` may
- *   override the default spec-ops factory.
+ *   override the registered spec-ops selector.
  * @returns {Promise<object>} `buildTeamPlan` result.
  */
 export async function buildSpecOpsTeamPlan(fireteam, combat, team, context = {}) {
@@ -1084,7 +1105,6 @@ export async function buildSpecOpsTeamPlan(fireteam, combat, team, context = {})
     }
     return fireteam.buildTeamPlan(combat, team, {
         teamPreset: SPEC_OPS_PRESET_ID,
-        ...context,
-        tactic: context.tactic !== undefined ? context.tactic : specOpsTactic
+        ...context
     });
 }

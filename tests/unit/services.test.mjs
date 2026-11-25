@@ -48,6 +48,7 @@ test("module api exposes version, capabilities, config and services", () => {
     assert.equal(api.hasCapability("config.resolveEffectiveConfig"), true);
     assert.equal(api.hasCapability("services.register"), true);
     assert.equal(api.hasCapability("planner.planTurn"), true);
+    assert.equal(api.hasCapability("tactics.registry"), true);
     assert.equal(typeof api.config.resolveEffectiveConfig, "function");
     assert.equal(typeof api.services.register, "function");
     assert.deepEqual([...api.presets], [...AI_PRESETS]);

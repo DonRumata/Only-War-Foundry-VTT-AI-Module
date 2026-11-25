@@ -285,7 +285,8 @@ combatant, context)` строит immutable DTO-снапшот и детерми
 оружия сохраняется до 3 типов в курируемом порядке — melee `[allOut,
 charge, standard, lightning, swift, called_shot]`, ranged `[full_auto,
 semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
-`suppressing_fire` достижим — step-контракт несёт `targetPoint`/`template`
+`EXCLUDED_ATTACK_TYPES` пуст: `suppressing_fire` не исключается и достижим —
+step-контракт несёт `targetPoint`/`template`
 (issue #14). Вариант `charge` использует
 действие с `attackType: "charge"` того же оружия, если оно есть. Новые
 факторы: `attackType` (привлекательность типа атаки), `vulnerable` (цель
@@ -366,6 +367,27 @@ half-move, цель `reactionUsed`. Фактор `attackType` несёт
 `desire × (1 − chance)`; цель с потраченной реакцией добавляет
 `vulnerable` (planner читает флаг документа её комбатанта); бот с
 потраченной реакцией не декларирует overwatch (`reaction-used`).
+
+## Tactic registry (issue #92)
+
+`scripts/tactics/registry.js` — instance-local pure-сервис `tactics`
+(`api.services`, регистрируется в `module.js` на `init`). Запись selector'а:
+`{presetId, kind:"maneuver"|"overlay", priority, select}`; shorthand
+`registerTacticSelector(presetId, select)` даёт `maneuver` с приоритетом
+`DEFAULT_TACTIC_PRIORITY = 100`. Меньший `priority` оценивается раньше,
+равный — в порядке регистрации. В v1 `resolveTactic(presetId, input)` учитывает
+только `maneuver` и возвращает первый non-null descriptor; overlay — точка
+подключения следующих инкрементов и не участвует в выборе манёвра. Selector
+обязан быть synchronous/pure/deterministic и не мутировать Document/input.
+Точное повторное внесение того же selector'а с тем же kind/priority
+идемпотентно; конфликтующее — ошибка. `fireteam._resolveTactic` сначала
+сохраняет legacy-приоритет explicit `context.tactic` (function/object;
+`null`/`false` отключают), затем обращается к registry по `teamPreset`.
+specOps зарегистрирован через тот же `specOpsTactic`; assault/rangedCover/hold
+пока не имеют selectors и получают null/fallback без новых тактик. Для тактик
+`collectMembers` дополнительно несёт `turnIndex` (индекс в `combat.turns`)
+и `hasActed` (`turnIndex < combat.turn`; `turn:null`/отсутствие индекса —
+false), не меняя solo-планировщик.
 
 ## Реакции (issue #37)
 

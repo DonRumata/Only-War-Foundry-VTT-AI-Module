@@ -238,8 +238,8 @@ export async function _resolveActions(actor, context) {
     // (standard/charge/allOut/…) — curate per weapon: keep all available
     // attack types but cap each weapon to MAX_ATTACK_TYPES_PER_WEAPON
     // picks in curated preference order so a multi-type weapon cannot
-    // crowd others out under DEFAULT_MAX_ACTIONS. `suppressing_fire` is
-    // excluded outright (it needs a targetPoint/template).
+    // crowd others out under DEFAULT_MAX_ACTIONS. `suppressing_fire` is not
+    // excluded: the step contract carries its targetPoint/template geometry.
     // Injected/custom actions (no attackType) always pass through.
     const apiGroups = new Map();
     const passthrough = [];

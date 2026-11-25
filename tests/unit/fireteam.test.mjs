@@ -20,6 +20,7 @@ import {
     resolveTeamConfig
 } from "../../scripts/fireteam.js";
 import { createPlannerService } from "../../scripts/planner.js";
+import { createTacticRegistry } from "../../scripts/tactics/registry.js";
 import {
     makeActor,
     makeCombatant,
@@ -530,6 +531,79 @@ test("buildTeamPlan is deterministic for identical input", async () => {
         JSON.parse(JSON.stringify(r2.teamPlan.phases)));
 });
 
+test("buildTeamPlan resolves a registered preset tactic and empty presets fall back", async () => {
+    const flag = { teamId: "alpha", teamPreset: "assault" };
+    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
+    const wing = makeMember({ fireteam: flag, x: 100, y: 0, initiative: 10 });
+    const world = makeTeamWorld([leader, wing], { enemyX: 400 });
+    const tactics = createTacticRegistry();
+    let selectorInput = null;
+    tactics.registerTacticSelector({
+        presetId: "assault",
+        kind: "maneuver",
+        priority: 10,
+        select: input => {
+            selectorInput = input;
+            return {
+                name: "registered-test-maneuver",
+                reason: "registered",
+                assignments: {
+                    [leader.combatant.id]: "support",
+                    [wing.combatant.id]: "support"
+                },
+                allowFlank: false,
+                breakdown: { source: "test" }
+            };
+        }
+    });
+    const service = createFireteamService({ planner: createPlannerService(), tactics });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 42,
+        targets: injectedTargets(world)
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.tactic, "registered-test-maneuver");
+    assert.equal(result.teamPlan.diagnostics.tactic.reason, "registered");
+    assert.ok(result.teamPlan.members.every(member => member.task === "support"));
+    assert.equal(selectorInput.teamId, "alpha");
+    assert.equal(selectorInput.members.length, 2);
+    const inputTurns = Object.fromEntries(
+        selectorInput.members.map(member => [member.combatantId, member.turnIndex]));
+    assert.equal(inputTurns[leader.combatant.id], 0);
+    assert.equal(inputTurns[wing.combatant.id], 1);
+    assert.ok(selectorInput.members.every(member => member.hasActed === false));
+
+    // assault/rangedCover/hold have the same registry hook; without a
+    // registered selector the historical default assignment policy applies.
+    const unregistered = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 42,
+        targets: injectedTargets(world),
+        teamPreset: "rangedCover"
+    });
+    assert.equal(unregistered.status, FIRETEAM_STATUS.ok);
+    assert.equal(unregistered.teamPlan.tactic, null);
+    assert.equal(unregistered.teamPlan.diagnostics.tactic, null);
+});
+
+test("registry selector errors degrade to the legacy tactic-error diagnostic", async () => {
+    const flag = { teamId: "alpha", teamPreset: "assault" };
+    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
+    const wing = makeMember({ fireteam: flag, x: 100, y: 0, initiative: 10 });
+    const world = makeTeamWorld([leader, wing], { enemyX: 400 });
+    const tactics = createTacticRegistry();
+    tactics.registerTacticSelector("assault", () => {
+        throw new Error("broken selector");
+    });
+    const service = createFireteamService({ planner: createPlannerService(), tactics });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        seed: 42,
+        targets: injectedTargets(world)
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    assert.equal(result.teamPlan.tactic, null);
+    assert.equal(result.teamPlan.diagnostics.tactic.reason, "tactic-error");
+});
+
 test("buildTeamPlan reports no-members and leader-unavailable", async () => {
     const member = makeMember({ fireteam: { teamId: "alpha" } });
     const world = makeTeamWorld([member]);
@@ -614,4 +688,35 @@ test("regroupPoints returns the leader point then the centroid", () => {
     assert.ok(centroid);
     assert.ok(Math.abs(centroid.x - 400 / 3) < 1e-3);
     assert.ok(Math.abs(centroid.y - 400 / 3) < 1e-3);
+});
+
+test("collectMembers exposes combat turnIndex and hasActed without changing order", () => {
+    const a = makeMember({ fireteam: { teamId: "alpha" } });
+    const b = makeMember({ fireteam: { teamId: "alpha" } });
+    const world = makeTeamWorld([a, b]);
+    // Deliberately use a turn order different from combatant-id order.
+    world.combat.turns = [b.combatant, a.combatant, world.enemy];
+    world.combat.turn = 1;
+    const service = createFireteamService();
+    const members = service.collectMembers(world.combat, "alpha");
+    const byId = Object.fromEntries(members.map(member => [member.combatantId, member]));
+    assert.equal(byId[a.combatant.id].turnIndex, 1);
+    assert.equal(byId[a.combatant.id].hasActed, false);
+    assert.equal(byId[b.combatant.id].turnIndex, 0);
+    assert.equal(byId[b.combatant.id].hasActed, true);
+
+    // Foundry reports `turn: null` before the first activation: nobody has
+    // acted, but the indexes remain available to tactics.
+    world.combat.turn = null;
+    for (const member of service.collectMembers(world.combat, "alpha")) {
+        assert.equal(member.hasActed, false);
+        assert.notEqual(member.turnIndex, null);
+    }
+
+    // Older/headless combat fixtures without `turns` degrade to null/false.
+    const withoutTurns = { ...world.combat, turns: undefined, turn: 0 };
+    for (const member of service.collectMembers(withoutTurns, "alpha")) {
+        assert.equal(member.turnIndex, null);
+        assert.equal(member.hasActed, false);
+    }
 });

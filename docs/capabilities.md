@@ -113,8 +113,9 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Типы атаки из `actions.list`: на оружие кандидатизируется до 3 типов в
   курируемом порядке (ranged: `full_auto, semi_auto, standard, ripper_charge,
   called_shot, suppressing_fire`; melee: `allOut, charge, standard, lightning,
-  swift, called_shot`); `suppressing_fire` — отдельная роль, проходит всегда
-  (issue #14). Дальние атаки с пустым клипом исключаются (`no-ammo`).
+  swift, called_shot`); `EXCLUDED_ATTACK_TYPES` пуст — `suppressing_fire`
+  как отдельная роль area-denial проходит всегда (issue #14). Дальние атаки
+  с пустым клипом исключаются (`no-ammo`).
 - Статусы: `stunned` → короткий `end-turn`-план; `pinned` — вето charge,
   run и сближающих перемещений; `prone` — бюджет движения пополам,
   вето charge и run.
@@ -443,6 +444,13 @@ execute: расхождение — `stale-state` (перемещение, см�
   character}` на актёре и/или токене (TokenConfig отображает только
   token-флаги). `character` (issue #19) — общий темперамент группы,
   overlay на веса всех членов.
+- Per-preset tactic registry (issue #92, сервис `api.services.get("tactics")`):
+  selector `{presetId, kind, priority, select}` — pure/deterministic;
+  меньший priority раньше, tie-break — порядок регистрации, в v1 побеждает
+  первый non-null `maneuver` descriptor. Явный `context.tactic` function/object
+  сохраняет более высокий приоритет, `null`/`false` отключают тактику. specOps
+  использует прежний `specOpsTactic`; assault/rangedCover/hold имеют точку
+  подключения, но без зарегистрированных тактик получают null/fallback.
 - `TeamPlan` координирует временные задания и мягкую связность. Для
   жизнеспособного отряда с назначенной инициативой исполнитель сохраняет
   прогресс манёвра на Combat и строит свежий план только для текущего хода.
