@@ -53,6 +53,10 @@ import {
     INTERDICT_ROLE,
     selectInterdiction
 } from "./interdiction.js";
+import {
+    PINCER_TACTIC,
+    selectPincerTactic
+} from "./pincer.js";
 
 export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
@@ -891,6 +895,8 @@ export function specOpsFlankFallback(members, tactic, failure) {
  * @param {object|null} [input.combat] Combat document for geometry lookup.
  * @param {object} [input.context] Planning context (`walls`, `scene`,
  *   `regroup`, `specOpsConfig`, `seed`).
+ * @param {*} [input.moraleTier] Committed team morale tier of the fireteam
+ *   (issue #88 pincer morale gate; `context.moraleTier` is the fallback).
  * @param {object} [input.config] `SpecOpsConfig` overrides.
  * @returns {object} `{name, reason, assignments, allowFlank, regroup,
  *   objective, maxDetachedPhases, breakdown}`; `name: null` means the
@@ -906,7 +912,8 @@ export function selectSpecOpsTactic({
     combat = null,
     context = {},
     config = null,
-    character = null
+    character = null,
+    moraleTier = null
 } = {}) {
     const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
@@ -1036,12 +1043,53 @@ export function selectSpecOpsTactic({
             breakdown: { ...breakdown }
         };
     }
+    // Issue #88: the pincer is the first attack maneuver of the cascade —
+    // evaluated after suppression and before flank-and-fix/coordinated
+    // assault. The pure core owns the gates (member floor, superiority,
+    // morale, enemy concentration), the signed maneuver points and the
+    // group composition. Three outcomes: a committed `pincer` descriptor,
+    // a degraded one-side `flank-and-fix` (stable `pincer-degraded-*`
+    // reason) which IS the base maneuver, or a `null` fallthrough that
+    // leaves the legacy cascade below byte-identical. Navigation probes
+    // are as honest as the synchronous contract allows — the pure core
+    // records its straight-line approximation in the breakdown instead of
+    // faking exactness when no synchronous route search is available.
+    const pincer = selectPincerTactic({
+        members: positioned,
+        leaderId: leader?.combatantId ?? leaderId,
+        targets: centerTargets,
+        objective: objective ?? null,
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        navigation: geometryContext.navigation ?? context.navigation ?? null,
+        context: geometryContext,
+        config: cfg
+    });
+    breakdown.pincer = {
+        name: pincer.name ?? null,
+        reason: pincer.reason ?? null,
+        selected: pincer.name === PINCER_TACTIC,
+        ...(pincer.breakdown ?? {})
+    };
+
     // The base maneuver is the ordinary flank/assault/covering cascade of
     // the squad. It is computed first so the interdiction pass below can
     // compose over it; when interception degrades the base descriptor is
     // returned unchanged apart from the recorded degradation breakdown.
     let base;
-    if (flank) {
+    if (pincer.name === PINCER_TACTIC
+        || (pincer.name === "flank-and-fix" && pincer.objective)) {
+        // Committed pincer or its specified degradation: the pure
+        // descriptor is the base maneuver, re-rooted on the spec-ops
+        // breakdown so the cascade diagnostics keep their single shape.
+        // `maxDetachedPhases`/`taskCapacities`/`flankMinAngleDegrees` of
+        // the pure core travel with it unchanged.
+        base = {
+            ...pincer,
+            breakdown: { ...breakdown }
+        };
+    } else if (flank) {
         breakdown.flank = { side: flank.side, flankerId: flank.flanker.combatantId };
         const targetId = _objectiveTargetId(objective, hostiles);
         base = finish("flank-and-fix",
@@ -1120,7 +1168,12 @@ export function selectSpecOpsTactic({
     // role-scoped.
     const baseObjective = base.objective && typeof base.objective === "object" ? base.objective : {};
     const flankFields = {};
-    for (const key of ["flankTargetId", "flankSide", "flankPoint"]) {
+    // Issue #88: the pincer objective contract (`elements`/`sync`/
+    // `syncPolicy`/`targetPoint`) travels through the composite exactly
+    // like the legacy flank proof fields — the interception keys always
+    // win conflicts through the spread below.
+    for (const key of ["flankTargetId", "flankSide", "flankPoint",
+        "elements", "sync", "syncPolicy", "targetPoint"]) {
         if (baseObjective[key] !== undefined && baseObjective[key] !== null) {
             flankFields[key] = baseObjective[key];
         }
@@ -1130,6 +1183,11 @@ export function selectSpecOpsTactic({
         allowFlank: base.allowFlank === true,
         ...(base.flankMinAngleDegrees !== undefined
             ? { flankMinAngleDegrees: base.flankMinAngleDegrees } : {}),
+        // Issue #88: the pincer per-element capacity cap survives the
+        // composition — interdictors are picked out of the fix/base
+        // assignments, so the flank element sizes still hold.
+        ...(base.taskCapacities && typeof base.taskCapacities === "object"
+            ? { taskCapacities: { ...base.taskCapacities } } : {}),
         objective: { ...flankFields, ...interdiction.objective },
         maxDetachedPhases: cfg.maxDetachedRounds,
         breakdown: { ...breakdown, baseTactic: base.name }

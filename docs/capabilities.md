@@ -491,8 +491,30 @@ execute: расхождение — `stale-state` (перемещение, см�
   первый non-null `maneuver` descriptor. Явный `context.tactic` function/object
   сохраняет более высокий приоритет, `null`/`false` отключают тактику. specOps
   использует прежний `specOpsTactic`; rangedCover теперь тоже имеет
-  зарегистрированный maneuver-selector. assault/hold без тактик получают
-  null/fallback.
+  зарегистрированный maneuver-selector. assault (issue #88) регистрирует
+  loose-pincer selector; hold без тактики получает null/fallback.
+- Pincer / двойной охват (issue #88): чистое ядро `presets/pincer.js` —
+  два знаковых манёвренных пункта (`elements.left/right.point`), проверка
+  расхождения маршрутов (угол/пересечения/коридор, синхронные
+  navigation-пробы с честным straight-line fallback в `probes`),
+  детерминированная композиция групп (лидер в fix-базе; n=4 → 2+1+1,
+  n=5 → 2+1+2, n=6 → 2+2+2). specOps оценивает `pincer` после suppression
+  и до flank-and-fix/coordinated-assault; деградация — spec-ops
+  flank-and-fix с причиной `pincer-degraded-*`, fallthrough `name: null`
+  сохраняет прежний каскад. Element флангера — его `groupId`
+  (`flank-left`/`flank-right`); резервации целей ключируются
+  `task|groupId|targetId`, ёмкости элементов независимы
+  (`taskCapacities.flank`). Member context несёт per-member знаковый
+  `team.flankPoint`/`flankSide` — scoring-only, без жёсткого вето.
+  Синхронизация удара `objective.sync`: `elastic` (ждём только самого
+  раннего транзитного флангера, удар при готовности одной стороны) /
+  `strict` (ждём всех) / `none` (loose — не ждём); delay-записи несут
+  `awaitIds[]`/`policy`, `validateTeamPlan` различает elastic/strict
+  матрицу слома `sync-broken`. Барьер фаз покрывает только движущихся.
+  Assault-пресет — ослабленный `pincer-loose` (`sync: "none"`, центральный
+  элемент штурмует) с overlay `ASSAULT_TASK_WEIGHTS.flank`
+  (`flankProgress 6`, `advance +1` аддитивно). Пороги — поля `pincer*`
+  в `SPEC_OPS_CONFIG`.
 - Suppress-and-bound (issue #86): чистое ядро `tactics/suppress-and-bound.js`
   выбирает capable suppressor по полуавтоматической/полностью автоматической
   очереди, заряду, актуальному `turnIndex` и безопасному конусу. В каскаде

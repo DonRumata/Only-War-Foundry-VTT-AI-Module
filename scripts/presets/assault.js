@@ -23,6 +23,13 @@
  * the shared factor breakdown — candidate legality lives in the planner.
  */
 import { evaluateFactors } from "../planner.js";
+import { _tokenDoc } from "../planner/documents.js";
+import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
+import {
+    pincerFlankProgress,
+    selectPincerTactic
+} from "./pincer.js";
+import { specOpsTokenCenter } from "./spec-ops.js";
 
 /** Preset id registered in the planner preset registry. */
 export const ASSAULT_PRESET_ID = "assault";
@@ -91,24 +98,54 @@ export const ASSAULT_WEIGHTS = Object.freeze({
 });
 
 /**
+ * Team-task weight overlays of the assault preset (issue #88). The only
+ * overlay is the loose-pincer flank pressure: `flankProgress` enters the
+ * vector at weight 6 (the mirror of the spec-ops flank pull) and the
+ * advance pull grows by +1 over the base doctrine — an additive delta,
+ * not a replacement, so the flank element of an assault team out-advances
+ * the centre instead of turning cautious.
+ */
+export const ASSAULT_TASK_WEIGHTS = Object.freeze({
+    flank: Object.freeze({ flankProgress: 6, advance: 1 })
+});
+
+/**
  * Evaluate one planner candidate for the assault preset. Delegates to the
  * shared weighted-factor evaluator and annotates the breakdown with the
  * preset/variant so diagnostics explain *why* a charge or approach won.
+ * Inside a fireteam (`context.team.task`) the `flank` overlay applies the
+ * loose-pincer pressure of issue #88: the per-member signed `flankPoint`
+ * injected by the fireteam pulls the element toward its own maneuver
+ * point — scoring only, never a hard veto.
  * @param {object} input Evaluation input from the planner.
  * @param {object} [input.factors] Factor vector (`SCORE_FACTORS`).
  * @param {object} [input.candidate] Scored candidate `{variant, target, move, action}`.
  * @param {object} [input.weights] Effective merged weights.
+ * @param {object} [input.context] Planning context (`team`, `selfPos`).
  * @returns {{score: number, breakdown: object}}
  */
-export function evaluateAssault({ factors = {}, candidate = {}, weights = ASSAULT_WEIGHTS } = {}) {
-    const evaluation = evaluateFactors(factors, weights);
+export function evaluateAssault({ factors = {}, candidate = {}, weights = ASSAULT_WEIGHTS,
+    context = {} } = {}) {
+    const flank = context.team?.task === "flank";
+    const enriched = { ...factors };
+    let effective = weights;
+    if (flank) {
+        enriched.flankProgress = pincerFlankProgress(candidate, context);
+        effective = {
+            ...weights,
+            flankProgress: ASSAULT_TASK_WEIGHTS.flank.flankProgress,
+            advance: (weights.advance ?? 0) + ASSAULT_TASK_WEIGHTS.flank.advance
+        };
+    }
+    const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,
         breakdown: {
             ...evaluation.breakdown,
             preset: ASSAULT_PRESET_ID,
             variant: candidate.variant ?? null,
-            charge: candidate.variant === "charge"
+            charge: candidate.variant === "charge",
+            ...(flank ? { team: { task: "flank", flankProgress: enriched.flankProgress } } : {})
         }
     };
 }
@@ -143,4 +180,96 @@ export function registerAssaultPreset(planner) {
         throw new Error("[only-war-ai] Assault preset requires a planner service");
     }
     return planner.registerPreset(ASSAULT_PRESET_ID, assaultPresetDefinition());
+}
+
+/**
+ * Assault team tactic selector (issue #88): the loose pincer variant is
+ * the preset's only maneuver — a pure-melee assault squad has no fix base
+ * worth pinning with, so the centre element assaults through the middle
+ * while the two flank elements pressure the signed maneuver points. The
+ * contract is deliberately thinner than the spec-ops pincer: `sync:
+ * "none"` (nobody holds a strike), no angle proof, no hard veto — the
+ * flank pull lives entirely in the `flankProgress` scoring overlay. A
+ * `null` name means the default fireteam policy applies unchanged.
+ *
+ * Positions are center-normalized exactly like the spec-ops adapter so
+ * the pure geometry sees token centres, not top-left corners.
+ * @param {object} input
+ * @param {object[]} [input.members] Fireteam member entries.
+ * @param {string|null} [input.leaderId] Leader combatant id.
+ * @param {object[]|null} [input.targets] Normalized targets.
+ * @param {object|null} [input.objective] Shared objective.
+ * @param {*} [input.moraleTier] Team morale tier.
+ * @param {object|null} [input.scene] Planning scene.
+ * @param {object|null} [input.combat] Combat document.
+ * @param {object} [input.context] Planning context (`walls`, `navigation`).
+ * @param {object} [input.config] Pincer config overrides.
+ * @returns {object} Serializable tactic descriptor (`pincer-loose`,
+ *   degraded `flank-and-fix`) or a `name: null` fallthrough record.
+ */
+export function selectAssaultTactic({
+    members = [],
+    leaderId = null,
+    targets = null,
+    objective = null,
+    moraleTier = null,
+    scene = null,
+    combat = null,
+    context = {},
+    config = null
+} = {}) {
+    const planningScene = context.scene ?? scene ?? combat?.scene ?? context.combat?.scene ?? null;
+    const planningCombat = combat ?? context.combat ?? null;
+    const positioned = (members ?? [])
+        .filter(m => m && m.combatantId && m.defeated !== true && m.enabled !== false)
+        .sort((a, b) => String(a.combatantId).localeCompare(String(b.combatantId)))
+        .map(member => ({
+            ...member,
+            position: specOpsTokenCenter(_tokenDoc(member.combatant?.token),
+                planningScene, member.position),
+            positionIsCenter: true
+        }));
+    return selectPincerTactic({
+        members: positioned,
+        leaderId,
+        targets,
+        objective,
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        loose: true,
+        variant: "assault",
+        scene: planningScene,
+        combat: planningCombat,
+        navigation: context.navigation ?? null,
+        context,
+        config
+    });
+}
+
+/**
+ * Default tactic factory passed to `fireteam.buildTeamPlan` as
+ * `context.tactic` (auto-applied for `teamPreset === "assault"`).
+ * @param {object} input Selector input (see {@link selectAssaultTactic}).
+ * @returns {object} Tactic descriptor.
+ */
+export function assaultTactic(input = {}) {
+    return selectAssaultTactic(input);
+}
+
+/**
+ * Register/replace the assault maneuver selector on a tactic registry
+ * (issue #88). Mirrors the spec-ops registration: explicit
+ * `context.tactic` still wins over the registered selector.
+ * @param {object} tactics Tactic registry (`api.services.get("tactics")`).
+ * @returns {object} The stored selector record.
+ */
+export function registerAssaultTacticSelector(tactics) {
+    if (!tactics || typeof tactics.registerTacticSelector !== "function") {
+        throw new Error("[only-war-ai] Assault tactic requires a tactic registry");
+    }
+    return tactics.registerTacticSelector({
+        presetId: ASSAULT_PRESET_ID,
+        kind: "maneuver",
+        priority: DEFAULT_TACTIC_PRIORITY,
+        select: assaultTactic
+    });
 }

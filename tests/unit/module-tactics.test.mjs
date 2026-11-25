@@ -26,5 +26,11 @@ test("init registers the tactics service with specOps and rangedCover selectors"
     assert.equal(rangedCover.length, 1);
     assert.equal(rangedCover[0].kind, "maneuver");
     assert.equal(typeof rangedCover[0].select, "function");
-    assert.equal(tactics.resolveTactic("assault", {}), null);
+    // Issue #88: assault registers its loose-pincer selector — empty input
+    // degrades to the fallthrough record, never to a committed maneuver.
+    const assault = tactics.listTacticSelectors("assault");
+    assert.equal(assault.length, 1);
+    assert.equal(assault[0].kind, "maneuver");
+    const fallthrough = tactics.resolveTactic("assault", {});
+    assert.equal(fallthrough?.name ?? null, null);
 });

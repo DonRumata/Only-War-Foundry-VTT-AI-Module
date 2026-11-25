@@ -92,6 +92,10 @@ import {
     INTERDICT_ROLE
 } from "./presets/interdiction.js";
 import {
+    PINCER_LOOSE_TACTIC,
+    PINCER_TACTIC
+} from "./presets/pincer.js";
+import {
     SUPPRESS_AND_BOUND,
     pointInSuppressionZone
 } from "./tactics/suppress-and-bound.js";
@@ -220,6 +224,67 @@ function _clearInterdictionGeometry(assignment) {
     delete assignment.role;
     delete assignment.objective;
     assignment.assignedTargetId = null;
+}
+
+/**
+ * Targeted pincer demotion policy (issue #88): once a flanker/fixer
+ * assignment is demoted by GM intervention/morale, its signed element no
+ * longer exists and must not keep resolving the per-member flank point.
+ * Only genuine pincer markers are cleared — the gate requires both a
+ * pincer role (`flanker`/`fixer`) and a pincer element
+ * (`flank-left`/`flank-right`/`fix`/`center`), so an arbitrary injected
+ * object-form assignment with foreign metadata passes through untouched.
+ * The member objective is preserved: it is serializable tactical metadata
+ * and the shared-objective precedence rules decide whether it still
+ * narrows targets.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearPincerGeometry(assignment) {
+    if (!assignment || !["flanker", "fixer"].includes(assignment.role)) return;
+    if (!["flank-left", "flank-right", "fix", "center"].includes(assignment.element)) return;
+    delete assignment.role;
+    delete assignment.element;
+}
+
+/**
+ * Pincer maneuver test (issue #88): the strict/loose tactic itself or the
+ * interdiction composite over a pincer base. Drives the multi-await sync
+ * policy and the reservation geometry downstream.
+ * @param {string|null} tacticName Committed tactic name.
+ * @param {object|null} [tactic] Tactic descriptor.
+ * @returns {boolean}
+ */
+function _isPincerManeuver(tacticName, tactic = null) {
+    if (tacticName === PINCER_TACTIC || tacticName === PINCER_LOOSE_TACTIC) return true;
+    const base = tactic?.breakdown?.baseTactic ?? null;
+    return tacticName === INTERDICTION_TACTIC
+        && (base === PINCER_TACTIC || base === PINCER_LOOSE_TACTIC);
+}
+
+/**
+ * Per-member flank maneuver anchor (issue #88): a pincer objective
+ * carries two signed maneuver points under `elements.left/right.point`;
+ * the member's own element selects its side's point. Members without a
+ * flank element — fix base, legacy single flank group — keep the legacy
+ * shared `objective.flankPoint` (absent on a true pincer objective).
+ * @param {object|null} assignment Member assignment (`element`).
+ * @param {object|null} objective Shared/member objective.
+ * @returns {{point: object|null, side: string|null}}
+ */
+function _memberFlankAnchor(assignment, objective) {
+    const side = assignment?.element === "flank-left" ? "left"
+        : assignment?.element === "flank-right" ? "right" : null;
+    if (side) {
+        const point = objective?.elements?.[side]?.point ?? null;
+        if (Number.isFinite(point?.x) && Number.isFinite(point?.y)) {
+            return { point: { x: point.x, y: point.y }, side };
+        }
+    }
+    const legacy = objective?.flankPoint ?? null;
+    if (Number.isFinite(legacy?.x) && Number.isFinite(legacy?.y)) {
+        return { point: legacy, side: objective?.flankSide ?? side };
+    }
+    return { point: null, side };
 }
 
 /**
@@ -645,40 +710,87 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
  * @param {string} input.teamId Team id.
  * @param {Map<string,string>} [input.memberMorale]
  *   `combatantId → effective tier` from the team evaluation.
+ * @param {string|null} [input.sync] Pincer sync policy of the committed
+ *   objective (`elastic`/`strict`/`none`); null keeps the legacy
+ *   single-flanker semantics.
  * @returns {Map} `combatantId → {reason, until, syncRound, awaitId}`.
  */
 function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
-    diagnostics, teamId, memberMorale = null }) {
+    diagnostics, teamId, memberMorale = null, sync = null }) {
     const result = new Map();
     if (context?.syncDelay === false) return result;
     if (!convergence?.targetId) return result;
-    let flanker = null;
+    // Issue #88: the loose assault pincer carries `sync: "none"` — its
+    // flank pressure is scoring-only and the squad never holds a strike
+    // for it. Legacy flank-and-fix passes no policy at all.
+    if (sync === "none") return result;
+    const strikesTargetOf = plan => plan?.target?.tokenId === convergence.targetId
+        || (plan?.steps ?? []).some(step =>
+            (step?.type === "attack" || step?.type === "test")
+            && (step?.input?.targetTokenId === convergence.targetId
+                || step?.input?.targetTokenUuid
+                    === (convergence.targetUuid ?? convergence.targetId)));
+    // Transit cost proxy of one member plan: the summed movement cost of
+    // its move steps — the remaining-route approximation the elastic
+    // policy sorts on (issue #88). Ties resolve by combatant id.
+    const transitCostOf = member => {
+        const steps = plans?.get(member.combatantId)?.plan?.steps ?? [];
+        let total = 0;
+        for (const step of steps) {
+            if (step?.type !== "move") continue;
+            total += _finiteOr(step?.cost?.movement, 0);
+        }
+        return total;
+    };
+    const transitFlankers = [];
     for (const member of ordered ?? []) {
         if (assignMap?.get(member.combatantId)?.task !== "flank") continue;
         const steps = plans?.get(member.combatantId)?.plan?.steps ?? [];
         const moves = steps.some(step => step?.type === "move");
         const strikes = steps.some(step => step?.type === "attack" || step?.type === "test");
-        if (moves && !strikes) {
-            flanker = member;
-            break;
-        }
+        if (moves && !strikes) transitFlankers.push(member);
     }
-    if (!flanker) return result;
+    if (!transitFlankers.length) return result;
+    // Issue #88 pincer sync policies. `elastic` releases the strike as
+    // soon as one flank side is ready: when any flank member already
+    // attacks the target this round nobody waits at all, and the fix
+    // base otherwise awaits only the earliest transit flanker. `strict`
+    // awaits every transit flanker. Without a pincer policy the legacy
+    // single-flanker behavior stands: the first transit flanker in
+    // maneuver order is the one awaited member.
+    let awaitIds;
+    let policy = null;
+    if (sync === "elastic" || sync === "strict") {
+        policy = sync;
+        if (sync === "elastic") {
+            const flankerStrikes = (ordered ?? []).some(member => {
+                if (assignMap?.get(member.combatantId)?.task !== "flank") return false;
+                return strikesTargetOf(plans?.get(member.combatantId)?.plan);
+            });
+            if (flankerStrikes) return result;
+            const earliest = [...transitFlankers].sort((a, b) =>
+                (transitCostOf(a) - transitCostOf(b))
+                || String(a.combatantId).localeCompare(String(b.combatantId)))[0];
+            awaitIds = [earliest.combatantId];
+        } else {
+            awaitIds = transitFlankers
+                .map(member => member.combatantId)
+                .sort((a, b) => String(a).localeCompare(String(b)));
+        }
+    } else {
+        awaitIds = [transitFlankers[0].combatantId];
+    }
+    const awaitSet = new Set(awaitIds);
     const maxSyncRounds = _finiteOr(context?.maxSyncRounds, DEFAULT_MAX_SYNC_ROUNDS);
     const round = Number.isFinite(combat?.round) ? combat.round : null;
     for (const member of ordered ?? []) {
-        if (member.combatantId === flanker.combatantId) continue;
+        if (awaitSet.has(member.combatantId)) continue;
         // Flankers are never delayed — they are the wait condition.
         if (assignMap?.get(member.combatantId)?.task === "flank") continue;
         const entry = plans?.get(member.combatantId);
         const plan = entry?.plan;
         if (!plan) continue;
-        const strikesTarget = plan.target?.tokenId === convergence.targetId
-            || (plan.steps ?? []).some(step =>
-                (step?.type === "attack" || step?.type === "test")
-                && (step?.input?.targetTokenId === convergence.targetId
-                    || step?.input?.targetTokenUuid
-                        === (convergence.targetUuid ?? convergence.targetId)));
+        const strikesTarget = strikesTargetOf(plan);
         if (!strikesTarget) continue;
         // Issue #26: a member whose *effective* morale tier is `desperate`
         // cannot be trusted to hold position for the synchronized
@@ -701,7 +813,11 @@ function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
             reason: "await-sync",
             until: "flank-ready",
             syncRound: round,
-            awaitId: flanker.combatantId
+            // `awaitId` stays the first awaited id for backward
+            // compatibility; the full multi-await list and the pincer
+            // policy ride along (issue #88).
+            awaitId: awaitIds[0],
+            ...(policy ? { awaitIds: [...awaitIds], policy } : {})
         };
         plans.set(member.combatantId, {
             ...entry,
@@ -1090,7 +1206,14 @@ export function createFireteamService({
                 assaultAssigned++;
             }
             if (task === "flank") flankAssigned++;
-            const groupId = task === "flank" ? "flank-1" : "main";
+            // Issue #88: the pincer composition signs its flank elements
+            // (`flank-left`/`flank-right`) and the element is the group
+            // identity — the barrier, reservation keys and planning order
+            // follow it. Legacy assignments without an element keep the
+            // historical single `flank-1` group.
+            const groupId = task === "flank"
+                ? (/^flank-.+/.test(forced?.element ?? "") ? forced.element : "flank-1")
+                : "main";
             // Issue #16/#85: a shared objective may restrict its target to
             // the members that actually contribute kill-EV. Scored focus is
             // stricter: `assignedMembers` is the capacity-limited assignment
@@ -1341,7 +1464,7 @@ export function createFireteamService({
             const plan = planOf(assignment.combatantId);
             const targetId = plan?.target?.tokenId ?? assignment.assignedTargetId ?? null;
             if (targetId) {
-                const key = `${assignment.task}|${targetId}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${targetId}`;
                 const capacity = _finiteOr(capacities[assignment.task], 1);
                 const used = targetCount.get(key) ?? 0;
                 const focusExempt = _focusAssigned(assignment, context.focus)
@@ -1689,11 +1812,17 @@ export function createFireteamService({
      * @param {object} capacities Task capacities.
      * @param {string} task
      * @param {string|null} targetId
+     * @param {string} [groupId] Maneuver group of the reservation key
+     *   (issue #88 — the two signed pincer elements hold independent
+     *   per-element capacities).
      * @returns {boolean}
      */
-    function _targetAtCapacity(counts, capacities, task, targetId) {
+    function _targetAtCapacity(counts, capacities, task, targetId, groupId = "main") {
         if (!targetId) return false;
-        const key = `${task}|${targetId}`;
+        // Issue #88: the reservation key carries the maneuver group so the
+        // two signed pincer flank elements hold independent per-element
+        // capacities instead of competing for one shared flank slot.
+        const key = `${task}|${groupId ?? "main"}|${targetId}`;
         const used = counts.get(key) ?? 0;
         return used >= _finiteOr(capacities[task], 1);
     }
@@ -1722,7 +1851,7 @@ export function createFireteamService({
                 && _idListsOverlap(targetIds, focusIds)) {
                 return true;
             }
-            return !_targetAtCapacity(counts, capacities, assignment.task, id);
+            return !_targetAtCapacity(counts, capacities, assignment.task, id, assignment.groupId);
         });
     }
 
@@ -1913,8 +2042,14 @@ export function createFireteamService({
             });
         }
         const moverIds = movement.map(step => step.combatantId);
+        // Issue #88: every signed flank group (`flank-` prefix), not only
+        // the legacy `flank-1`, joins the barrier requirement while the
+        // maneuver is unproven.
         const flankIds = flankProven ? [] : sorted
-            .filter(member => assignMap.get(member.combatantId)?.groupId === "flank-1")
+            .filter(member => {
+                const group = assignMap.get(member.combatantId)?.groupId ?? "main";
+                return typeof group === "string" && group.startsWith("flank-");
+            })
             .map(member => member.combatantId);
         const required = [...new Set([...flankIds, ...moverIds])];
         const barrier = required.length
@@ -2399,15 +2534,20 @@ export function createFireteamService({
      *   forwarded to tactic selectors (interdiction memory rejection).
      * @param {object|null} [input.focusObjective] Concentrate-fire objective
      *   selected before the maneuver registry.
+     * @param {*} [input.moraleTier] Committed team morale tier forwarded to
+     *   the tactic selectors (issue #88 pincer morale gate).
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context,
-        focusObjective = null, character = null }) {
+        focusObjective = null, character = null, moraleTier = null }) {
         const selectorInput = {
             members,
             leaderId,
             teamId,
             seed,
+            // Issue #88: the pincer morale gate reads the committed team
+            // tier — the selector never re-derives morale itself.
+            moraleTier,
             // Issue #87: without injected contacts the selector still sees
             // the live visible hostiles — the scan carries positions,
             // wounds, emitter projections and charge rates. Injected
@@ -3013,7 +3153,8 @@ export function createFireteamService({
             combat,
             context,
             focusObjective: selectedFocus,
-            character
+            character,
+            moraleTier: moraleInfo.tier
         });
         const tacticName = tactic?.name ?? tactic?.tactic ?? null;
         // Issue #87: the interdiction screen is a composite maneuver — its
@@ -3162,6 +3303,7 @@ export function createFireteamService({
                 assignment.groupId = "main";
                 _clearSuppressionGeometry(assignment);
                 _clearInterdictionGeometry(assignment);
+                _clearPincerGeometry(assignment);
             }
         }
         diagnostics.gmControlled = [...gmControlledIds];
@@ -3190,6 +3332,7 @@ export function createFireteamService({
                 assignment.groupId = "main";
                 _clearSuppressionGeometry(assignment);
                 _clearInterdictionGeometry(assignment);
+                _clearPincerGeometry(assignment);
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
@@ -3213,7 +3356,11 @@ export function createFireteamService({
         // reservation priority follows maneuver priority.
         const orderOf = member => {
             if (member.combatantId === election.combatantId) return 0;
-            return assignMap.get(member.combatantId)?.groupId === "flank-1" ? 1 : 2;
+            // Issue #88: every signed flank group (`flank-left`/
+            // `flank-right` and the legacy `flank-1`) plans before the
+            // fix base — reservation priority follows maneuver priority.
+            const group = assignMap.get(member.combatantId)?.groupId ?? "main";
+            return typeof group === "string" && group.startsWith("flank-") ? 1 : 2;
         };
         const ordered = [...members].sort((a, b) =>
             (orderOf(a) - orderOf(b))
@@ -3221,6 +3368,10 @@ export function createFireteamService({
 
         const capacities = {
             ...TARGET_TASK_CAPACITY,
+            // Issue #88: the pincer composition caps its flank elements
+            // (`taskCapacities.flank = maxFlankSize`); explicit caller
+            // overrides still win over the tactic-authored capacities.
+            ...(tactic?.taskCapacities ?? {}),
             ...(context.taskCapacities ?? {})
         };
 
@@ -3254,6 +3405,11 @@ export function createFireteamService({
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
+            // Issue #88: the maneuver anchor is per-member — a pincer
+            // objective signs two maneuver points and the member's own
+            // flank element selects its side's point; legacy single-point
+            // objectives resolve exactly as before.
+            const flankAnchor = _memberFlankAnchor(assignment, tactic?.objective ?? null);
             const memberContext = {
                 ...context,
                 seed,
@@ -3286,7 +3442,10 @@ export function createFireteamService({
                     // `flankPoint` (perpendicular strike position), not
                     // the target itself — without it the task was a dead
                     // label and the member wandered (smoke finding).
-                    flankPoint: tactic?.objective?.flankPoint ?? null,
+                    // Issue #88: per-member signed point/side of the
+                    // pincer elements (see `_memberFlankAnchor`).
+                    flankPoint: flankAnchor.point,
+                    ...(flankAnchor.side ? { flankSide: flankAnchor.side } : {}),
                     // Issue #87: the interdictor's screen anchor travels
                     // with the team context so the movement generator can
                     // merge screen-point candidates and `screenProgress`
@@ -3410,6 +3569,7 @@ export function createFireteamService({
                     assignment.groupId = "main";
                     _clearSuppressionGeometry(assignment);
                     _clearInterdictionGeometry(assignment);
+                    _clearPincerGeometry(assignment);
                     try {
                         const retry = await memberPlanner.planTurn(combat,
                             member.combatant, {
@@ -3456,7 +3616,7 @@ export function createFireteamService({
             const targetId = result?.plan?.target?.tokenId
                 ?? assignment.assignedTargetId ?? null;
             if (targetId && result?.plan) {
-                const key = `${assignment.task}|${targetId}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${targetId}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
             // One member's LOS is not another member's permission to fire.
@@ -3467,7 +3627,10 @@ export function createFireteamService({
         }
 
         const reservationContext = {
-            taskCapacities: context.taskCapacities,
+            // Issue #88: already merged with the tactic-authored
+            // capacities above — `reserveResources` merges them over the
+            // defaults idempotently.
+            taskCapacities: capacities,
             tokens,
             focus: convergence
         };
@@ -3535,7 +3698,7 @@ export function createFireteamService({
                 `${previousStatus}->${retry?.status ?? "error"}`;
             const retryTarget = retry?.plan?.target?.tokenId ?? null;
             if (retryTarget) {
-                const key = `${assignment.task}|${retryTarget}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${retryTarget}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
         }
@@ -3717,7 +3880,11 @@ export function createFireteamService({
             context,
             diagnostics,
             teamId,
-            memberMorale: moraleInfo.effective
+            memberMorale: moraleInfo.effective,
+            // Issue #88: the pincer objective carries the committed sync
+            // mode (`elastic`/`strict`/`none`); legacy flank-and-fix
+            // objectives carry none and keep single-flanker semantics.
+            sync: tactic?.objective?.sync ?? null
         });
         // Fresh gm-intervention demotions can happen during member
         // planning, after the first diagnostic snapshot. Publish the final
@@ -3854,7 +4021,13 @@ export function createFireteamService({
             assignMap,
             plans,
             members: memberEntries,
-            flankProven: flankRules !== null
+            // Issue #88 barrier decision: a pincer's flank geometry is
+            // proven at selection time (corridor/divergence checks of the
+            // pure core), exactly like the spec-ops angle proof — so only
+            // genuinely moving members hold the movement barrier. A
+            // stationary in-position flanker must not break the compile;
+            // its side's readiness is what the sync-delay pass watches.
+            flankProven: flankRules !== null || _isPincerManeuver(tacticName, tactic)
         });
         const memberPlans = {};
         for (const member of ordered) {
@@ -3961,13 +4134,25 @@ export function createFireteamService({
         // awaited member is gone or defeated/disabled the wait is broken:
         // report `sync-broken` before the generic member check so the
         // caller sees the actual reason.
+        // Issue #88 multi-await matrix: a strict pincer wait breaks when
+        // ANY awaited flanker is lost, an elastic wait only when ALL of
+        // them are (the strike releases on the first ready side). The
+        // legacy single-`awaitId` record is both at once — conservative
+        // strict is the default for policy-less records.
         for (const entry of teamPlan.members ?? []) {
-            const awaitedId = entry?.delayed?.awaitId ?? null;
-            if (!awaitedId) continue;
-            const awaited = members.find(m => m.combatantId === awaitedId);
-            if (!awaited || awaited.defeated === true || awaited.enabled === false) {
-                return fail(TEAM_PLAN_REASONS.syncBroken);
-            }
+            const delayed = entry?.delayed ?? null;
+            const awaitedIds = Array.isArray(delayed?.awaitIds) && delayed.awaitIds.length
+                ? delayed.awaitIds
+                : (delayed?.awaitId ? [delayed.awaitId] : []);
+            if (!awaitedIds.length) continue;
+            const lost = id => {
+                const awaited = members.find(m => m.combatantId === id);
+                return !awaited || awaited.defeated === true || awaited.enabled === false;
+            };
+            const broken = delayed?.policy === "elastic"
+                ? awaitedIds.every(lost)
+                : awaitedIds.some(lost);
+            if (broken) return fail(TEAM_PLAN_REASONS.syncBroken);
         }
         for (const entry of teamPlan.members ?? []) {
             const live = members.find(m => m.combatantId === entry.combatantId);

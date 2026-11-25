@@ -92,6 +92,40 @@ objective несёт `targetId/screenPoint/protectId`; остальные чле
 сужается) и никогда не становится целью concentrate-fire — фокус
 перевычисляется с учётом исключений. Деградация честно пишется в
 `breakdown.interdiction.rejected`, каскад продолжается базовым манёвром.
+Двойной охват (issue #88): после ветки suppression и до
+flank-and-fix/coordinated-assault каскад оценивает чистое ядро
+`presets/pincer.js` — манёвр «клещи» (`pincer`) при численном
+превосходстве, сконцентрированном противнике, минимум четырёх бойцах и
+морали не ниже `pressured`. Ядро строит два знаковых манёвренных пункта
+(`objective.elements.left/right.point`), проверяет расхождение маршрутов
+(угол ≥ 60°, без пересечений после trim, коридорная сепарация) и
+детерминированно компонует группы: лидер всегда в fix-базе (`support`,
+element `fix`), фланговые элементы `flank-left`/`flank-right` (n=4 →
+2+1+1, n=5 → 2+1+2, n=6 → 2+2+2). Element — это идентичность группы:
+`groupId` бойца равен `flank-left`/`flank-right`, ключи резерваций целей
+`task|groupId|targetId` дают каждому элементу независимую ёмкость
+(`taskCapacities.flank`), а fireteam инжектирует в member context
+собственный знаковый `team.flankPoint`/`flankSide` — scoring тянет
+флангера к его пункту без жёсткого вето. Синхронизация удара:
+`objective.sync` `elastic` (fix-база ждёт только самого раннего
+транзитного флангера; удар при готовности хотя бы одной стороны) или
+`strict` (ждутся все транзитные флангеры) — delay-записи несут
+`awaitIds[]`/`policy`, `validateTeamPlan` различает матрицу слома
+(elastic — все ожидаемые потеряны, strict — любой). Барьер фаз покрывает
+только реально движущихся членов: геометрия клещей доказана ещё при
+выборе, поэтому стоящий на месте флангер не ломает компиляцию TeamPlan.
+Деградация (одна сторона заблокирована/маршруты не расходятся) возвращает
+spec-ops `flank-and-fix` со стабильной причиной `pincer-degraded-*` и
+прежним контрактом доказательства угла; при `name: null` каскад
+байт-идентичен прежнему. Штурмовой пресет получил ослабленный вариант
+`pincer-loose` (`selectAssaultTactic`, зарегистрирован в реестре тактик):
+без fix-базы, центральный элемент штурмует (`element center`,
+`sync: "none"` — никто не ждёт), фланговое давление живёт только в
+overlay `ASSAULT_TASK_WEIGHTS.flank` (`flankProgress 6`, `advance +1`
+аддитивно). Пороги клещей — поля `pincer*` в `SPEC_OPS_CONFIG`
+(`pincerMinMembers 4, pincerSync "elastic", pincerMinMorale "pressured",
+pincerMaxTravelMeters 12` и др.), переопределяются через
+`context.specOpsConfig` как остальная доктрина.
 Конфиг specOps: `flankMinAngleDegrees 60, maxDetachedRounds 2,
 highThreatRatio 2, supportWeight 6, flankWeight 8, assaultWeight 7,
 cohesionWeight 10, interdictConfidenceMin 0.7, interdictMinRangedEV 6,

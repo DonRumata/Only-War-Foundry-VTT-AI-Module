@@ -598,11 +598,11 @@ test("reserveResources never assigns one target twice beyond task capacity", () 
     // flank capacity 1: only the first flanker keeps the target.
     assert.equal(flankReservations.length, 1);
     assert.equal(flankReservations[0].memberId, "a");
-    assert.deepEqual(flankReservations.map(t => t.key), ["flank|T1"],
-        "reservation keys stay task|target and never include role/element");
+    assert.deepEqual(flankReservations.map(t => t.key), ["flank|flank-1|T1"],
+        "reservation keys are task|groupId|targetId (issue #88) and never include role/element");
     const targetConflicts = result.conflicts.filter(c => c.type === "target");
     assert.equal(targetConflicts.length, 1);
-    assert.equal(targetConflicts[0].key, "flank|T1");
+    assert.equal(targetConflicts[0].key, "flank|flank-1|T1");
     assert.equal(targetConflicts[0].loserId, "b");
     assert.equal(targetConflicts[0].winnerId, "a");
     const plainAssignments = assignments.map(({ role, element, objective, ...rest }) => rest);
