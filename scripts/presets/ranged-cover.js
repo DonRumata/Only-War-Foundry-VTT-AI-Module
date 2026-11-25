@@ -54,6 +54,9 @@ import {
     specOpsFlankProgress,
     specOpsTargetCenter
 } from "./spec-ops.js";
+import {
+    evaluatePeelCascade
+} from "../tactics/peel-withdrawal.js";
 
 /** Preset id registered in the planner preset registry. */
 export const RANGED_COVER_PRESET_ID = "rangedCover";
@@ -158,12 +161,31 @@ export const RANGED_COVER_TASK_WEIGHTS = Object.freeze({
         rangeBand: 5,
         flankAngle: 6,
         flankProgress: 5
+    }),
+    regroup: Object.freeze({
+        attackNow: 3,
+        attackAfterMove: 1,
+        advance: 0,
+        los: 4,
+        cover: 8,
+        exposure: -4,
+        holdPosition: -2,
+        withdrawal: 11,
+        freeAttackCost: -8,
+        disengage: 4
     })
 });
 
 /** Role overlays; suppression is a role bonus, never a hard direct-fire veto. */
 export const RANGED_COVER_ROLE_WEIGHTS = Object.freeze({
-    suppressor: Object.freeze({ suppression: 8 })
+    suppressor: Object.freeze({ suppression: 8 }),
+    withdraw: Object.freeze({
+        withdrawal: 5, freeAttackCost: -4, attackNow: -5, attackAfterMove: -6, holdPosition: -4
+    }),
+    cover: Object.freeze({
+        coveringWithdrawal: 8, suppression: 7, attackNow: 3, overwatch: 1, holdPosition: 2,
+        withdrawal: -4
+    })
 });
 
 /** Candidate variants whose action produces an attack/test step. */
@@ -586,6 +608,21 @@ export function selectRangedCoverTactic(input = {}) {
     const combat = input.combat ?? context.combat ?? null;
     const scene = input.scene ?? context.scene ?? combat?.scene ?? null;
     const geometryContext = { ...context, combat, scene };
+    // Issue #89: peel outranks suppress-and-bound — suppression can be the
+    // peel cover mode, but the squad must not recommit to a normal bounding
+    // maneuver once withdrawal doctrine has triggered.
+    const peel = evaluatePeelCascade({
+        members: input.members ?? [],
+        leaderId: input.leaderId ?? null,
+        targets: input.targets ?? context.targets ?? [],
+        casualties: input.casualties ?? context.casualties ?? 0,
+        moraleInfo: input.moraleInfo ?? context.moraleInfo ?? null,
+        moraleTier: input.moraleTier ?? context.moraleTier ?? null,
+        scene,
+        combat,
+        context: geometryContext
+    });
+    if (peel.descriptor) return peel.descriptor;
     const targets = (input.targets ?? context.targets ?? []).map(target => {
         const center = specOpsTargetCenter(target, geometryContext);
         return center ? { ...target, x: center.x, y: center.y } : target;
@@ -601,6 +638,11 @@ export function selectRangedCoverTactic(input = {}) {
         context: geometryContext
     });
     const breakdown = {
+        peel: {
+            selected: false,
+            reason: peel.reason ?? null,
+            rejections: [...(peel.rejections ?? [])]
+        },
         suppression: {
             reason: suppression.reason,
             selected: suppression.selected,
@@ -700,6 +742,14 @@ export function evaluateRangedCover({
     if (role === "suppressor") {
         enriched.suppression = suppressionFactorOf(candidate);
     }
+    if (role === "cover") {
+        const mode = context.team?.peel?.coverMode ?? null;
+        enriched.coveringWithdrawal = mode === "suppression"
+            ? suppressionFactorOf(candidate)
+            : mode === "overwatch"
+                ? (candidate.variant === "overwatch" ? 1 : 0)
+                : (ATTACK_VARIANTS.has(candidate.variant) ? 1 : 0);
+    }
     if (task === "flank") {
         const { angle } = specOpsFlankGeometry(candidate, context);
         const minAngle = context.team?.flankMinAngleDegrees ?? 90;
@@ -730,6 +780,7 @@ export function evaluateRangedCover({
                     task: task ?? context.team.task ?? null,
                     role,
                     suppression: role === "suppressor" ? (enriched.suppression ?? 0) : null,
+                    coveringWithdrawal: role === "cover" ? (enriched.coveringWithdrawal ?? 0) : null,
                     flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
                     flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null
                 }

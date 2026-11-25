@@ -747,7 +747,11 @@ test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", 
     const flankPlan = plan.memberPlans[flanker.combatantId];
     assert.equal(flankPlan?.breakdown?.preset, SPEC_OPS_PRESET_ID);
     assert.equal(flankPlan?.breakdown?.team?.task, "flank");
-    assert.equal(flankPlan?.breakdown?.tactic, "flank-and-fix");
+    assert.deepEqual(flankPlan?.breakdown?.tactic, {
+        name: "flank-and-fix",
+        role: null,
+        reason: "outnumbered-flank-open"
+    });
     assert.equal(flankPlan.breakdown.team.flankAngle, 1);
     const [move, attack] = flankPlan.steps;
     assert.equal(move.type, "move");

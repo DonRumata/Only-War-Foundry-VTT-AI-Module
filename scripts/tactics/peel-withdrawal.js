@@ -626,9 +626,13 @@ function _capabilitiesOf(raw, extra) {
         raw.hasRanged, raw.canShoot,
         rangedItem ? true : (hasAction(["standard", "semi_auto", "full_auto", "called_shot"]) ? true : undefined),
         false);
+    const fullAutoItem = items.some(item => item?.type === "weapon"
+        && String(item.system?.class ?? "").toLowerCase() !== "melee"
+        && Number(item.system?.rateOfFire?.full) > 0);
     const suppression = _firstDefined(
         explicit.suppression, explicit.suppressionCapable, raw.suppressionCapable,
         hasAction(["suppressing_fire"]) ? true : undefined,
+        fullAutoItem ? true : undefined,
         false);
     const melee = _firstDefined(
         explicit.melee, explicit.meleeCapable, raw.meleeCapable, raw.hasMelee,
@@ -2290,4 +2294,31 @@ export function evaluatePeelWithdrawal(input = {}) {
  */
 export function selectPeelWithdrawal(input = {}) {
     return evaluatePeelWithdrawal(input).descriptor ?? null;
+}
+
+/**
+ * Integration adapter for preset cascades: merge the fireteam selector
+ * envelope (`moraleTier`, `context.navigation`, `context.threatMap`,
+ * `context.rates`, scene/grid fallbacks) into the explicit pure-core input
+ * without reading Foundry globals or mutating documents. Explicit input
+ * fields always win over context fallbacks; selector purity and the
+ * no-latch contract are unchanged.
+ * @param {object} input Fireteam/preset selector input.
+ * @returns {object} Frozen peel evaluation (`evaluatePeelWithdrawal`).
+ */
+export function evaluatePeelCascade(input = {}) {
+    const context = input.context ?? {};
+    const scene = input.scene ?? context.scene ?? input.combat?.scene ?? context.combat?.scene ?? null;
+    const moraleTier = input.moraleTier ?? context.moraleTier ?? null;
+    return evaluatePeelWithdrawal({
+        ...input,
+        scene,
+        grid: input.grid ?? context.grid ?? scene?.grid ?? null,
+        rates: input.rates ?? context.rates ?? null,
+        navigation: input.navigation ?? context.navigation ?? null,
+        threatMap: input.threatMap ?? context.threatMap ?? null,
+        dangerAt: input.dangerAt ?? context.dangerAt,
+        moraleInfo: input.moraleInfo ?? (moraleTier ? { tier: moraleTier } : null),
+        context
+    });
 }

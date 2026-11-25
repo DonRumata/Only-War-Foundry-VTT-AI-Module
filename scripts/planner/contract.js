@@ -127,7 +127,11 @@ export const SCORE_FACTORS = Object.freeze([
     "outnumber",
     "tieUp",
     "seek",
-    "run"
+    "run",
+    "withdrawal",
+    "coveringWithdrawal",
+    "freeAttackCost",
+    "disengage"
 ]);
 
 
@@ -217,7 +221,14 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     // Run mechanic (smoke request): a full-action sprint at the run rate.
     // Distance closed is already paid by `advance` — the factor only
     // carries preset taste for burning the whole turn on movement.
-    run: 0
+    run: 0,
+    // Peel-withdrawal (issue #89): doctrine factors are zero in the
+    // skeleton — only team-role overlays of combat presets price an
+    // organized withdrawal, cover fire and the explicit free-attack cost.
+    withdrawal: 0,
+    coveringWithdrawal: 0,
+    freeAttackCost: 0,
+    disengage: 0
 });
 
 

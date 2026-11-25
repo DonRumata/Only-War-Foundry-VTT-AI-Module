@@ -90,13 +90,23 @@ import {
  * @param {Map<string,object>|null} [input.shooterProfiles] tokenUuid →
  *   `{threat, distance}` of visible enemies — feeds the `counterThreat`
  *   factor weighting safer firing angles.
+ * @param {number|null} [input.withdrawal] Precomputed regroup progress
+ *   of a peel withdrawal candidate (`0..1`).
+ * @param {number|null} [input.coveringWithdrawal] Cover-role lane/mode
+ *   evidence (`0..1`).
+ * @param {number|null} [input.freeAttackCost] Explicit ordinary melee-exit
+ *   risk cost (`0..1`); presets weight it negatively.
+ * @param {number|null} [input.disengage] Structural Disengage capability
+ *   marker (`1` only for the full-action move candidate).
  * @returns {object}
  */
 export function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
     lastUsedWeapon = null, traits = [], dodgeTN = null,
     allyEngagedTargets = null, enemies = null, lastAttacker = null,
-    orderBoost = null, lastTarget = null, shooterProfiles = null }) {
+    orderBoost = null, lastTarget = null, shooterProfiles = null,
+    withdrawal = null, coveringWithdrawal = null, freeAttackCost = null,
+    disengage = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -316,7 +326,25 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
         // Run mechanic (smoke request): a full-action sprint beyond the
         // full-move rate — the doctrine weight prices burning the whole
         // turn on ground gain.
-        run: variant === "run" ? 1 : 0
+        run: variant === "run" ? 1 : 0,
+        // Peel-withdrawal (issue #89): candidate-generation metadata,
+        // already normalized by the planner/pure selector. `withdrawal`
+        // measures progress toward the validated regroup point (1 = exact
+        // arrival), `freeAttackCost` is the explicit positive cost of an
+        // ordinary melee exit (the preset weight is negative), and
+        // `disengage` marks the rare structurally detected full-action
+        // capability. `coveringWithdrawal` is lane/mode evidence computed
+        // for cover-role candidates.
+        withdrawal: Number.isFinite(withdrawal)
+            ? Math.max(0, Math.min(1, withdrawal))
+            : (variant === "withdraw" || variant === "disengage" ? 1 : 0),
+        coveringWithdrawal: Number.isFinite(coveringWithdrawal)
+            ? Math.max(0, Math.min(1, coveringWithdrawal)) : 0,
+        freeAttackCost: Number.isFinite(freeAttackCost)
+            ? Math.max(0, Math.min(1, freeAttackCost)) : 0,
+        disengage: Number.isFinite(disengage)
+            ? Math.max(0, Math.min(1, disengage))
+            : (variant === "disengage" ? 1 : 0)
     };
 }
 

@@ -34,6 +34,7 @@
  */
 import { evaluateFactors } from "../planner.js";
 import { _findToken, _tokenDoc, _tokenPosition } from "../planner/documents.js";
+import { _deepFreeze } from "../planner/util.js";
 import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
 import {
     SUPPRESS_AND_BOUND,
@@ -57,6 +58,10 @@ import {
     PINCER_TACTIC,
     selectPincerTactic
 } from "./pincer.js";
+import {
+    PEEL_WITHDRAWAL_NAME,
+    evaluatePeelCascade
+} from "../tactics/peel-withdrawal.js";
 
 export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
@@ -67,6 +72,7 @@ export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
 export const SPEC_OPS_TACTICS = Object.freeze([
     SUPPRESS_AND_BOUND,
     INTERDICTION_TACTIC,
+    PEEL_WITHDRAWAL_NAME,
     "flank-and-fix",
     "coordinated-assault",
     "covering-advance",
@@ -197,7 +203,10 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         proximity: 0.5,
         threat: 3,
         holdPosition: 0,
-        cohesionRestore: 10
+        cohesionRestore: 10,
+        withdrawal: 8,
+        freeAttackCost: -7,
+        disengage: 3
     })
 });
 
@@ -218,6 +227,27 @@ export const SPEC_OPS_ROLE_WEIGHTS = Object.freeze({
         stickyTarget: 2,
         screenProgress: 8,
         holdPosition: -4
+    }),
+    // Issue #89 peel roles: withdrawers buy movement toward the validated
+    // regroup point and explicitly pay the ordinary free-attack cost; the
+    // rare structural Disengage capability is only a mitigation bonus.
+    withdraw: Object.freeze({
+        withdrawal: 7,
+        freeAttackCost: -6,
+        disengage: 3,
+        attackNow: -4,
+        attackAfterMove: -6,
+        charge: -8,
+        holdPosition: -5
+    }),
+    cover: Object.freeze({
+        coveringWithdrawal: 8,
+        suppression: 6,
+        attackNow: 2,
+        overwatch: 1,
+        holdPosition: 2,
+        charge: -4,
+        withdrawal: -4
     })
 });
 
@@ -897,6 +927,8 @@ export function specOpsFlankFallback(members, tactic, failure) {
  *   `regroup`, `specOpsConfig`, `seed`).
  * @param {*} [input.moraleTier] Committed team morale tier of the fireteam
  *   (issue #88 pincer morale gate; `context.moraleTier` is the fallback).
+ * @param {object|null} [input.moraleInfo] Full morale evaluation for the
+ *   stateless peel trigger.
  * @param {object} [input.config] `SpecOpsConfig` overrides.
  * @returns {object} `{name, reason, assignments, allowFlank, regroup,
  *   objective, maxDetachedPhases, breakdown}`; `name: null` means the
@@ -913,7 +945,8 @@ export function selectSpecOpsTactic({
     context = {},
     config = null,
     character = null,
-    moraleTier = null
+    moraleTier = null,
+    moraleInfo = null
 } = {}) {
     const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
@@ -950,6 +983,42 @@ export function selectSpecOpsTactic({
         // members ⇒ the configured individual preset handles the plan).
         return finish(null, "insufficient-members");
     }
+    // Issue #89: peel-withdrawal is evaluated before every legacy
+    // regroup-fallback branch. The pure core owns trigger/hysteresis,
+    // regroup validation, role allocation and cost margins; a rejection is
+    // diagnostic-only and the legacy fallback below remains available.
+    const peel = evaluatePeelCascade({
+        members: available,
+        leaderId,
+        targets,
+        casualties,
+        moraleInfo: moraleInfo ?? context.moraleInfo
+            ?? (moraleTier ?? context.moraleTier
+                ? { tier: moraleTier ?? context.moraleTier }
+                : null),
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        scene,
+        combat,
+        context
+    });
+    breakdown.peel = {
+        selected: peel.status === "ok",
+        reason: peel.reason ?? null,
+        rejections: [...(peel.rejections ?? [])],
+        ...(peel.status === "ok" ? {} : { breakdown: peel.breakdown ?? null })
+    };
+    if (peel.descriptor) {
+        return _deepFreeze({
+            ...peel.descriptor,
+            maxDetachedPhases: cfg.maxDetachedRounds,
+            breakdown: {
+                ...breakdown,
+                ...(peel.breakdown ?? {}),
+                peel: { ...breakdown.peel }
+            }
+        });
+    }
+
     if (context.regroup === true) {
         return finish("regroup-fallback", "forced-regroup",
             { regroup: true, assignments: all("regroup") });
@@ -1243,6 +1312,37 @@ export function specOpsVeto({ candidate = {}, context = {} } = {}) {
 }
 
 /**
+ * Evidence that a cover-role candidate performs the peel cover mode chosen
+ * by the pure selector. Mode feasibility/lane evidence is selection-time
+ * doctrine; this factor only sharpens execution scoring and is zero for
+ * withdrawers.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Planning context.
+ * @returns {number} `0..1` cover evidence.
+ */
+function _coveringWithdrawal(candidate, context) {
+    if (context.team?.role !== "cover") return 0;
+    const peel = context.team?.peel ?? null;
+    const mode = peel?.coverMode ?? peel?.cover?.mode ?? null;
+    if (mode === "suppression") return suppressionFactorOf(candidate);
+    if (mode === "overwatch") return candidate.variant === "overwatch" ? 1 : 0;
+    if (mode === "melee") {
+        return candidate.action && (candidate.action.class === "melee"
+            || candidate.variant === "charge" || candidate.action.attackType === "charge") ? 1 : 0;
+    }
+    if (mode === "direct") {
+        if (!ATTACK_VARIANTS.has(candidate.variant) || candidate.cone) return 0;
+        const ids = [peel?.coverTargetId, peel?.coverTargetUuid, peel?.coverTarget]
+            .filter(value => value !== null && value !== undefined).map(String);
+        if (!ids.length) return 1;
+        const targetIds = [candidate.target?.tokenId, candidate.target?.tokenUuid]
+            .filter(value => value !== null && value !== undefined).map(String);
+        return ids.some(id => targetIds.includes(id)) ? 1 : 0;
+    }
+    return 0;
+}
+
+/**
  * Evaluate one planner candidate for the spec-ops preset. Inside a
  * fireteam the member's temporary task picks a weight overlay and may
  * add the `flankAngle`/`cohesionRestore` factors; outside a fireteam the
@@ -1271,6 +1371,9 @@ export function evaluateSpecOps({
     if (context.team?.role === "suppressor") {
         enriched.suppression = suppressionFactorOf(candidate);
     }
+    if (context.team?.role === "cover") {
+        enriched.coveringWithdrawal = _coveringWithdrawal(candidate, context);
+    }
     if (context.team?.role === INTERDICT_ROLE) {
         // Issue #87: the screen pull only exists for the interdictor. It
         // is zero without a screen point, so a legal charge never has to
@@ -1295,11 +1398,11 @@ export function evaluateSpecOps({
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
     if (context.team?.role === "suppressor") effective.suppression = 8;
-    if (context.team?.role === INTERDICT_ROLE) {
-        // Issue #87 role overlay: additive deltas over the task weights —
-        // the interdictor sharpens its assault task (`charge` 5 → 8,
-        // `tieUp` 4 → 8) instead of replacing it.
-        for (const [key, delta] of Object.entries(SPEC_OPS_ROLE_WEIGHTS.interdictor)) {
+    const roleOverlay = SPEC_OPS_ROLE_WEIGHTS[context.team?.role] ?? null;
+    if (roleOverlay) {
+        // Role overlays are additive deltas over the task weights — a role
+        // sharpens the assigned task instead of replacing the maneuver.
+        for (const [key, delta] of Object.entries(roleOverlay)) {
             effective[key] = (effective[key] ?? 0) + delta;
         }
     }
@@ -1327,7 +1430,9 @@ export function evaluateSpecOps({
                 suppression: context.team?.role === "suppressor"
                     ? (enriched.suppression ?? 0) : null,
                 screenProgress: context.team?.role === INTERDICT_ROLE
-                    ? (enriched.screenProgress ?? 0) : null
+                    ? (enriched.screenProgress ?? 0) : null,
+                coveringWithdrawal: context.team?.role === "cover"
+                    ? (enriched.coveringWithdrawal ?? 0) : null
             }
         }
     };

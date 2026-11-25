@@ -30,6 +30,9 @@ import {
     selectPincerTactic
 } from "./pincer.js";
 import { specOpsTokenCenter } from "./spec-ops.js";
+import {
+    evaluatePeelCascade
+} from "../tactics/peel-withdrawal.js";
 
 /** Preset id registered in the planner preset registry. */
 export const ASSAULT_PRESET_ID = "assault";
@@ -106,7 +109,20 @@ export const ASSAULT_WEIGHTS = Object.freeze({
  * the centre instead of turning cautious.
  */
 export const ASSAULT_TASK_WEIGHTS = Object.freeze({
-    flank: Object.freeze({ flankProgress: 6, advance: 1 })
+    flank: Object.freeze({ flankProgress: 6, advance: 1 }),
+    regroup: Object.freeze({
+        withdrawal: 12, freeAttackCost: -8, disengage: 4, charge: -10
+    })
+});
+
+/** Peel role overlays of the assault preset (issue #89). */
+export const ASSAULT_ROLE_WEIGHTS = Object.freeze({
+    withdraw: Object.freeze({
+        withdrawal: 5, freeAttackCost: -4, attackNow: -5, attackAfterMove: -6, holdPosition: -5
+    }),
+    cover: Object.freeze({
+        coveringWithdrawal: 8, attackNow: 3, melee: 2, overwatch: -1, withdrawal: -4
+    })
 });
 
 /**
@@ -136,6 +152,23 @@ export function evaluateAssault({ factors = {}, candidate = {}, weights = ASSAUL
             flankProgress: ASSAULT_TASK_WEIGHTS.flank.flankProgress,
             advance: (weights.advance ?? 0) + ASSAULT_TASK_WEIGHTS.flank.advance
         };
+    }
+    const role = typeof context.team?.role === "string" ? context.team.role : null;
+    if (context.team?.task === "regroup") {
+        effective = { ...effective, ...ASSAULT_TASK_WEIGHTS.regroup };
+    }
+    if (ASSAULT_ROLE_WEIGHTS[role]) {
+        effective = { ...effective };
+        for (const [key, delta] of Object.entries(ASSAULT_ROLE_WEIGHTS[role])) {
+            effective[key] = (effective[key] ?? 0) + delta;
+        }
+        if (role === "cover") {
+            const mode = context.team?.peel?.coverMode ?? null;
+            enriched.coveringWithdrawal = mode === "overwatch"
+                ? (candidate.variant === "overwatch" ? 1 : 0)
+                : (candidate.variant === "attack-in-place" || candidate.variant === "move-attack"
+                    || candidate.variant === "charge" ? 1 : 0);
+        }
     }
     const evaluation = evaluateFactors(enriched, effective);
     return {
@@ -204,6 +237,10 @@ export function registerAssaultPreset(planner) {
  * @param {object|null} [input.combat] Combat document.
  * @param {object} [input.context] Planning context (`walls`, `navigation`).
  * @param {object} [input.config] Pincer config overrides.
+ * @param {number|object} [input.casualties] Casualty count/detail forwarded
+ *   to peel-withdrawal.
+ * @param {object|null} [input.moraleInfo] Full morale evaluation forwarded
+ *   to peel-withdrawal.
  * @returns {object} Serializable tactic descriptor (`pincer-loose`,
  *   degraded `flank-and-fix`) or a `name: null` fallthrough record.
  */
@@ -216,7 +253,9 @@ export function selectAssaultTactic({
     scene = null,
     combat = null,
     context = {},
-    config = null
+    config = null,
+    casualties = 0,
+    moraleInfo = null
 } = {}) {
     const planningScene = context.scene ?? scene ?? combat?.scene ?? context.combat?.scene ?? null;
     const planningCombat = combat ?? context.combat ?? null;
@@ -229,7 +268,25 @@ export function selectAssaultTactic({
                 planningScene, member.position),
             positionIsCenter: true
         }));
-    return selectPincerTactic({
+    // Issue #89: a triggered peel outranks the loose pincer — survival
+    // doctrine beats committing the assault. Rejection is diagnostic-only
+    // and the ordinary pincer cascade continues unchanged.
+    const peel = evaluatePeelCascade({
+        members,
+        leaderId,
+        targets,
+        casualties,
+        moraleInfo: moraleInfo ?? context.moraleInfo
+            ?? (moraleTier ?? context.moraleTier
+                ? { tier: moraleTier ?? context.moraleTier }
+                : null),
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        scene: planningScene,
+        combat: planningCombat,
+        context
+    });
+    if (peel.descriptor) return peel.descriptor;
+    const base = selectPincerTactic({
         members: positioned,
         leaderId,
         targets,
@@ -243,6 +300,17 @@ export function selectAssaultTactic({
         context,
         config
     });
+    return {
+        ...base,
+        breakdown: {
+            ...(base.breakdown ?? {}),
+            peel: {
+                selected: false,
+                reason: peel.reason ?? null,
+                rejections: [...(peel.rejections ?? [])]
+            }
+        }
+    };
 }
 
 /**

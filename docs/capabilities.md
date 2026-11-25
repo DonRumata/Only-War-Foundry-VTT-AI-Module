@@ -515,6 +515,23 @@ execute: расхождение — `stale-state` (перемещение, см�
   элемент штурмует) с overlay `ASSAULT_TASK_WEIGHTS.flank`
   (`flankProgress 6`, `advance +1` аддитивно). Пороги — поля `pincer*`
   в `SPEC_OPS_CONFIG`.
+- Peel-withdrawal (issue #89): чистое stateless ядро
+  `tactics/peel-withdrawal.js` оценивает командный отход под прикрытием по
+  OR-trigger (desperate morale, total/recent losses, close threat с
+  гистерезисом danger enter/exit). В specOps peel идёт до legacy
+  regroup-fallback; в rangedCover — до suppress-and-bound, в assault — до
+  loose-pincer. Selector выдаёт ttl=1 `regroupPoint/threatCentroid/lane`,
+  explainable rejections и object assignments `withdraw`/`cover`; persistent
+  state и `peelActive` нет. Withdrawer получает objective-driven move
+  candidates к regroup point; ordinary withdraw несёт явный
+  `freeAttackCost`, а `disengage` существует только при structural
+  capability evidence и сериализуется как move metadata. Cover priority —
+  suppression → direct → overwatch (reaction-used veto); pinned/stunned и
+  invalid/trap regroup geometry проверяются без пустых ходов. Explicit
+  objective/assignments/`context.tactic`/focus/suppression/interdiction/
+  pincer не перетираются silently; GM/morale demotion снимает peel role и
+  peel objective. Пороги `peel*` — экспериментальные world settings с
+  pure-core defaults и context overrides.
 - Suppress-and-bound (issue #86): чистое ядро `tactics/suppress-and-bound.js`
   выбирает capable suppressor по полуавтоматической/полностью автоматической
   очереди, заряду, актуальному `turnIndex` и безопасному конусу. В каскаде

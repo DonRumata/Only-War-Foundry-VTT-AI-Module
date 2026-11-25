@@ -180,6 +180,111 @@ import {
 
 
 /**
+ * Distance from a point to a segment in pixels. Used only for defensive
+ * peel-route vetoes; tactical geometry remains in the pure selector.
+ * @param {object} point
+ * @param {object} a
+ * @param {object} b
+ * @returns {number}
+ */
+function _pointSegmentDistancePx(point, a, b) {
+    if (!point || !a || !b) return Number.POSITIVE_INFINITY;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const length2 = (dx * dx) + (dy * dy);
+    if (length2 <= 0) return Math.hypot(point.x - a.x, point.y - a.y);
+    const t = Math.max(0, Math.min(1,
+        (((point.x - a.x) * dx) + ((point.y - a.y) * dy)) / length2));
+    return Math.hypot(point.x - (a.x + (t * dx)), point.y - (a.y + (t * dy)));
+}
+
+/**
+ * Polyline of a withdrawal move. Candidate cells from `findCandidates`
+ * may lack waypoints; the endpoint-only fallback still allows an enemy
+ * cell/consolidated threat-centroid crossing check.
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @returns {object[]}
+ */
+function _withdrawalPolyline(move, selfPos) {
+    const points = [{ x: selfPos.x, y: selfPos.y }];
+    for (const point of move?.waypoints ?? []) {
+        if (Number.isFinite(point?.x) && Number.isFinite(point?.y)) {
+            points.push({ x: point.x, y: point.y });
+        }
+    }
+    if (Number.isFinite(move?.x) && Number.isFinite(move?.y)) {
+        const last = points[points.length - 1];
+        if (!last || Math.hypot(last.x - move.x, last.y - move.y) > 1e-9) {
+            points.push({ x: move.x, y: move.y });
+        }
+    }
+    return points;
+}
+
+/**
+ * Whether the withdrawal polyline crosses an enemy cell or the consolidated
+ * threat centroid. This is a conservative runtime revalidation of the pure
+ * selector's vetoes, not a second tactical geometry engine.
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @param {object[]} enemies Enemy contacts `{x,y}` in pixels.
+ * @param {object|null} threatCentroid Peel threat centroid in pixels.
+ * @param {number} pxPerUnit Pixels per scene unit.
+ * @returns {boolean}
+ */
+function _withdrawalRouteCrossesThreat(move, selfPos, enemies, threatCentroid, pxPerUnit) {
+    const points = _withdrawalPolyline(move, selfPos);
+    if (points.length < 2) return false;
+    const radius = Math.max(1, 0.5 * (pxPerUnit > 0 ? pxPerUnit : 1));
+    const blockers = [
+        ...(enemies ?? []).filter(enemy => Number.isFinite(enemy?.x) && Number.isFinite(enemy?.y)),
+        ...(Number.isFinite(threatCentroid?.x) && Number.isFinite(threatCentroid?.y)
+            ? [threatCentroid] : [])
+    ];
+    for (const blocker of blockers) {
+        for (let index = 0; index < points.length - 1; index += 1) {
+            if (_pointSegmentDistancePx(blocker, points[index], points[index + 1]) <= radius + 1e-9) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Pinned-withdrawal legality outside melee: no route point may reduce the
+ * distance to any enemy, and the endpoint must not end closer to the
+ * nearest enemy than the start. Engaged members are treated as ordinary
+ * melee withdrawals (pinning is suppressed by melee per the corebook).
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @param {object[]} enemies Enemy contacts `{x,y,reachPx}`.
+ * @returns {boolean}
+ */
+function _pinnedWithdrawalRouteLegal(move, selfPos, enemies) {
+    const points = _withdrawalPolyline(move, selfPos);
+    let startNearest = Number.POSITIVE_INFINITY;
+    let endNearest = Number.POSITIVE_INFINITY;
+    for (const enemy of enemies ?? []) {
+        if (!Number.isFinite(enemy?.x) || !Number.isFinite(enemy?.y)) continue;
+        const startDistance = Math.hypot(enemy.x - selfPos.x, enemy.y - selfPos.y);
+        startNearest = Math.min(startNearest, startDistance);
+        const engagedAtStart = Number.isFinite(enemy.reachPx)
+            && startDistance <= enemy.reachPx + 1e-9;
+        if (engagedAtStart) continue;
+        for (const point of points.slice(1)) {
+            if (Math.hypot(enemy.x - point.x, enemy.y - point.y) < startDistance - 1e-9) {
+                return false;
+            }
+        }
+        const end = points[points.length - 1];
+        if (end) endNearest = Math.min(endNearest, Math.hypot(enemy.x - end.x, enemy.y - end.y));
+    }
+    return !Number.isFinite(startNearest) || endNearest >= startNearest - 1e-9;
+}
+
+/**
  * Create the `planner` service published as `api.services.get("planner")`.
  * Pure/deterministic: never mutates documents; sibling services are looked
  * up lazily through `api.services` or injected via `context`.
@@ -935,6 +1040,11 @@ export function createPlannerService({
         const targetPosOf = target => ({ x: target?.x ?? null, y: target?.y ?? null });
 
         const candidates = [];
+        // Peel withdrawers need their withdrawal anchor before the target
+        // loop: the nearest contact supplies commitment/unpin context, while
+        // the move itself is generated toward the regroup objective.
+        const threatTarget = _nearestThreat(targets, selfPos, grid);
+        const withdrawalMoves = new Map();
         let routesMissing = false;
         // L0 hard vetoes (issue #24): every candidate rejection is
         // absolute — no personality or morale layer may revive it, and
@@ -1019,6 +1129,11 @@ export function createPlannerService({
                 grid, navigation, perception, context: planContext
             }).filter(_withinRemaining);
             diagnostics.metrics.movesEvaluated += moves.length;
+            for (const move of moves) {
+                if (move?.withdrawal === true && !move.stay) {
+                    withdrawalMoves.set(`${move.key}|${move.x}|${move.y}`, move);
+                }
+            }
 
             let approachMove = null;
             for (const move of moves) {
@@ -1464,6 +1579,133 @@ export function createPlannerService({
             }
         }
 
+        // Peel-withdrawal candidates (issue #89): the regroup anchor was
+        // merged into the bounded navigation enumeration as marked
+        // withdrawal cells. They are scored once per turn rather than once
+        // per hostile target — withdrawal is objective-driven movement, not
+        // an approach toward the contact that happens to own the probe.
+        const peelContext = planContext.team?.peel ?? null;
+        const peelCost = peelContext?.cost ?? null;
+        const peelRegroupPoint = peelContext?.regroupPoint
+            ?? planContext.team?.regroupPoint ?? null;
+        if (planContext.team?.role === "withdraw" && withdrawalMoves.size
+            && Number.isFinite(peelRegroupPoint?.x) && Number.isFinite(peelRegroupPoint?.y)) {
+            const peelMode = peelCost?.mode === "disengage" ? "disengage" : "withdraw";
+            const threatCentroid = peelContext?.threatCentroid
+                ?? peelContext?.objective?.threatCentroid ?? null;
+            for (const originalMove of withdrawalMoves.values()) {
+                let move = { ...originalMove };
+                const candidateKey = `${peelMode}|${move.key ?? `${move.x},${move.y}`}`;
+                if (move.stay) continue;
+                const cost = _finiteOr(move.cost, 0);
+                const ordinaryHalves = halfMoveLimit !== null && cost > halfMoveLimit + 1e-9 ? 2 : 1;
+                const requiredHalves = peelMode === "disengage" ? ACTION_BUDGET_HALVES : ordinaryHalves;
+                if (requiredHalves > actionBudget) {
+                    rejectOnce(`withdraw|${candidateKey}`, "over-budget");
+                    continue;
+                }
+                if (peelMode === "disengage" && halfMoveLimit !== null
+                    && cost > halfMoveLimit + 1e-9) {
+                    rejectOnce(`withdraw|${candidateKey}`, "disengage-beyond-half-move");
+                    continue;
+                }
+                const remainingLimit = spentMove > 0 && totalMoveBudget !== null
+                    ? Math.max(0, totalMoveBudget - spentMove) : null;
+                if (remainingLimit !== null && cost > remainingLimit + 1e-9) {
+                    rejectOnce(`withdraw|${candidateKey}`, "over-budget");
+                    continue;
+                }
+                // Revalidate the exact serialized route when navigation is
+                // available. Candidate cells prove reachability in general;
+                // the executor must still receive the concrete waypoint
+                // contract and threat-crossing vetoes must inspect the same
+                // path the move step will execute.
+                if (navigation && typeof navigation.planRoute === "function"
+                    && !Array.isArray(move.waypoints)) {
+                    const budget = peelMode === "disengage"
+                        ? halfMoveLimit
+                        : (requiredHalves === 1 ? halfMoveLimit : totalMoveBudget);
+                    let route = null;
+                    try {
+                        route = budget !== null
+                            ? navigation.planRoute(tokenDoc, { x: move.x, y: move.y }, budget,
+                                { rates: planContext.rates, reservations: planContext.reservations })
+                            : null;
+                    } catch(err) {
+                        route = null;
+                    }
+                    if (!route || route.exact !== true || !route.endpoint) {
+                        rejectOnce(`withdraw|${candidateKey}`, "no-exact-route");
+                        continue;
+                    }
+                    move = {
+                        ...move,
+                        x: route.endpoint.x,
+                        y: route.endpoint.y,
+                        cost: _finiteOr(route.cost, cost),
+                        costCells: _finiteOr(route.costCells, move.costCells),
+                        waypoints: Array.isArray(route.waypoints) ? route.waypoints : null
+                    };
+                }
+                if (navigation && typeof navigation.validateEndpoint === "function") {
+                    let endpointValid = true;
+                    try {
+                        endpointValid = navigation.validateEndpoint(tokenDoc,
+                            { x: move.x, y: move.y }, {
+                                rates: planContext.rates,
+                                reservations: planContext.reservations
+                            })?.valid !== false;
+                    } catch(err) {
+                        endpointValid = true;
+                    }
+                    if (!endpointValid) {
+                        rejectOnce(`withdraw|${candidateKey}`, "invalid-endpoint");
+                        continue;
+                    }
+                }
+                if (_withdrawalRouteCrossesThreat(move, selfPos, enemyContacts,
+                    threatCentroid, pxPerUnit)) {
+                    rejectOnce(`withdraw|${candidateKey}`, "route-through-threat");
+                    continue;
+                }
+                if (isPinned && peelMode !== "disengage"
+                    && !_pinnedWithdrawalRouteLegal(move, selfPos, enemyContacts)) {
+                    rejectOnce(`withdraw|${candidateKey}`, "pinned-no-safe-exit");
+                    continue;
+                }
+                if (peelMode === "disengage") {
+                    const countEngagers = point => (enemyContacts ?? []).filter(enemy =>
+                        Number.isFinite(enemy?.reachPx)
+                        && Math.hypot(enemy.x - point.x, enemy.y - point.y)
+                            <= enemy.reachPx + 1e-9).length;
+                    if (countEngagers({ x: move.x, y: move.y }) >= countEngagers(selfPos)) {
+                        rejectOnce(`withdraw|${candidateKey}`, "disengage-endpoint-engagers");
+                        continue;
+                    }
+                }
+                const startToRegroup = _pixelDistance(selfPos, peelRegroupPoint, grid);
+                const endToRegroup = _pixelDistance({ x: move.x, y: move.y }, peelRegroupPoint, grid);
+                const withdrawalProgress = endToRegroup <= 1e-9 ? 1
+                    : (Number.isFinite(startToRegroup) && startToRegroup > 0 && Number.isFinite(endToRegroup)
+                        ? Math.max(0, Math.min(1, (startToRegroup - endToRegroup) / startToRegroup))
+                        : 1);
+                const risk = _finiteOr(peelCost?.freeAttackRisk, 0);
+                const stayRisk = _finiteOr(peelCost?.stayRisk, 0);
+                const freeAttackCost = peelMode === "disengage" ? 0
+                    : Math.max(0, Math.min(1, risk / Math.max(risk, stayRisk, 1)));
+                candidates.push({
+                    target: threatTarget ?? targets[0] ?? null,
+                    action: null,
+                    move,
+                    variant: peelMode,
+                    withdrawal: withdrawalProgress,
+                    freeAttackCost,
+                    disengage: peelMode === "disengage" ? 1 : 0,
+                    peelEngagers: Array.isArray(peelCost?.engagers) ? [...peelCost.engagers] : []
+                });
+            }
+        }
+
         // Directed-cone weapons (spray, suppressing fire) cover a sector
         // rather than a token: `_bestConeAim` sweeps firing directions for
         // maximum hostile coverage under a strict friendly/neutral veto.
@@ -1556,7 +1798,6 @@ export function createPlannerService({
         // persists on the combatant `aim` flag until the shot is taken
         // (aimedUntil). Worth planning when no shot is available now or
         // the preset explicitly prefers it.
-        const threatTarget = _nearestThreat(targets, selfPos, grid);
         // Standalone aim only makes sense for a ranged loadout facing a
         // live contact — for last-known memories a search move or an
         // overwatch declaration is the meaningful turn instead.

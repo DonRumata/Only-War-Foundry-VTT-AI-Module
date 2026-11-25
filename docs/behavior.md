@@ -15,7 +15,8 @@ los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
 danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
 alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge, order, ev,
-stickyTarget, outnumber, tieUp, seek, run`.
+stickyTarget, outnumber, tieUp, seek, run, withdrawal,
+coveringWithdrawal, freeAttackCost, disengage`.
 
 Issue #37: EV-срез уклонения живёт на факторе `ev` — `damageNorm ×
 attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
@@ -28,6 +29,9 @@ attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
 Preset-only: `rangeBand`, `aimOpportunity` (rangedCover/hold);
 `insideZone, returnToZone, moveToLos, escapeMelee, searchMove,
 anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
+`withdrawal/freeAttackCost/disengage` создаются только для objective-driven
+peel-отхода, `coveringWithdrawal` — только для cover-роли; вне этих ролей
+веса равны нулю и факторы инертны.
 
 ### Веса пресетов
 
@@ -70,6 +74,7 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | grudge | 4 | 1 | 2 | 3 |
 | seek | 1.5 | 0 | 0 | 3 |
 | run | 1.5 | 0.5 | 0 | 1 |
+| withdrawal/coveringWithdrawal/freeAttackCost/disengage | 0 | 0 | 0 | 0 |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -78,7 +83,11 @@ assault/regroup — мерджатся поверх базы), solo-overlay `SPE
 `tieUp +4` (4→8), `meleeEngage +2`, `stickyTarget +2`,
 preset-only фактор `screenProgress 8` (прогресс endpoint к точке экрана
 `team.screenPoint` — зеркало `flankProgress`, без жёсткого вето) и
-`holdPosition −4`. Каскад манёвров: suppress-and-bound (#86) оценивается
+`holdPosition −4`. Peel-роли (issue #89) — аддитивные overlays:
+`withdraw` (`withdrawal +7`, `freeAttackCost −6`, `disengage +3`,
+attacks/charge/hold отрицательно) и `cover` (`coveringWithdrawal +8`,
+`suppression +6`, direct/overwatch как fallback, `withdrawal −4` — прикрытие
+не убегает). Каскад манёвров: suppress-and-bound (#86) оценивается
 первым; при его деградации чистое ядро `presets/interdiction.js` пробует
 interdiction-screen до флангов/штурма — чистый стрелок противника
 (триггер A, confidence `rangedEV/(rangedEV+meleeEV) ≥ 0.7` и
@@ -126,6 +135,39 @@ overlay `ASSAULT_TASK_WEIGHTS.flank` (`flankProgress 6`, `advance +1`
 (`pincerMinMembers 4, pincerSync "elastic", pincerMinMorale "pressured",
 pincerMaxTravelMeters 12` и др.), переопределяются через
 `context.specOpsConfig` как остальная доктрина.
+Peel-withdrawal (issue #89): командный манёвр отхода под прикрытием, не
+новый preset и не новый `FIRETEAM_TASKS` task. Чистое ядро
+`tactics/peel-withdrawal.js` переоценивается каждый раунд без latch/state;
+OR-trigger — morale desperate, потери total/recent либо близкая угроза с
+гистерезисом опасности. В specOps peel проверяется до legacy
+regroup-fallback; при отказе fallback сохраняет прежнее поведение, а
+`breakdown.peel` объясняет trigger/regroup/cover/role rejection. В
+rangedCover peel стоит до suppress-and-bound, в assault — до loose-pincer.
+Descriptor несёт `objective{type:"peel-withdrawal", ttl:1, regroupPoint,
+threatCentroid, lane, trigger, hysteresis}` и object assignments:
+withdrawer — `task:"regroup", role:"withdraw"`, прикрывающий —
+`task:"support", role:"cover"`. Точка перегруппировки выбирается fan-поиском
+от threat centroid через read-only navigation (`validateEndpoint`/`planRoute`);
+маршрут не должен проходить через enemy cell/центроид. Роли платят явную
+стоимость выхода из melee: ordinary withdraw всегда рискует свободной атакой,
+`disengage` — только move metadata при структурно доказанной capability
+(system trait/talent/action); v1 API не считается источником Disengage.
+Pinned вне melee может отходить только по не сокращающей дистанцию к врагам
+траектории; pinned в melee обрабатывается как ordinary engaged, stunned не
+получает withdrawal movement. Cover priority — suppression → direct →
+overwatch (reactionUsed исключает overwatch, но не создаёт shooting veto);
+при всех положительных margin desperate-отряд может уйти без прикрытия
+(`uncovered-desperate`). Явный `context.tactic`, caller `objective` и
+caller `assignments` имеют более высокий precedence: peel не перетирает их,
+а его objective без `targetId` не отменяет concentrate-fire focus. В планере
+withdrawer получает дополнительные nav-кандидаты к `regroupPoint`,
+revалидирует exact route/endpoint/threat-crossing и получает variants
+`withdraw|disengage` через обычный move step; `freeAttackCost` — отдельный
+негативный фактор, не скрытый veto. Cover-фактор — evidence только выбранного
+selector-режима (suppression/direct/overwatch/melee). GM/morale-демоции
+снимают peel role и peel-objective точечно; манёвр stateless переоценивается
+на следующем раунде.
+
 Конфиг specOps: `flankMinAngleDegrees 60, maxDetachedRounds 2,
 highThreatRatio 2, supportWeight 6, flankWeight 8, assaultWeight 7,
 cohesionWeight 10, interdictConfidenceMin 0.7, interdictMinRangedEV 6,

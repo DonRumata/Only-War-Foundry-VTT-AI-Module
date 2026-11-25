@@ -403,11 +403,32 @@ half-move, цель `reactionUsed`. Фактор `attackType` несёт
 идемпотентно; конфликтующее — ошибка. `fireteam._resolveTactic` сначала
 сохраняет legacy-приоритет explicit `context.tactic` (function/object;
 `null`/`false` отключают), затем обращается к registry по `teamPreset`.
-specOps зарегистрирован через тот же `specOpsTactic`; assault/rangedCover/hold
-пока не имеют selectors и получают null/fallback без новых тактик. Для тактик
+specOps, rangedCover и assault зарегистрированы как maneuver-selectors;
+hold пока получает null/fallback без новых тактик. Для тактик
 `collectMembers` дополнительно несёт `turnIndex` (индекс в `combat.turns`)
 и `hasActed` (`turnIndex < combat.turn`; `turn:null`/отсутствие индекса —
 false), не меняя solo-планировщик.
+
+Peel-withdrawal (issue #89): pure stateless ядро `scripts/tactics/peel-withdrawal.js`
+не хранит `peelActive` и не добавляет preset/`FIRETEAM_TASKS`. specOps проверяет
+его до legacy regroup-fallback, rangedCover — до suppress-and-bound, assault —
+до loose-pincer. Selector адаптирует read-only входы (positions, rates,
+morale/casualties, turn order, engagement, weapon capabilities, navigation,
+danger) без document mutations и возвращает frozen descriptor
+`objective{type:"peel-withdrawal", ttl:1, regroupPoint, threatCentroid, lane}`
++ object assignments `withdraw`/`cover` + explainable rejections. Явные
+`context.tactic`, caller objective/assignments и concentrate-fire focus имеют
+приоритет; peel не перетирает их. Member context использует существующий
+`team` канал: withdrawer получает `task:"regroup", role:"withdraw"` и
+regroup anchor, cover — `task:"support", role:"cover"` и cover mode/target.
+Planner мерджит navigation-кандидаты к regroup point, генерирует variants
+`withdraw|disengage` через обычный move step и факторы
+`withdrawal/coveringWithdrawal/freeAttackCost/disengage` (новых executor
+step types нет). Ordinary withdraw явно платит free-attack cost; `disengage`
+— только structural capability evidence, API v1.0 не считается таким
+доказательством. GM/morale demotions очищают peel role/objective geometry.
+Пороги `peel*` — world settings с experimental defaults; context overrides
+выигрывают.
 
 ## Реакции (issue #37)
 

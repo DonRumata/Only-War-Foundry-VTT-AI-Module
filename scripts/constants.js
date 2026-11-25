@@ -149,7 +149,26 @@ export const SETTING_KEYS = Object.freeze({
     // Issue #26: outnumber ratio at which the enemy headcount alone
     // turns the morale proposal `desperate` (default
     // `MORALE_DESPERATE_OUTNUMBER_RATIO = 2` — a 2:1 deficit).
-    moraleDesperateRatio: "moraleDesperateRatio"
+    moraleDesperateRatio: "moraleDesperateRatio",
+    // Issue #89 peel-withdrawal experimental thresholds. Defaults live in
+    // `PEEL_DEFAULT_THRESHOLDS`; every key remains context-overridable.
+    peelCasualtyRatio: "peelCasualtyRatio",
+    peelCasualtiesRecent: "peelCasualtiesRecent",
+    peelCloseThreatDistance: "peelCloseThreatDistance",
+    peelCloseThreatRatio: "peelCloseThreatRatio",
+    peelDangerEnter: "peelDangerEnter",
+    peelDangerExit: "peelDangerExit",
+    peelRegroupDangerMax: "peelRegroupDangerMax",
+    peelRegroupThreatRadius: "peelRegroupThreatRadius",
+    peelMinWithdrawalGain: "peelMinWithdrawalGain",
+    peelFreeAttackMargin: "peelFreeAttackMargin",
+    peelAllowUncovered: "peelAllowUncovered",
+    peelDefaultHitChance: "peelDefaultHitChance",
+    peelDefaultMeleeEV: "peelDefaultMeleeEV",
+    peelMeleeReach: "peelMeleeReach",
+    peelRegroupArriveRadius: "peelRegroupArriveRadius",
+    peelCommitmentRadius: "peelCommitmentRadius",
+    peelEnemyCellRadius: "peelEnemyCellRadius"
 });
 
 /**

@@ -65,6 +65,7 @@ import { emitBarkOnce } from "./barks.js";
 import {
     getAIDifficulty,
     getMoraleDesperateRatio,
+    getPeelThresholds,
     getPreferredCohesion,
     getSpecOpsConfig,
     logDiagnostics
@@ -86,6 +87,9 @@ import {
     specOpsFlankFallback,
     specOpsTokenCenter
 } from "./presets/spec-ops.js";
+import {
+    PEEL_WITHDRAWAL_NAME
+} from "./tactics/peel-withdrawal.js";
 import {
     INTERDICTION_TACTIC,
     INTERDICT_OBJECTIVE_TYPE,
@@ -244,6 +248,29 @@ function _clearPincerGeometry(assignment) {
     if (!["flank-left", "flank-right", "fix", "center"].includes(assignment.element)) return;
     delete assignment.role;
     delete assignment.element;
+}
+
+/**
+ * Targeted peel-withdrawal demotion policy (issue #89): once a withdraw or
+ * cover assignment is demoted by GM intervention/morale, the peel role and
+ * its cost/geometry channel must not keep steering the member. Peel has no
+ * latch — clearing the object-form role is sufficient; the next round's
+ * selector re-evaluates the whole team statelessly.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearPeelGeometry(assignment) {
+    if (!assignment || !["withdraw", "cover"].includes(assignment.role)) return;
+    // `withdraw` remains meaningful on the regroup task and `cover` on
+    // support. Morale's flank→regroup/assault→support remap therefore does
+    // not destroy explicit peel-shaped assignments; a demotion that leaves
+    // the role/task pair invalid (notably GM→support for a withdrawer)
+    // clears both the role and the peel objective geometry.
+    if ((assignment.role === "withdraw" && assignment.task === "regroup")
+        || (assignment.role === "cover" && assignment.task === "support")) {
+        return;
+    }
+    delete assignment.role;
+    if (assignment.objective?.type === "peel-withdrawal") delete assignment.objective;
 }
 
 /**
@@ -2536,10 +2563,82 @@ export function createFireteamService({
      *   selected before the maneuver registry.
      * @param {*} [input.moraleTier] Committed team morale tier forwarded to
      *   the tactic selectors (issue #88 pincer morale gate).
+     * @param {object|null} [input.moraleInfo] Full morale evaluation forwarded
+     *   to stateless tactics (peel reads tier/counters without re-deriving them).
+     * @param {object|null} [input.casualtyDetail] Total/recent/initial casualty
+     *   counts for peel-withdrawal trigger evaluation.
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context,
-        focusObjective = null, character = null, moraleTier = null }) {
+        focusObjective = null, character = null, moraleTier = null, moraleInfo = null,
+        casualtyDetail = null }) {
+        const targets = context.tacticTargets ?? (Array.isArray(context.targets)
+            ? context.targets
+            : _convergentTargets({ members, combat, context }));
+        // Issue #89 peel inputs: adaptation happens here, once, before the
+        // preset cascades. Selectors remain pure — this block only reads
+        // documents/services and builds plain data. In particular it does
+        // not narrow `context.targets`; attack-pool narrowing stays in the
+        // focus/interdiction channels.
+        const scene = context.scene ?? combat?.scene ?? null;
+        const navigation = context.navigation ?? _service("navigation");
+        const threatMapService = context.threatMap ?? _service("threatMap");
+        let threatMap = threatMapService;
+        let dangerAt = typeof context.dangerAt === "function" ? context.dangerAt : null;
+        if (!dangerAt && threatMapService) {
+            try {
+                const current = typeof threatMapService.map === "function"
+                    ? threatMapService.map() : null;
+                if (typeof current?.dangerAt === "function") {
+                    threatMap = current;
+                    dangerAt = point => current.dangerAt(point);
+                } else if (typeof threatMapService.buildMap === "function") {
+                    const built = threatMapService.buildMap({
+                        targets,
+                        combat,
+                        scene,
+                        grid: context.grid ?? scene?.grid ?? null
+                    });
+                    if (typeof built?.dangerAt === "function") {
+                        threatMap = built;
+                        dangerAt = point => built.dangerAt(point);
+                    }
+                }
+            } catch(err) {
+                dangerAt = null;
+            }
+        }
+        const defeatedCount = _finiteOr(casualtyDetail?.total, 0);
+        const casualtyOverride = context.casualties;
+        const casualties = casualtyOverride && typeof casualtyOverride === "object"
+            ? casualtyOverride
+            : {
+                // Legacy `context.casualties` means recent defeats (the
+                // specOps fallback adds live defeated members itself); the
+                // peel core needs total/recent/initialStrength explicitly.
+                total: defeatedCount,
+                recent: Math.max(0, _finiteOr(casualtyOverride,
+                    _finiteOr(context.casualtiesRecent, 0))),
+                initialStrength: Math.max(1, _finiteOr(context.initialStrength,
+                    members.length + defeatedCount))
+            };
+        const selectorContext = {
+            ...context,
+            navigation,
+            threatMap,
+            ...(dangerAt ? { dangerAt } : {}),
+            scene,
+            grid: context.grid ?? scene?.grid ?? null,
+            casualties,
+            peel: { ...getPeelThresholds(), ...(context.peel ?? {}) },
+            moraleInfo: moraleInfo ? {
+                tier: moraleInfo.tier ?? moraleTier ?? null,
+                effectiveTeamTier: moraleInfo.tier ?? moraleTier ?? null,
+                record: moraleInfo.record ?? null,
+                counters: moraleInfo.record?.counters ?? null,
+                diagnostics: moraleInfo.diagnostics ?? null
+            } : (moraleTier ? { tier: moraleTier, effectiveTeamTier: moraleTier } : null)
+        };
         const selectorInput = {
             members,
             leaderId,
@@ -2548,18 +2647,13 @@ export function createFireteamService({
             // Issue #88: the pincer morale gate reads the committed team
             // tier — the selector never re-derives morale itself.
             moraleTier,
-            // Issue #87: without injected contacts the selector still sees
-            // the live visible hostiles — the scan carries positions,
-            // wounds, emitter projections and charge rates. Injected
-            // callers keep exact control of the contact list.
-            targets: context.tacticTargets ?? (Array.isArray(context.targets)
-                ? context.targets
-                : _convergentTargets({ members, combat, context })),
+            moraleInfo: selectorContext.moraleInfo,
+            targets,
             objective: context.objective ?? focusObjective ?? null,
-            casualties: _finiteOr(context.casualties, 0),
-            scene: context.scene ?? combat?.scene ?? null,
+            casualties,
+            scene,
             combat,
-            context,
+            context: selectorContext,
             character
         };
         const source = context.tactic;
@@ -3154,7 +3248,12 @@ export function createFireteamService({
             context,
             focusObjective: selectedFocus,
             character,
-            moraleTier: moraleInfo.tier
+            moraleTier: moraleInfo.tier,
+            moraleInfo,
+            casualtyDetail: {
+                total: allMembers.filter(member => member.defeated === true).length,
+                initialStrength: allMembers.length
+            }
         });
         const tacticName = tactic?.name ?? tactic?.tactic ?? null;
         // Issue #87: the interdiction screen is a composite maneuver — its
@@ -3304,6 +3403,7 @@ export function createFireteamService({
                 _clearSuppressionGeometry(assignment);
                 _clearInterdictionGeometry(assignment);
                 _clearPincerGeometry(assignment);
+                _clearPeelGeometry(assignment);
             }
         }
         diagnostics.gmControlled = [...gmControlledIds];
@@ -3333,6 +3433,7 @@ export function createFireteamService({
                 _clearSuppressionGeometry(assignment);
                 _clearInterdictionGeometry(assignment);
                 _clearPincerGeometry(assignment);
+                _clearPeelGeometry(assignment);
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
@@ -3402,6 +3503,14 @@ export function createFireteamService({
         const suppressionCone = tacticName === SUPPRESS_AND_BOUND
             ? (_jsonClone(tactic?.objective?.suppressionCone ?? tactic?.cone ?? null))
             : null;
+        const peelObjective = tacticName === PEEL_WITHDRAWAL_NAME
+            ? _jsonClone(tactic?.objective ?? null) : null;
+        const peelCosts = new Map((tacticName === PEEL_WITHDRAWAL_NAME
+            ? (tactic?.breakdown?.costs ?? []) : [])
+            .map(cost => [String(cost.combatantId), cost]));
+        const peelStranded = new Set((tacticName === PEEL_WITHDRAWAL_NAME
+            ? (tactic?.breakdown?.stranded ?? []) : [])
+            .map(entry => String(entry.combatantId ?? entry)));
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
@@ -3430,6 +3539,22 @@ export function createFireteamService({
                     ...(assignment.role !== "suppressor" && suppressionZones.length
                         ? { exclusionZones: _jsonClone(suppressionZones) } : {}),
                     objective: sharedTargetId,
+                    ...(tacticName === PEEL_WITHDRAWAL_NAME ? {
+                        peel: {
+                            objective: _jsonClone(peelObjective),
+                            regroupPoint: _jsonClone(peelObjective?.regroupPoint ?? null),
+                            threatCentroid: _jsonClone(peelObjective?.threatCentroid ?? null),
+                            lane: _jsonClone(peelObjective?.lane ?? null),
+                            coverMode: tactic?.cover?.mode ?? null,
+                            coverTargetId: tactic?.cover?.target?.tokenId
+                                ?? tactic?.cover?.target?.targetId ?? null,
+                            coverTargetUuid: tactic?.cover?.target?.tokenUuid
+                                ?? tactic?.cover?.target?.targetUuid ?? null,
+                            cost: peelCosts.has(String(member.combatantId))
+                                ? _jsonClone(peelCosts.get(String(member.combatantId))) : null,
+                            stranded: peelStranded.has(String(member.combatantId))
+                        }
+                    } : {}),
                     memberObjective: assignment.objective
                         ? _jsonClone(assignment.objective) : null,
                     assignment: _assignmentDescriptor(assignment),
@@ -3453,7 +3578,7 @@ export function createFireteamService({
                     screenPoint: assignment.role === INTERDICT_ROLE
                         ? (assignment.objective?.screenPoint ?? null) : null,
                     regroupPoint: assignment.task === "regroup"
-                        ? (rejoinPoints[0] ?? null) : null
+                        ? (peelObjective?.regroupPoint ?? rejoinPoints[0] ?? null) : null
                 }
             };
             // Issue #85 minimal split awareness: `targets` remains the full
@@ -3570,6 +3695,7 @@ export function createFireteamService({
                     _clearSuppressionGeometry(assignment);
                     _clearInterdictionGeometry(assignment);
                     _clearPincerGeometry(assignment);
+                    _clearPeelGeometry(assignment);
                     try {
                         const retry = await memberPlanner.planTurn(combat,
                             member.combatant, {
@@ -3990,6 +4116,7 @@ export function createFireteamService({
                 ...(assignment.element ? { element: assignment.element } : {}),
                 ...(assignment.objective
                     ? { objective: _jsonClone(assignment.objective) } : {}),
+                ...(peelStranded.has(String(member.combatantId)) ? { stranded: true } : {}),
                 detached: cohesion.detached,
                 detachedUntilPhase: cohesion.detached
                     ? _finiteOr(context.detachedUntilPhase, 1) : null,
@@ -4032,7 +4159,22 @@ export function createFireteamService({
         const memberPlans = {};
         for (const member of ordered) {
             const plan = plans.get(member.combatantId)?.plan ?? null;
-            memberPlans[member.combatantId] = plan ? _jsonClone(plan) : null;
+            if (!plan) {
+                memberPlans[member.combatantId] = null;
+                continue;
+            }
+            const serialized = _jsonClone(plan);
+            // Issue #89 descriptor contract: every member plan explains the
+            // team tactic compactly without duplicating the pure breakdown.
+            serialized.breakdown = {
+                ...(serialized.breakdown ?? {}),
+                tactic: {
+                    name: tacticName ?? null,
+                    role: assignMap.get(member.combatantId)?.role ?? null,
+                    reason: tactic?.reason ?? null
+                }
+            };
+            memberPlans[member.combatantId] = serialized;
         }
 
         const revision = _teamRevision(combat, members, {

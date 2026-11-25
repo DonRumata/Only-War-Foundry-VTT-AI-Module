@@ -56,7 +56,7 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
         // move beyond the half-move rate costs a full action; a run is
         // always the whole action economy however short the sprint.
         const moveHalves = variant === "charge" ? 0
-            : variant === "run" ? 2
+            : variant === "run" || variant === "disengage" ? 2
                 : (candidate.action === null || candidate.action === undefined)
                     ? (halfMoveLimit !== null && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1)
                     : 1;
@@ -69,8 +69,18 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                 waypoints: move.waypoints ?? [],
                 approximate: move.approximate === true,
                 // `run` rides the step so the executor can stamp the
-                // +20-evasion marker after the sprint lands.
-                ...(variant === "run" ? { mode: "run" } : {})
+                // +20-evasion marker after the sprint lands. Peel
+                // `disengage` is likewise move metadata, not a new step
+                // type: it is the full-action melee exit only when the
+                // selector structurally detected that capability.
+                ...(variant === "run" ? { mode: "run" } : {}),
+                ...(variant === "disengage"
+                    ? {
+                        mode: "disengage",
+                        disengagesFrom: Array.isArray(candidate.peelEngagers)
+                            ? [...candidate.peelEngagers] : []
+                    }
+                    : {})
             },
             preconditions: ["turn", "self-position", "collision"],
             projectedResourceDelta: { movement: -(_finiteOr(move.cost, 0)) }
