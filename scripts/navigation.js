@@ -551,10 +551,10 @@ export function searchRoute(input) {
         const node = heap.pop();
         const key = offsetKey(node.offset);
         if (node.g > (gScore.get(key) ?? Infinity) + EPSILON) continue;
-        visited++;
-        if (visited > maxVisited) {
+        if (visited >= maxVisited) {
             return { status: "limit", path: null, cost: null, visited, best, limited: true };
         }
+        visited++;
 
         if (canStop(node.offset)) {
             if (node.h < best.h - EPSILON
@@ -633,17 +633,17 @@ export function floodReachable(input) {
         const node = heap.pop();
         const key = offsetKey(node.offset);
         if (node.g > (gScore.get(key) ?? Infinity) + EPSILON) continue;
-        visited++;
-        if (visited > maxVisited) {
+        if (visited >= maxVisited) {
             limited = true;
             break;
         }
+        visited++;
         if (canStop(node.offset)) {
             if (cells.length >= limit) {
-                // Keep visiting for the counter but stop collecting.
-            } else {
-                cells.push({ i: node.offset.i, j: node.offset.j, cost: node.g });
+                limited = true;
+                break;
             }
+            cells.push({ i: node.offset.i, j: node.offset.j, cost: node.g });
         }
         for (const next of getNeighbors(node.offset)) {
             const nextKey = offsetKey(next);
@@ -991,9 +991,8 @@ export function createGridAdapter(env = {}) {
 
     /**
      * Authoritative movement-cost measurement of a serialized waypoint
-     * list: `TokenDocument#measureMovementPath` (v13+, honours difficult
-     * terrain configured through region behaviours), `canvas.grid.
-     * measurePath` (v12+/v14), then `measureDistance` per segment (v13).
+     * list: the placeable token's measurement includes terrain costs.
+     * The document method without a cost callback only measures distance.
      * Returns null when no API answered — callers fall back to the
      * geometric edge-cost sum.
      * @param {object|null} tokenDoc
@@ -1003,21 +1002,22 @@ export function createGridAdapter(env = {}) {
     function measurePathCost(tokenDoc, points) {
         if (!Array.isArray(points) || points.length < 2) return 0;
         const input = points.map(p => ({ x: p.x, y: p.y }));
-        try {
-            if (typeof tokenDoc?.measureMovementPath === "function") {
-                // Like TokenDocument.move, token measurement expects
-                // document top-lefts, not the plan's footprint centres.
-                const size = describe()?.size ?? 100;
-                const dx = (tokenDoc.width ?? 1) * size / 2;
-                const dy = (tokenDoc.height ?? 1) * size / 2;
-                const result = tokenDoc.measureMovementPath(input.map(p => ({
-                    x: p.x - dx, y: p.y - dy
-                })));
-                const cost = result?.cost ?? result?.distance;
-                if (Number.isFinite(cost)) return cost;
+        if (tokenDoc) {
+            const size = describe()?.size ?? 100;
+            const dx = (tokenDoc.width ?? 1) * size / 2;
+            const dy = (tokenDoc.height ?? 1) * size / 2;
+            const documentPoints = input.map(p => ({ x: p.x - dx, y: p.y - dy }));
+            const placeable = tokenDoc.object;
+            for (const token of [placeable, tokenDoc]) {
+                try {
+                    const withTerrain = token?.createTerrainMovementPath?.(documentPoints) ?? documentPoints;
+                    const result = token?.measureMovementPath?.(withTerrain);
+                    const cost = result?.cost ?? result?.distance;
+                    if (Number.isFinite(cost) || (token === placeable && cost === Infinity)) return cost;
+                } catch(_err) {
+                    // Fall through to the next measurement adapter.
+                }
             }
-        } catch(_err) {
-            // Fall through to the grid measurement.
         }
         const g = grid();
         try {
@@ -1048,14 +1048,15 @@ export function createGridAdapter(env = {}) {
 
     /**
      * Whether the platform can account for difficult terrain: a v13+ token
-     * movement-cost path (`measureMovementPath` on token documents plus a
+     * movement-cost path (`measureMovementPath` on placeables plus a
      * modify-movement-cost region behaviour) or a known terrain module.
      * @param {object|null} tokenDoc
      * @returns {boolean}
      */
     function supportsTerrain(tokenDoc = null) {
         try {
-            if (typeof tokenDoc?.measureMovementPath === "function"
+            if (typeof tokenDoc?.object?.measureMovementPath === "function"
+                && typeof tokenDoc.object.createTerrainMovementPath === "function"
                 && globalThis.foundry?.data?.regionBehaviors?.ModifyMovementCostRegionBehaviorType) {
                 return true;
             }
@@ -1140,6 +1141,34 @@ export function footprintCells(offset, footprint) {
 }
 
 /**
+ * Grid cells claimed by a token along adjacent route waypoints. Include
+ * the corners of a diagonal sweep, not just the start/end footprints.
+ * @param {object} token Token document or a footprint-bearing snapshot.
+ * @param {object[]} waypoints Grid offsets, optionally with pixel coordinates.
+ * @returns {object[]} Unique offsets.
+ */
+export function movementCells(token, waypoints) {
+    const w = Math.max(1, Math.round(token?.width ?? 1));
+    const h = Math.max(1, Math.round(token?.height ?? 1));
+    const cells = new Map();
+    let previous = null;
+    for (const point of waypoints ?? []) {
+        if (!Number.isInteger(point?.i) || !Number.isInteger(point?.j)) {
+            previous = null;
+            continue;
+        }
+        const adjacent = previous && Math.abs(point.i - previous.i) <= 1
+            && Math.abs(point.j - previous.j) <= 1;
+        const from = adjacent ? previous : point;
+        const offset = { i: Math.min(point.i, from.i), j: Math.min(point.j, from.j) };
+        const swept = { w: w + Math.abs(point.j - from.j), h: h + Math.abs(point.i - from.i) };
+        for (const cell of footprintCells(offset, swept)) cells.set(offsetKey(cell), cell);
+        previous = point;
+    }
+    return [...cells.values()];
+}
+
+/**
  * Build the search context for a token on the active scene: grid
  * descriptor, footprint, origin offset, bounds, reservations and the
  * primitive callbacks the pure search operates on.
@@ -1150,6 +1179,8 @@ export function footprintCells(offset, footprint) {
  *   crossed but not stood on) or "block" (treat as walls).
  * @param {Array} [options.reservations] Extra blocked cells: offsets
  *   `{i, j}` or `"i,j"` keys.
+ * @param {object} [options.origin] Project a route from this grid offset
+ *   instead of the live token position, without changing the document.
  * @returns {object} `{status, reason?, ...context}`.
  */
 export function buildNavigationContext(token, options = {}) {
@@ -1167,7 +1198,8 @@ export function buildNavigationContext(token, options = {}) {
         };
     }
     const doc = _tokenDoc(token);
-    const origin = doc
+    const projected = Number.isInteger(options.origin?.i) && Number.isInteger(options.origin?.j);
+    const origin = projected ? { i: options.origin.i, j: options.origin.j } : doc
         ? adapter.toOffset({
             x: doc._source?.x ?? doc.x ?? token?.object?.x,
             y: doc._source?.y ?? doc.y ?? token?.object?.y
@@ -1196,10 +1228,12 @@ export function buildNavigationContext(token, options = {}) {
         const fp = _footprintOf(other, adapter);
         for (const cell of footprintCells(o, fp)) reservations.add(offsetKey(cell));
     }
+    const blocked = new Set();
     for (const entry of options.reservations ?? []) {
-        if (typeof entry === "string") reservations.add(entry);
-        else if (Number.isFinite(entry?.i) && Number.isFinite(entry?.j)) reservations.add(offsetKey(entry));
+        if (typeof entry === "string") blocked.add(entry);
+        else if (Number.isFinite(entry?.i) && Number.isFinite(entry?.j)) blocked.add(offsetKey(entry));
     }
+    for (const key of blocked) reservations.add(key);
 
     const size = grid.size;
     const fw = footprint.w * size;
@@ -1249,6 +1283,9 @@ export function buildNavigationContext(token, options = {}) {
      */
     function canStand(offset) {
         if (!fitsInside(offset)) return false;
+        if (blocked.size && footprintCells(offset, footprint).some(cell => blocked.has(offsetKey(cell)))) {
+            return false;
+        }
         if (occupiedPolicy === OCCUPIED_POLICIES.block && isReserved(offset)) return false;
         return true;
     }
@@ -1270,6 +1307,9 @@ export function buildNavigationContext(token, options = {}) {
      * @returns {boolean}
      */
     function isOpen(from, to) {
+        if (blocked.size && movementCells(doc, [from, to]).some(cell => blocked.has(offsetKey(cell)))) {
+            return false;
+        }
         const a = footprintCenter(from);
         const b = footprintCenter(to);
         if (!a || !b) return false;
@@ -1294,10 +1334,14 @@ export function buildNavigationContext(token, options = {}) {
         return diagonal ? diagCost : 1;
     }
 
-    const center = {
+    const center = projected ? footprintCenter(origin) : {
         x: (doc._source?.x ?? doc.x) + (fw / 2),
         y: (doc._source?.y ?? doc.y) + (fh / 2)
     };
+
+    if (!center || (projected && !canStand(origin))) {
+        return { status: NAVIGATION_STATUS.failed, reason: NAVIGATION_REASONS.invalidInput };
+    }
 
     return {
         status: NAVIGATION_STATUS.ok,
@@ -1407,7 +1451,7 @@ function _fitRouteToBudget(path, costCells, context, budgetCells) {
     const points = waypoints.map(({ x, y }) => ({ x, y }));
     const measure = (length, cells) => {
         const measured = context.measureCost?.(length === points.length ? points : points.slice(0, length));
-        return Number.isFinite(measured) ? measured : cells * distance;
+        return typeof measured === "number" && measured >= 0 ? measured : cells * distance;
     };
     if (waypoints.length < 2) return { waypoints, costCells: 0, cost: 0 };
     if (costCells <= budgetCells + EPSILON && context.canStop(path.at(-1))) {
@@ -1671,15 +1715,23 @@ function _geometricReachable(context, budgetCells, options = {}) {
 export function findReachableOnContext(context, budgetCells, options = {}) {
     const reachable = _geometricReachable(context, budgetCells, options);
     if (reachable.status !== NAVIGATION_STATUS.ok || !context.measureCost) return reachable;
+    const maxVisited = options.maxVisited ?? DEFAULT_SEARCH_LIMIT;
     let visitedNodes = reachable.visitedNodes;
+    let limited = reachable.limited;
     const cells = [];
     for (const cell of reachable.cells) {
-        const route = planRouteOnContext(context, cell, budgetCells, options);
+        const remaining = maxVisited - visitedNodes;
+        if (remaining <= 0) {
+            limited = true;
+            break;
+        }
+        const route = planRouteOnContext(context, cell, budgetCells, { maxVisited: remaining });
         visitedNodes += route.visitedNodes ?? 0;
         if (route.exact) cells.push({ ...cell, cost: route.cost, costCells: route.costCells });
+        if (route.reason === NAVIGATION_REASONS.searchLimit) limited = true;
     }
     cells.sort((a, b) => (a.cost - b.cost) || (a.i - b.i) || (a.j - b.j));
-    return _deepFreeze({ ...reachable, cells, visitedNodes });
+    return _deepFreeze({ ...reachable, cells, visitedNodes, limited });
 }
 
 /**
@@ -1709,7 +1761,8 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
         return _failure(NAVIGATION_REASONS.invalidInput);
     }
     const weights = { ...DEFAULT_CANDIDATE_WEIGHTS, ...(options.weights ?? {}) };
-    const targetDoc = _tokenDoc(options.target);
+    const target = _tokenDoc(options.target);
+    const targetDoc = target?.documentName === "Token" || Number.isFinite(target?.width) ? target : null;
     const targetPoint = targetDoc && Number.isFinite(targetDoc.x)
         ? {
             x: targetDoc.x + ((targetDoc.width ?? 1) * context.grid.size / 2),
@@ -2149,6 +2202,9 @@ export function createNavigationService({ api = null, adapter = null } = {}) {
         }
         const points = offsets.map(o => context.toPoint(o));
         const measured = context.measureCost?.(points);
+        if (measured === Infinity) {
+            return _failure(NAVIGATION_REASONS.budgetExceeded, { sceneId: context.sceneId });
+        }
         return _deepFreeze({
             status: NAVIGATION_STATUS.ok,
             cost: Number.isFinite(measured) ? measured : cells * context.grid.distance,

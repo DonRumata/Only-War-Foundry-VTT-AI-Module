@@ -3,6 +3,7 @@
  * only assignments and verified progress survive the change of initiative.
  */
 import { FLAG_KEYS, MODULE_ID } from "../constants.js";
+import { movementCells } from "../navigation.js";
 import { isLiveOperation, readOperation } from "../operations.js";
 import { isDeadOrDefeated, isHiddenToken } from "../perception.js";
 import { _collisionRevision } from "../planner/documents.js";
@@ -23,7 +24,11 @@ const statesOf = combat => {
 };
 const beforeTurn = (combat, turn) => combat.round < turn.round
     || (combat.round === turn.round && combat.turn < turn.turn);
-const acts = phase => phase === "movement" || phase === "action";
+const acts = phase => phase === "movement" || phase === "action" || phase === "regroup";
+const coordinating = state => state.members.some(member => member.move || member.action);
+const movementLocks = (state, member) => state.members
+    .filter(other => other !== member && other.move)
+    .flatMap(other => other.move.cells ?? [other.move.destination]);
 const sameProgress = (a, b) => a?.id === b?.id
     && a?.last?.id === b?.last?.id && a?.inFlight === b?.inFlight;
 
@@ -71,8 +76,11 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         if (state.controllerId !== operation?.controllerId) return "controller-changed";
         if ((state.inFlight && state.inFlight !== operation.id)
             || beforeTurn(combat, state.last ?? state)) return "team-turn-interrupted";
-        if (combat.round >= state.expiresRound) return "team-timeout";
-        if (_collisionRevision(scene) !== state.collision) return "collision-changed";
+        if ((coordinating(state) && combat.round >= state.expiresRound)
+            || state.members.some(member => Number.isFinite(member.rejoin?.untilRound)
+                && member.rejoin.untilRound < combat.round)) return "team-timeout";
+        // Once attacks are done, find the return route against live geometry.
+        if (coordinating(state) && _collisionRevision(scene) !== state.collision) return "collision-changed";
         const fireteam = service("fireteam", context.fireteam);
         for (const member of state.members) {
             const live = _findCombatant(combat, member.id);
@@ -127,6 +135,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             const moveRef = movement?.steps.find(ref => ref.combatantId === id);
             const move = moveRef ? plan.steps[moveRef.stepIndex] : null;
             const to = move?.input?.to;
+            const token = _tokenDoc(entry.combatant.token);
             // Lost reservations and bundled charges cannot be replayed
             // as independent moves on an earlier turn.
             if (plan.steps.some(step => step.type === "move") && (!move
@@ -142,9 +151,18 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
                 && step.type !== "end-turn" && !(step.type === "aim" && act))) return null;
             members.push({
                 id, tokenId: entry.tokenId, task: assignment.task, groupId: assignment.groupId,
-                position: positionOf(_tokenDoc(entry.combatant.token)),
-                move: move ? { destination: { i: to.i, j: to.j }, mode: move.input.mode ?? null } : null,
-                action: act ? { type: act.type, targetId } : null
+                position: positionOf(token),
+                move: move ? { destination: { i: to.i, j: to.j }, mode: move.input.mode ?? null,
+                    route: move.input.waypoints, cost: move.cost?.movement, halves: move.cost?.halves,
+                    cells: movementCells(token, [...(move.input.waypoints ?? []), to]) } : null,
+                action: act ? { type: act.type, targetId, name: act.input.name ?? null,
+                    halves: (act.cost?.halves ?? 0) + (plan.steps.find(step => step.type === "aim")?.cost?.halves ?? 0),
+                    resources: act.projectedResourceDelta ?? {} } : null,
+                separation: assignment.separation ?? null,
+                rejoin: assignment.rejoinPoint ? {
+                    point: assignment.rejoinPoint, route: assignment.rejoinRoute, cost: assignment.rejoinCost,
+                    maxRounds: assignment.maxDetachedRounds, untilRound: null
+                } : null
             });
         }
         const required = action?.barrier?.requiredAssignmentIds ?? [];
@@ -152,6 +170,9 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         if (members.filter(member => member.move || member.action).length < 2) return null;
         return {
             id: draft.id, teamId: draft.teamId, leaderId: draft.leaderId, tactic: draft.tactic,
+            objective: draft.objective ?? null, score: draft.score,
+            tacticReason: draft.diagnostics?.tactic?.reason ?? null,
+            preferredCohesion: draft.diagnostics?.preferredCohesion,
             character: draft.character, teamPreset: draft.teamPreset,
             round: context.combat.round, turn: context.combat.turn,
             expiresRound: context.combat.round + MAX_MANEUVER_ROUNDS,
@@ -224,13 +245,10 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         const movers = state.members.filter(member => member.move);
         let ownMove = null;
         for (const member of previous ? movers.filter(member => member === active) : movers) {
-            const reservations = state.members
-                .filter(other => other !== member && other.move)
-                .map(other => other.move.destination);
             const planned = await planner.planTurn(combat, _findCombatant(combat, member.id), {
                 ...base, ...(member === active ? {} : { spent: undefined }),
                 team: forMember(member),
-                teamTurn: { phase: "movement", ...member.move, reservations }
+                teamTurn: { phase: "movement", ...member.move, reservations: movementLocks(state, member) }
             });
             if (!planned?.plan?.steps.some(step => step.type === "move")) {
                 return wait("team-route-unavailable", "interrupt");
@@ -238,6 +256,30 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             if (member === active) ownMove = planned;
         }
         if (ownMove) return wrap(ownMove, "movement");
+        if (!coordinating(state) && active.rejoin) {
+            const leader = _tokenDoc(_findCombatant(combat, state.leaderId)?.token);
+            const grid = context.combat.scene?.grid;
+            const leaderCenter = Number.isFinite(grid?.size) ? {
+                x: center.x + ((leader.width ?? 1) * grid.size / 2),
+                y: center.y + ((leader.height ?? 1) * grid.size / 2)
+            } : null;
+            const reservations = state.members.filter(member => member !== active && member.rejoin)
+                .flatMap(member => movementCells(_tokenDoc(_findCombatant(combat, member.id)?.token),
+                    [member.rejoin.point]));
+            const rejoin = await fireteam.planRejoin(_tokenDoc(combatant.token), leaderCenter, {
+                grid, preferredCohesion: state.preferredCohesion, navigation: base.navigation,
+                rates: base.rates, reservations
+            });
+            if (!rejoin) return wait("team-rejoin-unavailable", "interrupt");
+            const returning = await planner.planTurn(combat, combatant, {
+                ...base, team: forMember(active),
+                teamTurn: rejoin.cost > 0
+                    ? { phase: "movement", destination: rejoin.point, reservations }
+                    : { phase: "wait", reason: "team-regrouped" }
+            });
+            return returning?.plan ? wrap(returning, "regroup")
+                : wait("team-rejoin-unavailable", "interrupt");
+        }
         // Passing a turn never waits on a promise/animation from a different
         // NPC. That NPC must get its normal place in initiative.
         if (movers.length || !active.action) {
@@ -297,7 +339,8 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         const active = state.members.find(member => member.id === combatant.id);
         if (phase === "movement") {
             const nav = service("navigation", context.planContext?.navigation);
-            const endpoint = nav?.validateEndpoint?.(_tokenDoc(combatant.token), active.move.destination);
+            const endpoint = nav?.validateEndpoint?.(_tokenDoc(combatant.token),
+                active.move.destination, { reservations: movementLocks(state, active) });
             if (endpoint && endpoint.valid !== true) {
                 return fail("team-route-unavailable");
             }
@@ -335,7 +378,9 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         if (!live && !state) return true;
         try {
             const remaining = others.filter(record => record?.teamId !== turn.state.teamId
-                && record?.expiresRound > combat.round && record.controllerId === context.operation.controllerId);
+                && (record?.expiresRound > combat.round || record.members.some(member =>
+                    member.rejoin?.untilRound >= combat.round))
+                && record.controllerId === context.operation.controllerId);
             await combat.setFlag(MODULE_ID, FLAG_KEYS.teamManeuvers, state ? [...remaining, state] : remaining);
             return true;
         } catch(err) {
@@ -384,22 +429,26 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         }
         if (phase === "wait") return;
         const member = state.members.find(entry => entry.id === combatant.id);
-        const step = plan.steps.find(entry => entry.type === (phase === "movement" ? "move" : member.action.type));
+        const moving = phase === "movement" || phase === "regroup";
+        const step = plan.steps.find(entry => entry.type === (moving ? "move" : member.action.type));
         const done = result.stepsDone.some(entry => entry.stepId === step?.id && entry.status === "done"
             && entry.reason !== "adjudicated-skill-test");
         let replacement = null;
-        if (done && phase === "movement") {
+        if (done && moving) {
             const token = _tokenDoc(combatant.token);
             const position = { ..._docPoint(step.input.to, token, { scene: context.combat.scene }),
                 elevation: member.position.elevation };
             if (!stateReason(state, context, { id: member.id, position })) {
-                replacement = { ...member, position, move: null };
+                replacement = { ...member, position, move: null, rejoin: phase === "regroup" || !member.rejoin
+                    ? null : { ...member.rejoin, untilRound: context.combat.round + member.rejoin.maxRounds } };
             }
+        } else if (phase === "regroup" && !step && !stateReason(state, context)) {
+            replacement = { ...member, rejoin: null };
         } else if (done && !stateReason(state, context)) {
             replacement = { ...member, action: null };
         }
         const members = state.members.map(entry => entry === member ? replacement : entry);
-        const pending = replacement && members.some(entry => entry.move || entry.action);
+        const pending = replacement && members.some(entry => entry.move || entry.action || entry.rejoin);
         await write(context, combatant, turn, pending
             ? { ...state, members, actionStarted: state.actionStarted || phase === "action", inFlight: null,
                 last: { id: context.operation.id, round: context.combat.round, turn: context.combat.turn } }

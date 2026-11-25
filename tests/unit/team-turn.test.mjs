@@ -8,10 +8,10 @@ import { createFireteamService } from "../../scripts/fireteam.js";
 import { createOperationService, readOperation } from "../../scripts/operations.js";
 import { createPlannerService } from "../../scripts/planner.js";
 import { registerRangedCoverPreset } from "../../scripts/presets/ranged-cover.js";
-import { createPreviewController } from "../../scripts/ui/preview-dialog.js";
+import { buildPreviewViewModel, createPreviewController } from "../../scripts/ui/preview-dialog.js";
 import { makeActor, makeCombat, makeCombatant, makeScene, makeToken } from "./fixtures.mjs";
 
-async function fixture({ mode = "automatic" } = {}) {
+async function fixture({ mode = "automatic", detached = false, blockedRejoin = false } = {}) {
     const api = createModuleApi();
     const scene = makeScene();
     scene.walls = [];
@@ -27,7 +27,9 @@ async function fixture({ mode = "automatic" } = {}) {
         };
         const combatant = makeCombatant({ actor, token });
         Object.assign(combatant, { tokenId: token.id, initiative });
-        await combatant.setFlag(MODULE_ID, FLAG_KEYS.fireteam, { teamId: "alpha" });
+        await combatant.setFlag(MODULE_ID, FLAG_KEYS.fireteam, {
+            teamId: "alpha", ...(detached ? { preferredCohesion: 2 } : {})
+        });
         return combatant;
     };
     const shooter = await member(600, 100, 20);
@@ -56,14 +58,18 @@ async function fixture({ mode = "automatic" } = {}) {
             ({ status: "ok", visibleTargets: visibleTargets(viewer), lastKnownTargets: [] })
     });
     const to = { x: 550, y: 350, i: 3, j: 5 };
-    const waypoints = [{ x: 250, y: 350 }, to];
+    const waypoints = [{ x: 250, y: 350, i: 3, j: 2 }, to];
     const route = { exact: true, cost: 4.5, endpoint: to, waypoints };
+    const home = { x: 650, y: 250, i: 2, j: 6 };
+    const rejoin = { ...home, cost: 1.5, waypoints: [to, home], exact: true, endpoint: home };
     api.services.register("navigation", {
-        findCandidates: viewer => ({
+        findCandidates: (viewer, budget, options) => ({
             status: "ok",
-            candidates: viewer.x === 200 ? [{ ...to, waypoints, cost: 4.5, los: true }] : []
+            candidates: detached && options.target?.x === 650
+                ? (blockedRejoin ? [] : [rejoin])
+                : viewer.x === 200 ? [{ ...to, waypoints, cost: 4.5, los: true }] : []
         }),
-        planRoute: () => route
+        planRoute: (_viewer, destination) => destination.i === home.i && destination.j === home.j ? rejoin : route
     });
     let controller = true;
     const operations = createOperationService({ hooks: {} });
@@ -153,6 +159,34 @@ test("a route blocked after the wait cancels the maneuver without moving or atta
     assert.equal(world.combat.combatant, world.target);
 });
 
+test("the return to cohesion consumes the detached member's normal turn", async () => {
+    const world = await fixture({ detached: true });
+    await world.turn(); // shooter waits
+    await world.turn(); // flanker moves
+    assert.ok(world.records()[0].members.find(m => m.id === world.flanker.id).rejoin.untilRound > 1);
+    await world.combat.nextTurn();
+    await world.turn();
+    await world.turn();
+    assert.equal(world.attacks.length, 2);
+    assert.deepEqual(world.moves, [world.flanker.tokenId], "no extra move is granted on an attack turn");
+    await world.combat.nextTurn();
+    await world.turn(); // shooter passes while the flanker has the return assignment
+    assert.equal(world.combat.combatant, world.flanker);
+    await world.turn();
+    assert.deepEqual(world.moves, [world.flanker.tokenId, world.flanker.tokenId]);
+    assert.deepEqual([world.flanker.token.x, world.flanker.token.y], [600, 200]);
+    assert.equal(world.combat.combatant, world.target);
+    assert.deepEqual(world.records(), []);
+});
+
+test("a draft without an affordable return route does not start the detached maneuver", async () => {
+    const world = await fixture({ detached: true, blockedRejoin: true });
+    const result = await world.turn();
+    assert.notEqual(result.reason, "team-waiting");
+    assert.deepEqual(world.moves, []);
+    assert.ok(!world.records()?.some(state => state.members.some(m => m.task === "flank")));
+});
+
 test("first coordinated attack checks a waiting ally's LOS with no rollback of movement", async () => {
     const world = await fixture();
     await world.turn();
@@ -211,7 +245,7 @@ test("only the new controller may discard a maneuver after GM handoff", async ()
 });
 
 test("preview does not commit progress; confirming a wait passes and cancelling aborts", async () => {
-    const world = await fixture({ mode: "preview" });
+    const world = await fixture({ mode: "preview", detached: true });
     world.api._state.enabled = true;
     game.modules.set(MODULE_ID, { api: world.api });
     const preview = createPreviewController({
@@ -219,6 +253,12 @@ test("preview does not commit progress; confirming a wait passes and cancelling 
     });
     let result = await world.turn();
     assert.equal(result.plan?.teamTurn?.phase, "wait");
+    const view = buildPreviewViewModel(result.plan, { combat: world.combat });
+    assert.equal(view.team.members.length, 2);
+    const flank = view.team.members.find(member => !member.active);
+    assert.equal(flank.waitsForMovement, true);
+    assert.ok(flank.move.route.length && flank.rejoin.route.length);
+    assert.deepEqual(flank.action.resources, { ammo: -1 });
     assert.equal(world.records(), undefined);
     preview.openPreview(world.calls.at(-1).data);
     const accepted = await preview.resolvePreview(result.operationId, { decision: "confirm" });

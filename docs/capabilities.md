@@ -69,8 +69,8 @@ execute: расхождение — `stale-state` (перемещение, см�
 
 ### Perception (issue #401)
 
-- LOS строго от зрителя-бота: `canvas.visibility.testVisibility` → legacy
-  API → `visionSource` → геометрический fallback по стенам (`type:"sight"`).
+- LOS строго от зрителя-бота: его `visionSource` и проверка стен (`type:"sight"`).
+  Если зрение не настроено, проверяется только геометрия, не видимость GM.
 - Цели: противоположная disposition (viewer-симметричная: FRIENDLY-бот
   атакует HOSTILE, и наоборот), живые, не hidden. Нейтралы — только через
   `includeNeutral`/`dispositions`. Нейтральный бот (disp 0) считает

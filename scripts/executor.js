@@ -1158,7 +1158,8 @@ export function createExecutorService({
                         reason: planned?.reason ?? EXECUTOR_REASONS.planFailed,
                         operationId
                     });
-                    await _finish(context, run, result, true);
+                    // Unsupported scenes remain under manual GM control.
+                    await _finish(context, run, result, planned?.status !== "unsupported");
                     _report(context, run, result);
                     return result;
                 }

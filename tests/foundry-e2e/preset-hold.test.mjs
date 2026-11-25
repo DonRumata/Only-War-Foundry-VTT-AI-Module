@@ -29,7 +29,8 @@ async function setup() {
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
     await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
-      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 30, damage: '1d10+3' } }
+      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 30, damage: '1d10+3',
+        clip: { value: 6, max: 9 }, rateOfFire: { single: 1, semi: 0, full: 0 } } }
     ]);
   });
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
@@ -94,9 +95,9 @@ async function testLocalizedPresetName() {
   assert.ok(label && label !== 'OWAI.Preset.hold', 'hold preset is localized');
 }
 
-async function testBehindWallExitsToLosAndAttacks() {
-  // The NPC stands behind the tall wall: the standing shot is vetoed and
-  // the plan relocates inside the hold radius to an endpoint with LOS.
+async function testHoldsBehindWallWithoutKnownTarget() {
+  // No current or remembered target: a theoretically useful firing
+  // position must not reveal the enemy behind the wall.
   const result = await page.evaluate(async (cid) => {
     const planner = game.modules.get('only-war-ai').api.services.get('planner');
     const combatant = game.combat?.combatants?.get(cid);
@@ -116,16 +117,9 @@ async function testBehindWallExitsToLosAndAttacks() {
   assert.equal(result.status, 'ok', `expected ok plan, got ${result.status}`);
   const plan = result.plan;
   assert.equal(plan.preset, 'hold');
-  assert.equal(plan.breakdown?.variant, 'move-attack', 'blocked shot should plan move + attack');
-  assert.equal(plan.breakdown?.factors?.moveToLos, 1, 'endpoint should restore LOS');
-  const move = plan.steps.find((s) => s.type === 'move');
-  assert.ok(move, 'move step exists');
-  assert.equal(move.input.to.x, 700);
-  assert.equal(move.input.to.y, 800);
-  const attack = plan.steps.find((s) => s.type === 'attack');
-  assert.ok(attack, 'attack step exists');
-  assert.ok(plan.diagnostics.rejected.some((e) => e.reason === 'no-line-of-sight'),
-    'blocked attack should be rejected with no-line-of-sight');
+  assert.equal(plan.breakdown?.variant, 'hold', 'the NPC holds rather than pursuing an unseen enemy');
+  assert.equal(plan.target, null, 'no target is known');
+  assert.ok(plan.steps.every(s => !['move', 'attack'].includes(s.type)));
   console.log('hold plan:', JSON.stringify(plan.steps.map((s) => s.type)));
 }
 
@@ -205,7 +199,7 @@ async function cleanup() {
     await setup();
     await testHoldPresetRegistered();
     await testLocalizedPresetName();
-    await testBehindWallExitsToLosAndAttacks();
+        await testHoldsBehindWallWithoutKnownTarget();
     await testHoldsPositionWithAttack();
     await testMeleeContactIsAnswered();
     console.log('preset-hold.test.mjs PASSED');

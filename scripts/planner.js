@@ -1252,7 +1252,7 @@ export function createPlannerService({
                 && actionBudget > 0 && Number.isFinite(detourBudget) && detourBudget > 0
                 ? _resolveDetour({
                     navigation, tokenDoc, selfPos, targetPos: targetPosOf(target),
-                    grid, budget: detourBudget
+                    grid, budget: detourBudget, reservations: planContext.reservations
                 })
                 : null;
             if (detourMove) approachMove = detourMove;

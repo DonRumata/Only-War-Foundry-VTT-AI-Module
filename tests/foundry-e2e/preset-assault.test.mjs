@@ -29,13 +29,14 @@ async function setup() {
     await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       { name: 'Chainsword', type: 'weapon', system: { class: 'melee', damage: '1d10+4' } },
-      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 8, damage: '1d10+3' } }
+      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 8, damage: '1d10+3',
+        clip: { value: 6, max: 9 }, rateOfFire: { single: 1, semi: 0, full: 0 } } }
     ]);
   });
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
   sceneId = await h.createTestScene(page, { grid: 1, size: 100 });
   npcTokenId = await h.placeToken(page, sceneId, npcId, { x: 400, y: 400 });
-  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 700, y: 400 });
+  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1000, y: 400 });
 
   // Explicit dispositions: npc hostile (-1) vs enemy friendly (+1).
   await page.evaluate(async (data) => {
@@ -93,46 +94,26 @@ async function testChargeToMelee() {
   console.log('charge plan:', JSON.stringify(plan.steps.map((s) => s.type)));
 }
 
-async function testMovePlusRanged() {
-  // Push the enemy beyond standing weapon range; inject a legal route
-  // that lands inside lasgun range (navigation service stand-in).
+async function testRangedFallback() {
+  // Without the sword, the NPC still takes a legal lasgun shot.
   await page.evaluate(async (data) => {
+    const actor = game.actors.get(data.npcId);
+    await actor.items.find(i => i.name === 'Chainsword').delete();
     await game.scenes.get(data.sceneId).tokens.get(data.enemyTokenId)
-      .update({ x: 1900, y: 400 });
-  }, { sceneId, enemyTokenId });
+      .update({ x: 800, y: 400 });
+  }, { sceneId, enemyTokenId, npcId });
 
   const result = await page.evaluate(async (cid) => {
     const planner = game.modules.get('only-war-ai').api.services.get('planner');
     const combatant = game.combat?.combatants?.get(cid);
-    const scene = canvas.scene;
-    const size = scene.grid.size || 100;
-    const unit = scene.grid.distance || 1;
-    const pxPerUnit = size / unit;
-    const target = Array.from(scene.tokens.values())
-      .find((t) => t.id !== combatant.tokenId);
-    // Issue #31: a move bundled with an attack must fit the half-move
-    // rate (agility 40 → 4), so the injected route costs 4, not the old
-    // 8 that the full move used to allow.
-    const landing = {
-      x: target.x - 6 * pxPerUnit,
-      y: target.y,
-      cost: 4,
-      distance: 6,
-      los: true
-    };
-    const outcome = await planner.planTurn(game.combat, combatant, {
-      seed: 7,
-      moves: [landing]
-    });
+    const outcome = await planner.planTurn(game.combat, combatant, { seed: 7 });
     return JSON.parse(JSON.stringify(outcome));
   }, page._owaiCombatantId);
 
   assert.equal(result.status, 'ok', `expected ok plan, got ${result.status}`);
   const plan = result.plan;
-  assert.equal(plan.breakdown?.variant, 'move-attack', 'far target should plan move + ranged attack');
-  const move = plan.steps.find((s) => s.type === 'move');
   const attack = plan.steps.find((s) => s.type === 'attack');
-  assert.ok(move && attack, 'move + attack steps exist');
+  assert.ok(attack, 'ranged fallback attacks instead of holding');
   assert.notEqual(attack.input.mode, 'charge');
   const lasgunUuid = await page.evaluate((aid) =>
     game.actors.get(aid).items.find((i) => i.name === 'Lasgun')?.uuid ?? null, npcId);
@@ -190,7 +171,7 @@ async function cleanup() {
     await testAssaultPresetRegistered();
     await testLocalizedPresetName();
     await testChargeToMelee();
-    await testMovePlusRanged();
+    await testRangedFallback();
     await testLastKnownSearch();
     console.log('preset-assault.test.mjs PASSED');
     process.exit(0);

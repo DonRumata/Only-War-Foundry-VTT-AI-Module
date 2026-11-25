@@ -385,6 +385,30 @@ test("reserveResources never assigns one target twice beyond task capacity", () 
     assert.equal(result.targets.filter(t => t.task === "assault").length, 1);
 });
 
+test("reservations reject swept path intersections and overlapping large endpoints", () => {
+    const service = createFireteamService();
+    const assignments = ["wide", "crossing", "overlap", "clear"].map(combatantId => ({
+        combatantId, task: "advance"
+    }));
+    const point = (i, j) => ({ i, j, x: j * 100, y: i * 100 });
+    const move = (...waypoints) => ({
+        steps: [{ type: "move", input: { waypoints, to: waypoints.at(-1) } }]
+    });
+    const plans = {
+        wide: move(point(1, 0), point(1, 1), point(1, 2)),
+        crossing: move(point(0, 1), point(1, 1), point(2, 1), point(3, 1)),
+        overlap: move(point(3, 3), point(2, 3)),
+        clear: move(point(4, 4), point(4, 3))
+    };
+    const result = service.reserveResources(assignments, plans, {
+        tokens: new Map([["wide", { width: 2, height: 2 }]])
+    });
+    assert.deepEqual(result.endpoints.map(entry => entry.memberId), ["wide", "clear"]);
+    assert.deepEqual(result.conflicts.map(c => [c.type, c.loserId, c.winnerId]), [
+        ["route", "crossing", "wide"], ["endpoint", "overlap", "wide"]
+    ]);
+});
+
 test("TeamPlan measures cohesion in scene units, not canvas pixels", async () => {
     const leader = makeMember({ fireteam: { teamId: "alpha" }, initiative: 20 });
     const wing = makeMember({ fireteam: { teamId: "alpha" }, x: 300 });
@@ -462,6 +486,10 @@ test("buildTeamPlan produces a phased TeamPlan with barrier and assignments", as
     for (const phase of plan.phases) {
         for (const step of phase.steps) {
             assert.equal(plan.memberPlans[step.combatantId]?.id, step.planId);
+            if (step.type === "rejoin") {
+                assert.ok(byId[step.combatantId].rejoinRoute.length);
+                continue;
+            }
             assert.equal(
                 plan.memberPlans[step.combatantId]?.steps?.[step.stepIndex]?.type,
                 step.type);

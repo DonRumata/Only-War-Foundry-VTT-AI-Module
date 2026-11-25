@@ -52,7 +52,8 @@ npm run test:all      # все тесты последовательно
 | `executor.test.mjs` | `runPlan`/`executePlan`: move/attack шаги, идемпотентность по operationId, `token-moved`, `not-controller`, автоматический и preview режимы, resourceDelta/chat cards. |
 | `fireteam.test.mjs` | `fireteam.buildTeamPlan`: TeamPlan по членам отряда, тактика/assignment, diagnostics без записи в документы. |
 | `fireteam-tactics.test.mjs` | Issue #410: flank-and-fix на квадратной и гекс-сетке, барьер coordinated-assault, covering advance/regroup без конфликтов резерваций, soft cohesion (в пределах/за пределами/detached), очистка временных assignment после терминального TeamPlan, отсутствие перманентных ролей. |
-| `preview.test.mjs` | GM preview (#409): confirm/cancel/timeout, ре-валидация snapshot, `previewRequested` хук, headless-поведение. |
+| `team-turn.test.mjs` | Ходы участников до и после барьера, прерывание без отката, путь воссоединения и секция отряда в Handlebars-превью. Движение и инициатива штатные, броски подменены для воспроизводимости. |
+| `preview.test.mjs` | GM preview (#409): tracker запускает операцию AI; confirm исполняет ход, cancel и timeout оставляют токен и инициативу без изменений. |
 | `grid-types.test.mjs` | Issue #410: golden path всех пресетов на гекс-сетке (gridType=2), гекс-fireteam сценарий, gridless-сцена (gridType=0) → управляемый `unsupported`/`gridless-unsupported` без падения. |
 | `multi-gm.test.mjs` | Issue #410: две GM-сессии — детерминированная элекция одного controller, исполнение только контроллером, дубли — no-op, передача контроллера отменяет чужие операции, без активного GM — `waiting-for-gm`/`not-controller`. |
 | `stale-replan.test.mjs` | Issue #410: stale-план при изменённом мире → ровно один replan → `replan-limit-exceeded` → hold-and-report без исполнения. |

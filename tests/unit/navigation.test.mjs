@@ -771,6 +771,32 @@ test("findReachable exposes measured costs, not unaffordable geometric cells", (
     assert.deepEqual(findReachableOnContext(context, 3), result);
 });
 
+test("findReachable shares its expansion limit with route cost verification", () => {
+    const context = contextFor(mockToken(), { rows: 1, cols: 10, distance: 1 });
+    const result = findReachableOnContext(context, 10, { maxVisited: 15 });
+    assert.equal(result.limited, true);
+    assert.ok(result.visitedNodes <= 15);
+    assert.deepEqual(result.cells.map(cell => cell.j), [0, 1]);
+});
+
+test("routes from a projected origin respect transit reservations and measured cost", () => {
+    const token = mockToken({ x: 0, y: 0 });
+    const service = serviceFor({
+        rows: 1, cols: 6, distance: 1, measureCost: points => (points.length - 1) * 2
+    });
+    const origin = { i: 0, j: 4 };
+    const destination = { i: 0, j: 2 };
+    const route = service.planRoute(token, destination, 4, { origin });
+    assert.ok(route.exact);
+    assert.deepEqual(route.waypoints.map(wp => wp.j), [4, 3, 2]);
+    assert.equal(route.cost, 4);
+    assert.equal(service.planRoute(token, destination, 3, { origin }).exact, false);
+    assert.equal(service.planRoute(token, destination, 4, {
+        origin, reservations: [{ i: 0, j: 3 }]
+    }).exact, false, "a reserved transit cell breaks the only return corridor");
+    assert.deepEqual([token.x, token.y], [0, 0], "projection does not move the document");
+});
+
 test("A* core: deterministic order and visited bound", () => {
     const grid = { kind: "square" };
     const input = {

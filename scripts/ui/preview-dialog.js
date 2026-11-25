@@ -409,6 +409,7 @@ export function buildPreviewViewModel(plan, context = {}) {
         breakdown,
         intent,
         teamPhase: plan?.teamTurn?.phase ?? null,
+        team: _teamPreview(plan, combat, context.scene),
         morale,
         diagnostics,
         trace,
@@ -422,6 +423,37 @@ export function buildPreviewViewModel(plan, context = {}) {
         timeoutSeconds: Number.isFinite(context.timeoutSeconds) && context.timeoutSeconds > 0
             ? context.timeoutSeconds
             : null
+    };
+}
+
+/**
+ * Project only the uncompleted team assignments. The single-NPC preview
+ * below still describes the one plan that Confirm is allowed to execute.
+ * @param {object} plan
+ * @param {object|null} combat
+ * @param {object|null} scene
+ * @returns {object|null}
+ */
+function _teamPreview(plan, combat, scene) {
+    const turn = plan?.teamTurn;
+    const state = turn?.state;
+    if (!state?.members?.length) return null;
+    const name = id => id ? (_findTokenDoc(id, { combat, scene })?.name ?? id) : null;
+    return {
+        id: state.teamId, tactic: state.tactic, reason: state.tacticReason, interruption: turn.phase === "interrupt"
+            ? turn.reason : null,
+        objective: name(state.objective),
+        score: state.score,
+        members: state.members.map(member => ({
+            name: (_findCombatant(combat, member.id)?.name ?? name(member.tokenId)) || member.id,
+            task: member.task, group: member.groupId,
+            active: member.id === plan.snapshot?.combatantId,
+            waitsForMovement: state.required.includes(member.id) && Boolean(member.move),
+            move: member.move,
+            action: member.action ? { ...member.action, target: name(member.action.targetId) } : null,
+            separation: Number.isFinite(member.separation) ? Math.round(member.separation * 10) / 10 : null,
+            rejoin: member.rejoin
+        }))
     };
 }
 
@@ -473,6 +505,25 @@ export function localizePreviewViewModel(vm, i18n = null) {
         title: _label(i18nSource, "OWAI.Preview.Title", "AI plan preview"),
         teamPhaseLabel: vm.teamPhase
             ? _label(i18nSource, `OWAI.Preview.TeamTurn.${vm.teamPhase}`, vm.teamPhase) : null,
+        team: vm.team ? {
+            ...vm.team,
+            tacticLabel: vm.team.tactic ? _label(i18nSource, `OWAI.Tactic.${vm.team.tactic}`, vm.team.tactic) : null,
+            reasonLabel: vm.team.reason
+                ? _label(i18nSource, `OWAI.Preview.TeamReason.${vm.team.reason}`, vm.team.reason) : null,
+            interruptionLabel: vm.team.interruption
+                ? _label(i18nSource, STALE_REASON_LABEL_KEYS[vm.team.interruption]
+                    ?? `OWAI.Preview.TeamReason.${vm.team.interruption}`, vm.team.interruption) : null,
+            members: vm.team.members.map(member => ({
+                ...member,
+                taskLabel: _label(i18nSource, `OWAI.Task.${member.task}`, member.task),
+                action: member.action ? {
+                    ...member.action,
+                    label: _label(i18nSource, `OWAI.Preview.Step.${member.action.type}`, member.action.type),
+                    resources: Object.entries(member.action.resources ?? {}).filter(([, value]) => value !== 0)
+                        .map(([key, value]) => ({ label: _label(i18nSource, `OWAI.Preview.Resource.${key}`, key), value }))
+                } : null
+            }))
+        } : null,
         npc: vm.npc
             ? {
                 ...vm.npc,

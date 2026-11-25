@@ -53,6 +53,7 @@ import {
     resolveLayerFlags,
     sanitizeMoraleRecord
 } from "./layers.js";
+import { movementCells, offsetKey } from "./navigation.js";
 import { personalityIdentity, resolvePersonality } from "./personalities.js";
 import { isHostileDisposition, mergeTeamMemory } from "./perception.js";
 import {
@@ -79,7 +80,8 @@ export const FIRETEAM_STATUS = Object.freeze({
     noMembers: "no-members",
     leaderUnavailable: "leader-unavailable",
     disabled: "disabled",
-    waitingForGm: "waiting-for-gm"
+    waitingForGm: "waiting-for-gm",
+    invalid: "invalid-plan"
 });
 
 /**
@@ -1085,7 +1087,7 @@ export function createFireteamService({
     }
 
     /**
-     * Reservation table for movement endpoints and targets (issue #408).
+     * Reservation table for target capacity and swept movement footprints.
      * Entries reserve in assignment order; a conflict records the winner and
      * the loser instead of assigning one resource twice.
      * @param {object[]} assignments Entries from {@link assignTasks}.
@@ -1093,6 +1095,7 @@ export function createFireteamService({
      * @param {object} [context]
      * @param {object} [context.taskCapacities] Override
      *   {@link TARGET_TASK_CAPACITY} per task.
+     * @param {Map} [context.tokens] Token documents keyed by combatant id.
      * @returns {{targets: object[], endpoints: object[], routes: object[],
      *   conflicts: object[]}}
      */
@@ -1141,40 +1144,62 @@ export function createFireteamService({
             const move = (plan?.steps ?? []).find(step => step?.type === "move");
             const to = move?.input?.to ?? null;
             if (to && Number.isFinite(to.x) && Number.isFinite(to.y)) {
+                const memberId = assignment.combatantId;
+                const token = context.tokens?.get(memberId);
+                const end = movementCells(token, [to]);
+                const swept = movementCells(token, [...(move.input.waypoints ?? []), to]);
                 const key = `${to.x},${to.y}`;
-                if (!endpointOwner.has(key)) {
-                    endpointOwner.set(key, assignment.combatantId);
-                    endpoints.push({
-                        key,
-                        x: to.x,
-                        y: to.y,
-                        memberId: assignment.combatantId
-                    });
-                    for (const wp of move.input?.waypoints ?? []) {
-                        const wpKey = Number.isFinite(wp?.x) && Number.isFinite(wp?.y)
-                            ? `${wp.x},${wp.y}` : null;
-                        if (wpKey && !routeOwner.has(wpKey)) {
-                            routeOwner.set(wpKey, assignment.combatantId);
-                            routes.push({
-                                key: wpKey,
-                                x: wp.x,
-                                y: wp.y,
-                                memberId: assignment.combatantId
-                            });
-                        }
-                    }
-                } else {
+                const endKeys = end.length ? end.map(offsetKey) : [`pixel:${key}`];
+                const endpointConflict = endKeys.find(cell => endpointOwner.has(cell));
+                const routeConflict = swept.map(offsetKey).find(cell => routeOwner.has(cell));
+                if (endpointConflict || routeConflict) {
                     conflicts.push({
-                        type: "endpoint",
-                        key,
-                        loserId: assignment.combatantId,
-                        winnerId: endpointOwner.get(key),
-                        reason: "endpoint-reserved"
+                        type: endpointConflict ? "endpoint" : "route",
+                        key: endpointConflict ?? routeConflict,
+                        loserId: memberId,
+                        winnerId: endpointOwner.get(endpointConflict) ?? routeOwner.get(routeConflict),
+                        reason: endpointConflict ? "endpoint-reserved" : "route-reserved"
                     });
+                    continue;
+                }
+                for (const cell of endKeys) endpointOwner.set(cell, memberId);
+                endpoints.push({ key, x: to.x, y: to.y, memberId, cells: end });
+                for (const cell of swept) {
+                    const cellKey = offsetKey(cell);
+                    routeOwner.set(cellKey, memberId);
+                    routes.push({ key: cellKey, ...cell, memberId });
                 }
             }
         }
         return { targets, endpoints, routes, conflicts };
+    }
+
+    /**
+     * Find a legal stopping cell within cohesion, not the leader's occupied
+     * cell. A single full move is a conservative, bounded return budget.
+     * @param {object} token Token document.
+     * @param {object} center Projected leader centre in pixels.
+     * @param {object} context Navigation, budget and optional projected origin.
+     * @returns {Promise<object|null>} Verified route, or null if unavailable.
+     */
+    async function planRejoin(token, center, context = {}) {
+        const navigation = _service("navigation", context.navigation);
+        const size = context.grid?.size;
+        const distance = context.grid?.distance;
+        if (!navigation?.findCandidates || !center || !(size > 0) || !(distance > 0)) return null;
+        const rates = context.rates ?? (await navigation.getMovementRates?.(token))?.rates;
+        if (!(rates?.full > 0)) return null;
+        const { candidates } = navigation.findCandidates(token, rates.full, {
+            target: { x: center.x, y: center.y }, count: 6,
+            weights: { distance: 1, los: 0, cover: 0 },
+            origin: context.origin, reservations: context.reservations
+        });
+        const within = point => Math.hypot(point.x - center.x, point.y - center.y) / size * distance
+            <= context.preferredCohesion + 1e-9;
+        const best = candidates?.find(c => within(c) && c.waypoints?.length
+            && Number.isInteger(c.i) && Number.isInteger(c.j));
+        return best ? { point: { x: best.x, y: best.y, i: best.i, j: best.j },
+            route: best.waypoints, cost: best.cost } : null;
     }
 
     /**
@@ -1372,11 +1397,10 @@ export function createFireteamService({
      * @param {object[]} input.ordered Ordered member entries.
      * @param {Map} input.assignMap `combatantId → assignment`.
      * @param {Map} input.plans `combatantId → planTurn result`.
-     * @param {Set} input.endpointLosers Members whose move step lost an
-     *   endpoint reservation and is therefore excluded from the phases.
+     * @param {object[]} input.members Assignments with verified rejoin routes.
      * @returns {object[]} Phase descriptors `{id, name, barrier, steps}`.
      */
-    function _buildPhases({ ordered, assignMap, plans, endpointLosers }) {
+    function _buildPhases({ ordered, assignMap, plans, members }) {
         const sortKey = member => {
             const group = assignMap.get(member.combatantId)?.groupId ?? "main";
             const rank = group === "main" ? 1 : 0;
@@ -1386,14 +1410,11 @@ export function createFireteamService({
             sortKey(a).localeCompare(sortKey(b)));
         const movement = [];
         const action = [];
-        const regroup = [];
         for (const member of sorted) {
             const result = plans.get(member.combatantId);
             const plan = result?.plan;
             if (!plan) continue;
             const steps = plan.steps ?? [];
-            const skippedMove = endpointLosers.has(member.combatantId);
-            let moveSkipped = false;
             steps.forEach((step, index) => {
                 const ref = {
                     combatantId: member.combatantId,
@@ -1402,15 +1423,9 @@ export function createFireteamService({
                     type: step?.type ?? null
                 };
                 if (step?.type === "move") {
-                    if (skippedMove && !moveSkipped) {
-                        moveSkipped = true;
-                        return;
-                    }
                     movement.push(ref);
                 } else if (step?.type === "attack" || step?.type === "test") {
                     action.push(ref);
-                } else {
-                    regroup.push(ref);
                 }
             });
         }
@@ -1418,7 +1433,7 @@ export function createFireteamService({
         const flankIds = sorted
             .filter(member => assignMap.get(member.combatantId)?.groupId === "flank-1")
             .map(member => member.combatantId);
-        const required = flankIds.length ? flankIds : [...new Set(moverIds)];
+        const required = [...new Set([...flankIds, ...moverIds])];
         const barrier = required.length
             ? {
                 id: "barrier-movement",
@@ -1430,7 +1445,10 @@ export function createFireteamService({
         return [
             { id: "phase-0", name: "movement", barrier: null, steps: movement },
             { id: "phase-1", name: "action", barrier, steps: action },
-            { id: "phase-2", name: "regroup", barrier: null, steps: regroup }
+            { id: "phase-2", name: "regroup", barrier: null,
+                steps: members.filter(member => member.rejoinPoint).map(member => ({
+                    combatantId: member.combatantId, planId: member.planId, type: "rejoin"
+                })) }
         ];
     }
 
@@ -2330,13 +2348,16 @@ export function createFireteamService({
         const teamContacts = _teamContacts({ members, combat, context, perception });
 
         const reservedTargets = new Map();
+        const routeLocks = [...(context.reservations ?? [])];
         const plans = new Map();
+        const tokens = new Map(ordered.map(member => [member.combatantId, _tokenDoc(member.combatant.token)]));
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
             const memberContext = {
                 ...context,
                 seed,
+                reservations: routeLocks.slice(),
                 replanCount: _finiteOr(context.replanCount, 0),
                 ...(context.readOnly ? {
                     includeNeutral: resolveConfig(member.combatant)?.includeNeutral === true
@@ -2445,6 +2466,9 @@ export function createFireteamService({
                 }
             }
             plans.set(member.combatantId, result);
+            const move = result?.plan?.steps?.find(step => step.type === "move");
+            if (move) routeLocks.push(...movementCells(tokens.get(member.combatantId),
+                [...(move.input?.waypoints ?? []), move.input?.to]));
             if (diagnostics.memberStatuses[member.combatantId] === undefined) {
                 diagnostics.memberStatuses[member.combatantId] = result?.status ?? "error";
             }
@@ -2463,22 +2487,11 @@ export function createFireteamService({
             }
         }
 
-        // Post-pass: reservation table + conflict detection. Endpoint
-        // losers keep their plan but their move step is excluded from the
-        // phases (first reservation wins, deterministic order).
-        const reservations = reserveResources(assignments, plans, {
-            taskCapacities: context.taskCapacities
-        });
-        diagnostics.reservations = _jsonClone({
-            targets: reservations.targets,
-            endpoints: reservations.endpoints,
-            conflicts: reservations.conflicts
-        });
+        const reservationContext = { taskCapacities: context.taskCapacities, tokens };
+        const orderedAssignments = ordered.map(member => assignMap.get(member.combatantId));
+        const initialReservations = reserveResources(orderedAssignments, plans, reservationContext);
         const targetLosers = new Set(
-            reservations.conflicts.filter(c => c.type === "target")
-                .map(c => c.loserId));
-        const endpointLosers = new Set(
-            reservations.conflicts.filter(c => c.type === "endpoint")
+            initialReservations.conflicts.filter(c => c.type === "target")
                 .map(c => c.loserId));
         // Target losers get one retarget retry against the remaining pool.
         for (const member of ordered) {
@@ -2494,6 +2507,8 @@ export function createFireteamService({
             const retry = await memberPlanner.planTurn(combat, member.combatant, {
                 ...context,
                 seed,
+                reservations: [...(context.reservations ?? []), ...initialReservations.routes
+                    .filter(cell => cell.memberId !== member.combatantId)],
                 replanCount: _finiteOr(context.replanCount, 0) + 1,
                 targets: retryTargets,
                 team: {
@@ -2532,6 +2547,20 @@ export function createFireteamService({
             teamId,
             memberMorale: moraleInfo.effective
         });
+        const reservations = reserveResources(orderedAssignments, plans, reservationContext);
+        diagnostics.reservations = _jsonClone(reservations);
+        const routeConflict = reservations.conflicts.find(conflict => conflict.type !== "target");
+        const reject = reason => {
+            if (!context.teamFallback && tactic?.name !== "regroup-fallback") {
+                return buildTeamPlan(combat, team, {
+                    ...context, readOnly: true, teamFallback: true, assignments: undefined,
+                    allowFlank: false, regroup: true, convergence: false,
+                    tactic: { name: "regroup-fallback", reason, regroup: true }
+                });
+            }
+            return { status: FIRETEAM_STATUS.invalid, teamPlan: null, reason, diagnostics };
+        };
+        if (routeConflict) return reject(routeConflict.reason);
 
         // Cohesion evaluation: occupied cell centres are in pixels, but
         // the configured preferred distance is in scene units. Detached
@@ -2553,6 +2582,7 @@ export function createFireteamService({
         };
         const center = projectedCenter(ordered.find(member => member.combatantId === election.combatantId));
         const memberEntries = [];
+        const rejoinLocks = [...(context.reservations ?? [])];
         let cohesionPenalty = 0;
         let score = 0;
         const breakdown = { members: {}, cohesion: [] };
@@ -2560,17 +2590,29 @@ export function createFireteamService({
             const assignment = assignMap.get(member.combatantId);
             const plan = plans.get(member.combatantId)?.plan ?? null;
             const move = (plan?.steps ?? []).find(step => step?.type === "move");
-            const cohesion = evaluateCohesion({
+            const separation = {
                 endpoint: projectedCenter(member),
                 center,
                 unitsPerPixel,
                 preferredCohesion,
-                task: assignment.task,
+                task: move ? assignment.task : "support",
                 detachedUntilPhase: _finiteOr(context.detachedUntilPhase, 1),
                 maxDetachedPhases,
-                rejoinAvailable: rejoinPoints.length > 0,
-                reachable: move ? endpointLosers.has(member.combatantId) === false : true
-            });
+                rejoinAvailable: true
+            };
+            let cohesion = evaluateCohesion(separation);
+            let rejoin = null;
+            if (cohesion.detached) {
+                rejoin = await planRejoin(tokens.get(member.combatantId), center, {
+                    grid, preferredCohesion, rates: context.rates, navigation: context.navigation,
+                    origin: move.input.to,
+                    reservations: [...rejoinLocks, ...reservations.endpoints
+                        .filter(endpoint => endpoint.memberId !== member.combatantId)
+                        .flatMap(endpoint => endpoint.cells)]
+                });
+                if (!rejoin) cohesion = evaluateCohesion({ ...separation, rejoinAvailable: false });
+                else rejoinLocks.push(...movementCells(tokens.get(member.combatantId), rejoin.route));
+            }
             cohesionPenalty += cohesion.penalty;
             breakdown.cohesion.push({
                 combatantId: member.combatantId,
@@ -2585,10 +2627,9 @@ export function createFireteamService({
                 reason: cohesion.reason
             });
             if (!cohesion.allowed && DETACHED_TASKS.has(assignment.task)) {
-                diagnostics.rejected.push({
-                    member: member.combatantId,
-                    reason: `detached-${cohesion.reason}`
-                });
+                const reason = `detached-${cohesion.reason}`;
+                diagnostics.rejected.push({ member: member.combatantId, reason });
+                return reject(reason);
             }
             score += _finiteOr(plan?.score, 0);
             breakdown.members[member.combatantId] = _finiteOr(plan?.score, 0);
@@ -2601,7 +2642,11 @@ export function createFireteamService({
                 detached: cohesion.detached,
                 detachedUntilPhase: cohesion.detached
                     ? _finiteOr(context.detachedUntilPhase, 1) : null,
-                rejoinPoint: cohesion.detached ? (rejoinPoints[0] ?? null) : null,
+                maxDetachedRounds: cohesion.detached ? maxDetachedPhases : null,
+                separation: cohesion.distance,
+                rejoinPoint: rejoin?.point ?? null,
+                rejoinRoute: rejoin?.route ?? null,
+                rejoinCost: rejoin?.cost ?? null,
                 assignedTargetId: plan?.target?.tokenId ?? assignment.assignedTargetId,
                 assignedTargetUuid: plan?.target?.tokenUuid ?? null,
                 assignedEndpoint: move?.input?.to
@@ -2624,7 +2669,7 @@ export function createFireteamService({
             ordered,
             assignMap,
             plans,
-            endpointLosers
+            members: memberEntries
         });
         const memberPlans = {};
         for (const member of ordered) {
@@ -2649,6 +2694,7 @@ export function createFireteamService({
                 ? teamPreset : null,
             character,
             tactic: diagnostics.tactic?.name ?? null,
+            objective: tactic?.objective?.targetId ?? context.objective?.targetId ?? null,
             convergence,
             revision,
             seed,
@@ -2769,6 +2815,7 @@ export function createFireteamService({
         validateTeamPlan,
         invalidateTeamPlan,
         regroupPoints,
+        planRejoin,
         evaluateCohesion,
         collectMembers,
         resolveTeamConfig,

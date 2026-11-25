@@ -29,7 +29,8 @@ async function setup() {
   npcId = await h.createTestActor(page, 'npc', names.npc, async (actor) => {
     await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
-      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 10, damage: '1d10+3' } }
+      { name: 'Lasgun', type: 'weapon', system: { class: 'basic', range: 10, damage: '1d10+3',
+        clip: { value: 6, max: 9 }, rateOfFire: { single: 1, semi: 0, full: 0 } } }
     ]);
   });
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
@@ -89,10 +90,9 @@ async function testRangedCoverPresetRegistered() {
   assert.equal(info.allowNoTarget, true);
 }
 
-async function testBehindWallToFiringPosition() {
-  // The NPC stands behind the tall wall: the standing shot is vetoed and
-  // the plan relocates to the flank endpoint that has LOS plus cover
-  // from the low wall.
+async function testUnseenTargetStaysUnknown() {
+  // A potential firing position can't reveal a target currently hidden
+  // from the viewer, even when the destination itself is reachable.
   const result = await page.evaluate(async (cid) => {
     const planner = game.modules.get('only-war-ai').api.services.get('planner');
     const combatant = game.combat?.combatants?.get(cid);
@@ -111,20 +111,8 @@ async function testBehindWallToFiringPosition() {
   assert.equal(result.status, 'ok', `expected ok plan, got ${result.status}`);
   const plan = result.plan;
   assert.equal(plan.preset, 'rangedCover');
-  assert.equal(plan.breakdown?.variant, 'move-attack', 'blocked shot should plan move + attack');
-  assert.equal(plan.breakdown?.position?.los, 1, 'chosen endpoint must have LOS');
-  assert.ok(plan.breakdown?.position?.cover > 0, 'chosen endpoint should be covered');
-  const move = plan.steps.find((s) => s.type === 'move');
-  assert.ok(move, 'move step exists');
-  assert.equal(move.input.to.x, 700);
-  assert.equal(move.input.to.y, 800);
-  const attack = plan.steps.find((s) => s.type === 'attack');
-  assert.ok(attack, 'attack step exists');
-  const lasgunUuid = await page.evaluate((aid) =>
-    game.actors.get(aid).items.find((i) => i.name === 'Lasgun')?.uuid ?? null, npcId);
-  assert.equal(attack.input.itemUuid, lasgunUuid, 'attack should use the lasgun');
-  assert.ok(plan.diagnostics.rejected.some((e) => e.reason === 'no-line-of-sight'),
-    'blocked attack should be rejected with no-line-of-sight');
+  assert.equal(plan.target, null, 'a wall hides the never-seen target');
+  assert.ok(plan.steps.every(s => s.type !== 'attack'), 'no blind shot from a hypothetical endpoint');
   console.log('ranged-cover plan:', JSON.stringify(plan.steps.map((s) => s.type)));
 }
 
@@ -141,9 +129,6 @@ async function testBlockedShotNeverFiresBlind() {
   }, page._owaiCombatantId);
 
   assert.ok(['ok', 'no-action'].includes(result.status), `unexpected status ${result.status}`);
-  const rejected = result.diagnostics?.rejected ?? result.plan?.diagnostics?.rejected ?? [];
-  assert.ok(rejected.some((e) => e.reason === 'no-line-of-sight'),
-    'blocked attack should be rejected with no-line-of-sight');
   if (result.status === 'ok') {
     assert.ok(result.plan.steps.every((s) => s.type !== 'attack'),
       'vetoed shot must not produce an attack step');
@@ -202,7 +187,7 @@ async function cleanup() {
     await setup();
     await testRangedCoverPresetRegistered();
     await testLocalizedPresetName();
-    await testBehindWallToFiringPosition();
+        await testUnseenTargetStaysUnknown();
     await testBlockedShotNeverFiresBlind();
     await testOpenPositionMovesToCover();
     console.log('preset-ranged-cover.test.mjs PASSED');

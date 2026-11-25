@@ -9,6 +9,43 @@
     {{#if teamPhaseLabel}}
     <p>{{teamPhaseLabel}}</p>
     {{/if}}
+    {{#if team}}
+    <details class="ow-ai-preview-team" open>
+        <summary>{{localize "OWAI.Preview.Team.Label"}}: {{team.id}}{{#if team.tacticLabel}} ({{team.tacticLabel}}){{/if}}</summary>
+        <p class="notes">{{localize "OWAI.Preview.Team.Scope"}}</p>
+        {{#if team.objective}}<p>{{localize "OWAI.Preview.Target.Label"}}: {{team.objective}}</p>{{/if}}
+        {{#if team.reasonLabel}}<p>{{team.reasonLabel}}</p>{{/if}}
+        {{#if team.interruptionLabel}}<p>{{team.interruptionLabel}}</p>{{/if}}
+        {{#if team.score}}<p>{{localize "OWAI.Preview.Score"}}: {{team.score}}</p>{{/if}}
+        <ul>
+            {{#each team.members}}
+            <li>
+                <strong>{{name}}</strong> · {{taskLabel}} ({{group}})
+                {{#if active}}<em>{{localize "OWAI.Preview.Team.Active"}}</em>{{/if}}
+                {{#if waitsForMovement}}<em>{{localize "OWAI.Preview.Team.Required"}}</em>{{/if}}
+                {{#if move}}
+                <div>{{localize "OWAI.Preview.Route.Label"}}:
+                    {{#each move.route}}({{x}}, {{y}}){{#unless @last}} → {{/unless}}{{/each}}
+                    · {{localize "OWAI.Preview.Route.Cost"}}: {{move.cost}}
+                    · {{localize "OWAI.Preview.Team.Halves"}}: {{move.halves}}</div>
+                {{/if}}
+                {{#if action}}
+                <div>{{action.label}}{{#if action.name}}: {{action.name}}{{/if}} → {{action.target}}
+                    · {{localize "OWAI.Preview.Team.Halves"}}: {{action.halves}}
+                    {{#each action.resources}} · {{label}}: {{value}}{{/each}}</div>
+                {{/if}}
+                {{#if rejoin}}
+                <div>{{localize "OWAI.Preview.Team.Rejoin"}}:
+                    {{#each rejoin.route}}({{x}}, {{y}}){{#unless @last}} → {{/unless}}{{/each}}
+                    · {{localize "OWAI.Preview.Route.Cost"}}: {{rejoin.cost}}
+                    · {{localize "OWAI.Preview.Team.Separation"}}: {{separation}}
+                    · {{localize "OWAI.Preview.Team.MaxRounds"}}: {{rejoin.maxRounds}}</div>
+                {{/if}}
+            </li>
+            {{/each}}
+        </ul>
+    </details>
+    {{/if}}
     <div class="ow-ai-preview-summary">
         <div class="form-group">
             <label>{{localize "OWAI.Preview.Npc"}}</label>

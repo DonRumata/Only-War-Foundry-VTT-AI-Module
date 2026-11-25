@@ -246,7 +246,7 @@ function _sceneTokens() {
 /**
  * Call `testVisibility` defensively; returns null when the API shape is
  * missing or threw so callers can fall through to the next adapter.
- * @param {object} tester Object exposing `testVisibility`.
+ * @param {object} tester Viewer or source exposing `testVisibility`.
  * @param {object} point `{x, y}` point to test.
  * @param {object} options Options forwarded to the API.
  * @returns {boolean|null}
@@ -261,50 +261,87 @@ function _tryTestVisibility(tester, point, options) {
 }
 
 /**
- * Line-of-sight adapter for Foundry 13/14. Resolution order:
- * `canvas.visibility.testVisibility` (v13+), `canvas.effects.visibility`
- * (legacy path), placeable `testVisibility`, `visionSource.testVisibility`,
- * then a geometric wall fallback (`canvas.walls.checkCollision` or a manual
- * segment test). The check is always evaluated from `from`'s vision
- * sources — never from `game.user` — so GM-owned clients do not leak
- * hidden information.
+ * Create a private vision source for an unselected NPC. The canvas-level
+ * visibility test uses every active source (or GM omniscience); its
+ * `object` option is the target, not the viewing token.
+ * @param {object} from Viewer token (placeable or document).
+ * @param {Function} test Callback run with the viewer's source, if any.
+ * @returns {*}
+ */
+function _withViewerVision(from, test) {
+    const viewer = _tokenObject(from);
+    const doc = _tokenDocument(from);
+    if (globalThis.canvas?.scene?.tokenVision === false || doc?.sight?.enabled !== true
+        || viewer?.vision?.los) return test(viewer?.vision ?? null);
+    const Vision = globalThis.CONFIG?.Canvas?.visionSourceClass;
+    if (typeof Vision !== "function" || typeof viewer?._getVisionSourceData !== "function") {
+        return test(null);
+    }
+    let source;
+    try {
+        source = new Vision({ object: viewer, sourceId: `${MODULE_ID}.${viewer.sourceId}` });
+        Object.assign(source.blinded ?? {}, viewer._getVisionBlindedStates?.());
+        source.initialize(viewer._getVisionSourceData());
+    } catch(_err) {
+        source?.destroy?.();
+        return test(null);
+    }
+    try {
+        return test(source);
+    } finally {
+        source.destroy();
+    }
+}
+
+/**
+ * Check one point with the viewer's own vision and the scene's walls.
+ * @param {object} from Viewer token or movement probe.
+ * @param {object} to Target token.
+ * @param {object|null} source Unregistered or live viewer vision source.
+ * @returns {boolean}
+ */
+function _lineOfSight(from, to, source) {
+    const origin = _positionOf(from);
+    const target = _positionOf(to);
+    if (!origin || !target || isBlinded(from)) return false;
+    if (!_geometricLineOfSight(origin, target)) return false;
+
+    const viewer = _tokenObject(from);
+    const doc = _tokenDocument(from);
+    if (globalThis.canvas?.scene?.tokenVision === false || from?.document === null) return true;
+    if (typeof viewer?.testVisibility === "function") {
+        const seen = _tryTestVisibility(viewer, target, { tolerance: 2 });
+        if (seen !== null) return seen;
+    }
+    if (typeof source?.testVisibility === "function") {
+        const seen = _tryTestVisibility(source, target, {});
+        if (seen !== null) return seen;
+    }
+    if (doc?.sight?.enabled !== true) return true;
+    if (!source || source.isBlinded) return false;
+    const modes = globalThis.CONFIG?.Canvas?.detectionModes;
+    const config = {
+        object: _tokenObject(to),
+        tests: [{ point: { ...target, elevation: _elevationOf(to) }, los: new Map() }]
+    };
+    return (doc.detectionModes ?? []).some(mode => {
+        if (mode.id !== "basicSight" && mode.id !== "lightPerception") return false;
+        try {
+            return modes?.[mode.id]?.testVisibility?.(source, mode, config) === true;
+        } catch(_err) {
+            return false;
+        }
+    });
+}
+
+/**
+ * Test line of sight independently of the GM's selected tokens.
  * @param {object} from Viewer token (placeable or document).
  * @param {object} to Target token (placeable or document).
  * @returns {boolean}
  */
 export function hasLineOfSight(from, to) {
-    const origin = _positionOf(from);
-    const target = _positionOf(to);
-    if (!origin || !target) return false;
-
-    const viewer = _tokenObject(from);
-    const layer = globalThis.canvas?.visibility ?? globalThis.canvas?.effects?.visibility;
-    if (layer && typeof layer.testVisibility === "function") {
-        const seen = _tryTestVisibility(layer, target, { object: viewer, tolerance: 2 });
-        // When core reports "visible" the walls still apply: scenes with
-        // vision disabled or an uninitialized visibility layer answer
-        // permissively, so cross-check the geometry before trusting it.
-        if (seen === true) return _geometricLineOfSight(origin, target);
-        if (seen === false) {
-            // A probe point with an explicitly null document is not a real
-            // canvas token: core reports it "not visible" regardless of
-            // walls — for such probes the wall geometry is the authority.
-            if (from?.document === null || viewer?.document === null) {
-                return _geometricLineOfSight(origin, target);
-            }
-            return false;
-        }
-    }
-    if (viewer && typeof viewer.testVisibility === "function") {
-        const seen = _tryTestVisibility(viewer, target, { tolerance: 2 });
-        if (seen !== null) return seen;
-    }
-    const vision = viewer?.vision ?? _tokenDocument(from)?.vision;
-    if (vision && typeof vision.testVisibility === "function") {
-        const seen = _tryTestVisibility(vision, target, {});
-        if (seen !== null) return seen;
-    }
-    return _geometricLineOfSight(origin, target);
+    return _withViewerVision(from, source => _lineOfSight(from, to, source));
 }
 
 /**
@@ -448,7 +485,10 @@ export function measureDistance(from, to) {
     const b = _positionOf(to);
     if (!a || !b) return null;
     try {
-        const result = globalThis.canvas?.grid?.measureDistance?.(a, b);
+        const grid = globalThis.canvas?.grid;
+        const result = typeof grid?.measurePath === "function"
+            ? grid.measurePath([a, b], { gridSpaces: true })
+            : grid?.measureDistance?.(a, b);
         if (typeof result === "number" && Number.isFinite(result)) return result;
         if (result && Number.isFinite(result.distance)) return result.distance;
     } catch(_err) {
@@ -506,39 +546,40 @@ export function visibleTargets(viewer, options = {}) {
     const combat = options.combat ?? globalThis.game?.combat ?? null;
     const combatants = _combatantIndex(combat);
     const viewerDisposition = dispositionOf(viewer);
-    const targets = [];
-
-    for (const candidate of _sceneTokens()) {
-        const doc = _tokenDocument(candidate);
-        if (!doc || doc === viewerDoc) continue;
-        if (doc.id && doc.id === viewerDoc.id) continue;
-        if (doc.destroyed === true || doc.actor?.destroyed === true) continue;
-        if (!doc.actor) continue;
-        const combatant = combatants.get(doc.id) ?? null;
-        if (isDeadOrDefeated(candidate, { combatant })) continue;
-        if (!isHostileDisposition(viewerDisposition, dispositionOf(candidate), options)) continue;
-        const hidden = isHiddenToken(candidate, { combatant });
-        if (hidden && options.includeHidden !== true) continue;
-        if (options.ignoreLOS !== true && !hasLineOfSight(viewer, candidate)) continue;
-        const position = _positionOf(candidate);
-        targets.push({
-            tokenId: doc.id ?? null,
-            tokenUuid: _tokenUuid(candidate),
-            actorId: doc.actor?.id ?? null,
-            name: doc.name ?? _tokenObject(candidate)?.name ?? null,
-            sceneId: globalThis.canvas.scene?.id ?? null,
-            disposition: dispositionOf(candidate),
-            x: position?.x ?? null,
-            y: position?.y ?? null,
-            elevation: _elevationOf(candidate),
-            distance: measureDistance(viewer, candidate),
-            statuses: [...statusIdsOf(candidate)].sort(),
-            hidden,
-            canAttack: !hidden
-        });
-    }
-    targets.sort((a, b) => String(a.tokenId).localeCompare(String(b.tokenId)));
-    return targets;
+    const find = source => {
+        const targets = [];
+        for (const candidate of _sceneTokens()) {
+            const doc = _tokenDocument(candidate);
+            if (!doc || doc === viewerDoc) continue;
+            if (doc.id && doc.id === viewerDoc.id) continue;
+            if (doc.destroyed === true || doc.actor?.destroyed === true) continue;
+            if (!doc.actor) continue;
+            const combatant = combatants.get(doc.id) ?? null;
+            if (isDeadOrDefeated(candidate, { combatant })) continue;
+            if (!isHostileDisposition(viewerDisposition, dispositionOf(candidate), options)) continue;
+            const hidden = isHiddenToken(candidate, { combatant });
+            if (hidden && options.includeHidden !== true) continue;
+            if (options.ignoreLOS !== true && !_lineOfSight(viewer, candidate, source)) continue;
+            const position = _positionOf(candidate);
+            targets.push({
+                tokenId: doc.id ?? null,
+                tokenUuid: _tokenUuid(candidate),
+                actorId: doc.actor?.id ?? null,
+                name: doc.name ?? _tokenObject(candidate)?.name ?? null,
+                sceneId: globalThis.canvas.scene?.id ?? null,
+                disposition: dispositionOf(candidate),
+                x: position?.x ?? null,
+                y: position?.y ?? null,
+                elevation: _elevationOf(candidate),
+                distance: measureDistance(viewer, candidate),
+                statuses: [...statusIdsOf(candidate)].sort(),
+                hidden,
+                canAttack: !hidden
+            });
+        }
+        return targets.sort((a, b) => String(a.tokenId).localeCompare(String(b.tokenId)));
+    };
+    return options.ignoreLOS === true ? find(null) : _withViewerVision(viewer, find);
 }
 
 /**

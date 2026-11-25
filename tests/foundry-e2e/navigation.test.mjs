@@ -105,6 +105,38 @@ async function testSquareRouteAroundWall() {
     }
 }
 
+async function testMeasuredTerrainBudget() {
+    const sceneId = await createScene(1);
+    const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
+    const costs = await page.evaluate(async ({ sceneId, tokenId }) => {
+        const scene = game.scenes.get(sceneId);
+        const nav = game.modules.get('only-war-ai').api.services.get('navigation');
+        const token = scene.tokens.get(tokenId);
+        const destination = { i: 5, j: 7 };
+        const budget = 2 * scene.grid.distance;
+        const clear = nav.planRoute(token, destination, budget);
+        await scene.createEmbeddedDocuments('Region', [{
+            name: 'E2E Difficult Terrain',
+            shapes: [{ type: 'rectangle', x: 300, y: 300, width: 800, height: 800 }],
+            behaviors: [{ type: 'modifyMovementCost', system: { difficulties: { walk: 2 } } }]
+        }]);
+        const tight = nav.planRoute(token, destination, budget);
+        const exact = nav.planRoute(token, destination, 2 * budget);
+        const reachable = nav.findReachable(token, budget);
+        return {
+            budget, clear, tight, exact,
+            reachable: reachable.cells?.some(cell => cell.i === destination.i && cell.j === destination.j)
+        };
+    }, { sceneId, tokenId });
+    assert.equal(costs.clear.exact, true, 'open ground fits a two-step budget');
+    assert.equal(costs.tight.status, 'partial', 'terrain doubles the route cost');
+    assert.equal(costs.tight.cost, costs.budget, 'only one step fits in the terrain');
+    assert.equal(costs.reachable, false, 'reachable cells respect the same budget');
+    assert.equal(costs.exact.exact, true, 'double the budget reaches the destination');
+    assert.equal(costs.exact.cost, 2 * costs.budget);
+    console.log('native difficult terrain limits measured movement on square grid');
+}
+
 async function testUnreachableEndpoint() {
     const sceneId = await createScene(1);
     const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
@@ -204,6 +236,7 @@ async function cleanup() {
         blockerId = await h.createTestActor(page, 'npc', names.blocker);
         await testServiceRegistered();
         await testSquareRouteAroundWall();
+        await testMeasuredTerrainBudget();
         await testUnreachableEndpoint();
         await testOccupiedEndpoint();
         await testHexScene();

@@ -681,19 +681,19 @@ test("specOps fireteam builds a coordinated assault at superiority", async () =>
     const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
     const second = makeMember({ fireteam: flag, x: 100, y: 0, initiative: 10 });
     const third = makeMember({ fireteam: flag, x: 200, y: 50, initiative: 8 });
-    // 3 vs 1 on open ground → coordinated assault.
-    const world = makeTeamWorld([leader, second, third], { enemyCount: 1, enemyX: 20000 });
+    // 3 vs 1 with legal actions from separate positions.
+    const world = makeTeamWorld([leader, second, third], { enemyCount: 1, enemyX: 400 });
     const service = makeSpecOpsService();
     const result = await service.buildTeamPlan(world.combat,
-        { teamId: "alpha" }, { seed: 5, targets: injectedTargets(world) });
+        { teamId: "alpha" }, { seed: 5, targets: injectedTargets(world), moves: [] });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     const plan = result.teamPlan;
     assert.equal(plan.tactic, "coordinated-assault");
     assert.equal(plan.diagnostics.tactic.reason, "superiority");
     assert.ok(plan.members.every(m => m.task === "assault"));
     // Synchronized: every member shares the same barrier before actions.
-    assert.ok(plan.phases[1].barrier === null
-        || plan.phases[1].barrier.requiredAssignmentIds.length >= 0);
+    assert.equal(plan.phases[1].barrier, null, "no movement barrier is needed");
+    assert.equal(plan.phases[1].steps.length, 2, "two legal attacks fit the target reservation");
 });
 
 test("specOps fireteam regroups under overwhelming threat and losses", async () => {

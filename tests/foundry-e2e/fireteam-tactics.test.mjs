@@ -274,12 +274,13 @@ async function testTemporaryAssignments() {
     }
     const flags = await page.evaluate((data) =>
         data.cids.map((cid) => {
-            const combatant = game.combat.combatants.get(cid);
+            const combatant = game.combats.get(data.combatId).combatants.get(cid);
             return combatant?.flags?.['only-war-ai'] ?? {};
-        }), { cids: env.memberCids });
+        }), { cids: env.memberCids, combatId: env.combatId });
     for (const flag of flags) {
-        assert.deepEqual(Object.keys(flag).sort(), ['fireteam', 'override'],
-            `only config flags persist, got ${JSON.stringify(flag)}`);
+        const persistent = ['fireteam', 'override', 'memory', 'morale'];
+        assert.deepEqual(Object.keys(flag).filter(key => !persistent.includes(key)), [],
+            `planning may record memory and morale but not assignments: ${JSON.stringify(flag)}`);
         assert.deepEqual(flag.fireteam, { teamId: 'alpha-tactics', teamPreset: 'specOps' },
             'no task or role is persisted on the combatant');
     }
