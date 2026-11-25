@@ -90,7 +90,7 @@ function makeWorld({ enemies = [{ x: 500, y: 0 }], preset = "assault", weapons =
 
     const enemyCombatants = enemies.map(enemy => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         enemyActor.statuses = new Set(enemy.statuses ?? []);
         const enemyToken = makeToken({ actor: enemyActor });
@@ -239,6 +239,64 @@ test("validateSnapshot reports statuses-changed on self status drift", async () 
         selfStatuses: ["stunned"]
     });
     assert.equal(injected.reason, STALE_REASONS.statusesChanged);
+});
+
+test("validateSnapshot reconciles self-inflicted status changes of the plan's own steps", async () => {
+    const world = makeWorld();
+    const planner = createPlannerService();
+    const { plan } = await planner.planTurn(world.combat, world.combatant, {
+        seed: 42,
+        targets: injectedTargets(world),
+        selfStatuses: ["pinned"]
+    });
+    const validation = (extra = {}) => ({
+        combat: world.combat,
+        combatant: world.combatant,
+        token: world.token,
+        scene: world.scene,
+        ...extra
+    });
+
+    // Issue #93: the unpin test cleared `pinned` mid-plan — without the
+    // executor's adjust report the drift reads as external interference.
+    const drift = planner.validateSnapshot(plan, validation({ selfStatuses: [] }));
+    assert.equal(drift.valid, false);
+    assert.equal(drift.reason, STALE_REASONS.statusesChanged);
+
+    // Reporting the self-inflicted removal reconciles the reading — the
+    // fingerprint fast-path itself stays valid, so the end-turn step of
+    // the same plan is never replanned away.
+    const unpinned = planner.validateSnapshot(plan, validation({
+        selfStatuses: [],
+        selfStatusAdjust: { added: [], removed: ["pinned"] }
+    }));
+    assert.deepEqual(unpinned, { valid: true, reason: null });
+
+    // The mirrored direction: a drop-prone step applied `prone` — the
+    // self-inflicted addition reconciles exactly the same way.
+    const dropProne = planner.validateSnapshot(plan, validation({
+        selfStatuses: ["pinned", "prone"],
+        selfStatusAdjust: { added: ["prone"], removed: [] }
+    }));
+    assert.deepEqual(dropProne, { valid: true, reason: null });
+
+    // External drift is never masked: a status the plan did not touch
+    // still invalidates even alongside the self-inflicted removal.
+    const external = planner.validateSnapshot(plan, validation({
+        selfStatuses: ["stunned"],
+        selfStatusAdjust: { added: [], removed: ["pinned"] }
+    }));
+    assert.equal(external.valid, false);
+    assert.equal(external.reason, STALE_REASONS.statusesChanged);
+
+    // The anchored reconcile manufactures no phantom difference when the
+    // reported removal never actually happened (the test had failed —
+    // the executor would not report it, but the planner stays robust).
+    const phantom = planner.validateSnapshot(plan, validation({
+        selfStatuses: ["pinned"],
+        selfStatusAdjust: { added: ["pinned"], removed: [] }
+    }));
+    assert.deepEqual(phantom, { valid: true, reason: null });
 });
 
 test("pinned vetoes charge and closing approaches for a melee NPC", async () => {
@@ -416,7 +474,11 @@ test("attackType factor prefers full_auto for a ranged attack-in-place", async (
         seed: 1,
         personality: false,
         targets: injectedTargets(world),
-        actions: rangedApiActions(),
+        // Issue #93: suppressing fire is a cone attack whose coverage now
+        // feeds the `area` factor — against a single target it outscores
+        // full_auto, which is correct but orthogonal to this factor test,
+        // so the suppression entry is filtered out here.
+        actions: rangedApiActions().filter(action => action.attackType !== "suppressing_fire"),
         maxActions: 10
     });
     assert.equal(result.status, PLANNER_STATUS.ok);

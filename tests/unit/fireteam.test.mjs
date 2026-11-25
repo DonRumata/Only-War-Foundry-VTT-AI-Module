@@ -119,7 +119,7 @@ function makeMember({
 function makeTeamWorld(members, { enemyX = 2000, enemyY = 0 } = {}) {
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = enemyX;
@@ -528,6 +528,75 @@ test("buildTeamPlan is deterministic for identical input", async () => {
     assert.deepEqual(
         JSON.parse(JSON.stringify(r1.teamPlan.phases)),
         JSON.parse(JSON.stringify(r2.teamPlan.phases)));
+});
+
+test("target-conflict retry replans keep the full team context (issue #93)", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, x: 0, initiative: 20 });
+    const second = makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 15 });
+    const world = makeTeamWorld([leader, second]);
+    // Stub planner: both members engage the same target, so the
+    // capacity-1 reservation conflicts and the loser replans once.
+    const contexts = new Map();
+    const stubPlanner = {
+        planTurn: async (combat, combatant, context) => {
+            const list = contexts.get(combatant.id) ?? [];
+            list.push(context);
+            contexts.set(combatant.id, list);
+            return {
+                status: "ok",
+                reason: null,
+                plan: {
+                    id: `plan-${combatant.id}-${list.length}`,
+                    target: { tokenId: world.enemyToken.id },
+                    steps: [{
+                        id: "step-end-turn-1",
+                        type: "end-turn",
+                        cost: {},
+                        input: {},
+                        preconditions: ["turn"],
+                        projectedResourceDelta: {}
+                    }],
+                    snapshot: { targets: [] },
+                    diagnostics: { layers: [] }
+                }
+            };
+        }
+    };
+    const service = createFireteamService({ planner: stubPlanner });
+    const result = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, {
+        seed: 5,
+        targets: injectedTargets(world),
+        assignments: {
+            [leader.combatant.id]: "assault",
+            [second.combatant.id]: "assault"
+        },
+        taskCapacities: { assault: 1 },
+        tactic: {
+            name: "test-tactic",
+            objective: { targetId: "obj-1", flankPoint: { x: 50, y: 60 } }
+        }
+    });
+    assert.equal(result.status, FIRETEAM_STATUS.ok);
+    // Exactly one member lost the target reservation and replanned.
+    const retried = [...contexts.entries()].filter(([, list]) => list.length > 1);
+    assert.equal(retried.length, 1, "one member replans after losing the target");
+    const [[, list]] = retried;
+    assert.equal(list.length, 2, "the loser replans exactly once");
+    const [first, retry] = list;
+    assert.equal(retry.replanCount, first.replanCount + 1);
+    // The team metadata of the first pass survives the retry verbatim —
+    // the partial rebuild used to drop every field below.
+    assert.deepEqual(retry.team.center, first.team.center, "center preserved");
+    assert.equal(retry.team.objective, "obj-1", "tactic objective preserved");
+    assert.deepEqual(retry.team.flankPoint, { x: 50, y: 60 }, "flankPoint preserved");
+    assert.equal(retry.team.leaderId, first.team.leaderId);
+    assert.equal(retry.team.teamId, first.team.teamId);
+    assert.deepEqual(retry.team.contacts, first.team.contacts);
+    assert.equal(retry.team.task, first.team.task);
+    assert.equal(retry.tactic, first.tactic, "tactic name preserved");
 });
 
 test("buildTeamPlan reports no-members and leader-unavailable", async () => {

@@ -103,7 +103,7 @@ function makeWorld({ weapons = [RANGED_WEAPON] } = {}) {
     };
 
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;

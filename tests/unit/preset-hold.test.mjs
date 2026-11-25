@@ -150,7 +150,7 @@ function makeWorld({ enemies = [{ x: 300, y: 0 }], walls = [], selfPos = { x: 0,
 
     const enemyCombatants = enemies.map(enemy => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemy.x;
         enemyToken.y = enemy.y;

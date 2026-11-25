@@ -92,7 +92,7 @@ function makeWorld({
 
     const enemyCombatants = enemies.map((enemy) => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemy.x;
@@ -512,7 +512,7 @@ test("ending inside an enemy's reach marks engageDenial", async () => {
 /*  unpin                                        */
 /* -------------------------------------------- */
 
-test("pinned combatant with willpower gets an unpin test candidate", async () => {
+test("a pinned combatant's plan carries the free end-of-turn unpin step", async () => {
     const world = makeWorld({
         enemies: [{ x: 300, y: 0 }],
         system: { characteristics: { willpower: { base: 35 } } }
@@ -527,9 +527,10 @@ test("pinned combatant with willpower gets an unpin test candidate", async () =>
         selfStatuses: ["pinned"]
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
-    const unpinFactors = factorsOf(captured, candidate => candidate.variant === "unpin");
-    assert.ok(unpinFactors, "unpin candidate is generated for a pinned bot");
-    assert.equal(unpinFactors.unpin, 1);
+    // Issue #93: unpin never competes as an action candidate — the free
+    // end-of-turn test rides every plan instead.
+    assert.equal(factorsOf(captured, candidate => candidate.variant === "unpin"), null,
+        "no unpin candidate is generated anymore");
 
     const test = result.plan.steps.find(step => step.type === "test");
     assert.ok(test, "the chosen plan serializes the unpin test step");
@@ -537,8 +538,237 @@ test("pinned combatant with willpower gets an unpin test candidate", async () =>
     assert.equal(test.input.key, "willpower");
     assert.equal(test.input.characteristic, "willpower");
     assert.equal(test.input.actionId, "unpin");
-    assert.equal(test.cost.halves, 2, "unpin costs a full action");
-    assert.equal(result.plan.steps.at(-1).type, "end-turn");
+    assert.equal(test.input.unpin, true);
+    assert.equal(test.input.endOfTurn, true);
+    assert.equal(test.cost.halves, 0, "unpin is a free end-of-turn test, not an action");
+    // The step rides ahead of the end-turn step, after the paid actions.
+    const endIndex = result.plan.steps.findIndex(step => step.type === "end-turn");
+    const testIndex = result.plan.steps.indexOf(test);
+    assert.ok(endIndex >= 0 && testIndex >= 0 && testIndex < endIndex,
+        "the unpin test is serialized ahead of the end-turn step");
+    // Exactly one unpin step per plan, with a stable id (idempotent
+    // across mid-plan replans through the system operation journal).
+    assert.equal(result.plan.steps.filter(step => step.input?.unpin === true).length, 1);
+    assert.equal(test.id, "step-test-unpin");
+});
+
+test("the unpin modifier reads cover against the nearest known threat", async () => {
+    const world = makeWorld({
+        enemies: [{ x: 300, y: 0 }],
+        system: { characteristics: { willpower: { base: 35 } } }
+    });
+    const inputs = {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        selfStatuses: ["pinned"]
+    };
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    // In cover (estimate ≥ 0.5): the +30 in-cover test.
+    const covered = await planner.planTurn(world.combat, world.combatant, {
+        ...inputs,
+        navigation: { coverEstimate: () => 0.8 }
+    });
+    const coveredStep = covered.plan.steps.find(step => step.input?.unpin === true);
+    assert.equal(coveredStep.input.modifier, 30);
+    assert.equal(coveredStep.input.modifierBasis, "in-cover");
+    // Below the cover threshold and without a navigation service the
+    // conservative base test stands.
+    const exposed = await planner.planTurn(world.combat, world.combatant, {
+        ...inputs,
+        navigation: { coverEstimate: () => 0.2 }
+    });
+    const exposedStep = exposed.plan.steps.find(step => step.input?.unpin === true);
+    assert.equal(exposedStep.input.modifier, 0);
+    assert.equal(exposedStep.input.modifierBasis, "base");
+    const bare = await planner.planTurn(world.combat, world.combatant, inputs);
+    const bareStep = bare.plan.steps.find(step => step.input?.unpin === true);
+    assert.equal(bareStep.input.modifier, 0);
+    assert.equal(bareStep.input.modifierBasis, "base");
+});
+
+/**
+ * Planner whose scoring always prefers a moving candidate — the unpin
+ * probe tests need a deterministic winner carrying a move step.
+ * @returns {object} Planner service.
+ */
+function moveForcingPlanner() {
+    const planner = createPlannerService();
+    planner.registerPreset("assault", {
+        weights: { attackNow: 10, advance: 1 },
+        evaluate({ factors, candidate, weights: w }) {
+            const base = evaluateFactors(factors, w).score;
+            return candidate.move && !candidate.move.stay ? base + 1000 : base;
+        }
+    });
+    return planner;
+}
+
+test("the unpin cover probe reads the planned move endpoint, not the start position", async () => {
+    const world = makeWorld({
+        enemies: [{ x: 300, y: 0 }],
+        system: { characteristics: { willpower: { base: 35 } } }
+    });
+    // A lateral endpoint far from the enemy: distance-keeping moves stay
+    // legal for a pinned bot (closing ones are vetoed).
+    const endpoint = { x: 500, y: 400 };
+    const inputs = {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        selfStatuses: ["pinned"],
+        moves: [{ x: endpoint.x, y: endpoint.y, i: 5, j: 4, cost: 2, distance: 10, los: true }]
+    };
+    const planner = moveForcingPlanner();
+
+    // Endpoint in cover, the turn-start spot in the open → the +30 test:
+    // the bot crawls behind the wall this turn and tests from there.
+    const probes = [];
+    const covered = await planner.planTurn(world.combat, world.combatant, {
+        ...inputs,
+        navigation: {
+            coverEstimate: (_token, point) => {
+                probes.push({ x: point.x, y: point.y });
+                return point.x === endpoint.x && point.y === endpoint.y ? 0.8 : 0;
+            }
+        }
+    });
+    assert.equal(covered.status, PLANNER_STATUS.ok);
+    assert.ok(covered.plan.steps.some(step => step.type === "move"),
+        "the forced move-attack plan won");
+    const coveredStep = covered.plan.steps.find(step => step.input?.unpin === true);
+    assert.equal(coveredStep.input.modifier, 30);
+    assert.equal(coveredStep.input.modifierBasis, "in-cover");
+    // Scoring probes cover for the injected moves first; the unpin probe
+    // runs after `_stepsFor`, so it is always the last call — and it must
+    // carry the serialized move endpoint verbatim (a footprint centre).
+    assert.deepEqual(probes.at(-1), endpoint,
+        "the last probe point is the serialized move endpoint verbatim");
+
+    // Regression: the covered START no longer decides — the endpoint out
+    // in the open means the base +0 test even though the bot began its
+    // turn behind the wall.
+    const exposed = await planner.planTurn(world.combat, world.combatant, {
+        ...inputs,
+        navigation: {
+            coverEstimate: (_token, point) =>
+                (point.x === endpoint.x && point.y === endpoint.y ? 0 : 0.8)
+        }
+    });
+    const exposedStep = exposed.plan.steps.find(step => step.input?.unpin === true);
+    assert.equal(exposedStep.input.modifier, 0);
+    assert.equal(exposedStep.input.modifierBasis, "base");
+});
+
+test("the unpin probe of a moveless plan reads the current footprint centre", async () => {
+    const world = makeWorld({
+        enemies: [{ x: 300, y: 0 }],
+        system: { characteristics: { willpower: { base: 35 } } }
+    });
+    const probes = [];
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        selfStatuses: ["pinned"],
+        navigation: {
+            coverEstimate: (_token, point) => {
+                probes.push({ x: point.x, y: point.y });
+                return 0;
+            }
+        }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.ok(result.plan.steps.every(step => step.type !== "move"),
+        "no move without injected candidates");
+    // Token at top-left (0,0) on a 100px grid, width/height 1 — the
+    // no-move fallback probes the footprint centre in pixels. Earlier
+    // probes are the scoring-time cover reads of the stay candidate.
+    assert.deepEqual(probes.at(-1), { x: 50, y: 50 });
+});
+
+test("a replayed commitment probes the committed move endpoint for the unpin modifier", async () => {
+    const world = makeWorld({
+        enemies: [{ x: 300, y: 0 }],
+        system: { characteristics: { willpower: { base: 35 } } }
+    });
+    const endpoint = { x: 500, y: 400 };
+    const enemy = world.enemies[0];
+    const record = {
+        id: "c-unpin-endpoint",
+        status: "active",
+        combatId: world.combat.id,
+        combatantId: world.combatant.id,
+        createdRound: world.combat.round,
+        createdTurn: world.combat.turn,
+        ttl: 2,
+        source: "test",
+        steps: [
+            {
+                id: "step-move-1", type: "move", cost: { movement: 2, halves: 1 },
+                input: { to: { x: endpoint.x, y: endpoint.y, i: 5, j: 4 } },
+                preconditions: ["turn"], projectedResourceDelta: {}
+            },
+            {
+                id: "step-attack-2", type: "attack", cost: { halves: 1 },
+                input: {
+                    actionId: "lasgun", name: "Lasgun",
+                    itemUuid: `Actor.${world.actor.id}.Item.w1`,
+                    targetTokenUuid: enemy.token.uuid,
+                    targetTokenId: enemy.token.id, range: 100
+                },
+                preconditions: ["turn"], projectedResourceDelta: {}
+            },
+            {
+                id: "step-end-turn-3", type: "end-turn", cost: {},
+                input: { reason: "committed" },
+                preconditions: ["turn"], projectedResourceDelta: {}
+            }
+        ],
+        expectedState: {
+            self: { x: world.token.x, y: world.token.y, elevation: 0 },
+            target: {
+                tokenId: enemy.token.id,
+                tokenUuid: enemy.token.uuid,
+                x: enemy.token.x,
+                y: enemy.token.y
+            },
+            morale: null,
+            threats: [{ tokenId: enemy.token.id, x: enemy.token.x, y: enemy.token.y }]
+        }
+    };
+    const probes = [];
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        selfStatuses: ["pinned"],
+        layers: { commitment: true },
+        commitment: record,
+        navigation: {
+            coverEstimate: (_token, point) => {
+                probes.push({ x: point.x, y: point.y });
+                return point.x === endpoint.x && point.y === endpoint.y ? 0.8 : 0;
+            }
+        }
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.equal(result.plan.breakdown.reason, "commitment");
+    const step = result.plan.steps.find(entry => entry.input?.unpin === true);
+    assert.ok(step, "the replayed commitment carries the unpin step");
+    assert.equal(step.input.modifier, 30);
+    assert.equal(step.input.modifierBasis, "in-cover");
+    assert.deepEqual(probes, [endpoint],
+        "cover is probed from the committed endpoint, not the live position");
 });
 
 test("a pinned combatant without willpower logs unpin-unavailable", async () => {
@@ -554,14 +784,12 @@ test("a pinned combatant without willpower logs unpin-unavailable", async () => 
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
     assert.ok(result.plan.diagnostics.rejected.some(entry => entry.reason === "unpin-unavailable"),
-        "missing characteristic rejects the unpin candidate");
-    assert.equal(factorsOf(captured, candidate => candidate.variant === "unpin"), null,
-        "no unpin candidate without the characteristic");
-    assert.ok(!result.plan.steps.some(step => step.type === "test"),
-        "no test step is serialized");
+        "missing characteristic records why no recovery step appears");
+    assert.ok(!result.plan.steps.some(step => step.input?.unpin === true),
+        "no unpin step is serialized without the characteristic");
 });
 
-test("a non-pinned combatant gets no unpin candidate", async () => {
+test("a non-pinned combatant gets no unpin step", async () => {
     const world = makeWorld({
         enemies: [{ x: 300, y: 0 }],
         system: { characteristics: { willpower: { base: 35 } } }
@@ -576,7 +804,28 @@ test("a non-pinned combatant gets no unpin candidate", async () => {
     });
     assert.equal(result.status, PLANNER_STATUS.ok);
     assert.equal(factorsOf(captured, candidate => candidate.variant === "unpin"), null);
+    assert.ok(!result.plan.steps.some(step => step.input?.unpin === true),
+        "no unpin step without the pinned status");
     assert.ok(!result.plan.diagnostics.rejected.some(entry => entry.reason === "unpin-unavailable"));
+});
+
+test("a stunned combatant never receives the unpin step", async () => {
+    const world = makeWorld({
+        enemies: [{ x: 300, y: 0 }],
+        system: { characteristics: { willpower: { base: 35 } } }
+    });
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, {
+        seed: 1,
+        actions: world.actions,
+        targets: targetsOf(world),
+        blastTokens: scanOf(world),
+        selfStatuses: ["pinned", "stunned"]
+    });
+    assert.equal(result.status, PLANNER_STATUS.ok);
+    assert.deepEqual(result.plan.steps.map(step => step.type), ["end-turn"],
+        "stunned still short-circuits to the bare end-turn plan");
 });
 
 /* -------------------------------------------- */

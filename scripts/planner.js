@@ -107,6 +107,7 @@ import {
     _findCombatantByToken,
     _findToken,
     _moraleOf,
+    _reconcileSelfStatuses,
     _resourcesFingerprint,
     _sceneOf,
     _selfStatuses,
@@ -136,7 +137,9 @@ import {
     buildPlanSnapshot
 } from "./planner/snapshot.js";
 import {
-    _stepsFor
+    _planEndCentre,
+    _stepsFor,
+    _unpinTestStep
 } from "./planner/steps.js";
 import { SPEC_OPS_FALLBACK_PRESETS } from "./presets/spec-ops-config.js";
 import {
@@ -430,6 +433,77 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
+        // Services resolve ahead of L1: the committed-attack staleness
+        // check (los-broken) needs the perception probe inside the live
+        // view, and navigation feeds the flank move probe further down.
+        // They are hoisted above the team-coordination short-circuits so
+        // the pinned recovery step below can probe cover in every path.
+        const perception = _service("perception", context.perception);
+        const navigation = _service("navigation", context.navigation);
+        // Issue #93: pinning recovery is not an action — per the Only War
+        // corebook the pinned character makes a free Willpower test at
+        // the end of its turn (+0 base, +30 when in cover against the
+        // nearest known threat; the not-shot-at bonus needs shot data the
+        // module does not track, so it is never assumed). The test never
+        // competes as a full-cost action candidate: every plan a pinned
+        // bot receives — scored, replayed commitment or team-coordinated —
+        // carries the zero-cost `endOfTurn` step ahead of the end-turn
+        // step instead. Actors without a willpower characteristic cannot
+        // test and simply stay pinned.
+        const unpinAvailable = isPinned && _unpinAction(actor) !== null;
+        // `endCentre` — the footprint centre (pixels) the plan leaves the
+        // bot in: the test is taken at the END of the turn, so cover is
+        // probed from the endpoint of the planned movement, never from
+        // the turn-start spot (review finding: a pinned bot legally
+        // crawling into cover must see the +30). Null/absent means the
+        // plan has no move — the current position stands.
+        const unpinModifierSpec = (threatTargets, endCentre = null) => {
+            const spec = { modifier: 0, modifierBasis: "base" };
+            const threat = _nearestThreat(threatTargets, selfPos, grid);
+            if (!threat || !navigation || typeof navigation.coverEstimate !== "function"
+                || !Number.isFinite(threat?.x) || !Number.isFinite(threat?.y)) {
+                return spec;
+            }
+            // The serialized move endpoint is already a footprint centre
+            // in pixels (the executor contract — see `_stepMove`), exactly
+            // what `coverEstimate` probes. `selfPos` on the other hand is
+            // the token's top-left document point, so the no-move fallback
+            // converts it to the footprint centre.
+            const size = _finiteOr(grid?.size, 100);
+            const centre = Number.isFinite(endCentre?.x) && Number.isFinite(endCentre?.y)
+                ? { x: endCentre.x, y: endCentre.y }
+                : (Number.isFinite(selfPos?.x) && Number.isFinite(selfPos?.y)
+                    ? {
+                        x: selfPos.x + (_finiteOr(tokenDoc?.width, 1) * size / 2),
+                        y: selfPos.y + (_finiteOr(tokenDoc?.height, 1) * size / 2)
+                    }
+                    : null);
+            if (!centre) return spec;
+            try {
+                const cover = navigation.coverEstimate(tokenDoc, centre,
+                    { x: threat.x, y: threat.y });
+                if (_finiteOr(cover, 0) >= 0.5) {
+                    spec.modifier = 30;
+                    spec.modifierBasis = "in-cover";
+                }
+            } catch(_err) {
+                // Cover probing is best-effort — the base +0 test stands.
+            }
+            return spec;
+        };
+        const appendUnpinStep = (steps, spec) => {
+            if (!unpinAvailable || !spec) return steps;
+            if ((steps ?? []).some(step => step?.input?.unpin === true)) return steps;
+            const step = _unpinTestStep(spec);
+            const list = [...(steps ?? [])];
+            // The test is taken at the end of the turn: it rides ahead of
+            // the end-turn step, after everything the budget paid for.
+            const endIndex = list.reduce((acc, entry, index) =>
+                (entry?.type === "end-turn" ? index : acc), -1);
+            if (endIndex >= 0) list.splice(endIndex, 0, step);
+            else list.push(step);
+            return list;
+        };
         const teamTurn = context.teamTurn;
         const coordinationPlan = (steps, reason) => {
             diagnostics.chosenStep = steps[0].id;
@@ -443,13 +517,13 @@ export function createPlannerService({
         if (teamTurn?.phase === "wait") {
             const steps = _stepsFor({ candidate: { variant: "hold" } });
             steps[0].input.reason = teamTurn.reason;
-            return coordinationPlan(steps, teamTurn.reason);
+            // A hold carries no movement — `_planEndCentre` yields null
+            // and the cover probe falls back to the current position.
+            return coordinationPlan(
+                appendUnpinStep(steps,
+                    unpinModifierSpec(context.targets ?? [], _planEndCentre(steps))),
+                teamTurn.reason);
         }
-        // Services resolve ahead of L1: the committed-attack staleness
-        // check (los-broken) needs the perception probe inside the live
-        // view, and navigation feeds the flank move probe further down.
-        const perception = _service("perception", context.perception);
-        const navigation = _service("navigation", context.navigation);
         // Resolve the personality before L1 too: a commitment replay
         // used to show a blank personality line in the preview — the
         // profile is a cheap flag/seeded read, and the replayed plan now
@@ -480,7 +554,14 @@ export function createPlannerService({
             interventions: _finiteOr(commitment.interventions, 0)
         };
         if (commitment.decision) {
-            const steps = commitment.decision.steps;
+            // Issue #93: a pinned bot still takes its free end-of-turn
+            // recovery test when replaying a commitment — the dedup in
+            // `appendUnpinStep` no-ops when the committed plan already
+            // carries the step. The replayed steps are copied so the
+            // commitment record itself is never mutated.
+            const steps = appendUnpinStep([...commitment.decision.steps],
+                unpinModifierSpec(context.targets ?? [],
+                    _planEndCentre(commitment.decision.steps)));
             diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id
                 ?? steps[0]?.id ?? null;
             // Preview readability (smoke finding): a replayed commitment
@@ -1400,7 +1481,11 @@ export function createPlannerService({
             candidates.push({
                 target: coneTarget, action, move: null,
                 variant: "attack-in-place",
-                cone: { ...aim, spec }
+                cone: { ...aim, spec },
+                // Issue #93: cone coverage feeds the `area` factor exactly
+                // like a blast template — without it cones always scored
+                // zero area and lost to single-target shots.
+                blastHits: aim.hits
             });
             if (!spec.spray || isPinned) continue;
             // Spray move-attack: aim is recomputed from each route
@@ -1427,7 +1512,8 @@ export function createPlannerService({
                 candidates.push({
                     target: coneTarget, action, move,
                     variant: "move-attack",
-                    cone: { ...aimFromMove, spec }
+                    cone: { ...aimFromMove, spec },
+                    blastHits: aimFromMove.hits
                 });
             }
         }
@@ -1594,25 +1680,13 @@ export function createPlannerService({
             });
         }
 
-        // Issue #39 `unpin`: a pinned combatant may spend a full action
-        // on the Willpower test that clears pinning — the recovery
-        // alternative to the drop-prone cover answer. Actors without a
-        // `willpower` characteristic never get the candidate; a pinned
-        // bot that cannot even try logs `unpin-unavailable`.
-        if (isPinned) {
-            const unpin = _unpinAction(actor);
-            if (!unpin) {
-                rejectL0("unpin", "unpin-unavailable");
-            } else if (_actionCost(unpin) > actionBudget) {
-                rejectL0(`unpin|${unpin.id}`, "over-budget");
-            } else {
-                candidates.push({
-                    variant: "unpin",
-                    action: unpin,
-                    target: threatTarget,
-                    move: null
-                });
-            }
+        // Issue #93 `unpin`: pinning recovery is a free end-of-turn
+        // Willpower test, not an action — no candidate competes here; the
+        // zero-cost step is appended to the winning plan below. An actor
+        // without a `willpower` characteristic cannot even try, so the
+        // plan trace records why no recovery step appears.
+        if (isPinned && !unpinAvailable) {
+            rejectL0("unpin", "unpin-unavailable");
         }
 
         // Issue #38 orders: a fireteam leader may spend the turn giving an
@@ -1894,7 +1968,17 @@ export function createPlannerService({
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
         // attack step — the executor clears the flag once the shot lands.
-        const steps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
+        // Issue #93: the pinned bot's free end-of-turn recovery test
+        // rides every scored plan — appended ahead of the end-turn step
+        // with the cover-based modifier of the nearest known threat.
+        // Issue #93 review: cover for the end-of-turn test is probed
+        // from the endpoint of the plan's own movement — a pinned bot
+        // legally crawling into cover this turn tests at +30 there,
+        // while a bot ending in the open tests at +0 even when its
+        // turn-start spot was covered.
+        const scoredSteps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
+        const steps = appendUnpinStep(scoredSteps,
+            unpinModifierSpec(targets, _planEndCentre(scoredSteps)));
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
         // Issue #25 L1: when the commitment layer is on, the scored plan
@@ -1908,9 +1992,13 @@ export function createPlannerService({
         // A bare hold (`[end-turn]`) never commits: the expectedState
         // would carry no threats to drift-check, so a replayed hold stays
         // blind to new contacts — a sealed grenadier kept holding for
-        // turns after the door opened (smoke finding).
+        // turns after the door opened (smoke finding). Issue #93: the
+        // free end-of-turn unpin step does not count as plan content
+        // either — a pinned bot whose only step is the recovery test
+        // still holds, and holds never commit.
         const commitmentPayload = layerFlags.commitment === true && steps.length
-            && steps.some(step => step?.type && step.type !== "end-turn")
+            && steps.some(step => step?.type && step.type !== "end-turn"
+                && step?.input?.unpin !== true)
             ? {
                 source: "planner",
                 ttl: commitment.reactive === true
@@ -2180,9 +2268,13 @@ export function createPlannerService({
 
         // Fast path: the fingerprint covers every field the checks below
         // inspect, so an equal fingerprint means the plan is still valid.
+        // `statusAdjust` (issue #93) reconciles the plan's own status
+        // mutations before hashing — see the statuses check below.
         const live = _staleFingerprint({
             combat, combatant, token: tokenDoc, actor, targetToken, collision,
-            selfStatuses: currentContext.selfStatuses, snapshot
+            selfStatuses: currentContext.selfStatuses,
+            statusAdjust: currentContext.selfStatusAdjust ?? null,
+            snapshot
         });
         if (live === snapshot.staleFingerprint) {
             return { valid: true, reason: null };
@@ -2229,8 +2321,19 @@ export function createPlannerService({
         }
         // Self statuses (pinned/prone/stunned/…) gate which candidates are
         // legal, so any drift invalidates the plan with its own reason.
-        const liveStatuses = _selfStatuses(actor, tokenDoc, currentContext.selfStatuses);
+        // Issue #93: the plan's own end-of-turn steps mutate self statuses
+        // mid-execution — a successful unpin test clears `pinned`, a
+        // drop-prone step applies `prone`. The executor reports those
+        // self-inflicted changes through `currentContext.selfStatusAdjust`
+        // (`added` = statuses the plan applied, `removed` = statuses it
+        // cleared) so they reconcile here instead of reading as external
+        // drift; only GM/system intervention may invalidate the plan.
         const plannedStatuses = Array.isArray(self.statuses) ? self.statuses : [];
+        const liveStatuses = _reconcileSelfStatuses(
+            _selfStatuses(actor, tokenDoc, currentContext.selfStatuses),
+            plannedStatuses,
+            currentContext.selfStatusAdjust ?? null
+        );
         if (liveStatuses.join("|") !== plannedStatuses.join("|")) {
             return { valid: false, reason: STALE_REASONS.statusesChanged };
         }

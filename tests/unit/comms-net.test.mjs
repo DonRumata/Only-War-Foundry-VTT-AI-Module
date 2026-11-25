@@ -89,7 +89,7 @@ function mem(x, y, { sceneId = "scene-1", lastSeenRound = 1, lastSeenTurn = 0 } 
 function makeNetWorld(members, { round = 1 } = {}) {
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.disposition = 1;

@@ -115,8 +115,10 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
   всё ещё считается провокацией A.
 - `engageDenial` — обратный переход: кандидат стартует вне всех reach и
   заканчивает внутри чужого (вход в ближний бой — «блокировка» цели).
-- `unpin` — кандидат `unpin` (см. п. 8a) существует только у
-  pinned-бота с WP-характеристикой; фактор =1 у него одного.
+- `unpin` — с issue #93 снятие pinning не конкурирует как кандидат:
+  нулевой end-of-turn тест автоматически вставляется в план pinned-бота
+  (см. п. 8a). Фактор сохранён в контракте скоринга для совместимости,
+  но всегда равен 0.
 - `grudge` — цель кандидата совпадает с записанным `lastAttacker`
   (`tokenUuid|tokenId|actorId`), масштаб `min(woundsLost/10, 1)`
   (дефолт 5, когда рекорд без счётчика) — царапина почти не тянет,
@@ -210,13 +212,33 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    гарантированно падает с `system-api-missing`, бот держит hold);
    `drop-prone` — free-действие при pinned либо при `danger ≥ 0.5`
    на собственной клетке (не для уже prone).
-8a. `unpin` кандидат (issue #39): у pinned-комбатанта при наличии
-   характеристики `willpower` (`system.characteristics.willpower` либо
-   `actor.characteristics.willpower`) генерируется синтетическое
-   full-cost действие — WP-тест, снимающий pinning. Без характеристики —
-   rejected `unpin-unavailable`; при `cost > actionBudget` —
-   `over-budget`. Сериализуется шагом `test` по обычному контракту
-   executor'а (`prepareTest`/`executeTest`).
+8a. `unpin` end-of-turn шаг (issue #39, пересмотрено в issue #93): по
+   корбуке снятие pinning — не действие, а свободный тест Воли в конце
+   хода (+0; +30 в укрытии от ближайшей известной угрозы —
+   `navigation.coverEstimate` ≥ 0.5; бонус «не обстреливали» не
+   выдумывается — данных о выстрелах у модуля нет). Укрытие оценивается
+   для позиции КОНЦА хода: probe-точка — endpoint последнего move-шага
+   сериализованного плана (`input.to` — центр футпринта в пикселях,
+   контракт executor'а; helper `_planEndCentre`), а не стартовая позиция
+   — pinned-бот, легально отползающий в укрытие distance-keeping
+   move-attack'ом или replay'ящий commitment с перемещением, тестируется
+   с +30; без движения — центр футпринта текущей позиции. Никакого
+   кандидата:
+   у pinned-комбатанта при наличии характеристики `willpower`
+   (`system.characteristics.willpower` либо `actor.characteristics.willpower`)
+   нулевой шаг `test` (`halves: 0`, `input.unpin/endOfTurn: true`,
+   `modifier`/`modifierBasis`, стабильный id `step-test-unpin` —
+   идемпотентность повторного теста за ход через operation-journal)
+   автоматически вставляется перед end-turn любого плана — scored,
+   replay commitment (dedup, если шаг уже есть в записи), team-wait и
+   delay-stub. Без характеристики — rejected `unpin-unavailable` и шага
+   нет; stunned-план шага не содержит. Executor исполняет шаг через
+   `prepareTest`/`executeTest` и снимает `pinned` только при успешном
+   броске (`outcome.roll.success` — системный `removeCondition`, фолбэк
+   `toggleStatusEffect("pinned", {active:false})`); провал оставляет
+   статус, неактуальный шаг (уже не pinned) пропускается с `not-pinned`.
+   Нулевая стоимость не блокируется irreversible-бюджетом и не тратит
+   его.
 9. `hold` кандидат: `alwaysOfferHold`, или `allowNoTarget`, или
    `allowNoAction`.
 9. Скоринг: `_factorsOf` → `preset.veto` (reject в диагностику) →
@@ -242,10 +264,11 @@ ready-weapon → drop-prone → end-turn` (всегда последний). Att
 контракт, что у blast-атаки, оверлей рисует круг без нового читателя).
 `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
 записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`; `unpin`
-(issue #39) — шаг `test` с `input {type:"characteristic",
+(issue #93) — шаг `test` с `input {type:"characteristic",
 key:"willpower", characteristic:"willpower", testKind:"characteristic",
-actionId:"unpin"}`, `cost.halves:2` — верифицированный контракт
-`api.rolls.prepareTest`. Preconditions: move
+actionId:"unpin", unpin:true, endOfTurn:true, modifier, modifierBasis}`,
+`cost.halves:0` — свободный end-of-turn тест по корбуке, верифицированный
+контракт `api.rolls.prepareTest`. Preconditions: move
 `["turn","self-position","collision"]`, attack
 `["turn","target","resources"]`, aim/end-turn `["turn"]`, ready-weapon
 `["turn","resources"]`, drop-prone/unpin `["turn"]`.
@@ -286,7 +309,14 @@ adjudicated-manual, adjudicated-skill-test`.
 - Цикл шагов: перед каждым — abort check → `controller-changed`;
   `attack`/`test` один раз за ход, повторы — `action-budget-spent`.
 - `_validate`: позиция с толерантностью 0.5px (`token-moved` при внешнем
-  сдвиге) + `planner.validateSnapshot`.
+  сдвиге) + `planner.validateSnapshot`. Self-inflicted сдвиги статусов
+  самого плана (issue #93: успешный unpin снял `pinned`, drop-prone
+  применил `prone`) executor накапливает в `run.selfStatusAdjust`
+  (`added`/`removed`) и передаёт в validateSnapshot — они reconcile'ятся
+  против планового baseline и не читаются как внешнее вмешательство
+  (иначе end-turn после снятия pinned проваливался бы `statuses-changed`
+  и форсировал ложный реплан). Реплан сбрасывает adjust: свежий снапшот
+  уже несёт живые статусы.
 - Шаги: `move` → `TokenDocument#move(..., {method:"api"})` с fallback
   `update({x,y})`; `attack`/`test` → `prepare*+execute*` системного API
   (`operationId.stepId`); `aim` → флаг на combatant'е, снимается
@@ -508,7 +538,8 @@ adjudicated-manual, adjudicated-skill-test`.
 - `_syncDelay` — post-pass `buildTeamPlan` после планов членов (и после
   retry перераспределения): если есть конвергентная цель и флангер с
   move-only планом (ETA ≥ 1 хода), main-члены, чей план атакует
-  `convergence.targetId`, получают delay-stub план `[delay, end-turn]`.
+  `convergence.targetId`, получают delay-stub план `[delay, end-turn]`
+  (unpin-шаг pinned-члена сохраняется перед end-turn, issue #93).
 - Флангер никогда не ждёт сам; `morale`-desperate (#26 graceful) не ждёт;
   `delaySync.count ≥ maxSyncRounds` (default 2) снимает ожидание для
   того же `until`; `context.syncDelay === false` отключает проход.

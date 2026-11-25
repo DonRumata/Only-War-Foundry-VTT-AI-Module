@@ -303,10 +303,28 @@ melee/blast/cone) атака по цели, стоящей в melee-reach сою
 сам бот и цель не считаются); `leaveMeleeEngage`/`engageDenial` —
 поконтактный учёт свободной атаки: выход кандидата из melee-reach врага
 и вход в него снаружи (reach — melee-эмиттеры threat-профиля, фолбэк
-`DEFAULT_MELEE_RANGE` = 2); `unpin` — синтетический full-cost WP-тест
-для pinned-бота (`test`-шаг `type:"characteristic", key:"willpower"`,
-rejected `unpin-unavailable` без характеристики); `grudge` — цель
+`DEFAULT_MELEE_RANGE` = 2); `grudge` — цель
 совпадает с записью флага `lastAttacker` (сервис `grudges`, ниже).
+
+Unpin (issue #93): по корбуке снятие pinning — не действие, а свободный
+тест Воли в конце хода (+0; +30 в укрытии от ближайшей известной угрозы —
+`navigation.coverEstimate` ≥ 0.5, probe из точки endpoint'а последнего
+move-шага плана — центр футпринта в пикселях — либо текущей позиции без
+движения; бонус «не обстреливали» не выдумывается — данных о выстрелах у
+модуля нет). Pinned-бот не тратит бюджет на кандидата:
+нулевой `test`-шаг (`halves: 0`, `input.unpin/endOfTurn`,
+`type:"characteristic", key:"willpower"`, `modifier`/`modifierBasis`)
+автоматически вставляется перед end-turn любого его плана — scored,
+replay commitment, team-координации; stunned-план шага не содержит.
+`unpin-unavailable` в rejected остаётся диагностикой для актёра без
+характеристики willpower. Фактор `unpin` и веса пресетов сохранены для
+обратной совместимости контракта скоринга, но всегда равны нулю —
+соревнующегося кандидата больше нет. Executor исполняет шаг через
+`prepareTest`/`executeTest` и снимает `pinned` только при успешном броске
+(`outcome.roll.success` — системный `removeCondition`, фолбэк
+`toggleStatusEffect("pinned", {active:false})`); неактуальный шаг
+(статус уже снят) пропускается с `not-pinned`. Нулевая стоимость не
+попадает под irreversible-бюджет и не тратит его.
 
 Blast-awareness: blast-действия (`blastRadius` из `item.system.blastRadius`
 или `traits.blast`, метры) не целятся в токен — `_bestBlastAim` перебирает
@@ -320,7 +338,9 @@ LOS до точки обязателен, кроме ударов по last-know
 `input.targetPoint` + `input.blastRadius` (issue #29 — зона для GM-
 оверлея и системного шаблона) → `prepareAttack`. Фактор `area` =
 min(blastHits/2, 1); веса в пресетах (assault 4, specOps 5, rangedCover
-3, hold 2).
+3, hold 2). С issue #93 cone-кандидаты (spray/suppressing fire) тоже
+передают `blastHits` из `_bestConeAim` — раньше `area` для конусов
+всегда читался нулём.
 
 Конусы (spray/`suppressing_fire`, overwatch): ориентация строго по
 воспринимаемым якорям (issue #30) — `_bestConeAim` наводит сектор только

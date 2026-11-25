@@ -450,6 +450,9 @@ function _teamContacts({ members, combat, context, perception }) {
  */
 function _delayStubPlan(plan, { delay, teamId, round }) {
     const clone = _jsonClone(plan) ?? {};
+    // Issue #93: the pinned member's free end-of-turn recovery test
+    // survives the stub — delaying the strike never costs the test.
+    const unpinStep = (plan?.steps ?? []).find(step => step?.input?.unpin === true);
     clone.steps = [
         {
             id: "step-delay-1",
@@ -464,6 +467,7 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
             preconditions: ["turn"],
             projectedResourceDelta: {}
         },
+        ...(unpinStep ? [_jsonClone(unpinStep)] : []),
         {
             id: "step-end-turn-2",
             type: "end-turn",
@@ -1493,12 +1497,23 @@ export function createFireteamService({
     }
 
     /**
-     * Normalize a wounds spec: plain number or `{value}` object.
+     * Normalize a wounds spec into the remaining health pool the kill-EV
+     * model converges against. The only-war system counts `system.wounds.value`
+     * as damage *taken* (it grows towards `max`), so an object carrying both
+     * `value` and `max` yields `max - value` — a fresh enemy reads as its full
+     * pool and a dead one as zero. A plain number (injected targets/tests) is
+     * already an effective pool and passes through. When `max` is missing or
+     * unreadable the bare `value` is used as a degraded fallback — it keeps
+     * legacy object fixtures working but cannot express the correct live
+     * semantics, so callers should always provide `max`.
      * @param {*} raw
      * @returns {number|null}
      */
     function _woundsValue(raw) {
         if (Number.isFinite(raw)) return raw;
+        if (Number.isFinite(raw?.max) && Number.isFinite(raw?.value)) {
+            return raw.max - raw.value;
+        }
         if (Number.isFinite(raw?.value)) return raw.value;
         return null;
     }
@@ -2408,6 +2423,11 @@ export function createFireteamService({
         const reservedTargets = new Map();
         const routeLocks = [...(context.reservations ?? [])];
         const plans = new Map();
+        // Issue #93: every member's planner context is kept so the
+        // target-conflict retry below replans with the identical team
+        // metadata (`center`, `objective`, `flankPoint`, `regroupPoint`,
+        // the leader's `orderCandidate`) instead of a partial rebuild.
+        const memberContexts = new Map();
         const tokens = new Map(ordered.map(member => [member.combatantId, _tokenDoc(member.combatant.token)]));
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
@@ -2462,6 +2482,7 @@ export function createFireteamService({
                 assignment
             });
             if (memberTargets !== undefined) memberContext.targets = memberTargets;
+            memberContexts.set(member.combatantId, memberContext);
             let result;
             try {
                 result = await memberPlanner.planTurn(
@@ -2563,24 +2584,29 @@ export function createFireteamService({
                 reservedTargets,
                 capacities,
                 { ...assignment, assignedTargetId: null });
+            // Issue #93: replan from the member's original context so the
+            // retry keeps the team metadata the first pass assembled —
+            // `center`/`objective`/`flankPoint`/`regroupPoint` drive the
+            // flank geometry and cohesion of spec-ops presets and were
+            // silently dropped by the partial rebuild. Only the inputs
+            // that legitimately change (reservations, target pool, replan
+            // count, a demoted task/group) are overridden.
+            const stored = memberContexts.get(member.combatantId);
             const retry = await memberPlanner.planTurn(combat, member.combatant, {
-                ...context,
-                seed,
+                ...(stored ?? { ...context, seed }),
                 reservations: [...(context.reservations ?? []), ...initialReservations.routes
                     .filter(cell => cell.memberId !== member.combatantId)],
                 replanCount: _finiteOr(context.replanCount, 0) + 1,
                 targets: retryTargets,
-                ...(flankRules ? { tactic: tacticName } : {}),
                 team: {
-                    teamId,
+                    ...(stored?.team ?? {
+                        teamId,
+                        leaderId: election.combatantId,
+                        character,
+                        contacts: teamContacts
+                    }),
                     task: assignment.task,
-                    groupId: assignment.groupId,
-                    leaderId: election.combatantId,
-                    ...(flankRules ? {
-                        ...flankRules, flankPoint: tactic?.objective?.flankPoint ?? null
-                    } : {}),
-                    character,
-                    contacts: teamContacts
+                    groupId: assignment.groupId
                 }
             });
             plans.set(member.combatantId, retry);

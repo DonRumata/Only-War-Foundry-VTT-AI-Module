@@ -249,6 +249,39 @@ export function _selfStatuses(actor, tokenDoc, injected = null) {
 
 
 /**
+ * Reconcile self-inflicted status changes out of a live status reading
+ * (issue #93): the plan's own end-of-turn steps mutate self statuses
+ * mid-execution — a successful unpin test clears `pinned`, a drop-prone
+ * step applies `prone`. The executor reports those changes as
+ * `selfStatusAdjust` (`added` = statuses the plan applied, `removed` =
+ * statuses it cleared); undoing them against the live reading yields the
+ * statuses the world would show without the plan's own hand, so only
+ * external (GM/system) drift invalidates the plan. The reconcile is
+ * anchored on the planned baseline: a noop step (status already
+ * present/absent at plan time) must not manufacture a phantom
+ * difference.
+ * @param {string[]} liveStatuses Sorted live status ids.
+ * @param {string[]} plannedStatuses Sorted plan-time status ids.
+ * @param {object|null} adjust `{added: string[], removed: string[]}` or null.
+ * @returns {string[]} Sorted reconciled status ids.
+ */
+export function _reconcileSelfStatuses(liveStatuses, plannedStatuses, adjust) {
+    if (!adjust || (!Array.isArray(adjust.added) && !Array.isArray(adjust.removed))) {
+        return liveStatuses;
+    }
+    const planned = Array.isArray(plannedStatuses) ? plannedStatuses : [];
+    const reconciled = new Set(liveStatuses);
+    for (const id of adjust.added ?? []) {
+        if (!planned.includes(id)) reconciled.delete(id);
+    }
+    for (const id of adjust.removed ?? []) {
+        if (planned.includes(id)) reconciled.add(id);
+    }
+    return [...reconciled].sort();
+}
+
+
+/**
  * Whether a target token still exists and can be attacked: alive actor,
  * not defeated in combat, not hidden.
  * @param {object|null} targetToken

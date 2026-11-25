@@ -198,6 +198,10 @@ execute: расхождение — `stale-state` (перемещение, см�
 - **Fireteam kill-EV конвергенция**: `buildTeamPlan` суммирует ожидаемый
   урон членов, чьё оружие достаёт до цели (ranged — по дальности, melee —
   reach + полоса), и сравнивает с `wounds` цели (из snapshot/инъекции).
+  Семантика wounds — *оставшийся* запас здоровья (issue #93): система
+  считает `system.wounds.value` нанесённым уроном, поэтому объект
+  `{value, max}` читается как `max − value`; plain-число инъекции уже
+  считается эффективным запасом.
   `killEV ≥ wounds` → конвергентный объект: `teamPlan.convergence
   {targetId, targetUuid, killEV, wounds, margin, capableMembers}`,
   общий `assignedTargetId` всем способным, flank-группа не выделяется
@@ -389,11 +393,17 @@ execute: расхождение — `stale-state` (перемещение, см�
   reach врага снаружи оцениваются *по каждому врагу отдельно* — уйти от
   противника A в контакт к противнику B всё равно провоцирует A. Reach —
   melee-эмиттеры threat-профиля цели с фолбэком `DEFAULT_MELEE_RANGE`.
-- **`unpin`** — синтетическое full-cost действие для pinned-бота с
-  характеристикой `willpower`: WP-тест, снимающий pinning
-  (`test`-шаг `type:"characteristic", key:"willpower"` →
-  `api.rolls.prepareTest`/`executeTest`). Без характеристики — rejected
-  `unpin-unavailable`; альтернатива — `drop-prone` из issue #37.
+- **`unpin`** (issue #93) — по корбуке снятие pinning не действие, а
+  свободный тест Воли в конце хода: нулевой `test`-шаг
+  (`halves: 0`, `type:"characteristic", key:"willpower"`,
+  `unpin/endOfTurn: true`, `modifier` +0 либо +30 в укрытии от ближайшей
+  известной угрозы — probe из endpoint'а последнего move-шага плана,
+  т.к. тест идёт в конце хода) автоматически вставляется перед end-turn
+  любого плана pinned-бота → `api.rolls.prepareTest`/`executeTest`;
+  executor снимает
+  `pinned` только при успешном броске. Без характеристики — rejected
+  `unpin-unavailable` и шага нет; активная альтернатива в бюджете хода —
+  `drop-prone` из issue #37.
 - **`grudge` / `lastAttacker`** — Combatant-флаг `{tokenUuid, tokenId,
   actorId, round, turn, woundsLost, attribution}`, controller-only.
   Сервис `grudges` (`api.services`): вотчер `updateActor` + кэш wounds

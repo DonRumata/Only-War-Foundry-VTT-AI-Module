@@ -82,7 +82,7 @@ function makeWorld({ enemy = { x: 300, y: 0 }, preset = "assault", enabled = tru
     combatant.initiative = 10;
 
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = enemy.x;

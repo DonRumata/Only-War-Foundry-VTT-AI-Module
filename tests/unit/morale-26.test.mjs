@@ -129,7 +129,7 @@ function makeTeamWorld(members, { enemyCount = 1, round = 1 } = {}) {
     const enemies = [];
     for (let i = 0; i < enemyCount; i++) {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = 2000 + (i * 100);
@@ -417,7 +417,7 @@ test("planTurn: a desperate record shifts the scoring weights (L2 narrowing)", a
     const combatant = makeCombatant({ actor, token });
     combatant.tokenId = token.id;
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;
@@ -852,7 +852,7 @@ test("executor: a fresh committed plan barks once per round", async () => {
     const combatant = makeCombatant({ actor, token });
     combatant.tokenId = token.id;
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;

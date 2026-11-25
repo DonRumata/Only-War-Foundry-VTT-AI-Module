@@ -89,7 +89,7 @@ function makeWorld({ enemies = [{ x: 200, y: 0 }], preset = "assault", weapon = 
 
     const enemyCombatants = enemies.map((enemy, index) => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemy.x;

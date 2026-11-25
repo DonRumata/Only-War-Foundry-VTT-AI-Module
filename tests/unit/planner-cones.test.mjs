@@ -37,7 +37,7 @@ function makeWorld({ enemies = [{ x: 300, y: 0 }] } = {}) {
 
     const enemyCombatants = enemies.map(enemy => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemy.x;
@@ -203,6 +203,11 @@ test("clustered hostiles share one cone (midpoint direction, full coverage)", as
     assert.equal(attack.input.covered.length, 2, "both hostiles inside the cone");
     // Midpoint direction ~0° (due east) — the cluster's centre axis.
     assert.ok(Math.abs(attack.input.template.direction) < 20);
+    // Issue #93: the cone coverage feeds the `area` factor exactly like a
+    // blast template — two covered hostiles saturate it. Before the fix
+    // cone candidates never carried `blastHits` and `area` read 0.
+    assert.equal(result.plan.breakdown.factors.area, 1,
+        "two covered hostiles saturate the area factor");
 });
 
 test("a lone distant hostile outside the cone range yields no template step", async () => {

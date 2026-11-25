@@ -88,7 +88,7 @@ function makeWorld() {
     combatant.tokenId = token.id;
 
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;
@@ -952,7 +952,7 @@ test("buildTeamPlan: a gm-controlled flanker demotes to support, team lives", as
     };
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 20000;
     enemyToken.y = 0;
@@ -1052,7 +1052,7 @@ test("delay × commitment: the sync wait wins the turn, the record survives", as
     const flanker = makeMember({ fireteam: { teamId: "alpha" }, x: 20000, initiative: 5 });
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;
     enemyToken.y = 0;

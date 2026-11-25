@@ -560,6 +560,10 @@ export function createExecutorService({
                 combatant,
                 token: tokenView,
                 scene: context.scene,
+                // Issue #93: statuses the plan's own steps added/removed
+                // mid-execution (unpin/drop-prone) reconcile inside the
+                // planner instead of reading as external drift.
+                selfStatusAdjust: run.selfStatusAdjust ?? null,
                 ...(context.validation ?? {})
             });
         } catch(err) {
@@ -620,6 +624,10 @@ export function createExecutorService({
             if (replanned?.status === "ok" && replanned.plan) {
                 run.plan = replanned.plan;
                 run.stepIndex = 0;
+                // Issue #93: the fresh snapshot already carries the live
+                // statuses — prior self-inflicted adjustments would
+                // reconcile against the wrong baseline.
+                run.selfStatusAdjust = { added: [], removed: [] };
                 run.expectedPosition = _selfPosition(run.plan) ?? run.expectedPosition;
                 // Issue #27: the swapped plan carries its own trace.
                 run.trace = run.plan?.diagnostics?.trace ?? [];
@@ -821,8 +829,12 @@ export function createExecutorService({
                 }
 
                 // Irreversible roll/resource steps never repeat within a
-                // turn — replans keep the remaining budget only.
-                const irreversible = IRREVERSIBLE_STEP_TYPES.has(step.type);
+                // turn — replans keep the remaining budget only. A
+                // zero-cost step (issue #93: the free end-of-turn unpin
+                // test) sits outside the action economy: it neither is
+                // blocked by a spent irreversible budget nor spends it.
+                const irreversible = IRREVERSIBLE_STEP_TYPES.has(step.type)
+                    && _finiteOr(step?.cost?.halves, 1) > 0;
                 if (irreversible && irreversibleSpent) {
                     stepsDone.push({
                         stepId: step.id,
@@ -933,6 +945,20 @@ export function createExecutorService({
                             x: outcome.position.x,
                             y: outcome.position.y
                         };
+                    }
+                    // Issue #93: the plan's own end-of-turn steps mutate
+                    // self statuses — a successful unpin test cleared
+                    // `pinned`, a drop-prone step applied `prone`. Track
+                    // those self-inflicted changes so the validation of
+                    // the remaining steps (end-turn) does not read them
+                    // as external drift and trigger a spurious replan.
+                    if (outcome.unpinCleared === true && run.selfStatusAdjust) {
+                        run.selfStatusAdjust.removed.push("pinned");
+                    }
+                    if (step.type === "drop-prone" && !outcome.skipped
+                        && run.selfStatusAdjust) {
+                        run.selfStatusAdjust.added.push(
+                            step?.input?.statusId ?? "prone");
                     }
                     // Issue #25: every own move lands in the bounded
                     // `moveJournal` flag — the source of truth the L1
@@ -1065,6 +1091,12 @@ export function createExecutorService({
             expectedPosition: _selfPosition(plan),
             replanCount: _finiteOr(plan?.replanCount, 0),
             stepIndex: 0,
+            // Issue #93: self-inflicted status changes of the plan's own
+            // steps (unpin clears `pinned`, drop-prone applies `prone`) —
+            // validation reconciles them instead of reading external
+            // drift. Reset on every replan: the fresh snapshot already
+            // carries the live statuses.
+            selfStatusAdjust: { added: [], removed: [] },
             // Issue #33: budget already consumed this turn (GM manual
             // actions via context.spent / planContext.spent + executed
             // steps) — feeds replan planContext.
@@ -1116,6 +1148,9 @@ export function createExecutorService({
             expectedPosition: _selfPosition(context.plan),
             replanCount: _finiteOr(context.plan?.replanCount, 0),
             stepIndex: 0,
+            // Issue #93: see `executePlan` — self-inflicted status
+            // changes the validation reconciles.
+            selfStatusAdjust: { added: [], removed: [] },
             spent: {
                 movement: _finiteOr(
                     context.spent?.movement ?? context.planContext?.spent?.movement, 0),
