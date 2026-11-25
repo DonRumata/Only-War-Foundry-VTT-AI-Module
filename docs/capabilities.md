@@ -490,8 +490,24 @@ execute: расхождение — `stale-state` (перемещение, см�
   меньший priority раньше, tie-break — порядок регистрации, в v1 побеждает
   первый non-null `maneuver` descriptor. Явный `context.tactic` function/object
   сохраняет более высокий приоритет, `null`/`false` отключают тактику. specOps
-  использует прежний `specOpsTactic`; assault/rangedCover/hold имеют точку
-  подключения, но без зарегистрированных тактик получают null/fallback.
+  использует прежний `specOpsTactic`; rangedCover теперь тоже имеет
+  зарегистрированный maneuver-selector. assault/hold без тактик получают
+  null/fallback.
+- Suppress-and-bound (issue #86): чистое ядро `tactics/suppress-and-bound.js`
+  выбирает capable suppressor по полуавтоматической/полностью автоматической
+  очереди, заряду, актуальному `turnIndex` и безопасному конусу. В каскаде
+  specOps тактика стоит после regroup/casualty/pressure/no-contacts, но до
+  flank-and-fix/coordinated-assault; rangedCover v1 — suppress-or-null.
+  Descriptor отдаёт object assignments `{task,role,element,objective}` —
+  suppressor `support/fire`, maneuver element `advance|flank/bound` — и
+  сериализуемые `exclusionZones`. Участник с role `suppressor` получает preset-only
+  suppression factor `min(covered/2,1) × 8`; обычная стрельба не запрещена и
+  остаётся fallback. Остальные member contexts получают `team.exclusionZones`:
+  preset veto отклоняет только move endpoint в конусе (`suppression-zone`),
+  stay/attack-in-place легальны. После сборки TeamPlan проверяется фактический
+  cone step подавителя и waypoints/endpoints остальных маршрутов; повторное
+  нарушение после одного replan становится конфликтом `type:"zone"` с безопасной
+  деградацией без движения.
 - `TeamPlan` координирует временные задания и мягкую связность. Для
   жизнеспособного отряда с назначенной инициативой исполнитель сохраняет
   прогресс манёвра на Combat и строит свежий план только для текущего хода.

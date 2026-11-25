@@ -521,6 +521,27 @@ adjudicated-manual, adjudicated-skill-test`.
   по-прежнему выше реестра, `leader-lost` инвалидирует план.
 - `collectMembers` дополнительно отдаёт тактикам `turnIndex` из
   `combat.turns` и `hasActed` для текущего раунда (`turn:null` — false).
+- Suppress-and-bound (issue #86): specOps пробует тактику после веток
+  regroup/losses/pressure/no-contacts и до flank-and-fix/coordinated-assault;
+  rangedCover использует каскад suppress-or-null. Если ядро отказывает
+  (`no-suppressor`, `low-ammo`, `no-safe-cone`, `coverage-insufficient`, …),
+  каскад продолжается, а reason/candidates сохраняются в breakdown. Подавитель
+  назначается объектом `{task:"support", role:"suppressor", element:"fire"}`,
+  bound-элемент — `advance`/`flank` с `role:"bound", element:"maneuver"`;
+  `maxDetachedPhases` наследует ограничение манёвра. Конусная цель внешне
+  остаётся обычным attack target: если focus target покрыт конусом, descriptor
+  сохраняет именно его identity, а явный `context.objective.targetId` сильнее
+  cone-anchor metadata. Для suppressor-члена конусные кандидаты получают
+  `suppression = min(covered/2,1)` с весом ×8 без запрета direct fire.
+- Зона подавления действует только против teammates: не-подавители получают
+  `team.exclusionZones`; planner veto отклоняет move endpoint внутри конуса,
+  но не stay/attack-in-place. После сборки TeamPlan authoritative cone берётся
+  из реального suppression attack step (template/covered или serialized zone);
+  endpoints и waypoints чужих move steps проверяются в центрах footprint.
+  Первое нарушение вызывает один replan с исходными objective/focus pools;
+  повторное сначала выдаёт `zone/suppression-zone` conflict, затем пересобирает
+  план нарушителя без moves. Диагностика лежит в
+  `diagnostics.suppressionZones`.
 
 ### Концентрация огня (issue #85)
 

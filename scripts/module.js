@@ -26,7 +26,10 @@ import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
 import { createTacticRegistry } from "./tactics/registry.js";
 import { registerAssaultPreset } from "./presets/assault.js";
-import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
+import {
+    registerRangedCoverPreset,
+    registerRangedCoverTacticSelector
+} from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
 import {
     registerSpecOpsPreset,
@@ -300,9 +303,9 @@ function _registerPlannerService(api) {
 
 /**
  * Register the per-preset `tactics` registry on the module API (issue #92).
- * The registry is pure/deterministic and has no lifecycle. Only the baseline
- * spec-ops maneuver is built in for v1; assault/rangedCover/hold resolve to
- * null until their tactic increments register selectors here.
+ * The registry is pure/deterministic and has no lifecycle. specOps and
+ * rangedCover register their baseline maneuver selectors; assault/hold
+ * resolve to null until their tactic increments register selectors here.
  * @param {object} api Module API object.
  */
 function _registerTacticsService(api) {
@@ -310,6 +313,7 @@ function _registerTacticsService(api) {
     if (!api.services.has("tactics")) {
         const tactics = createTacticRegistry();
         registerSpecOpsTacticSelector(tactics);
+        registerRangedCoverTacticSelector(tactics);
         api.services.register("tactics", tactics);
     }
 }

@@ -74,6 +74,112 @@ const MEMORY_WEIGHT_SOURCES = Object.freeze(new Set([
 
 const EPSILON = 1e-9;
 
+/** Planner veto reason for a move endpoint entering friendly suppression. */
+export const SUPPRESSION_ZONE_VETO = "suppression-zone";
+
+/**
+ * Preset-only suppression-attack factor: suppression coverage counts twice as
+ * much as one covered hostile, capped at one. Only candidates whose cone spec
+ * is genuinely suppression fire qualify; ordinary spray/cone fire and direct
+ * attacks honestly keep a zero factor.
+ * @param {object} candidate Normalized planner candidate.
+ * @returns {number} 0..1.
+ */
+export function suppressionFactorOf(candidate = {}) {
+    if (candidate?.cone?.spec?.suppression !== true) return 0;
+    const covered = Array.isArray(candidate.cone?.covered)
+        ? candidate.cone.covered.length
+        : Math.max(0, _numberOr(candidate.blastHits, 0));
+    return _round(Math.max(0, Math.min(1, covered / 2)));
+}
+
+/**
+ * Whether a pixel-centre point lies inside one serialized suppression zone.
+ * The descriptor contract uses `{x, y, direction, angleDeg, rangePx}`;
+ * `angle`/`arc` aliases are accepted for planner-template-shaped rows.
+ * @param {object|null} point `{x, y}` in pixels.
+ * @param {object|null} zone Serialized suppression exclusion zone.
+ * @returns {boolean}
+ */
+export function pointInSuppressionZone(point, zone) {
+    if (!_isPoint(point) || !_isPoint(zone)) return false;
+    const direction = _numberOr(zone.direction, NaN);
+    const angleDeg = _numberOr(zone.angleDeg ?? zone.angle ?? zone.arc, NaN);
+    const rangePx = _numberOr(zone.rangePx ?? zone.range, NaN);
+    if (!Number.isFinite(direction) || !(angleDeg > 0) || !(rangePx > 0)) return false;
+    return _tokenInCone(zone, direction, angleDeg, rangePx, point) === true;
+}
+
+/**
+ * Selection-time suppression-zone violation of a candidate. Only the move
+ * endpoint is tested here — waypoints are verified against the authoritative
+ * post-plan cone in the fireteam layer — and stay/attack-in-place candidates
+ * deliberately remain legal (the specification forbids a hard movement veto
+ * from becoming a shooting veto).
+ * @param {object} candidate Normalized planner candidate.
+ * @param {object[]} zones Serialized suppression exclusion zones.
+ * @returns {object|null} The first violated zone, or null.
+ */
+export function suppressionZoneViolation(candidate = {}, zones = []) {
+    const move = candidate?.move;
+    if (!move || move.stay === true || !_isPoint(move)) return null;
+    const endpoint = { x: move.x, y: move.y };
+    return (zones ?? []).find(zone => pointInSuppressionZone(endpoint, zone)) ?? null;
+}
+
+/**
+ * Align the descriptor's ordinary attack-target slot with a preferred
+ * objective target when that target is actually covered by the chosen cone.
+ * Cone geometry is unchanged; only the ordering/metadata of the covered
+ * anchor is normalized. This keeps concentrate-fire and explicit objective
+ * identity compatible with the tactic instead of letting the lexicographic
+ * cone serialization pick another target silently. If the preferred target
+ * is outside the cone the descriptor is returned unchanged.
+ * @param {object|null} descriptor Suppress-and-bound descriptor.
+ * @param {object|null} preferred Objective carrying `targetId`/`targetUuid`.
+ * @returns {object|null} Descriptor (a copy when alignment was needed).
+ */
+export function alignSuppressAndBoundTarget(descriptor, preferred = null) {
+    if (!descriptor || !preferred) return descriptor;
+    const wanted = [preferred.targetId, preferred.targetUuid, preferred.tokenId]
+        .filter(value => value !== null && value !== undefined)
+        .map(String);
+    if (!wanted.length) return descriptor;
+    const forms = value => {
+        const text = String(value ?? "");
+        return [text, text.includes(".") ? text.split(".").pop() : text];
+    };
+    const wantedForms = new Set(wanted.flatMap(forms));
+    const covered = descriptor.cone?.covered ?? [];
+    const match = covered.find(entry =>
+        [entry.tokenId, entry.tokenUuid].some(id => wantedForms.has(String(id ?? ""))
+            || wantedForms.has(String(id ?? "").split(".").pop())));
+    if (!match) return descriptor;
+    const copy = JSON.parse(JSON.stringify(descriptor));
+    const targetId = preferred.targetId ?? match.tokenId ?? match.tokenUuid ?? null;
+    const targetUuid = preferred.targetUuid ?? match.tokenUuid ?? null;
+    const targetPoint = { x: match.x, y: match.y };
+    const write = objective => {
+        if (!objective || objective.type !== SUPPRESS_AND_BOUND) return;
+        objective.targetId = targetId;
+        objective.targetUuid = targetUuid;
+        objective.targetPoint = { ...targetPoint };
+    };
+    write(copy.objective);
+    for (const assignment of Object.values(copy.assignments ?? {})) {
+        write(assignment?.objective);
+    }
+    if (Array.isArray(copy.cone?.covered)) {
+        const matches = entry => [entry?.tokenId, entry?.tokenUuid].some(id =>
+            wantedForms.has(String(id ?? "")) || wantedForms.has(String(id ?? "").split(".").pop()));
+        copy.cone.covered.sort((a, b) => Number(!matches(a)) - Number(!matches(b)));
+    }
+    if (targetUuid && Array.isArray(copy.cone?.coveredTokenUuids)) {
+        copy.cone.coveredTokenUuids.sort((a, b) => Number(a !== targetUuid) - Number(b !== targetUuid));
+    }
+    return copy;
+}
+
 /**
  * Numeric coercion with fallback (item data occasionally arrives as strings).
  * @param {*} value

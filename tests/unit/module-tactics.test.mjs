@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 
 import "../../scripts/module.js";
 
-test("init registers the tactics service with the baseline specOps selector", () => {
+test("init registers the tactics service with specOps and rangedCover selectors", () => {
     game.modules.set("only-war-ai", {});
     const init = Hooks._calls.find(call => call.type === "once" && call.event === "init");
     assert.ok(init, "module init hook is registered");
@@ -22,5 +22,9 @@ test("init registers the tactics service with the baseline specOps selector", ()
     assert.equal(specOps.length, 1);
     assert.equal(specOps[0].kind, "maneuver");
     assert.equal(typeof specOps[0].select, "function");
+    const rangedCover = tactics.listTacticSelectors("rangedCover");
+    assert.equal(rangedCover.length, 1);
+    assert.equal(rangedCover[0].kind, "maneuver");
+    assert.equal(typeof rangedCover[0].select, "function");
     assert.equal(tactics.resolveTactic("assault", {}), null);
 });

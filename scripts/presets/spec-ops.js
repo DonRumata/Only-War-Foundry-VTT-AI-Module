@@ -36,6 +36,14 @@ import { evaluateFactors } from "../planner.js";
 import { _findToken, _tokenDoc, _tokenPosition } from "../planner/documents.js";
 import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
 import {
+    SUPPRESS_AND_BOUND,
+    SUPPRESSION_ZONE_VETO,
+    alignSuppressAndBoundTarget,
+    explainSuppressAndBound,
+    suppressionFactorOf,
+    suppressionZoneViolation
+} from "../tactics/suppress-and-bound.js";
+import {
     SPEC_OPS_CONFIG,
     SPEC_OPS_PRESET_ID,
     resolveSpecOpsConfig
@@ -48,6 +56,7 @@ export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
 
 /** Bounded team maneuvers the tactic selector may commit to. */
 export const SPEC_OPS_TACTICS = Object.freeze([
+    SUPPRESS_AND_BOUND,
     "flank-and-fix",
     "coordinated-assault",
     "covering-advance",
@@ -267,6 +276,18 @@ function _targetCenter(target, context) {
     const topLeft = _tokenPosition(token);
     return target.source === "fallback" || (target.x === topLeft.x && target.y === topLeft.y)
         ? specOpsTokenCenter(token, context.scene, target) : target;
+}
+
+/**
+ * Shared normalized-target centre helper for tactic adapters. Kept as a thin
+ * export over the spec-ops implementation so rangedCover does not duplicate
+ * the top-left/centre normalization rules.
+ * @param {object|null} target Normalized target record.
+ * @param {object} context Planning scene and combat for token lookup.
+ * @returns {{x: number, y: number}|null}
+ */
+export function specOpsTargetCenter(target, context) {
+    return _targetCenter(target, context);
 }
 
 /**
@@ -594,6 +615,28 @@ function _flankProgress(candidate, context) {
 }
 
 /**
+ * Shared flank geometry helper for team-tasked ranged presets. The
+ * implementation stays the spec-ops one — rangedCover imports this wrapper
+ * instead of copying the angle/side math.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Evaluation context.
+ * @returns {object} `{angle, side}`.
+ */
+export function specOpsFlankGeometry(candidate, context) {
+    return _flankGeometry(candidate, context);
+}
+
+/**
+ * Shared flank-progress helper for team-tasked ranged presets.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Evaluation context.
+ * @returns {number} 0..1.
+ */
+export function specOpsFlankProgress(candidate, context) {
+    return _flankProgress(candidate, context);
+}
+
+/**
  * Cohesion-restoration progress of the candidate endpoint toward the
  * team's regroup point (or centre): 1 when the endpoint lands on it,
  * 0 when it keeps or extends the distance. Feeds the
@@ -864,9 +907,14 @@ export function selectSpecOpsTactic({
     const positioned = available.map(member => ({
         ...member,
         position: specOpsTokenCenter(_tokenDoc(member.combatant?.token),
-            geometryContext.scene, member.position)
+            geometryContext.scene, member.position),
+        positionIsCenter: true
     }));
     const leader = positioned.find(m => m.combatantId === leaderId) ?? positioned[0];
+    const centerTargets = (targets ?? []).map(target => {
+        const center = _targetCenter(target, geometryContext);
+        return center ? { ...target, x: center.x, y: center.y } : target;
+    });
     const objectivePos = _objectivePosition(objective, hostiles.map(target => ({
         ...target, ..._targetCenter(target, geometryContext)
     })));
@@ -883,6 +931,48 @@ export function selectSpecOpsTactic({
     const flank = context.allowFlank !== false && objectivePos
         && (enemyCount > memberCount || frontalBlocked)
         ? _flankOptions(positioned, leader.combatantId, frontPos, objectivePos, walls, cfg) : null;
+
+    // Issue #86: suppression is evaluated after the retreat/no-contact
+    // branches and before every attack maneuver. A degradation does not end
+    // the cascade — its stable reason and candidate scan stay in the
+    // breakdown while flank/assault/covering-advance continue below.
+    let suppressionObjective = objective && typeof objective === "object"
+        ? { ...objective } : null;
+    if (flank && !suppressionObjective?.flankPoint) {
+        suppressionObjective = {
+            ...(suppressionObjective ?? {}),
+            flankPoint: {
+                x: Math.round(flank.point.x * 1e2) / 1e2,
+                y: Math.round(flank.point.y * 1e2) / 1e2
+            }
+        };
+    }
+    const suppression = explainSuppressAndBound({
+        members: positioned,
+        leaderId: leader?.combatantId ?? leaderId,
+        targets: centerTargets,
+        objective: suppressionObjective,
+        casualties: casualtyCount,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        context: {
+            ...geometryContext,
+            objective: suppressionObjective,
+            frontalBlocked,
+            boundTask: flank ? "flank" : geometryContext.boundTask
+        }
+    });
+    breakdown.suppression = {
+        reason: suppression.reason,
+        selected: suppression.selected,
+        ...suppression.breakdown
+    };
+    if (suppression.selected) {
+        return {
+            ...alignSuppressAndBoundTarget(suppression.descriptor, suppressionObjective),
+            breakdown: { ...breakdown }
+        };
+    }
     if (flank) {
         breakdown.flank = { side: flank.side, flankerId: flank.flanker.combatantId };
         const targetId = _objectiveTargetId(objective, hostiles);
@@ -946,6 +1036,9 @@ export function createSpecOpsTactic(config = {}) {
  * @returns {string|null} Rejection reason or null when acceptable.
  */
 export function specOpsVeto({ candidate = {}, context = {} } = {}) {
+    if (suppressionZoneViolation(candidate, context.team?.exclusionZones)) {
+        return SUPPRESSION_ZONE_VETO;
+    }
     const attack = ATTACK_VARIANTS.has(candidate.variant);
     if (context.team?.task === "flank" && Number.isFinite(context.team.flankMinAngleDegrees)) {
         return attack ? checkSpecOpsFlank(candidate, context).reason : "flank-attack-unavailable";
@@ -989,6 +1082,9 @@ export function evaluateSpecOps({
     const cfg = task && context.specOpsConfig
         ? resolveSpecOpsConfig(context.specOpsConfig) : SPEC_OPS_CONFIG;
     const enriched = { ...factors };
+    if (context.team?.role === "suppressor") {
+        enriched.suppression = suppressionFactorOf(candidate);
+    }
     if (task === "flank") {
         const { angle } = _flankGeometry(candidate, context);
         const minAngle = context.team.flankMinAngleDegrees ?? cfg.flankMinAngleDegrees;
@@ -1006,6 +1102,7 @@ export function evaluateSpecOps({
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
+    if (context.team?.role === "suppressor") effective.suppression = 8;
     if (task === "support") effective.cover = cfg.supportWeight;
     if (task === "flank") effective.flankAngle = cfg.flankWeight;
     if (task === "assault") {
@@ -1026,7 +1123,9 @@ export function evaluateSpecOps({
                 reason: task ? null : "no-fireteam",
                 flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
                 flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null,
-                cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null
+                cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null,
+                suppression: context.team?.role === "suppressor"
+                    ? (enriched.suppression ?? 0) : null
             }
         }
     };

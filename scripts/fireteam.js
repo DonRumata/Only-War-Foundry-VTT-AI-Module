@@ -86,6 +86,10 @@ import {
     specOpsFlankFallback,
     specOpsTokenCenter
 } from "./presets/spec-ops.js";
+import {
+    SUPPRESS_AND_BOUND,
+    pointInSuppressionZone
+} from "./tactics/suppress-and-bound.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
 export const FIRETEAM_STATUS = Object.freeze({
@@ -173,6 +177,22 @@ const MORALE_TASK_REMAP = Object.freeze({
  */
 const MORALE_CONFIDENT_ASSAULT_CAP = 2;
 const MORALE_CONFIDENT_FLANK_CAP = 2;
+
+/**
+ * Targeted suppress-and-bound demotion policy (issue #86): once a bound or
+ * suppressor assignment is demoted by GM intervention/morale, the geometric
+ * fire/maneuver role no longer exists and must not keep steering scoring or
+ * zone ownership. The member objective is deliberately preserved — it is
+ * serializable tactical metadata and the shared-objective precedence rules
+ * decide whether it still narrows targets. Generic roles such as `focus`
+ * are untouched.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearSuppressionGeometry(assignment) {
+    if (!assignment || !["suppressor", "bound"].includes(assignment.role)) return;
+    delete assignment.role;
+    delete assignment.element;
+}
 
 /**
  * Normalize a Foundry collection/Map/array/iterable into a plain array.
@@ -1002,6 +1022,8 @@ export function createFireteamService({
      * @param {boolean} [context.regroup] Force every member to `regroup`.
      * @param {object} [context.objective] `{targetId, flankTargetId}` shared
      *   team objective.
+     * @param {string|null} [context.explicitTargetId] Hard caller-ordered
+     *   shared target; suppress-and-bound cone metadata may not redirect it.
      * @returns {object[]} Assignments `{combatantId, tokenId, task, groupId,
      *   leader, assignedTargetId, role?, element?, objective?}` in
      *   deterministic order.
@@ -1057,7 +1079,10 @@ export function createFireteamService({
             const sharedTargetId = objectiveRestricted ? null : (task === "flank"
                 ? (context.objective?.flankTargetId ?? context.objective?.targetId ?? null)
                 : (context.objective?.targetId ?? null));
-            const assignedTargetId = forced?.objective?.targetId ?? sharedTargetId;
+            const suppressionConeMetadata = forced?.objective?.type === SUPPRESS_AND_BOUND;
+            const assignedTargetId = suppressionConeMetadata && context.explicitTargetId != null
+                ? context.explicitTargetId
+                : (forced?.objective?.targetId ?? sharedTargetId);
             const assignment = {
                 combatantId: member.combatantId,
                 tokenId: member.tokenId ?? null,
@@ -1735,6 +1760,86 @@ export function createFireteamService({
                 cost: move.cost?.movement
             } : null
         }, { ...context, selfPos: plan.snapshot?.self });
+    }
+
+    /**
+     * Authoritative suppression cone of the selected suppressor plan. The
+     * executable attack step carries direction/angle/range but not an origin;
+     * the origin is therefore the endpoint of the move preceding that attack,
+     * or the suppressor token footprint centre when the shot is in place.
+     * Range is serialized in scene units by the planner step contract and is
+     * converted to pixels with the scene grid.
+     * @param {object} input
+     * @param {object} input.member Suppressor member entry.
+     * @param {object} input.result Member planner result.
+     * @param {object} input.tactic Suppress-and-bound descriptor.
+     * @param {object|null} input.scene Planning scene.
+     * @returns {object|null} Serialized zone `{x,y,direction,angleDeg,rangePx}`.
+     */
+    function _authoritativeSuppressionCone({ member, result, tactic, scene }) {
+        const steps = result?.plan?.steps ?? [];
+        const index = steps.findIndex(step =>
+            (step?.type === "attack" || step?.type === "test")
+            && step.input?.suppressionFire === true
+            && step.input?.template);
+        if (index < 0) return null;
+        const input = steps[index].input;
+        const priorMove = steps.slice(0, index).reverse()
+            .find(step => step?.type === "move" && step.input?.to);
+        let origin = null;
+        if (priorMove && Number.isFinite(priorMove.input.to?.x) && Number.isFinite(priorMove.input.to?.y)) {
+            origin = { x: priorMove.input.to.x, y: priorMove.input.to.y };
+        } else {
+            const token = _tokenDoc(member?.combatant?.token);
+            origin = specOpsTokenCenter(token, scene, member?.position);
+        }
+        if (!Number.isFinite(origin?.x) || !Number.isFinite(origin?.y)) return null;
+        const grid = scene?.grid ?? {};
+        const size = _finiteOr(grid.size, 0);
+        const distance = _finiteOr(grid.distance, 0);
+        const pxPerUnit = size > 0 && distance > 0 ? size / distance : 1;
+        const fallbackCone = tactic?.cone ?? tactic?.objective?.suppressionCone ?? {};
+        const direction = _finiteOr(input.template.direction, fallbackCone.direction);
+        const angleDeg = _finiteOr(input.template.angle ?? input.template.angleDeg,
+            fallbackCone.angleDeg ?? fallbackCone.angle);
+        const rangePx = Number.isFinite(input.template.range)
+            ? input.template.range * pxPerUnit
+            : _finiteOr(fallbackCone.rangePx, NaN);
+        if (!Number.isFinite(direction) || !(angleDeg > 0) || !(rangePx > 0)) return null;
+        return {
+            x: Math.round(origin.x * 1e4) / 1e4,
+            y: Math.round(origin.y * 1e4) / 1e4,
+            direction,
+            angleDeg,
+            rangePx: Math.round(rangePx * 1e4) / 1e4,
+            ownerId: member?.combatantId ?? tactic?.suppressorId ?? null,
+            kind: "suppression"
+        };
+    }
+
+    /**
+     * First point of a member move entering a suppression zone. Both the
+     * serialized endpoint and every route waypoint are checked; stay plans
+     * and attack-in-place plans have no move step and are legal by contract.
+     * @param {object} result Member planner result.
+     * @param {object} zone Authoritative serialized suppression zone.
+     * @returns {object|null} `{point, stepId}` or null.
+     */
+    function _suppressionMoveViolation(result, zone) {
+        if (!zone) return null;
+        for (const step of result?.plan?.steps ?? []) {
+            if (step?.type !== "move") continue;
+            const points = [
+                ...(Array.isArray(step.input?.waypoints) ? step.input.waypoints : []),
+                step.input?.to
+            ].filter(point => Number.isFinite(point?.x) && Number.isFinite(point?.y));
+            for (const point of points) {
+                if (pointInSuppressionZone(point, zone)) {
+                    return { point: { x: point.x, y: point.y }, stepId: step.id ?? null };
+                }
+            }
+        }
+        return null;
     }
 
     /**
@@ -2925,7 +3030,8 @@ export function createFireteamService({
                 ? MORALE_CONFIDENT_ASSAULT_CAP : undefined,
             flankCap: moraleInfo.tier === "confident"
                 ? MORALE_CONFIDENT_FLANK_CAP : undefined,
-            objective: sharedObjective
+            objective: sharedObjective,
+            explicitTargetId: context.objective?.targetId ?? null
         });
         // Issue #25 gm-controlled degradation: members the GM moved this
         // round are demoted from detached/complex tasks to `support`
@@ -2944,6 +3050,7 @@ export function createFireteamService({
                 });
                 assignment.task = "support";
                 assignment.groupId = "main";
+                _clearSuppressionGeometry(assignment);
             }
         }
         diagnostics.gmControlled = [...gmControlledIds];
@@ -2970,6 +3077,7 @@ export function createFireteamService({
                 });
                 assignment.task = to;
                 assignment.groupId = "main";
+                _clearSuppressionGeometry(assignment);
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
@@ -3025,6 +3133,12 @@ export function createFireteamService({
         // Backward-compatible legacy channel: `team.objective` is always
         // the shared target id, never the member-scoped objective object.
         const sharedTargetId = sharedObjective?.targetId ?? null;
+        const suppressionZones = tacticName === SUPPRESS_AND_BOUND
+            && Array.isArray(tactic?.exclusionZones)
+            ? _jsonClone(tactic.exclusionZones) ?? [] : [];
+        const suppressionCone = tacticName === SUPPRESS_AND_BOUND
+            ? (_jsonClone(tactic?.objective?.suppressionCone ?? tactic?.cone ?? null))
+            : null;
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
@@ -3043,6 +3157,10 @@ export function createFireteamService({
                     groupId: assignment.groupId,
                     role: assignment.role ?? null,
                     element: assignment.element ?? null,
+                    ...(assignment.role === "suppressor" && suppressionCone
+                        ? { suppressionCone: _jsonClone(suppressionCone) } : {}),
+                    ...(assignment.role !== "suppressor" && suppressionZones.length
+                        ? { exclusionZones: _jsonClone(suppressionZones) } : {}),
                     objective: sharedTargetId,
                     memberObjective: assignment.objective
                         ? _jsonClone(assignment.objective) : null,
@@ -3144,6 +3262,7 @@ export function createFireteamService({
                     diagnostics.gmDemotions = gmDemotions;
                     assignment.task = "support";
                     assignment.groupId = "main";
+                    _clearSuppressionGeometry(assignment);
                     try {
                         const retry = await memberPlanner.planTurn(combat,
                             member.combatant, {
@@ -3241,6 +3360,10 @@ export function createFireteamService({
                     groupId: assignment.groupId,
                     role: assignment.role ?? null,
                     element: assignment.element ?? null,
+                    ...(assignment.role === "suppressor" && suppressionCone
+                        ? { suppressionCone: _jsonClone(suppressionCone) } : {}),
+                    ...(assignment.role !== "suppressor" && suppressionZones.length
+                        ? { exclusionZones: _jsonClone(suppressionZones) } : {}),
                     objective: sharedTargetId,
                     memberObjective: assignment.objective
                         ? _jsonClone(assignment.objective) : null,
@@ -3257,6 +3380,133 @@ export function createFireteamService({
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
         }
+
+        // Issue #86 post-plan verification: the pre-plan exclusion zones are
+        // only the selector's proposal. Once the suppressor has actually
+        // chosen (or honestly fallen back from) a suppression attack, the
+        // serialized attack step defines the authoritative cone. Other
+        // members get one context-preserving replan against that cone; a
+        // repeat violation is recorded as a zone conflict and the move is
+        // excluded by a final no-movement degradation.
+        const suppressionZoneDiagnostics = {
+            checked: false,
+            cone: null,
+            violations: [],
+            replans: [],
+            conflicts: []
+        };
+        if (tacticName === SUPPRESS_AND_BOUND) {
+            const suppressorId = tactic?.suppressorId
+                ?? assignments.find(entry => entry.role === "suppressor")?.combatantId
+                ?? null;
+            const suppressorMember = ordered.find(member => member.combatantId === suppressorId) ?? null;
+            const authoritativeCone = suppressorMember
+                ? _authoritativeSuppressionCone({
+                    member: suppressorMember,
+                    result: plans.get(suppressorId),
+                    tactic,
+                    scene
+                })
+                : null;
+            suppressionZoneDiagnostics.checked = authoritativeCone !== null;
+            suppressionZoneDiagnostics.cone = authoritativeCone;
+            if (authoritativeCone) {
+                for (const member of ordered) {
+                    if (member.combatantId === authoritativeCone.ownerId) continue;
+                    let violation = _suppressionMoveViolation(
+                        plans.get(member.combatantId), authoritativeCone);
+                    if (!violation) continue;
+                    suppressionZoneDiagnostics.violations.push({
+                        combatantId: member.combatantId,
+                        point: violation.point,
+                        stepId: violation.stepId,
+                        attempt: "initial"
+                    });
+                    const stored = memberContexts.get(member.combatantId);
+                    const preZoneReservations = reserveResources(
+                        orderedAssignments, plans, reservationContext);
+                    const retryContext = {
+                        ...(stored ?? { ...context, seed }),
+                        reservations: [
+                            ...(context.reservations ?? []),
+                            ...preZoneReservations.routes
+                                .filter(cell => cell.memberId !== member.combatantId)
+                        ],
+                        replanCount: _finiteOr(context.replanCount, 0) + 1,
+                        team: {
+                            ...(stored?.team ?? {
+                                teamId,
+                                leaderId: election.combatantId,
+                                character,
+                                contacts: teamContacts
+                            }),
+                            exclusionZones: [authoritativeCone]
+                        }
+                    };
+                    let retry = null;
+                    try {
+                        retry = await memberPlanner.planTurn(
+                            combat, member.combatant, retryContext);
+                    } catch(err) {
+                        retry = null;
+                    }
+                    suppressionZoneDiagnostics.replans.push({
+                        combatantId: member.combatantId,
+                        attempt: "zone-replan",
+                        status: retry?.status ?? "error"
+                    });
+                    if (retry?.plan) {
+                        plans.set(member.combatantId, retry);
+                        const previousStatus = diagnostics.memberStatuses[member.combatantId];
+                        diagnostics.memberStatuses[member.combatantId] =
+                            `${previousStatus}->${retry?.status ?? "error"}`;
+                        violation = _suppressionMoveViolation(retry, authoritativeCone);
+                    }
+                    if (!violation) continue;
+                    const conflict = {
+                        type: "zone",
+                        reason: "suppression-zone",
+                        loserId: member.combatantId,
+                        winnerId: authoritativeCone.ownerId,
+                        point: violation.point
+                    };
+                    suppressionZoneDiagnostics.conflicts.push(conflict);
+                    suppressionZoneDiagnostics.violations.push({
+                        combatantId: member.combatantId,
+                        point: violation.point,
+                        stepId: violation.stepId,
+                        attempt: "zone-replan"
+                    });
+                    // The one maneuver replan failed to clear the cone. Do
+                    // not loop indefinitely: degrade this member to the
+                    // planner's ordinary stay/attack-in-place candidates by
+                    // injecting an empty movement set. This is the safe
+                    // “move excluded” fallback, not another tactical replan.
+                    let holdRetry = null;
+                    try {
+                        holdRetry = await memberPlanner.planTurn(combat, member.combatant, {
+                            ...retryContext,
+                            moves: [],
+                            replanCount: _finiteOr(context.replanCount, 0) + 2
+                        });
+                    } catch(err) {
+                        holdRetry = null;
+                    }
+                    suppressionZoneDiagnostics.replans.push({
+                        combatantId: member.combatantId,
+                        attempt: "move-excluded",
+                        status: holdRetry?.status ?? "error"
+                    });
+                    if (holdRetry?.plan) {
+                        plans.set(member.combatantId, holdRetry);
+                        const previousStatus = diagnostics.memberStatuses[member.combatantId];
+                        diagnostics.memberStatuses[member.combatantId] =
+                            `${previousStatus}->${holdRetry?.status ?? "error"}`;
+                    }
+                }
+            }
+        }
+        diagnostics.suppressionZones = _jsonClone(suppressionZoneDiagnostics);
 
         if (flankRules) {
             // Check every assigned flanker after all demotions/retargets.
@@ -3315,8 +3565,12 @@ export function createFireteamService({
         // assignment records (including role/element/objective metadata).
         diagnostics.assignments = _jsonClone(assignments);
         const reservations = reserveResources(orderedAssignments, plans, reservationContext);
+        for (const conflict of suppressionZoneDiagnostics.conflicts) {
+            reservations.conflicts.push(_jsonClone(conflict));
+        }
         diagnostics.reservations = _jsonClone(reservations);
-        const routeConflict = reservations.conflicts.find(conflict => conflict.type !== "target");
+        const routeConflict = reservations.conflicts.find(conflict =>
+            conflict.type === "endpoint" || conflict.type === "route");
         const reject = reason => {
             if (!context.teamFallback && tactic?.name !== "regroup-fallback") {
                 return buildTeamPlan(combat, team, {
