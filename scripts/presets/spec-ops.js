@@ -11,10 +11,9 @@
  *   {@link selectSpecOpsTactic} via `context.tactic`).
  * - The tactic selector is a pure, deterministic situation assessment:
  *   member count, attackable contacts, casualties, threat pressure and
- *   flank geometry (perpendicular maneuver points, wall-blocked sides,
- *   minimum attack angle `flankMinAngleDegrees`). It returns a
- *   serializable descriptor `{name, reason, assignments, allowFlank,
- *   regroup, objective, maxDetachedPhases, breakdown}`.
+ *   flank geometry (maneuver hints). It proposes a serializable tactic;
+ *   the fireteam only commits to flank-and-fix once its member plans
+ *   prove the required attack angle and any movement to the firing cell.
  * - Bounded maneuvers: `flank-and-fix` (one group pins frontally, a flank
  *   group takes an alternative attack vector), `coordinated-assault` (all
  *   subgroups assault behind the shared barrier), `covering-advance`
@@ -34,9 +33,14 @@
  *   the preset never fires blind (`hidden-target`).
  */
 import { evaluateFactors } from "../planner.js";
+import { _findToken, _tokenDoc, _tokenPosition } from "../planner/documents.js";
+import {
+    SPEC_OPS_CONFIG,
+    SPEC_OPS_PRESET_ID,
+    resolveSpecOpsConfig
+} from "./spec-ops-config.js";
 
-/** Preset id registered in the planner preset registry. */
-export const SPEC_OPS_PRESET_ID = "specOps";
+export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
 /** Rejection reason produced by {@link specOpsVeto}. */
 export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
@@ -48,22 +52,6 @@ export const SPEC_OPS_TACTICS = Object.freeze([
     "covering-advance",
     "regroup-fallback"
 ]);
-
-/**
- * World-configurable spec-ops defaults (issue #412 `SpecOpsConfig`).
- * `maxDetachedRounds` bounds flank detachment phases; `highThreatRatio`
- * (enemies per member) switches the team to `regroup-fallback`.
- */
-export const SPEC_OPS_CONFIG = Object.freeze({
-    flankMinAngleDegrees: 60,
-    maxDetachedRounds: 2,
-    highThreatRatio: 2,
-    supportWeight: 6,
-    flankWeight: 8,
-    assaultWeight: 7,
-    cohesionWeight: 10,
-    fallbackPreset: "hold"
-});
 
 /**
  * Data-driven weights for the spec-ops preset — the solo/balanced base.
@@ -237,6 +225,50 @@ function _clamp01(value) {
 }
 
 /**
+ * Whether a point has both coordinates.
+ * @param {object|null} point Point in scene pixels.
+ * @returns {boolean}
+ */
+function _isPoint(point) {
+    return Number.isFinite(point?.x) && Number.isFinite(point?.y);
+}
+
+/**
+ * Convert document-space coordinates to the footprint centre used by
+ * vision and serialized route waypoints.
+ * @param {object|null} token Token document, absent for pure geometry inputs.
+ * @param {object|null} scene Planning scene.
+ * @param {object} [position] Token top-left (may come from a snapshot).
+ * @returns {{x: number, y: number}|null}
+ */
+export function specOpsTokenCenter(token, scene, position = _tokenPosition(token)) {
+    if (!_isPoint(position)) return null;
+    const size = scene?.grid?.size;
+    if (!token || !Number.isFinite(size) || size <= 0) return position;
+    return {
+        x: position.x + (_finiteOr(token.width, 1) * size / 2),
+        y: position.y + (_finiteOr(token.height, 1) * size / 2)
+    };
+}
+
+/**
+ * Perception supplies centres; combat fallback and older injected target
+ * records can carry a TokenDocument's top-left instead.
+ * @param {object|null} target Normalized target record.
+ * @param {object} context Planning scene and combat for token lookup.
+ * @returns {{x: number, y: number}|null}
+ */
+function _targetCenter(target, context) {
+    if (!_isPoint(target)) return null;
+    if (target.source === "visible" || target.canAttack === false) return target;
+    const id = target.tokenId ?? (typeof target.tokenUuid === "string" ? target.tokenUuid.split(".").pop() : null);
+    const token = _findToken(id, { combat: context.combat, scene: context.scene ?? { tokens: [] } });
+    const topLeft = _tokenPosition(token);
+    return target.source === "fallback" || (target.x === topLeft.x && target.y === topLeft.y)
+        ? specOpsTokenCenter(token, context.scene, target) : target;
+}
+
+/**
  * Normalize a Foundry collection/Map/array/iterable into a plain array.
  * @param {*} collection
  * @returns {object[]}
@@ -258,8 +290,7 @@ function _list(collection) {
  * @returns {number}
  */
 function _dist(a, b) {
-    if (!Number.isFinite(a?.x) || !Number.isFinite(a?.y)
-        || !Number.isFinite(b?.x) || !Number.isFinite(b?.y)) {
+    if (!_isPoint(a) || !_isPoint(b)) {
         return Number.POSITIVE_INFINITY;
     }
     return Math.hypot(b.x - a.x, b.y - a.y);
@@ -272,11 +303,10 @@ function _dist(a, b) {
  * @returns {number|null}
  */
 function _angleBetweenDeg(v1, v2) {
-    const m1 = Math.hypot(v1.x, v1.y);
-    const m2 = Math.hypot(v2.x, v2.y);
-    if (!(m1 > 0) || !(m2 > 0)) return null;
-    const dot = ((v1.x * v2.x) + (v1.y * v2.y)) / (m1 * m2);
-    return (Math.acos(Math.max(-1, Math.min(1, dot))) * 180) / Math.PI;
+    if (!(Math.hypot(v1.x, v1.y) > 0) || !(Math.hypot(v2.x, v2.y) > 0)) return null;
+    const dot = (v1.x * v2.x) + (v1.y * v2.y);
+    const cross = (v1.x * v2.y) - (v1.y * v2.x);
+    return (Math.atan2(Math.abs(cross), dot) * 180) / Math.PI;
 }
 
 /**
@@ -475,36 +505,71 @@ function _candidateEndpoint(candidate, context = {}) {
 }
 
 /**
- * `flankAngle` factor: the angle at the target between the team's
- * frontal approach (`context.team.center → target`) and the candidate's
- * attack vector (`endpoint → target`), normalized by
- * `flankMinAngleDegrees`. 1 = fully off-axis flank shot.
- * @param {object} candidate
- * @param {object} context
- * @param {number} minAngleDeg
- * @returns {number}
+ * Actual attack angle at the target relative to the team's frontal
+ * bearing. All points are footprint centres (or an explicit blast aim).
+ * @param {object|null} center Front position.
+ * @param {object|null} endpoint Firing position.
+ * @param {object|null} target Attack point.
+ * @returns {number|null}
  */
-function _flankAngle(candidate, context, minAngleDeg) {
-    const center = context.team?.center ?? context.teamCenter ?? null;
-    const target = candidate?.target ?? null;
-    const endpoint = _candidateEndpoint(candidate, context);
-    const min = Number.isFinite(minAngleDeg) && minAngleDeg > 0 ? minAngleDeg : 60;
-    if (!center || !target || !endpoint) return 0;
-    const deg = _angleBetweenDeg(
+function _attackAngle(center, endpoint, target) {
+    if (!_isPoint(center) || !_isPoint(endpoint) || !_isPoint(target)) return null;
+    return _angleBetweenDeg(
         { x: target.x - center.x, y: target.y - center.y },
         { x: target.x - endpoint.x, y: target.y - endpoint.y });
-    if (!Number.isFinite(deg)) return 0;
-    return Math.round(_clamp01(deg / min) * 1e4) / 1e4;
 }
 
 /**
- * `cohesionRestore` factor: how much closer the candidate endpoint lands
- * to the regroup/rejoin point (`context.team.regroupPoint`, falling back
- * to the team centre) relative to the current position.
+ * Resolve one candidate's actual firing geometry, not its maneuver hint.
+ * The same geometry drives the hard gate and the preset's soft score.
  * @param {object} candidate
  * @param {object} context
- * @returns {number}
+ * @returns {object}
  */
+function _flankGeometry(candidate, context) {
+    const center = context.team?.flankCenter ?? context.team?.center ?? context.teamCenter;
+    const move = candidate.move && !candidate.move.stay ? candidate.move : null;
+    const endpoint = move ?? specOpsTokenCenter(context.token, context.scene, context.selfPos);
+    const target = candidate.aim ?? _targetCenter(candidate.target, context);
+    const angle = _attackAngle(center, endpoint, target);
+    const cross = angle === null ? 0 : _cross(center, target, endpoint);
+    return { angle, side: cross > 0 ? "left" : cross < 0 ? "right" : null };
+}
+
+/**
+ * Check the attack of a proposed flank against the doctrine threshold.
+ * Native navigation certifies movement through its measured waypoints;
+ * a speculative endpoint, partial path or missing route is not proof.
+ * @param {object} candidate Attack target/aim and optional move.
+ * @param {object} context Member planning context with flank centre and cutoff.
+ * @returns {{angle: number|null, side: string|null, reason: string|null}}
+ */
+export function checkSpecOpsFlank(candidate, context) {
+    if (candidate.target?.canAttack !== true || candidate.target.hidden === true
+        || ["last-known", "team-contact"].includes(candidate.target.source)) {
+        return { angle: null, side: null, reason: "flank-attack-unavailable" };
+    }
+    const geometry = _flankGeometry(candidate, context);
+    if (!Number.isFinite(geometry.angle) || geometry.angle + 1e-9 < context.team.flankMinAngleDegrees) {
+        return { ...geometry, reason: "flank-angle-unmet" };
+    }
+    const move = candidate.move;
+    if (move && !move.stay) {
+        const route = move.waypoints;
+        const start = specOpsTokenCenter(context.token, context.scene, context.selfPos);
+        // Native routing starts at the snapped cell; an off-grid token
+        // can differ from that first waypoint by less than a grid cell.
+        const size = _finiteOr(context.scene?.grid?.size, 100);
+        if (move.approximate || !Number.isFinite(move.cost) || move.cost < 0
+            || !Array.isArray(route) || route.length < 2 || !route.every(_isPoint)
+            || !start || Math.abs(start.x - route[0].x) >= size || Math.abs(start.y - route[0].y) >= size
+            || _dist(route[0], move) <= 1e-6 || _dist(route.at(-1), move) > 1e-6) {
+            return { ...geometry, reason: "flank-route-unproven" };
+        }
+    }
+    return { ...geometry, reason: null };
+}
+
 /**
  * `flankProgress` factor: how much closer the candidate endpoint lands
  * to the team's flank maneuver point (`context.team.flankPoint`)
@@ -516,8 +581,8 @@ function _flankAngle(candidate, context, minAngleDeg) {
  */
 function _flankProgress(candidate, context) {
     const point = context.team?.flankPoint ?? null;
-    const self = context.selfPos;
-    const endpoint = _candidateEndpoint(candidate, context);
+    const self = specOpsTokenCenter(context.token, context.scene, context.selfPos);
+    const endpoint = candidate.move && !candidate.move.stay ? candidate.move : self;
     if (!Number.isFinite(point?.x) || !Number.isFinite(point?.y)
         || !Number.isFinite(self?.x) || !Number.isFinite(self?.y) || !endpoint) {
         return 0;
@@ -585,72 +650,56 @@ function _objectiveTargetId(objective, hostiles) {
 }
 
 /**
- * Evaluate the two perpendicular flank options around the objective.
- * Each side gets a maneuver point at `max(100, dist/2)` px off the
- * frontal bearing; a side is usable when its maneuver point keeps a
- * `flankMinAngleDegrees` attack angle and the nearest non-leader flanker
- * can reach it without crossing a move-blocking wall ("one corridor"
- * maps reject both sides).
+ * Rank two search anchors around the objective, not actual endpoints.
+ * Prefer a member already off-axis, then an unobstructed hint, short
+ * travel and close-range loadout. A wall on the direct segment to a hint
+ * says nothing about legal firing cells or routes around the obstruction.
  * @param {object[]} members
  * @param {string|null} leaderId
+ * @param {{x: number, y: number}|null} center Frontal position.
  * @param {{x: number, y: number}} objectivePos
  * @param {object[]} walls
  * @param {object} cfg Resolved spec-ops config.
- * @returns {{feasible: boolean, options: object[], best: object|null}}
+ * @returns {object|null} Preferred search anchor and first flanker.
  */
-function _flankOptions(members, leaderId, objectivePos, walls, cfg) {
-    const none = { feasible: false, options: [], best: null };
-    const centroid = _centroid(members);
-    if (!centroid) return none;
-    const front = { x: objectivePos.x - centroid.x, y: objectivePos.y - centroid.y };
+function _flankOptions(members, leaderId, center, objectivePos, walls, cfg) {
+    if (!center) return null;
+    const front = { x: objectivePos.x - center.x, y: objectivePos.y - center.y };
     const dist = Math.hypot(front.x, front.y);
-    if (!(dist > 0)) return none;
+    if (!(dist > 0)) return null;
     const unit = { x: front.x / dist, y: front.y / dist };
     const perp = { x: -unit.y, y: unit.x };
     const offset = Math.max(100, dist * 0.5);
-    const sides = [
-        { side: "left", point: { x: objectivePos.x + (perp.x * offset), y: objectivePos.y + (perp.y * offset) } },
-        { side: "right", point: { x: objectivePos.x - (perp.x * offset), y: objectivePos.y - (perp.y * offset) } }
-    ];
-    const pool = members.filter(m => m.combatantId !== leaderId);
+    const minAngle = cfg.flankMinAngleDegrees;
+    const rad = (Math.max(90, minAngle) * Math.PI) / 180;
+    const forward = -Math.cos(rad) * offset;
+    const lateral = Math.sin(rad) * offset;
     const options = [];
-    for (const entry of sides) {
-        let best = null;
-        for (const member of pool) {
+    for (const [side, sign] of [["left", 1], ["right", -1]]) {
+        const point = {
+            x: objectivePos.x + (unit.x * forward) + (perp.x * lateral * sign),
+            y: objectivePos.y + (unit.y * forward) + (perp.y * lateral * sign)
+        };
+        for (const member of members) {
             const pos = member.position;
-            if (!Number.isFinite(pos?.x) || !Number.isFinite(pos?.y)) continue;
+            if (member.combatantId === leaderId || !_isPoint(pos)) continue;
             const loadout = _loadout(member);
-            // Capability bias: melee/short-range members flank; travel
-            // distance decides otherwise, combatant id breaks ties.
-            const travel = _dist(pos, entry.point)
+            const travel = _dist(pos, point)
                 + (loadout.melee ? -50 : 0)
                 + (loadout.bestRange > 0 && loadout.bestRange <= 5 ? -25 : 0);
-            if (!best || travel < best.travel
-                || (travel === best.travel
-                    && String(member.combatantId) < String(best.member.combatantId))) {
-                best = { member, travel };
-            }
+            const angle = _attackAngle(center, pos, objectivePos);
+            options.push({
+                side, point, travel, flanker: member,
+                offAxis: Number.isFinite(angle) && angle + 1e-9 >= minAngle,
+                blocked: _wallsCrossed(pos, point, walls, "move") > 0
+            });
         }
-        if (!best) continue;
-        const blocked = _wallsCrossed(best.member.position, entry.point, walls, "move") > 0;
-        const angle = _angleBetweenDeg(
-            { x: objectivePos.x - centroid.x, y: objectivePos.y - centroid.y },
-            { x: objectivePos.x - entry.point.x, y: objectivePos.y - entry.point.y });
-        options.push({
-            side: entry.side,
-            point: entry.point,
-            flanker: best.member,
-            travel: Math.round(best.travel * 1e4) / 1e4,
-            blocked,
-            angle: Number.isFinite(angle) ? Math.round(angle * 10) / 10 : null
-        });
     }
-    const minAngle = Number.isFinite(cfg.flankMinAngleDegrees)
-        ? cfg.flankMinAngleDegrees : 60;
-    const open = options
-        .filter(o => !o.blocked && Number.isFinite(o.angle) && o.angle >= minAngle)
-        .sort((a, b) => (a.travel - b.travel) || a.side.localeCompare(b.side));
-    return { feasible: open.length > 0, options, best: open[0] ?? null };
+    options.sort((a, b) => Number(b.offAxis) - Number(a.offAxis)
+        || Number(a.blocked) - Number(b.blocked) || (a.travel - b.travel)
+        || a.side.localeCompare(b.side)
+        || String(a.flanker.combatantId).localeCompare(String(b.flanker.combatantId)));
+    return options[0] ?? null;
 }
 
 /**
@@ -702,6 +751,25 @@ function _coveringAssignments(members) {
 }
 
 /**
+ * Replace a rejected flank with covering advance, reporting the failed
+ * requirement to preview/executor rather than the tentative tactic.
+ * @param {object[]} members Living members.
+ * @param {object} tactic Original draft tactic.
+ * @param {object} failure Invalid flank evidence.
+ * @returns {object} Non-flank tactic descriptor.
+ */
+export function specOpsFlankFallback(members, tactic, failure) {
+    return {
+        name: "covering-advance",
+        reason: failure.reason,
+        assignments: _coveringAssignments(members),
+        allowFlank: false,
+        maxDetachedPhases: tactic.maxDetachedPhases,
+        breakdown: { ...tactic.breakdown, flank: { ...failure, feasible: false } }
+    };
+}
+
+/**
  * Deterministic spec-ops tactic selector (issue #412): assesses the
  * situation — member count, attackable contacts, casualties, threat
  * pressure and flank geometry — and returns a serializable descriptor
@@ -713,6 +781,8 @@ function _coveringAssignments(members) {
  * @param {object[]|null} [input.targets] Normalized shared target list.
  * @param {object|null} [input.objective] Shared objective `{targetId, x, y}`.
  * @param {number} [input.casualties] Defeated teammates this round.
+ * @param {object|null} [input.scene] Planning scene.
+ * @param {object|null} [input.combat] Combat document for geometry lookup.
  * @param {object} [input.context] Planning context (`walls`, `scene`,
  *   `regroup`, `specOpsConfig`, `seed`).
  * @param {object} [input.config] `SpecOpsConfig` overrides.
@@ -726,10 +796,12 @@ export function selectSpecOpsTactic({
     targets = null,
     objective = null,
     casualties = 0,
+    scene = null,
+    combat = null,
     context = {},
     config = null
 } = {}) {
-    const cfg = { ...SPEC_OPS_CONFIG, ...(config ?? context.specOpsConfig ?? {}) };
+    const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
         .filter(m => m && m.combatantId && m.defeated !== true && m.enabled !== false)
         .sort((a, b) => String(a.combatantId).localeCompare(String(b.combatantId)));
@@ -754,7 +826,8 @@ export function selectSpecOpsTactic({
         allowFlank: extra.allowFlank === true,
         regroup: extra.regroup === true,
         objective: extra.objective ?? null,
-        maxDetachedPhases: _finiteOr(cfg.maxDetachedRounds, 2),
+        maxDetachedPhases: cfg.maxDetachedRounds,
+        ...(extra.allowFlank ? { flankMinAngleDegrees: cfg.flankMinAngleDegrees } : {}),
         breakdown: { ...breakdown, ...(extra.breakdown ?? {}) }
     });
 
@@ -771,7 +844,7 @@ export function selectSpecOpsTactic({
         return finish("regroup-fallback", "casualties",
             { regroup: true, assignments: all("regroup") });
     }
-    if (pressure >= _finiteOr(cfg.highThreatRatio, 2)) {
+    if (pressure >= cfg.highThreatRatio) {
         return finish("regroup-fallback", "overwhelming-threat",
             { regroup: true, assignments: all("regroup") });
     }
@@ -783,41 +856,47 @@ export function selectSpecOpsTactic({
             { assignments: _coveringAssignments(available) });
     }
 
-    const leader = available.find(m => m.combatantId === leaderId) ?? available[0];
-    const objectivePos = _objectivePosition(objective, hostiles);
-    const walls = _wallsOf(context);
-    const frontPos = leader?.position ?? _centroid(available);
+    const planningCombat = combat ?? context.combat ?? null;
+    const geometryContext = {
+        ...context, scene: context.scene ?? scene ?? planningCombat?.scene, combat: planningCombat
+    };
+    const positioned = available.map(member => ({
+        ...member,
+        position: specOpsTokenCenter(_tokenDoc(member.combatant?.token),
+            geometryContext.scene, member.position)
+    }));
+    const leader = positioned.find(m => m.combatantId === leaderId) ?? positioned[0];
+    const objectivePos = _objectivePosition(objective, hostiles.map(target => ({
+        ...target, ..._targetCenter(target, geometryContext)
+    })));
+    const walls = _wallsOf(geometryContext);
+    const frontPos = leader.position ?? _centroid(positioned);
     const frontalBlocked = objectivePos && frontPos
         ? _wallsCrossed(frontPos, objectivePos, walls, "move") > 0
         : false;
-    const flank = objectivePos
-        ? _flankOptions(available, leader?.combatantId ?? null, objectivePos, walls, cfg)
-        : { feasible: false, options: [], best: null };
     breakdown.frontalBlocked = frontalBlocked;
-    breakdown.flank = flank.feasible
-        ? {
-            side: flank.best.side,
-            angle: flank.best.angle,
-            flankerId: flank.best.flanker.combatantId
-        }
-        : { feasible: false };
+    breakdown.flank = { feasible: false };
 
-    // Flank-and-fix needs an open side *and* a reason to maneuver: the
-    // frontal approach is blocked or the team is outnumbered.
-    if (flank.feasible && (enemyCount > memberCount || frontalBlocked)) {
+    // Only propose flanking when there is a reason to maneuver. Actual
+    // reachability and angle are checked against selected attack plans.
+    const flank = context.allowFlank !== false && objectivePos
+        && (enemyCount > memberCount || frontalBlocked)
+        ? _flankOptions(positioned, leader.combatantId, frontPos, objectivePos, walls, cfg) : null;
+    if (flank) {
+        breakdown.flank = { side: flank.side, flankerId: flank.flanker.combatantId };
         const targetId = _objectiveTargetId(objective, hostiles);
         return finish("flank-and-fix",
             frontalBlocked ? "frontal-blocked-flank-open" : "outnumbered-flank-open",
             {
                 allowFlank: true,
-                assignments: _flankAssignments(available, leader, flank.best),
+                assignments: _flankAssignments(positioned, leader, flank),
                 objective: {
                     targetId,
                     flankTargetId: targetId,
-                    flankSide: flank.best.side,
+                    flankSide: flank.side,
                     flankPoint: {
-                        x: Math.round(flank.best.point.x * 1e2) / 1e2,
-                        y: Math.round(flank.best.point.y * 1e2) / 1e2
+                        x: Math.round(flank.point.x * 1e2) / 1e2,
+                        y: Math.round(flank.point.y * 1e2) / 1e2
                     }
                 }
             });
@@ -825,7 +904,7 @@ export function selectSpecOpsTactic({
     if (enemyCount <= memberCount) {
         // Parity or superiority: a synchronized assault — unless the only
         // corridor is blocked and no flank route exists.
-        if (frontalBlocked && !flank.feasible) {
+        if (frontalBlocked) {
             return finish("covering-advance", "frontal-blocked-no-flank",
                 { assignments: _coveringAssignments(available) });
         }
@@ -849,27 +928,28 @@ export function specOpsTactic(input = {}) {
 }
 
 /**
- * Bind a tactic factory to a fixed `SpecOpsConfig` (world-configurable
- * values are injected by the GM through `context.specOpsConfig` anyway,
- * so this is mostly for tests and macros).
+ * Bind a tactic factory with explicit overrides for tests and macros.
  * @param {object} [config] `SpecOpsConfig` overrides.
  * @returns {Function} Tactic factory `(input) => descriptor`.
  */
 export function createSpecOpsTactic(config = {}) {
-    const merged = { ...SPEC_OPS_CONFIG, ...config };
-    return input => selectSpecOpsTactic({ ...input, config: merged });
+    return input => selectSpecOpsTactic({ ...input, config });
 }
 
 /**
- * Preset veto predicate (planner contract, issue #412): attack variants
- * aimed at a hidden or last-known contact are rejected — spec ops never
- * fires on a target it cannot legally attack.
+ * Preset veto: reject hidden targets, and for proposed flank assignments
+ * rank only actual attacks that meet the angle and route requirements.
  * @param {object} input
  * @param {object} [input.candidate] Normalized candidate.
+ * @param {object} [input.context] Member planning context.
  * @returns {string|null} Rejection reason or null when acceptable.
  */
-export function specOpsVeto({ candidate = {} } = {}) {
-    if (!ATTACK_VARIANTS.has(candidate.variant)) return null;
+export function specOpsVeto({ candidate = {}, context = {} } = {}) {
+    const attack = ATTACK_VARIANTS.has(candidate.variant);
+    if (context.team?.task === "flank" && Number.isFinite(context.team.flankMinAngleDegrees)) {
+        return attack ? checkSpecOpsFlank(candidate, context).reason : "flank-attack-unavailable";
+    }
+    if (!attack) return null;
     const target = candidate.target;
     // A blast aim point on a last-known position is the deliberate
     // "room clearing" memory-strike — the planner only offers it when
@@ -905,10 +985,13 @@ export function evaluateSpecOps({
         && SPEC_OPS_TASK_WEIGHTS[context.team.task]
         ? context.team.task
         : null;
-    const cfg = { ...SPEC_OPS_CONFIG, ...(context.specOpsConfig ?? {}) };
+    const cfg = task && context.specOpsConfig
+        ? resolveSpecOpsConfig(context.specOpsConfig) : SPEC_OPS_CONFIG;
     const enriched = { ...factors };
     if (task === "flank") {
-        enriched.flankAngle = _flankAngle(candidate, context, cfg.flankMinAngleDegrees);
+        const { angle } = _flankGeometry(candidate, context);
+        const minAngle = context.team.flankMinAngleDegrees ?? cfg.flankMinAngleDegrees;
+        enriched.flankAngle = Math.round(_clamp01(angle / minAngle) * 1e4) / 1e4;
         enriched.flankProgress = _flankProgress(candidate, context);
     }
     if (task === "regroup") {
@@ -922,6 +1005,12 @@ export function evaluateSpecOps({
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
+    if (task === "support") effective.cover = cfg.supportWeight;
+    if (task === "flank") effective.flankAngle = cfg.flankWeight;
+    if (task === "assault") {
+        effective.attackAfterMove = (cfg.assaultWeight / SPEC_OPS_CONFIG.assaultWeight) * overlay.attackAfterMove;
+    }
+    if (task === "regroup") effective.cohesionRestore = cfg.cohesionWeight;
     const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,

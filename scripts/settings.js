@@ -50,6 +50,23 @@ import {
     SETTING_KEYS,
     TRACE_MODES
 } from "./constants.js";
+import {
+    SPEC_OPS_CONFIG,
+    SPEC_OPS_FALLBACK_PRESETS,
+    SPEC_OPS_NUMERIC_RANGES,
+    resolveSpecOpsConfig
+} from "./presets/spec-ops-config.js";
+
+const SPEC_OPS_SETTINGS = {
+    flankMinAngleDegrees: SETTING_KEYS.specOpsFlankMinAngleDegrees,
+    maxDetachedRounds: SETTING_KEYS.specOpsMaxDetachedRounds,
+    highThreatRatio: SETTING_KEYS.specOpsHighThreatRatio,
+    supportWeight: SETTING_KEYS.specOpsSupportWeight,
+    flankWeight: SETTING_KEYS.specOpsFlankWeight,
+    assaultWeight: SETTING_KEYS.specOpsAssaultWeight,
+    cohesionWeight: SETTING_KEYS.specOpsCohesionWeight,
+    fallbackPreset: SETTING_KEYS.specOpsFallbackPreset
+};
 
 /** Register the module's world settings. Called on `init`. */
 export function registerSettings() {
@@ -282,6 +299,21 @@ export function registerSettings() {
         range: { min: 1, max: 10, step: 0.5 },
         default: 2
     });
+
+    for (const [field, key] of Object.entries(SPEC_OPS_SETTINGS)) {
+        const range = SPEC_OPS_NUMERIC_RANGES[field];
+        game.settings.register(MODULE_ID, key, {
+            name: `OWAI.Settings.SpecOps.${field}.Name`,
+            hint: `OWAI.Settings.SpecOps.${field}.Hint`,
+            scope: "world",
+            config: true,
+            default: SPEC_OPS_CONFIG[field],
+            ...(range ? { type: Number, range: { ...range } } : {
+                type: String,
+                choices: Object.fromEntries(SPEC_OPS_FALLBACK_PRESETS.map(id => [id, `OWAI.Preset.${id}`]))
+            })
+        });
+    }
 }
 
 /**
@@ -326,6 +358,23 @@ export function getPreferredCohesion() {
     } catch(_err) {
         return DEFAULT_PREFERRED_COHESION;
     }
+}
+
+/**
+ * Resolve one snapshot of the world doctrine for a new Spec Ops plan.
+ * @param {object|null} [overrides] Explicit TeamPlan inputs (macros/tests).
+ * @returns {object}
+ */
+export function getSpecOpsConfig(overrides = null) {
+    const stored = {};
+    for (const [field, key] of Object.entries(SPEC_OPS_SETTINGS)) {
+        try {
+            stored[field] = globalThis.game?.settings?.get(MODULE_ID, key);
+        } catch(_err) {
+            // Before init the setting is not registered. Use its default.
+        }
+    }
+    return resolveSpecOpsConfig(overrides, stored);
 }
 
 /**

@@ -37,6 +37,7 @@ async function setup() {
 
   const ids = await page.evaluate(async (data) => {
     const scene = game.scenes.get(data.sceneId);
+    await scene.update({ tokenVision: true });
     const mk = async (actorId, x, y, disposition, extra = {}) => {
       const actor = game.actors.get(actorId);
       const proto = actor.prototypeToken.toObject();
@@ -99,6 +100,10 @@ async function testServiceRegistered() {
 }
 
 async function testLineOfSightAndTargets() {
+  await page.waitForFunction(id => canvas.ready && !canvas.loading
+    && canvas.visibility.tokenVision && canvas.tokens.get(id)?.hasSight, walledTokenId);
+  await page.evaluate(id => canvas.tokens.get(id).control(), walledTokenId);
+  await page.waitForFunction(id => canvas.tokens.get(id)?.vision?.active, walledTokenId);
   const result = await page.evaluate((data) => {
     const perception = game.modules.get('only-war-ai')?.api?.services?.get?.('perception');
     const npc = canvas.tokens.get(data.npcTokenId);
@@ -116,7 +121,7 @@ async function testLineOfSightAndTargets() {
     };
   }, { npcTokenId, openTokenId, walledTokenId, hiddenTokenId });
 
-  assert.equal(result.losOpen, true, 'open target has line of sight');
+  assert.equal(result.losOpen, true, 'NPC sees the open target even when the selected GM token cannot');
   assert.equal(result.losWalled, false, 'wall blocks line of sight');
   assert.deepEqual(result.ids, [openTokenId], 'only the visible hostile target is listed');
   assert.equal(result.hiddenInTargets, false, 'hidden token never leaks to targets');
@@ -124,6 +129,23 @@ async function testLineOfSightAndTargets() {
   for (const field of ['tokenId', 'tokenUuid', 'distance', 'disposition', 'canAttack']) {
     assert.ok(result.targetFields.includes(field), `target entry carries ${field}`);
   }
+}
+
+async function testViewerRange() {
+  const result = await page.evaluate(async data => {
+    const npc = canvas.tokens.get(data.npcTokenId);
+    const target = canvas.tokens.get(data.openTokenId);
+    const perception = game.modules.get('only-war-ai').api.services.get('perception');
+    await npc.document.update({ 'sight.range': 1 });
+    target.control();
+    try {
+      return perception.visibleTargets(npc).map(t => t.tokenId);
+    } finally {
+      target.release();
+      await npc.document.update({ 'sight.range': 200 });
+    }
+  }, { npcTokenId, openTokenId });
+  assert.deepEqual(result, [], 'GM selection does not expand the NPC sight range');
 }
 
 async function testMemoryLifecycle() {
@@ -239,6 +261,7 @@ async function cleanup() {
     await setup();
     await testServiceRegistered();
     await testLineOfSightAndTargets();
+    await testViewerRange();
     await testMemoryLifecycle();
     await testScoreDeterminism();
     console.log('perception.test.mjs PASSED');

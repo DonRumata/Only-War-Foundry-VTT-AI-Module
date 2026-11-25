@@ -64,11 +64,12 @@ export function _normalizeMove(raw, { selfPos, targetPos, grid, stay = false }) 
  * @param {object} input.targetPos
  * @param {object} input.grid
  * @param {number} input.budget Scene units.
+ * @param {object[]} [input.reservations] Cells claimed by other assignments.
  * @returns {object|null}
  */
-export function _resolveDetour({ navigation, tokenDoc, selfPos, targetPos, grid, budget }) {
+export function _resolveDetour({ navigation, tokenDoc, selfPos, targetPos, grid, budget, reservations }) {
     try {
-        const route = navigation?.planRoute?.(tokenDoc, targetPos, budget, { followDetour: true });
+        const route = navigation?.planRoute?.(tokenDoc, targetPos, budget, { followDetour: true, reservations });
         if (!(route?.pathProgress > 0) || !(route.waypoints?.length > 1)) return null;
         return _normalizeMove({
             ...route.endpoint,
@@ -144,6 +145,7 @@ export function _resolveMoves({ tokenDoc, target, range, bandRange = null,
                         includeCover: true,
                         perception,
                         rates: context.rates,
+                        reservations: context.reservations,
                         ...options
                     });
                 return result && result.status === "ok" && Array.isArray(result.candidates)

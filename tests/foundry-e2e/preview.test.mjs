@@ -4,7 +4,7 @@ import * as h from './lib.mjs';
 
 /**
  * E2E for the GM preview UI (issue #409): with executionMode=preview a
- * `runPlan` call parks the operation and opens the preview dialog on the
+ * tracker turn parks the real operation and opens the preview dialog on the
  * controller GM client; Confirm executes the plan (move + attack), Cancel
  * touches nothing and the timeout auto-cancels. Requires a running Foundry
  * (FOUNDRY_URL), Chrome with CDP (CDP_URL) and the only-war-ai module.
@@ -26,8 +26,7 @@ let npcTokenId;
 let enemyTokenId;
 let combatId;
 let combatantId;
-let previousMode;
-let previousTimeout;
+let previousSettings;
 
 async function setup() {
   browser = await chromium.connectOverCDP(h.CDP_URL);
@@ -42,24 +41,17 @@ async function setup() {
     await actor.update({ 'system.characteristics.agility.base': 40 });
     await actor.createEmbeddedDocuments('Item', [
       {
-        name: 'Auto Pistol',
+        name: 'Chainsword',
         type: 'weapon',
-        system: {
-          class: 'pistol',
-          range: 10,
-          damage: '1d10+2',
-          clip: { value: 6, max: 9 },
-          rateOfFire: { single: 1, semi: 0, full: 0 }
-        }
+        system: { class: 'melee', damage: '1d10+4' }
       }
     ]);
   });
   enemyId = await h.createTestActor(page, 'npc', names.enemy);
   sceneId = await h.createTestScene(page, { grid: 1, size: 100 });
   npcTokenId = await h.placeToken(page, sceneId, npcId, { x: 400, y: 500 });
-  // 12 m away — out of pistol range (10 m) so the assault preset must
-  // move before attacking; the half-move cap keeps it a legal combo.
-  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 1600, y: 500 });
+  // Out of melee reach, within a charge.
+  enemyTokenId = await h.placeToken(page, sceneId, enemyId, { x: 800, y: 500 });
 
   await page.evaluate(async (data) => {
     const scene = game.scenes.get(data.sceneId);
@@ -68,43 +60,59 @@ async function setup() {
   }, { sceneId, npcTokenId, enemyTokenId });
 
   combatId = await h.createCombat(page, [npcTokenId, enemyTokenId]);
-  combatantId = await page.evaluate((tid) =>
-    game.combat?.combatants?.find((c) => c.tokenId === tid)?.id ?? null, npcTokenId);
+  combatantId = await page.evaluate(async ({ combatId, npcTokenId }) => {
+    const combat = game.combats.get(combatId);
+    combat.getTimeDelta = () => 0;
+    await combat.updateEmbeddedDocuments('Combatant', combat.combatants.map(c => ({
+      _id: c.id, initiative: c.tokenId === npcTokenId ? 20 : 10
+    })));
+    return combat.combatants.find(c => c.tokenId === npcTokenId)?.id;
+  }, { combatId, npcTokenId });
   assert.ok(combatantId, 'npc combatant exists');
   await h.setOverride(page, {
     kind: 'combatant', id: combatantId, override: { mode: 'enabled', preset: 'assault' }
   });
 
   // Force preview mode for the whole test.
-  previousMode = await page.evaluate(async () => {
-    const mode = game.settings.get('only-war-ai', 'executionMode');
-    await game.settings.set('only-war-ai', 'executionMode', 'preview');
-    return mode;
-  });
-  previousTimeout = await page.evaluate(async () => {
-    const value = game.settings.get('only-war-ai', 'previewTimeoutSeconds');
-    await game.settings.set('only-war-ai', 'previewTimeoutSeconds', 0);
-    return value;
+  previousSettings = await page.evaluate(async () => {
+    const settings = { executionMode: 'preview', previewTimeoutSeconds: 0,
+      turnPacingMs: 0, damageWaitTimeoutSeconds: 1, damageWaitAutoAdvance: true };
+    const previous = Object.fromEntries(Object.keys(settings).map(key =>
+      [key, game.settings.get('only-war-ai', key)]));
+    for (const [key, value] of Object.entries(settings)) {
+      await game.settings.set('only-war-ai', key, value);
+    }
+    return previous;
   });
 }
 
-/** Call executor.runPlan and return the serializable result. */
-async function runPlan() {
-  return page.evaluate(async (data) => {
-    const executor = game.modules.get('only-war-ai')?.api?.services?.get('executor');
-    const combatant = game.combat?.combatants?.get(data.combatantId);
-    const outcome = await executor.runPlan({
-      combat: game.combat,
-      combatant,
-      operation: {
-        id: `e2e-preview-${foundry.utils.randomID()}`,
-        combatantId: data.combatantId,
-        phase: 'awaiting-preview'
-      },
-      seed: 1
-    });
-    return JSON.parse(JSON.stringify(outcome));
-  }, { combatantId });
+async function requestPreview() {
+  await page.evaluate(async ({ combatId, combatantId }) => {
+    const combat = game.combats.get(combatId);
+    if (combat.round === 0) {
+      await combat.update({ round: 1, turn: 0 });
+    } else {
+      // After cancellation the GM still owns that turn. Pass it and the
+      // opponent's turn to request a fresh, authoritative preview.
+      if (combat.combatant?.id === combatantId) await combat.nextTurn();
+      await combat.nextTurn();
+    }
+  }, { combatId, combatantId });
+  await page.waitForSelector(DIALOG, { state: 'visible', timeout: 15000 });
+}
+
+async function waitForCancellation() {
+  await page.waitForSelector(DIALOG, { state: 'detached', timeout: 10000 });
+  await page.waitForFunction(id =>
+    game.combats.get(id)?.getFlag('only-war-ai', 'operation')?.phase === 'cancelled',
+  combatId);
+}
+
+async function currentTurn() {
+  return page.evaluate(id => {
+    const combat = game.combats.get(id);
+    return [combat.round, combat.turn, combat.combatant?.id];
+  }, combatId);
 }
 
 async function npcPosition() {
@@ -119,11 +127,7 @@ async function npcPosition() {
 }
 
 async function testDialogAppears() {
-  const result = await runPlan();
-  assert.equal(result.status, 'preview', `expected preview, got ${result.status}`);
-  assert.ok(result.plan, 'plan returned for the GM');
-
-  await page.waitForSelector(DIALOG, { state: 'visible', timeout: 5000 });
+  await requestPreview();
   const content = await page.evaluate(() => {
     const dialog = document.querySelector('#ow-ai-preview');
     return {
@@ -165,21 +169,23 @@ async function testConfirmExecutes() {
   console.log(`confirm executed: token moved ${JSON.stringify(before)} -> ${JSON.stringify(after)}`);
 
   await page.waitForSelector(DIALOG, { state: 'detached', timeout: 5000 });
+  await page.waitForFunction(({ combatId, enemyTokenId }) =>
+    game.combats.get(combatId)?.combatant?.tokenId === enemyTokenId,
+  { combatId, enemyTokenId }, { timeout: 20000 });
 }
 
 async function testCancelDoesNothing() {
+  await requestPreview();
   const before = await npcPosition();
+  const turnBefore = await currentTurn();
   const messagesBefore = await page.evaluate(() => game.messages?.size ?? 0);
 
-  const result = await runPlan();
-  assert.equal(result.status, 'preview');
-  await page.waitForSelector(DIALOG, { state: 'visible', timeout: 5000 });
   await page.click(`${DIALOG} [data-action=cancel]`);
-  await page.waitForSelector(DIALOG, { state: 'detached', timeout: 5000 });
-  await page.waitForTimeout(1000);
+  await waitForCancellation();
 
   const after = await npcPosition();
   assert.deepEqual(after, before, 'cancel left the token in place');
+  assert.deepEqual(await currentTurn(), turnBefore, 'cancel kept the NPC turn');
   const messagesAfter = await page.evaluate(() => game.messages?.size ?? 0);
   assert.equal(messagesAfter, messagesBefore, 'cancel produced no chat cards');
   console.log('cancel touched no documents');
@@ -190,15 +196,12 @@ async function testTimeoutCancels() {
     await game.settings.set('only-war-ai', 'previewTimeoutSeconds', 3);
   });
   try {
+    await requestPreview();
     const before = await npcPosition();
-    const result = await runPlan();
-    assert.equal(result.status, 'preview');
-    await page.waitForSelector(DIALOG, { state: 'visible', timeout: 5000 });
-    // The 3 s timeout auto-cancels the preview.
-    await page.waitForSelector(DIALOG, { state: 'detached', timeout: 10000 });
-    await page.waitForTimeout(500);
-    const after = await npcPosition();
-    assert.deepEqual(after, before, 'timed-out preview left the token in place');
+    const turnBefore = await currentTurn();
+    await waitForCancellation();
+    assert.deepEqual(await npcPosition(), before, 'timed-out preview left the token in place');
+    assert.deepEqual(await currentTurn(), turnBefore, 'timed-out preview kept the NPC turn');
     console.log('timeout auto-cancelled the preview');
   } finally {
     await page.evaluate(async () => {
@@ -209,15 +212,12 @@ async function testTimeoutCancels() {
 
 async function cleanup() {
   try {
-    if (previousMode !== undefined) {
-      await page.evaluate(async (mode) => {
-        await game.settings.set('only-war-ai', 'executionMode', mode);
-      }, previousMode);
-    }
-    if (previousTimeout !== undefined) {
-      await page.evaluate(async (value) => {
-        await game.settings.set('only-war-ai', 'previewTimeoutSeconds', value);
-      }, previousTimeout);
+    if (previousSettings) {
+      await page.evaluate(async settings => {
+        for (const [key, value] of Object.entries(settings)) {
+          await game.settings.set('only-war-ai', key, value);
+        }
+      }, previousSettings);
     }
   } catch { /* best-effort */ }
   await h.closeAllWindows(page);
@@ -228,6 +228,7 @@ async function cleanup() {
 }
 
 (async () => {
+  let failed = false;
   try {
     await setup();
     await testDialogAppears();
@@ -235,12 +236,13 @@ async function cleanup() {
     await testCancelDoesNothing();
     await testTimeoutCancels();
     console.log('preview.test.mjs PASSED');
-    process.exit(0);
   } catch (err) {
+    failed = true;
     console.error('preview.test.mjs FAILED:', err);
     try { await h.screenshot(page, 'preview-failure'); } catch { /* ignore */ }
-    process.exit(1);
   } finally {
     await cleanup().catch(() => {});
+    await browser?.close();
   }
+  process.exit(failed ? 1 : 0);
 })();

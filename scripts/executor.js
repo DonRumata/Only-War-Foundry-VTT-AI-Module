@@ -467,6 +467,10 @@ export function createExecutorService({
     function _planContext(context, operation, replanCount, run = null) {
         return {
             ...(context.planContext ?? {}),
+            ...(run?.plan?.fallbackPreset ? {
+                fallbackPreset: run.plan.fallbackPreset,
+                layers: { ...context.planContext?.layers, commitment: false }
+            } : {}),
             operation: operation ?? context.operation ?? null,
             operationId: context.operationId ?? operation?.id ?? null,
             replanCount,
@@ -1145,7 +1149,6 @@ export function createExecutorService({
                     return result;
                 }
                 let planned = null;
-                const plannedContext = _planContext(context, context.operation, 0, run);
                 try {
                     planned = await planCurrentTurn(context, run);
                 } catch(err) {
@@ -1158,7 +1161,8 @@ export function createExecutorService({
                         reason: planned?.reason ?? EXECUTOR_REASONS.planFailed,
                         operationId
                     });
-                    await _finish(context, run, result, true);
+                    // Unsupported scenes remain under manual GM control.
+                    await _finish(context, run, result, planned?.status !== "unsupported");
                     _report(context, run, result);
                     return result;
                 }
@@ -1168,7 +1172,9 @@ export function createExecutorService({
                 // Issue #27: the replay capture rides the plan journal
                 // when `aiCaptureContext` is on — fire-and-forget, the
                 // flag write never delays the turn.
-                if (!run.plan.teamTurn) _capturePlanContext(context, run, plannedContext);
+                if (!run.plan.teamTurn) {
+                    _capturePlanContext(context, run, _planContext(context, context.operation, 0, run));
+                }
             }
 
             // Preview mode: preflight only — the operation stays in

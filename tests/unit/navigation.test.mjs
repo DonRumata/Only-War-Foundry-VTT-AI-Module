@@ -35,6 +35,7 @@ import {
     validateEndpointOnContext,
     wallBlocks
 } from "../../scripts/navigation.js";
+import { createFireteamService } from "../../scripts/fireteam.js";
 import { createPlannerService } from "../../scripts/planner.js";
 import { registerRangedCoverPreset } from "../../scripts/presets/ranged-cover.js";
 import { makeActor, makeCombat, makeCombatant } from "./fixtures.mjs";
@@ -733,6 +734,112 @@ test("difficult terrain: measured cost is authoritative for budget", () => {
     assert.ok(approximation.approximations.includes("difficult-terrain-not-modelled"));
 });
 
+test("terrain detours recover a longer affordable route for reachability, candidates and projected rejoin", async () => {
+    const token = mockToken();
+    const origin = { i: 1, j: 1 };
+    const goal = { i: 1, j: 3 };
+    let measurements = 0;
+    const context = contextFor(token, {
+        rows: 3, cols: 5, distance: 1, diagonals: "illegal",
+        measureCost: points => {
+            measurements++;
+            return points.slice(1).reduce((cost, point) =>
+                cost + (point.x === 250 && point.y === 150 ? 4 : 1), 0);
+        }
+    }, { origin });
+    const direct = planRouteOnContext(context, goal, 5);
+    assert.equal(direct.exact, true);
+    assert.equal(direct.cost, 5);
+    assert.equal(direct.waypoints.length, 3);
+    assert.equal(measurements, 1, "don't explore alternatives when the geometric route already fits");
+
+    const detour = planRouteOnContext(context, goal, 4);
+    assert.equal(detour.exact, true);
+    assert.equal(detour.reason, null);
+    assert.equal(detour.cost, 4);
+    assert.equal(detour.costCells, 4);
+    assert.deepEqual(detour.waypoints.map(({ i, j }) => [i, j]), [[1, 1], [0, 1], [0, 2], [0, 3], [1, 3]]);
+    assert.deepEqual(_sansTiming(planRouteOnContext(context, goal, 4)), _sansTiming(detour));
+    assert.equal(planRouteOnContext(context, goal, 3).exact, false, "the detour cannot cut diagonal corners");
+
+    const reachable = findReachableOnContext(context, 4);
+    assert.equal(reachable.cells.find(cell => cell.i === goal.i && cell.j === goal.j)?.cost, 4);
+    const limited = findReachableOnContext(context, 4, { maxVisited: 35 });
+    assert.equal(limited.limited, true);
+    assert.ok(limited.visitedNodes <= 35, "flood fill, verification and detours share the expansion bound");
+    assert.equal(limited.cells.some(cell => cell.i === goal.i && cell.j === goal.j), false);
+    const target = context.toPoint(goal);
+    const { candidates } = findCandidatesOnContext(context, 4, { target, count: 1 });
+    assert.deepEqual(candidates[0]?.waypoints, detour.waypoints);
+    assert.equal(candidates[0]?.cost, 4);
+    const rejoin = await createFireteamService().planRejoin(token, target, {
+        navigation: createNavigationService({ adapter: context.adapter }),
+        grid: context.grid, preferredCohesion: 0, rates: { full: 4 }, origin
+    });
+    assert.deepEqual(rejoin, { point: { ...target, ...goal }, cost: 4, route: detour.waypoints });
+    assert.deepEqual([token.x, token.y], [0, 0], "the projected route did not move the token");
+
+    const bounded = planRouteOnContext(context, goal, 4, { maxVisited: direct.visitedNodes + 1 });
+    assert.equal(bounded.reason, NAVIGATION_REASONS.searchLimit);
+    assert.equal(bounded.visitedNodes, direct.visitedNodes + 1);
+    assert.deepEqual(bounded.endpoint, direct.waypoints[1], "keep the verified partial if the retry hits its bound");
+});
+
+test("terrain detours measure the full alternating-diagonal prefix and respect swept reservations and walls", () => {
+    const scene = { grid: { type: 1, size: 100, distance: 1, diagonals: 5 }, width: 400, height: 300 };
+    const token = mockToken({ x: 100, y: 100 });
+    // Native v13 shape of the placeable API, with ALTERNATING_2 (2, 1).
+    // Resetting phase for each edge would price this detour at 4.5 instead of 3.25.
+    token.object = {
+        createTerrainMovementPath: points => points.map(p => ({
+            ...p, terrain: p.y !== 100 ? 1 : (p.x === 200 ? Infinity : (p.x === 300 ? 1.25 : 1))
+        })),
+        measureMovementPath: points => {
+            let diagonals = 0;
+            let cost = 0;
+            for (let k = 1; k < points.length; k++) {
+                const from = points[k - 1];
+                const to = points[k];
+                const diagonal = from.x !== to.x && from.y !== to.y;
+                cost += (diagonal ? 2 - (diagonals++ % 2) : 1) * to.terrain;
+            }
+            return { cost };
+        }
+    };
+    const adapter = createGridAdapter({ canvas: {
+        scene,
+        walls: { placeables: [{ document: mockWall([200, 200, 200, 300]) }] }
+    } });
+    const navigation = createNavigationService({ adapter });
+    const goal = { i: 1, j: 3 };
+    const route = navigation.planRoute(token, goal, 3.25);
+    assert.equal(route.exact, true);
+    assert.deepEqual(route.waypoints.map(({ i, j }) => [i, j]), [[1, 1], [0, 2], [1, 3]]);
+    assert.equal(route.cost, 3.25);
+    assert.equal(route.costCells, 3);
+    assert.equal(navigation.measurePath(token, route.waypoints).cost, route.cost);
+    assert.equal(navigation.measurePath(token, [{ i: 1, j: 1 }, { i: 1, j: 2 }]).status, "failed");
+    const cell = navigation.findReachable(token, 3.25).cells.find(({ i, j }) => i === goal.i && j === goal.j);
+    assert.equal(cell?.cost, 3.25, "return measured scene units, not the geometric distance");
+    const move = navigation.findCandidates(token, 3.25, { target: route.endpoint, count: 1 }).candidates[0];
+    assert.equal(move?.cost, 3.25);
+    assert.deepEqual(move?.waypoints, route.waypoints);
+
+    const reserved = navigation.planRoute(token, goal, 3.25, { reservations: [{ i: 0, j: 1 }] });
+    assert.equal(reserved.exact, false, "a swept corner blocks the upper detour; the wall blocks the lower one");
+    assert.equal(reserved.reason, NAVIGATION_REASONS.budgetExceeded);
+});
+
+test("a measured zero is not replaced by the geometric cost", () => {
+    const context = contextFor(mockToken(), { distance: 1, measureCost: () => 0 });
+    const route = planRouteOnContext(context, { i: 0, j: 1 }, 1);
+    assert.equal(route.exact, true);
+    assert.equal(route.cost, 0);
+    assert.equal(route.costCells, 1);
+    assert.equal(planRouteOnContext(context, { i: 0, j: 1 }, 0).exact, false);
+    assert.equal(planRouteOnContext(context, { i: 0, j: 0 }, 0).exact, true);
+});
+
 test("difficult terrain also limits partial routes and never stops on an occupied prefix", () => {
     const token = mockToken();
     const context = contextFor(token, {
@@ -769,6 +876,32 @@ test("findReachable exposes measured costs, not unaffordable geometric cells", (
     const result = findReachableOnContext(context, 3);
     assert.deepEqual(result.cells.map(({ j, cost }) => [j, cost]), [[0, 0], [1, 2]]);
     assert.deepEqual(findReachableOnContext(context, 3), result);
+});
+
+test("findReachable shares its expansion limit with route cost verification", () => {
+    const context = contextFor(mockToken(), { rows: 1, cols: 10, distance: 1 });
+    const result = findReachableOnContext(context, 10, { maxVisited: 15 });
+    assert.equal(result.limited, true);
+    assert.ok(result.visitedNodes <= 15);
+    assert.deepEqual(result.cells.map(cell => cell.j), [0, 1]);
+});
+
+test("routes from a projected origin respect transit reservations and measured cost", () => {
+    const token = mockToken({ x: 0, y: 0 });
+    const service = serviceFor({
+        rows: 1, cols: 6, distance: 1, measureCost: points => (points.length - 1) * 2
+    });
+    const origin = { i: 0, j: 4 };
+    const destination = { i: 0, j: 2 };
+    const route = service.planRoute(token, destination, 4, { origin });
+    assert.ok(route.exact);
+    assert.deepEqual(route.waypoints.map(wp => wp.j), [4, 3, 2]);
+    assert.equal(route.cost, 4);
+    assert.equal(service.planRoute(token, destination, 3, { origin }).exact, false);
+    assert.equal(service.planRoute(token, destination, 4, {
+        origin, reservations: [{ i: 0, j: 3 }]
+    }).exact, false, "a reserved transit cell breaks the only return corridor");
+    assert.deepEqual([token.x, token.y], [0, 0], "projection does not move the document");
 });
 
 test("A* core: deterministic order and visited bound", () => {

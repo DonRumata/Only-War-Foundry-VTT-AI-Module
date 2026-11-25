@@ -78,6 +78,7 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
     }
     const attacks = action && target && ATTACK_VARIANTS.has(variant);
     if (attacks) {
+        const rememberedBlast = candidate.aim && target.canAttack !== true;
         steps.push({
             id: `step-${action.type === "attack" ? "attack" : "test"}-${steps.length + 1}`,
             type: action.type === "attack" ? "attack" : "test",
@@ -86,8 +87,8 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                 actionId: action.id,
                 name: action.name,
                 itemUuid: action.itemUuid,
-                targetTokenUuid: target.tokenUuid,
-                targetTokenId: target.tokenId,
+                targetTokenUuid: rememberedBlast ? null : target.tokenUuid,
+                targetTokenId: rememberedBlast ? null : target.tokenId,
                 range: _actionRange(action),
                 ...(action.attackType ? { attackType: action.attackType } : {}),
                 ...(variant === "charge" ? { mode: "charge" } : {}),

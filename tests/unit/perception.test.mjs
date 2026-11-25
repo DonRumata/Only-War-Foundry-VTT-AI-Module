@@ -117,13 +117,14 @@ function mockCombatant(tokenDoc) {
  * @param {object} [options]
  * @param {object[]} [options.tokens]
  * @param {object[]} [options.walls]
- * @param {Function|null} [options.testVisibility] Mock for the v13 layer.
+ * @param {Function|null} [options.testVisibility] Mock on each viewer token.
  * @param {object} [options.effects] Legacy `canvas.effects` mock.
  * @param {object} [options.scene]
  * @returns {Function}
  */
 function installCanvas({ tokens = [], walls = [], testVisibility = null, effects = null, scene = null } = {}) {
     const previous = globalThis.canvas;
+    if (testVisibility) for (const token of tokens) token.testVisibility = testVisibility;
     const collection = {
         contents: tokens,
         placeables: tokens,
@@ -142,7 +143,6 @@ function installCanvas({ tokens = [], walls = [], testVisibility = null, effects
         walls: { contents: walls, placeables: walls },
         grid: { measureDistance: (a, b) => Math.hypot(a.x - b.x, a.y - b.y) / 100 * 1.5 },
         dimensions: { size: 100, distance: 1.5 },
-        visibility: testVisibility ? { testVisibility } : undefined,
         effects: effects ?? undefined
     };
     return () => {
@@ -185,7 +185,7 @@ test("isHostileDisposition: opposite signs, neutral excluded by default", () => 
 /* Line of sight adapters                                                     */
 /* ------------------------------------------------------------------------- */
 
-test("hasLineOfSight uses the v13 canvas.visibility layer with viewer object", () => {
+test("hasLineOfSight uses a viewer-local visibility test", () => {
     const viewer = mockToken({ id: "viewer", x: 0, y: 0 });
     const target = mockToken({ id: "target", x: 300, y: 0 });
     const calls = [];
@@ -200,7 +200,7 @@ test("hasLineOfSight uses the v13 canvas.visibility layer with viewer object", (
         assert.equal(hasLineOfSight(viewer, target), true);
         assert.equal(calls.length, 1);
         assert.deepEqual(calls[0].point, { x: 350, y: 50 });
-        assert.equal(calls[0].options.object, viewer);
+        assert.equal(calls[0].options.tolerance, 2);
 
         const far = mockToken({ id: "far", x: 900, y: 0 });
         assert.equal(hasLineOfSight(viewer, far), false);
@@ -209,7 +209,7 @@ test("hasLineOfSight uses the v13 canvas.visibility layer with viewer object", (
     }
 });
 
-test("hasLineOfSight falls back to canvas.effects.visibility (legacy path)", () => {
+test("a viewer does not inherit the active user's canvas visibility", () => {
     const viewer = mockToken({ x: 0, y: 0 });
     const target = mockToken({ x: 300, y: 0 });
     const restore = installCanvas({
@@ -217,7 +217,7 @@ test("hasLineOfSight falls back to canvas.effects.visibility (legacy path)", () 
         effects: { visibility: { testVisibility: () => false } }
     });
     try {
-        assert.equal(hasLineOfSight(viewer, target), false);
+        assert.equal(hasLineOfSight(viewer, target), true);
     } finally {
         restore();
     }

@@ -17,11 +17,10 @@
  *   `canvas.walls.checkCollision` (v13) vs `CONFIG.Canvas.polygonBackends`
  *   / manual geometry (v12+), `measureDistance` (v13) vs `measurePath`
  *   (v14) and the `GridOffset` point conversion APIs.
- * - Difficult terrain: when the platform exposes a token movement-cost
- *   function (`TokenDocument#measureMovementPath`, v13+) the measured cost
- *   is authoritative for the budget check; the internal A* heuristic stays
- *   geometric. Without such an API the cost is approximated and the result
- *   is flagged via `approximations`.
+ * - Difficult terrain: the native token movement-cost API verifies the
+ *   geometric route. If it is too expensive, a bounded retry searches
+ *   alternate paths with measured prefix costs. Without this API the cost
+ *   is approximated and the result is flagged via `approximations`.
  * - Results are deterministic for an identical scene snapshot: neighbour
  *   order, priority-queue tie-breaks and candidate sorting are fixed, and
  *   each result carries a `revision` fingerprint of the inputs.
@@ -76,6 +75,9 @@ export const DEFAULT_SEARCH_LIMIT = 20000;
 
 /** Bound the optional search beyond the current turn's movement budget. */
 const DETOUR_SEARCH_LIMIT = 1024;
+
+/** Bound native prefix measurements when the geometric route is too expensive. */
+const MEASURED_DETOUR_SEARCH_LIMIT = 128;
 
 /** Default bound for returned reachable cells and candidates. */
 export const DEFAULT_RESULT_LIMIT = 512;
@@ -551,10 +553,10 @@ export function searchRoute(input) {
         const node = heap.pop();
         const key = offsetKey(node.offset);
         if (node.g > (gScore.get(key) ?? Infinity) + EPSILON) continue;
-        visited++;
-        if (visited > maxVisited) {
+        if (visited >= maxVisited) {
             return { status: "limit", path: null, cost: null, visited, best, limited: true };
         }
+        visited++;
 
         if (canStop(node.offset)) {
             if (node.h < best.h - EPSILON
@@ -633,17 +635,17 @@ export function floodReachable(input) {
         const node = heap.pop();
         const key = offsetKey(node.offset);
         if (node.g > (gScore.get(key) ?? Infinity) + EPSILON) continue;
-        visited++;
-        if (visited > maxVisited) {
+        if (visited >= maxVisited) {
             limited = true;
             break;
         }
+        visited++;
         if (canStop(node.offset)) {
             if (cells.length >= limit) {
-                // Keep visiting for the counter but stop collecting.
-            } else {
-                cells.push({ i: node.offset.i, j: node.offset.j, cost: node.g });
+                limited = true;
+                break;
             }
+            cells.push({ i: node.offset.i, j: node.offset.j, cost: node.g });
         }
         for (const next of getNeighbors(node.offset)) {
             const nextKey = offsetKey(next);
@@ -991,9 +993,8 @@ export function createGridAdapter(env = {}) {
 
     /**
      * Authoritative movement-cost measurement of a serialized waypoint
-     * list: `TokenDocument#measureMovementPath` (v13+, honours difficult
-     * terrain configured through region behaviours), `canvas.grid.
-     * measurePath` (v12+/v14), then `measureDistance` per segment (v13).
+     * list: the placeable token's measurement includes terrain costs.
+     * The document method without a cost callback only measures distance.
      * Returns null when no API answered — callers fall back to the
      * geometric edge-cost sum.
      * @param {object|null} tokenDoc
@@ -1003,21 +1004,22 @@ export function createGridAdapter(env = {}) {
     function measurePathCost(tokenDoc, points) {
         if (!Array.isArray(points) || points.length < 2) return 0;
         const input = points.map(p => ({ x: p.x, y: p.y }));
-        try {
-            if (typeof tokenDoc?.measureMovementPath === "function") {
-                // Like TokenDocument.move, token measurement expects
-                // document top-lefts, not the plan's footprint centres.
-                const size = describe()?.size ?? 100;
-                const dx = (tokenDoc.width ?? 1) * size / 2;
-                const dy = (tokenDoc.height ?? 1) * size / 2;
-                const result = tokenDoc.measureMovementPath(input.map(p => ({
-                    x: p.x - dx, y: p.y - dy
-                })));
-                const cost = result?.cost ?? result?.distance;
-                if (Number.isFinite(cost)) return cost;
+        if (tokenDoc) {
+            const size = describe()?.size ?? 100;
+            const dx = (tokenDoc.width ?? 1) * size / 2;
+            const dy = (tokenDoc.height ?? 1) * size / 2;
+            const documentPoints = input.map(p => ({ x: p.x - dx, y: p.y - dy }));
+            const placeable = tokenDoc.object;
+            for (const token of [placeable, tokenDoc]) {
+                try {
+                    const withTerrain = token?.createTerrainMovementPath?.(documentPoints) ?? documentPoints;
+                    const result = token?.measureMovementPath?.(withTerrain);
+                    const cost = result?.cost ?? result?.distance;
+                    if (Number.isFinite(cost) || (token === placeable && cost === Infinity)) return cost;
+                } catch(_err) {
+                    // Fall through to the next measurement adapter.
+                }
             }
-        } catch(_err) {
-            // Fall through to the grid measurement.
         }
         const g = grid();
         try {
@@ -1048,14 +1050,15 @@ export function createGridAdapter(env = {}) {
 
     /**
      * Whether the platform can account for difficult terrain: a v13+ token
-     * movement-cost path (`measureMovementPath` on token documents plus a
+     * movement-cost path (`measureMovementPath` on placeables plus a
      * modify-movement-cost region behaviour) or a known terrain module.
      * @param {object|null} tokenDoc
      * @returns {boolean}
      */
     function supportsTerrain(tokenDoc = null) {
         try {
-            if (typeof tokenDoc?.measureMovementPath === "function"
+            if (typeof tokenDoc?.object?.measureMovementPath === "function"
+                && typeof tokenDoc.object.createTerrainMovementPath === "function"
                 && globalThis.foundry?.data?.regionBehaviors?.ModifyMovementCostRegionBehaviorType) {
                 return true;
             }
@@ -1140,6 +1143,34 @@ export function footprintCells(offset, footprint) {
 }
 
 /**
+ * Grid cells claimed by a token along adjacent route waypoints. Include
+ * the corners of a diagonal sweep, not just the start/end footprints.
+ * @param {object} token Token document or a footprint-bearing snapshot.
+ * @param {object[]} waypoints Grid offsets, optionally with pixel coordinates.
+ * @returns {object[]} Unique offsets.
+ */
+export function movementCells(token, waypoints) {
+    const w = Math.max(1, Math.round(token?.width ?? 1));
+    const h = Math.max(1, Math.round(token?.height ?? 1));
+    const cells = new Map();
+    let previous = null;
+    for (const point of waypoints ?? []) {
+        if (!Number.isInteger(point?.i) || !Number.isInteger(point?.j)) {
+            previous = null;
+            continue;
+        }
+        const adjacent = previous && Math.abs(point.i - previous.i) <= 1
+            && Math.abs(point.j - previous.j) <= 1;
+        const from = adjacent ? previous : point;
+        const offset = { i: Math.min(point.i, from.i), j: Math.min(point.j, from.j) };
+        const swept = { w: w + Math.abs(point.j - from.j), h: h + Math.abs(point.i - from.i) };
+        for (const cell of footprintCells(offset, swept)) cells.set(offsetKey(cell), cell);
+        previous = point;
+    }
+    return [...cells.values()];
+}
+
+/**
  * Build the search context for a token on the active scene: grid
  * descriptor, footprint, origin offset, bounds, reservations and the
  * primitive callbacks the pure search operates on.
@@ -1150,6 +1181,8 @@ export function footprintCells(offset, footprint) {
  *   crossed but not stood on) or "block" (treat as walls).
  * @param {Array} [options.reservations] Extra blocked cells: offsets
  *   `{i, j}` or `"i,j"` keys.
+ * @param {object} [options.origin] Project a route from this grid offset
+ *   instead of the live token position, without changing the document.
  * @returns {object} `{status, reason?, ...context}`.
  */
 export function buildNavigationContext(token, options = {}) {
@@ -1167,7 +1200,8 @@ export function buildNavigationContext(token, options = {}) {
         };
     }
     const doc = _tokenDoc(token);
-    const origin = doc
+    const projected = Number.isInteger(options.origin?.i) && Number.isInteger(options.origin?.j);
+    const origin = projected ? { i: options.origin.i, j: options.origin.j } : doc
         ? adapter.toOffset({
             x: doc._source?.x ?? doc.x ?? token?.object?.x,
             y: doc._source?.y ?? doc.y ?? token?.object?.y
@@ -1196,10 +1230,12 @@ export function buildNavigationContext(token, options = {}) {
         const fp = _footprintOf(other, adapter);
         for (const cell of footprintCells(o, fp)) reservations.add(offsetKey(cell));
     }
+    const blocked = new Set();
     for (const entry of options.reservations ?? []) {
-        if (typeof entry === "string") reservations.add(entry);
-        else if (Number.isFinite(entry?.i) && Number.isFinite(entry?.j)) reservations.add(offsetKey(entry));
+        if (typeof entry === "string") blocked.add(entry);
+        else if (Number.isFinite(entry?.i) && Number.isFinite(entry?.j)) blocked.add(offsetKey(entry));
     }
+    for (const key of blocked) reservations.add(key);
 
     const size = grid.size;
     const fw = footprint.w * size;
@@ -1249,6 +1285,9 @@ export function buildNavigationContext(token, options = {}) {
      */
     function canStand(offset) {
         if (!fitsInside(offset)) return false;
+        if (blocked.size && footprintCells(offset, footprint).some(cell => blocked.has(offsetKey(cell)))) {
+            return false;
+        }
         if (occupiedPolicy === OCCUPIED_POLICIES.block && isReserved(offset)) return false;
         return true;
     }
@@ -1270,6 +1309,9 @@ export function buildNavigationContext(token, options = {}) {
      * @returns {boolean}
      */
     function isOpen(from, to) {
+        if (blocked.size && movementCells(doc, [from, to]).some(cell => blocked.has(offsetKey(cell)))) {
+            return false;
+        }
         const a = footprintCenter(from);
         const b = footprintCenter(to);
         if (!a || !b) return false;
@@ -1294,10 +1336,14 @@ export function buildNavigationContext(token, options = {}) {
         return diagonal ? diagCost : 1;
     }
 
-    const center = {
+    const center = projected ? footprintCenter(origin) : {
         x: (doc._source?.x ?? doc.x) + (fw / 2),
         y: (doc._source?.y ?? doc.y) + (fh / 2)
     };
+
+    if (!center || (projected && !canStand(origin))) {
+        return { status: NAVIGATION_STATUS.failed, reason: NAVIGATION_REASONS.invalidInput };
+    }
 
     return {
         status: NAVIGATION_STATUS.ok,
@@ -1392,39 +1438,107 @@ function _serializePath(path, context) {
 }
 
 /**
+ * Read the native cost, retaining zero and the impassable Infinity sentinel.
+ * @param {object} context
+ * @param {object[]} points Pixel waypoints.
+ * @returns {number|null}
+ */
+function _measuredCost(context, points) {
+    const cost = context.measureCost?.(points);
+    return typeof cost === "number" && cost >= 0 ? cost : null;
+}
+
+/**
  * Keep the longest stoppable prefix inside both the grid and platform
  * movement budgets. A reserved cell may be traversed but not end a turn.
  * @param {object[]} path Grid offsets including the start.
  * @param {number} costCells Geometric cost of the original path.
  * @param {object} context
  * @param {number} budgetCells
- * @returns {{waypoints: object[], costCells: number, cost: number}}
+ * @returns {{waypoints: object[], costCells: number, cost: number, overBudget?: boolean}}
  */
 function _fitRouteToBudget(path, costCells, context, budgetCells) {
     const waypoints = _serializePath(path, context);
     const distance = context.grid.distance;
     const budget = budgetCells * distance;
     const points = waypoints.map(({ x, y }) => ({ x, y }));
-    const measure = (length, cells) => {
-        const measured = context.measureCost?.(length === points.length ? points : points.slice(0, length));
-        return Number.isFinite(measured) ? measured : cells * distance;
-    };
     if (waypoints.length < 2) return { waypoints, costCells: 0, cost: 0 };
+    let overBudget = false;
     if (costCells <= budgetCells + EPSILON && context.canStop(path.at(-1))) {
-        const cost = measure(waypoints.length, costCells);
-        if (cost <= budget + EPSILON) return { waypoints, costCells, cost };
+        const measured = _measuredCost(context, points);
+        const cost = measured ?? costCells * distance;
+        if (Number.isFinite(cost) && cost <= budget + EPSILON) return { waypoints, costCells, cost };
+        overBudget = measured !== null;
     }
     let best = { waypoints: waypoints.slice(0, 1), costCells: 0, cost: 0 };
     let cells = 0;
-    for (let index = 1; index < path.length; index++) {
+    for (let index = 1; index < path.length - 1; index++) {
         cells += cellPathCost(path[index - 1], path[index], context.grid);
         if (cells > budgetCells + EPSILON) break;
         if (!context.canStop(path[index])) continue;
-        const cost = measure(index + 1, cells);
-        if (cost > budget + EPSILON) break;
+        const cost = _measuredCost(context, points.slice(0, index + 1)) ?? cells * distance;
+        if (!Number.isFinite(cost) || cost > budget + EPSILON) break;
         best = { waypoints: waypoints.slice(0, index + 1), costCells: cells, cost };
     }
-    return best;
+    return { ...best, overBudget };
+}
+
+/**
+ * Try alternative simple paths after the geometric route fails measurement.
+ * Measure from the start, not edge by edge: e.g. Foundry carries the cost
+ * phase of alternating diagonals across the whole path. Do not merge
+ * prefixes at the same offset: they can have different future costs.
+ * Geometry orders the queue but is not a lower bound on measured cost
+ * (terrain can discount movement). Each popped prefix uses at most one
+ * native measurement, including the exact path returned on success.
+ * @param {object} context
+ * @param {object} goal
+ * @param {number} budget Scene units.
+ * @param {number} maxVisited Remaining expansion bound.
+ * @returns {object} `{visited, limited, fitted?}`.
+ */
+function _findMeasuredDetour(context, goal, budget, maxVisited) {
+    const heap = new _MinHeap();
+    const distance = context.grid.distance;
+    const estimate = offset => cellPathCost(offset, goal, context.grid) * distance;
+    const start = context.origin.offset;
+    const h = estimate(start);
+    let serial = 0;
+    let visited = 0;
+    heap.push({ f: h, h, serial: serial++, offset: start, costCells: 0, previous: null });
+
+    while (heap.size) {
+        if (visited >= maxVisited) return { visited, limited: true };
+        const node = heap.pop();
+        visited++;
+        const path = [];
+        for (let step = node; step; step = step.previous) path.push(step.offset);
+        const waypoints = _serializePath(path.reverse(), context);
+        const cost = node.previous ? _measuredCost(context, waypoints.map(({ x, y }) => ({ x, y }))) : 0;
+        // Native costs accumulate nonnegative segments; extending this
+        // prefix cannot make it affordable if it is already over budget.
+        if (!Number.isFinite(cost) || cost > budget + EPSILON) continue;
+        if (node.offset.i === goal.i && node.offset.j === goal.j && context.canStop(node.offset)) {
+            return { visited, limited: false, fitted: { waypoints, costCells: node.costCells, cost } };
+        }
+
+        for (const next of context.neighbors(node.offset)) {
+            const step = context.edgeCost(node.offset, next, next.diagonal === true);
+            if (!Number.isFinite(step) || !context.canStand(next)) continue;
+            if (path.some(({ i, j }) => i === next.i && j === next.j)) continue;
+            if (!context.isOpen(node.offset, next)) continue;
+            const remaining = estimate(next);
+            heap.push({
+                f: cost + (step * distance) + remaining,
+                h: remaining,
+                serial: serial++,
+                offset: next,
+                costCells: node.costCells + step,
+                previous: node
+            });
+        }
+    }
+    return { visited, limited: false };
 }
 
 /**
@@ -1467,6 +1581,9 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
         || !context.moveBlocked(context.origin.point, goalPoint))) {
         return _failure(NAVIGATION_REASONS.pathNotFound, { sceneId: context.sceneId });
     }
+    const maxVisited = followDetour
+        ? Math.min(DETOUR_SEARCH_LIMIT, options.maxVisited ?? DETOUR_SEARCH_LIMIT)
+        : (options.maxVisited ?? DEFAULT_SEARCH_LIMIT);
     const result = searchRoute({
         start,
         goal,
@@ -1481,10 +1598,9 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
             : context.canStop,
         heuristic: offset => heuristicCells(offset, goal, context.grid),
         budget: followDetour ? Infinity : budgetCells,
-        maxVisited: followDetour
-            ? Math.min(DETOUR_SEARCH_LIMIT, options.maxVisited ?? DETOUR_SEARCH_LIMIT)
-            : (options.maxVisited ?? DEFAULT_SEARCH_LIMIT)
+        maxVisited
     });
+    let visitedNodes = result.visited;
 
     const distance = context.grid.distance;
     const budgetMeters = budgetCells * distance;
@@ -1507,10 +1623,10 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
      * @param {object[]} path
      * @param {number} costCells
      * @param {object} meta `{status, reason, exact}`
+     * @param {object} [fitted] Already budget-verified path, if available.
      * @returns {object}
      */
-    function _result(path, costCells, meta) {
-        const fitted = _fitRouteToBudget(path, costCells, context, budgetCells);
+    function _result(path, costCells, meta, fitted = _fitRouteToBudget(path, costCells, context, budgetCells)) {
         const { waypoints } = fitted;
         const trimmed = waypoints.length < path.length;
         const status = trimmed
@@ -1529,7 +1645,7 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
             endpoint,
             exact: !trimmed && meta.exact === true,
             partial: status === NAVIGATION_STATUS.partial,
-            visitedNodes: result.visited,
+            visitedNodes,
             ms: Math.round((_now() - started) * 100) / 100,
             revision,
             approximations,
@@ -1543,9 +1659,23 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
     }
 
     if (result.status === "found") {
-        const reason = followDetour && result.cost <= budgetCells + EPSILON && !context.canStop(goal)
+        let reason = followDetour && result.cost <= budgetCells + EPSILON && !context.canStop(goal)
             ? NAVIGATION_REASONS.endpointOccupied : null;
-        return _result(result.path, result.cost, { status: NAVIGATION_STATUS.ok, exact: true, reason });
+        const fitted = _fitRouteToBudget(result.path, result.cost, context, budgetCells);
+        // Only retry a stoppable goal that had a complete route within
+        // the geometric budget. In particular, keep followDetour's partial
+        // approach when it deliberately routes beyond this turn's budget.
+        if (fitted.overBudget) {
+            const detour = _findMeasuredDetour(context, goal, budgetMeters,
+                Math.min(MEASURED_DETOUR_SEARCH_LIMIT, maxVisited - visitedNodes));
+            visitedNodes += detour.visited;
+            if (detour.fitted) {
+                return _result(detour.fitted.waypoints, detour.fitted.costCells,
+                    { status: NAVIGATION_STATUS.ok, exact: true }, detour.fitted);
+            }
+            if (detour.limited) reason = NAVIGATION_REASONS.searchLimit;
+        }
+        return _result(result.path, result.cost, { status: NAVIGATION_STATUS.ok, exact: true, reason }, fitted);
     }
 
     if (result.status === "limit") {
@@ -1671,15 +1801,23 @@ function _geometricReachable(context, budgetCells, options = {}) {
 export function findReachableOnContext(context, budgetCells, options = {}) {
     const reachable = _geometricReachable(context, budgetCells, options);
     if (reachable.status !== NAVIGATION_STATUS.ok || !context.measureCost) return reachable;
+    const maxVisited = options.maxVisited ?? DEFAULT_SEARCH_LIMIT;
     let visitedNodes = reachable.visitedNodes;
+    let limited = reachable.limited;
     const cells = [];
     for (const cell of reachable.cells) {
-        const route = planRouteOnContext(context, cell, budgetCells, options);
+        const remaining = maxVisited - visitedNodes;
+        if (remaining <= 0) {
+            limited = true;
+            break;
+        }
+        const route = planRouteOnContext(context, cell, budgetCells, { maxVisited: remaining });
         visitedNodes += route.visitedNodes ?? 0;
         if (route.exact) cells.push({ ...cell, cost: route.cost, costCells: route.costCells });
+        if (route.reason === NAVIGATION_REASONS.searchLimit) limited = true;
     }
     cells.sort((a, b) => (a.cost - b.cost) || (a.i - b.i) || (a.j - b.j));
-    return _deepFreeze({ ...reachable, cells, visitedNodes });
+    return _deepFreeze({ ...reachable, cells, visitedNodes, limited });
 }
 
 /**
@@ -1709,7 +1847,8 @@ export function findCandidatesOnContext(context, budgetCells, options = {}) {
         return _failure(NAVIGATION_REASONS.invalidInput);
     }
     const weights = { ...DEFAULT_CANDIDATE_WEIGHTS, ...(options.weights ?? {}) };
-    const targetDoc = _tokenDoc(options.target);
+    const target = _tokenDoc(options.target);
+    const targetDoc = target?.documentName === "Token" || Number.isFinite(target?.width) ? target : null;
     const targetPoint = targetDoc && Number.isFinite(targetDoc.x)
         ? {
             x: targetDoc.x + ((targetDoc.width ?? 1) * context.grid.size / 2),
@@ -2149,6 +2288,9 @@ export function createNavigationService({ api = null, adapter = null } = {}) {
         }
         const points = offsets.map(o => context.toPoint(o));
         const measured = context.measureCost?.(points);
+        if (measured === Infinity) {
+            return _failure(NAVIGATION_REASONS.budgetExceeded, { sceneId: context.sceneId });
+        }
         return _deepFreeze({
             status: NAVIGATION_STATUS.ok,
             cost: Number.isFinite(measured) ? measured : cells * context.grid.distance,

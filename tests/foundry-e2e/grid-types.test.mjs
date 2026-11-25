@@ -28,6 +28,7 @@ let npcId;
 let enemyId;
 let hexSceneId;
 let gridlessSceneId;
+let gridlessCombatId;
 let npcTokenId;
 let enemyTokenId;
 let combatId;
@@ -169,7 +170,7 @@ async function testGridlessRejected() {
     gridlessSceneId = await h.createTestScene(page, { grid: 0, size: 100 });
     const gNpcToken = await h.placeToken(page, gridlessSceneId, npcId, { x: 400, y: 500 });
     const gEnemyToken = await h.placeToken(page, gridlessSceneId, enemyId, { x: 900, y: 500 });
-    const gCombatId = await h.createCombat(page, [gNpcToken, gEnemyToken]);
+    gridlessCombatId = await h.createCombat(page, [gNpcToken, gEnemyToken]);
     const gCombatantId = await page.evaluate((tid) =>
         game.combat?.combatants?.find((c) => c.tokenId === tid)?.id ?? null, gNpcToken);
     assert.ok(gCombatantId, 'npc combatant exists on gridless scene');
@@ -182,6 +183,7 @@ async function testGridlessRejected() {
         const combatant = game.combat?.combatants?.get(data.cid);
         const tokenBefore = { ...canvas.scene.tokens.get(data.tid)?._source };
         const messagesBefore = game.messages?.size ?? 0;
+        const turnBefore = [game.combat.round, game.combat.turn];
         let planned;
         let planError = null;
         try {
@@ -193,7 +195,9 @@ async function testGridlessRejected() {
         let execError = null;
         try {
             const mode = game.settings.get('only-war-ai', 'executionMode');
+            const diagnostics = game.settings.get('only-war-ai', 'diagnosticsEnabled');
             await game.settings.set('only-war-ai', 'executionMode', 'automatic');
+            await game.settings.set('only-war-ai', 'diagnosticsEnabled', false);
             try {
                 executed = await api.services.get('executor').runPlan({
                     combat: game.combat,
@@ -207,6 +211,7 @@ async function testGridlessRejected() {
                 });
             } finally {
                 await game.settings.set('only-war-ai', 'executionMode', mode);
+                await game.settings.set('only-war-ai', 'diagnosticsEnabled', diagnostics);
             }
         } catch (err) {
             execError = String(err?.message ?? err);
@@ -215,6 +220,7 @@ async function testGridlessRejected() {
         return JSON.parse(JSON.stringify({
             planned, planError, executed, execError,
             moved: tokenBefore.x !== tokenAfter.x || tokenBefore.y !== tokenAfter.y,
+            advanced: turnBefore[0] !== game.combat.round || turnBefore[1] !== game.combat.turn,
             newMessages: (game.messages?.size ?? 0) - messagesBefore
         }));
     }, { cid: gCombatantId, tid: gNpcToken });
@@ -229,10 +235,9 @@ async function testGridlessRejected() {
     assert.equal(outcome.executed.reason, 'gridless-unsupported',
         `executor should surface gridless-unsupported, got ${outcome.executed?.reason}`);
     assert.equal(outcome.moved, false, 'nothing moved on the gridless scene');
+    assert.equal(outcome.advanced, false, 'gridless refusal does not advance initiative');
     assert.equal(outcome.newMessages, 0, 'no chat cards were produced');
     console.log('gridless scene rejected with a controlled unsupported result');
-
-    await h.deleteCombat(page, gCombatId);
 }
 
 async function cleanup() {
@@ -245,6 +250,7 @@ async function cleanup() {
     } catch { /* best-effort */ }
     await h.closeAllWindows(page);
     if (combatId) await h.deleteCombat(page, combatId);
+    if (gridlessCombatId) await h.deleteCombat(page, gridlessCombatId);
     for (const sid of [hexSceneId, gridlessSceneId]) {
         if (sid) await h.deleteScene(page, sid);
     }

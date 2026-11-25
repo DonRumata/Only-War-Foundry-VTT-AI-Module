@@ -12,6 +12,7 @@ import {
     getLayerFlags,
     getPreferredCohesion,
     getPreviewTimeoutSeconds,
+    getSpecOpsConfig,
     getTurnPacingMs,
     isDiagnosticsEnabled,
     isMasterEnabled,
@@ -27,12 +28,13 @@ import {
     MODULE_ID,
     SETTING_KEYS
 } from "../../scripts/constants.js";
+import { SPEC_OPS_CONFIG } from "../../scripts/presets/spec-ops-config.js";
 
 test("registerSettings registers world-scoped settings", () => {
     _resetMocks();
     registerSettings();
     const registered = game.settings._registered;
-    assert.equal(registered.length, 22);
+    assert.deepEqual(registered.map(entry => entry.key).sort(), Object.values(SETTING_KEYS).sort());
     for (const entry of registered) {
         assert.equal(entry.scope, MODULE_ID);
         assert.equal(entry.data.scope, "world");
@@ -86,6 +88,23 @@ test("preferredCohesion defaults to 5 and reads a stored value", async () => {
     assert.equal(getPreferredCohesion(), 8);
     await game.settings.set(MODULE_ID, SETTING_KEYS.preferredCohesion, -1);
     assert.equal(getPreferredCohesion(), DEFAULT_PREFERRED_COHESION);
+});
+
+test("Spec Ops settings use valid explicit values before saved values and defaults", () => {
+    _resetMocks();
+    registerSettings();
+    assert.deepEqual(getSpecOpsConfig(), SPEC_OPS_CONFIG);
+    game.settings.set(MODULE_ID, SETTING_KEYS.specOpsFallbackPreset, "rangedCover");
+    game.settings.set(MODULE_ID, SETTING_KEYS.specOpsMaxDetachedRounds, 0);
+    game.settings.set(MODULE_ID, SETTING_KEYS.specOpsFlankMinAngleDegrees, 181);
+    game.settings.set(MODULE_ID, SETTING_KEYS.specOpsFlankWeight, "4");
+    assert.deepEqual(getSpecOpsConfig({
+        fallbackPreset: "specOps", maxDetachedRounds: 2.5, supportWeight: 0, flankMinAngleDegrees: 95
+    }), {
+        ...SPEC_OPS_CONFIG, fallbackPreset: "rangedCover", maxDetachedRounds: 0,
+        supportWeight: 0, flankMinAngleDegrees: 95
+    });
+    assert.equal(getSpecOpsConfig().flankMinAngleDegrees, SPEC_OPS_CONFIG.flankMinAngleDegrees);
 });
 
 test("previewTimeoutSeconds defaults to 60, honours 0 and rejects damaged values", async () => {

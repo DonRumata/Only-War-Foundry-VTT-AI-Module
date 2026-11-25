@@ -69,8 +69,8 @@ execute: расхождение — `stale-state` (перемещение, см�
 
 ### Perception (issue #401)
 
-- LOS строго от зрителя-бота: `canvas.visibility.testVisibility` → legacy
-  API → `visionSource` → геометрический fallback по стенам (`type:"sight"`).
+- LOS строго от зрителя-бота: его `visionSource` и проверка стен (`type:"sight"`).
+  Если зрение не настроено, проверяется только геометрия, не видимость GM.
 - Цели: противоположная disposition (viewer-симметричная: FRIENDLY-бот
   атакует HOSTILE, и наоборот), живые, не hidden. Нейтралы — только через
   `includeNeutral`/`dispositions`. Нейтральный бот (disp 0) считает
@@ -132,9 +132,10 @@ execute: расхождение — `stale-state` (перемещение, см�
   шаблоном. Союзник в зоне — вето; нейтрал — вето, кроме `includeNeutral`.
   Покрытие — `_blastTokens` (canvas placeables / боевой fallback /
   `context.blastTokens` в тестах).
-- Удар по last-known позиции (зачистка помещений) — без LOS; запомненная
-  точка считается одним предполагаемым hostile; rangedCover LOS-вето для
-  таких бросков снято.
+- Удар по last-known позиции (зачистка помещений) — без LOS и без передачи
+  токена цели в систему. Запомненная точка считается одним предполагаемым
+  противником; координаты из трекера без наблюдения годятся лишь для поиска.
+  Проверки дальности и безопасности союзников сохраняются.
 - Шаг несёт `input.targetPoint` → `prepareAttack` ставит шаблон по точке.
 - Фактор `area` = `min(blastHits/2, 1)`; веса: specOps 5, assault 4,
   rangedCover 3, hold 2.

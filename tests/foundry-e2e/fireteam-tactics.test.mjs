@@ -65,15 +65,18 @@ async function setup() {
  * Place the 3 members + 4 enemies on a fresh scene of the given grid type
  * and build the combat with fireteam + preset flags on the members.
  * @param {number} gridType Foundry grid type (1 = square, >= 2 = hex).
+ * @param {boolean} [withFlank] Place one member off the frontal axis.
  * @returns {Promise<object>} `{sceneId, combatId, memberCids, enemyTids}`.
  */
-async function setupTeamCombat(gridType) {
+async function setupTeamCombat(gridType, withFlank = false) {
     const sceneId = await h.createTestScene(page, { grid: gridType, size: 100 });
     scenes.push(sceneId);
     const memberTids = [];
     const enemyTids = [];
-    const memberPos = [{ x: 300, y: 300 }, { x: 300, y: 500 }, { x: 300, y: 700 }];
-    const enemyPos = [
+    const memberPos = withFlank
+        ? [{ x: 400, y: 400 }, { x: 600, y: 600 }, { x: 300, y: 500 }]
+        : [{ x: 300, y: 300 }, { x: 300, y: 500 }, { x: 300, y: 700 }];
+    const enemyPos = withFlank ? [600, 700, 800, 900].map(x => ({ x, y: 400 })) : [
         { x: 1400, y: 300 }, { x: 1500, y: 500 }, { x: 1400, y: 700 }, { x: 1600, y: 500 }
     ];
     for (const [i, actorId] of memberActorIds.entries()) {
@@ -92,17 +95,19 @@ async function setupTeamCombat(gridType) {
     const memberCids = await page.evaluate(async (data) => {
         const combat = game.combats.get(data.combatId);
         const ids = [];
-        for (const tid of data.memberTids) {
+        for (const [index, tid] of data.memberTids.entries()) {
             const combatant = combat.combatants.find((c) => c.tokenId === tid);
+            if (data.withFlank) await combatant.update({ initiative: 20 - index });
             await combatant.setFlag('only-war-ai', 'override', { mode: 'enabled', preset: 'specOps' });
             await combatant.setFlag('only-war-ai', 'fireteam', {
                 teamId: 'alpha-tactics',
-                teamPreset: 'specOps'
+                teamPreset: 'specOps',
+                ...(data.withFlank ? { preferredCohesion: 10 } : {})
             });
             ids.push(combatant.id);
         }
         return ids;
-    }, { combatId, memberTids });
+    }, { combatId, memberTids, withFlank });
     return { sceneId, combatId, memberCids, enemyTids };
 }
 
@@ -115,8 +120,8 @@ async function injectedTargets(sceneId, enemyTids, count) {
             return {
                 tokenId: token.id,
                 tokenUuid: token.uuid,
-                x: token._source?.x ?? token.x,
-                y: token._source?.y ?? token.y,
+                x: token._source.x + token.width * scene.grid.size / 2,
+                y: token._source.y + token.height * scene.grid.size / 2,
                 elevation: token.elevation ?? 0,
                 canAttack: true
             };
@@ -134,7 +139,7 @@ async function buildPlan(combatId, context = {}) {
 }
 
 async function testFlankAndFix(gridType, label) {
-    const env = await setupTeamCombat(gridType);
+    const env = await setupTeamCombat(gridType, true);
     const targets = await injectedTargets(env.sceneId, env.enemyTids);
     const result = await buildPlan(env.combatId, { seed: 7, targets });
     assert.equal(result.status, 'ok', `buildTeamPlan failed: ${result.reason}`);
@@ -149,9 +154,14 @@ async function testFlankAndFix(gridType, label) {
     assert.equal(supports.length, 2, 'the rest fix the enemy frontally');
     assert.equal(plan.phases.length, 3, 'movement/action/regroup phases exist');
     const barrier = plan.phases[1]?.barrier;
-    assert.ok(barrier, 'flank-and-fix gates actions behind a barrier');
-    assert.ok(barrier.requiredAssignmentIds.includes(flanks[0].combatantId),
-        'barrier requires the flanker to be in place first');
+    const flankerId = flanks[0].combatantId;
+    assert.ok(plan.diagnostics.tactic.breakdown.flank.angle >= plan.specOpsConfig.flankMinAngleDegrees,
+        'the planned attack meets the actual flank angle');
+    assert.ok(plan.phases[1].steps.some(step => step.combatantId === flankerId),
+        'the flanker has a legal attack');
+    assert.equal(barrier?.requiredAssignmentIds.includes(flankerId) ?? false,
+        plan.phases[0].steps.some(step => step.combatantId === flankerId),
+        'the barrier waits only for an actual planned movement');
     const verdict = await page.evaluate((p) =>
         game.modules.get('only-war-ai').api.services.get('fireteam').validateTeamPlan(p), plan);
     assert.equal(verdict.valid, true, `team plan should validate: ${verdict.reason}`);
@@ -274,12 +284,13 @@ async function testTemporaryAssignments() {
     }
     const flags = await page.evaluate((data) =>
         data.cids.map((cid) => {
-            const combatant = game.combat.combatants.get(cid);
+            const combatant = game.combats.get(data.combatId).combatants.get(cid);
             return combatant?.flags?.['only-war-ai'] ?? {};
-        }), { cids: env.memberCids });
+        }), { cids: env.memberCids, combatId: env.combatId });
     for (const flag of flags) {
-        assert.deepEqual(Object.keys(flag).sort(), ['fireteam', 'override'],
-            `only config flags persist, got ${JSON.stringify(flag)}`);
+        const persistent = ['fireteam', 'override', 'memory', 'morale'];
+        assert.deepEqual(Object.keys(flag).filter(key => !persistent.includes(key)), [],
+            `planning may record memory and morale but not assignments: ${JSON.stringify(flag)}`);
         assert.deepEqual(flag.fireteam, { teamId: 'alpha-tactics', teamPreset: 'specOps' },
             'no task or role is persisted on the combatant');
     }

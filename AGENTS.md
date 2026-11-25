@@ -228,11 +228,11 @@ Socket-канал `module.only-war-ai`: `ai-request`/`ai-status`; запросы
 `scripts/perception.js` — сервис `perception` (`api.services`):
 
 - LOS/видимость строго с перспективы NPC-токена: `hasLineOfSight(from, to)`
-  обходит `canvas.visibility.testVisibility` (v13+) → `canvas.effects.visibility`
-  → `token.testVisibility` → `visionSource` → геометрический fallback по стенам
-  (`canvas.walls.checkCollision` или ручной тест сегментов; v13 и legacy-схемы
-  `sight`/`door`). GM-only данные не используются: скрытые от NPC токены не
-  попадают в цели только потому, что controller — GM.
+  проверяет стены и собственный vision source токена с настроенным зрением.
+  Для невыбранного NPC источник создаётся без регистрации на canvas.
+  `canvas.visibility.testVisibility` не используется: он смешивает источники
+  видимости текущего пользователя. Без настроенного зрения действует
+  геометрический LOS; скрытые токены отфильтровываются отдельно.
 - `visibleTargets(token)` — кандидаты в цели: противоположная disposition
   (hostile↔friendly; neutral — только через `includeNeutral`/`dispositions`),
   без dead/defeated/hidden; `blinded` viewer не видит никого. Записи:

@@ -13,10 +13,11 @@ try {
         const [
             { createModuleApi }, { createAuthorityService }, { createExecutorService },
             { createFireteamService }, { createNavigationService }, { createOperationService },
-            { createPerceptionService }, { createPlannerService }, { registerRangedCoverPreset }
+            { createPerceptionService }, { createPlannerService }, { registerRangedCoverPreset },
+            { buildPreviewViewModel, localizePreviewViewModel }
         ] = await Promise.all([
             'api', 'authority', 'executor', 'fireteam', 'navigation', 'operations',
-            'perception', 'planner', 'presets/ranged-cover'
+            'perception', 'planner', 'presets/ranged-cover', 'ui/preview-dialog'
         ].map(imp));
         const check = (value, message) => { if (!value) throw new Error(message); };
         const waitFor = async (predicate, label) => {
@@ -29,12 +30,15 @@ try {
         check(game.user.isGM && game.system.id === 'only-war-local', 'Expected a GM in Only War');
         const initialScene = canvas.scene;
         const initialCombat = game.combat;
-        const original = () => JSON.stringify([
-            initialScene?.toObject(), initialCombat?.toObject(), game.time.worldTime
-        ]);
-        const before = original();
+        const snapshot = () => [
+            ['scene', JSON.stringify(initialScene?.toObject())],
+            ['combats', JSON.stringify(game.combats.contents.map(combat => combat.toObject()))],
+            ['tracker', game.combat?.id ?? null],
+            ['worldTime', JSON.stringify(game.time.worldTime)]
+        ];
+        const before = snapshot();
         const cases = [];
-        for (const interrupt of [false, true]) {
+        for (const [interrupt, detached] of [[false, false], [true, false], [false, true]]) {
             const cleanup = [];
             let authority;
             let combatHook;
@@ -63,7 +67,8 @@ try {
                     combat.combatants.find(c => c.tokenId === token.id));
                 for (const member of [lead, flank]) {
                     await member.setFlag('only-war-ai', 'fireteam', {
-                        teamId: 'teamplan-e2e', leaderId: lead.id
+                        teamId: 'teamplan-e2e', leaderId: lead.id,
+                        ...(detached ? { preferredCohesion: 2 } : {})
                     });
                 }
                 // Exercise Foundry's real nextTurn() without ticking timers in the user's world.
@@ -93,6 +98,9 @@ try {
                     // One deterministic candidate for the mover; waypoints,
                     // cost, endpoint and token movement are all native.
                     findCandidates(token, budget, options) {
+                        if (options.origin || options.target?.x === 650) {
+                            return navigation.findCandidates(token, budget, options);
+                        }
                         if (token.id !== b.id || token._source.x !== 200) return { status: 'ok', candidates: [] };
                         const route = navigation.planRoute(token, { x: 550, y: 350 }, budget, options);
                         return { status: 'ok', candidates: route.exact
@@ -141,30 +149,75 @@ try {
                 await waitFor(() => combat.combatant?.id === other.id, 'handoff to non-AI member');
                 check(!rolls.length && b._source.x === 500 && progress().length === 1,
                     `The shooter must pass, then the flanker must move: ${details()}`);
+                const returnPlan = progress()[0].members.find(member => member.id === flank.id).rejoin;
+                if (detached) {
+                    check(returnPlan?.route?.length > 1 && returnPlan.cost <= 8,
+                        `The detached assignment needs a verified return: ${details()}`);
+                    const model = localizePreviewViewModel(buildPreviewViewModel({
+                        snapshot: { combatantId: lead.id },
+                        teamTurn: { phase: 'wait', state: progress()[0] }
+                    }, { combat }));
+                    const html = await foundry.applications.handlebars.renderTemplate(
+                        'modules/only-war-ai/templates/ai-preview.hbs', model);
+                    const dom = new DOMParser().parseFromString(html, 'text/html');
+                    const team = dom.querySelector('.ow-ai-preview-team');
+                    check(team?.querySelectorAll('li').length === 2
+                        && team.textContent.includes(game.i18n.localize('OWAI.Preview.Team.Rejoin'))
+                        && dom.querySelectorAll('[data-action="confirm"]').length === 1,
+                    'Expected a team preview with the return route and one confirmation control');
+                }
                 if (interrupt) await flank.update({ defeated: true });
                 await combat.nextTurn(); // the non-AI combatant plays their turn
                 await waitFor(() => combat.combatant?.id === other.id && combat.round === 2, 'next round handoff');
                 const expected = interrupt ? [] : [[2, lead.id, a.uuid], [2, flank.id, b.uuid]];
-                check(JSON.stringify(rolls) === JSON.stringify(expected) && !progress().length
+                check(JSON.stringify(rolls) === JSON.stringify(expected) && progress().length === (detached ? 1 : 0)
                     && b._source.x === 500, `Invalid action phase or rollback: ${details()}`);
-                cases.push({ interrupt, moves: 1, attacks: rolls.length });
+                if (detached) {
+                    await combat.nextTurn();
+                    await waitFor(() => combat.combatant?.id === other.id && combat.round === 3, 'regroup handoff');
+                    const distance = Math.hypot(a._source.x - b._source.x, a._source.y - b._source.y) / 100;
+                    check(distance <= 2 && distance > 0 && !progress().length && rolls.length === 2,
+                        `Regroup did not return to a free cell in cohesion: ${details()}`);
+                }
+                cases.push({ interrupt, moves: detached ? 2 : 1, attacks: rolls.length });
             } finally {
                 authority?.stop();
                 if (combatHook) Hooks.off('updateCombat', combatHook);
+                // Foundry 13 activates the viewed combat after a deletion.
+                // Delete before switching scenes and suppress that activation
+                // even if the tracker falls back to another combat.
+                const tempCombat = cleanup.find(doc => doc.documentName === 'Combat');
+                if (tempCombat) {
+                    const combats = game.combats;
+                    const viewed = Object.getOwnPropertyDescriptor(combats, 'viewed');
+                    Object.defineProperty(combats, 'viewed', { configurable: true, value: undefined });
+                    try {
+                        await tempCombat.delete();
+                    } finally {
+                        if (viewed) Object.defineProperty(combats, 'viewed', viewed);
+                        else delete combats.viewed;
+                    }
+                    cleanup.splice(cleanup.indexOf(tempCombat), 1);
+                }
                 if (initialScene && canvas.scene?.id !== initialScene.id) {
                     await initialScene.view();
                     await waitFor(() => canvas.ready && canvas.scene?.id === initialScene.id, 'restore canvas');
                 }
                 for (const doc of cleanup.reverse()) await doc.delete();
+                if (game.combat !== initialCombat) await ui.combat.render({ combat: initialCombat });
             }
         }
-        return { cases, unchanged: before === original() };
+        const after = snapshot();
+        const changed = before.filter(([, value], i) => after[i][1] !== value).map(([name]) => name);
+        return { cases, unchanged: changed.length === 0, changed };
     }, scriptRoot);
     assert.deepEqual(report.cases, [
         { interrupt: false, moves: 1, attacks: 2 },
-        { interrupt: true, moves: 1, attacks: 0 }
+        { interrupt: true, moves: 1, attacks: 0 },
+        { interrupt: false, moves: 2, attacks: 2 }
     ]);
-    assert.equal(report.unchanged, true, 'existing scene, combat and world time stay unchanged');
+    assert.equal(report.unchanged, true,
+        `existing scene, combat and world time stay unchanged; changed: ${report.changed}`);
     console.log('team-turn.test.mjs PASSED:', report);
 } finally {
     await browser.close();

@@ -162,8 +162,8 @@ export function _bestBlastAim({
             if ((token.tokenId ?? token.id) === tokenDoc?.id) continue;
             if (_distPx(point, token) > radiusPx + 1e-9) continue;
             const disp = Math.sign(_finiteOr(token.disposition, 0));
-            if (_hostileTo(viewerDisposition, disp, options)) hits++;
-            else blocked = true;
+            if (!_hostileTo(viewerDisposition, disp, options)) blocked = true;
+            else if (!presumedUuid) hits++;
         }
         if (blocked || hits <= 0) continue;
         if (!best || hits > best.hits
