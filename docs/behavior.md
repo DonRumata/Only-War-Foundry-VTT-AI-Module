@@ -75,6 +75,8 @@ peel-отхода, `coveringWithdrawal` — только для cover-роли; 
 | seek | 1.5 | 0 | 0 | 3 |
 | run | 1.5 | 0.5 | 0 | 1 |
 | withdrawal/coveringWithdrawal/freeAttackCost/disengage | 0 | 0 | 0 | 0 |
+| recoverCover | 3 | 6 | 5 | 5 |
+| recoverRedirect | 2 | 2 | 2 | 2 |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
@@ -167,6 +169,45 @@ revалидирует exact route/endpoint/threat-crossing и получает v
 selector-режима (suppression/direct/overwatch/melee). GM/morale-демоции
 снимают peel role и peel-objective точечно; манёвр stateless переоценивается
 на следующем раунде.
+
+Recover-pinned overlay (issue #90): командное вытаскивание
+подавленного бойца — priority overlay поверх текущей тактики, не самостоятельный
+манёвр и не новый task-тип. Чистое stateless ядро `tactics/recover-pinned.js`
+переоценивается каждый раунд из `buildTeamPlan` после demotion-проходов и до
+цикла планирования членов; адаптер fireteam один раз читает документы
+(статусы, флаги `lastAttacker`/`committedPlan`, чат-лог, initiative order) и
+кормит ядру plain DTO с LOS/cover/danger-пробами. Атрибуция источника —
+confidence-лесенка: recorded (3) по suppression-карточке чата, свежий grudge
+`lastAttacker` (2, окно один раунд), los-nearest hostile (1), unknown (0);
+same-side и self-pin отклоняются на каждой ступени. Точечное cover-назначение
+делается только при confidence ≥ 2 и доказанной доступности источника в этом
+раунде; los-nearest даёт ослабленный режим `redirect-only`, unknown никогда не
+стреляет в пустоту. Кап — не более одного `cover-fire` назначения на команду в
+раунд: донор получает role-маркер и мягкий `assignedTargetId` на источник
+(пул возвращается к полному при недоступности цели), pinned-члены всегда
+демотируются в `support`+`recovering` (R5), остальные получают только
+`team.recover.redirectTargetId` — вес `recoverRedirect` на атаках по источнику,
+pool не сужается никогда. Донорский пул исключает pinned, melee-вовлечённых,
+gmControlled, уже отходивших в раунде, detached flank/assault, валидные
+L1-commitment, desperate-regroup (R4), maneuver-critical роли suppressor/
+bound/flanker/fixer/interdictor/withdraw/cover и focus-исполнителей (R7 —
+концентрация огня старше recover redirect). Тип атаки не форсируется: scoring
+сам выбирает suppression при 2+ hostiles в конусе (`area`) и прямой огонь
+против одиночного источника; для suppression-capable донора действует лишь
+скромный доктринальный наклон (`recoverRedirect` 1.0 у suppressing_fire против
+0.8 у прочих типов на источнике). Гейты неактивации — стабильные причины
+`no-pinned`/`no-donors`/`all-pinned`/`safe-in-cover-unreachable`/`source-dead`/
+`pinned-in-melee`; pinned в безопасном укрытии при недосягаемом источнике НЕ
+срывает манёвр. Триаж нескольких pinned: exposure desc (dangerAt −
+coverEstimate), ценность (лидер 4, suppression/heavy 2), maneuver-critical
+commitment (+2), combatantId asc — cover-fire получает только верхний. Фактор
+`recoverCover` у recovering-члена — clamp01 прироста `coverEstimate` endpoint'а
+относительно позиции угрозы (неподвижный endpoint ровно 0). Friendly-вето
+конусов/blast не ослабляется ни при какой confidence. TeamPlan несёт компактную
+секцию `recover` (active/mode/gate/pinned/coverAssignment/redirectTargetId),
+`breakdown.recover` (атрибуция/триаж/донор) и `diagnostics.recover` с
+demotion-записями; активация телеграфируется bark `OWAI.Bark.Recover.*` с
+dedup `combat|team|round` только на живых (не readOnly) построениях.
 
 Конфиг specOps: `flankMinAngleDegrees 60, maxDetachedRounds 2,
 highThreatRatio 2, supportWeight 6, flankWeight 8, assaultWeight 7,

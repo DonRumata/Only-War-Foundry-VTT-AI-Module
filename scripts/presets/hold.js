@@ -117,7 +117,12 @@ export const HOLD_WEIGHTS = Object.freeze({
     // Target inertia for defenders — keep holding the line against the
     // same enemy rather than spreading attention every round.
     stickyTarget: 5,
-    outnumber: 3
+    outnumber: 3,
+    // Recover-pinned overlay (issue #90): a pinned defender reaching
+    // cover against the pin threat fits the hold doctrine exactly; the
+    // redirect stays a soft weight so the line is never abandoned for it.
+    recoverCover: 5,
+    recoverRedirect: 2
 
 });
 

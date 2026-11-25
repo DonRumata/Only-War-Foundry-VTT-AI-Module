@@ -21,7 +21,7 @@
             {{#each team.members}}
             <li>
                 <strong>{{name}}</strong> · {{taskLabel}} ({{group}})
-                {{#if role}} · {{localize "OWAI.Preview.Team.Role"}}: {{role}}{{/if}}
+                {{#if role}} · {{localize "OWAI.Preview.Team.Role"}}: {{roleLabel}}{{/if}}
                 {{#if element}} · {{localize "OWAI.Preview.Team.Element"}}: {{element}}{{/if}}
                 {{#if active}}<em>{{localize "OWAI.Preview.Team.Active"}}</em>{{/if}}
                 {{#if waitsForMovement}}<em>{{localize "OWAI.Preview.Team.Required"}}</em>{{/if}}

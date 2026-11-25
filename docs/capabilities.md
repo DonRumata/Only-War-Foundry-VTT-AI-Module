@@ -532,6 +532,27 @@ execute: расхождение — `stale-state` (перемещение, см�
   pincer не перетираются silently; GM/morale demotion снимает peel role и
   peel objective. Пороги `peel*` — экспериментальные world settings с
   pure-core defaults и context overrides.
+- Recover-pinned overlay (issue #90): priority overlay командного
+  вытаскивания pinned-бойца поверх всех четырёх пресетов — не манёвр и не
+  новый task-тип. Чистое stateless ядро `tactics/recover-pinned.js`
+  (`attributePinSource`/`scorePinnedTriage`/`evaluateRecoverGate`/
+  `selectCoverMember`/`buildRecoverPinnedOverlay`) получает от fireteam
+  plain DTO: атрибуция по confidence-лесенке recorded (3, suppression
+  карточка чата) → grudge `lastAttacker` (2, окно раунд) → los-nearest (1)
+  → unknown (0) с same-side/self-pin отклонениями. Точечное cover-назначение
+  только при confidence ≥ 2 и доказанной доступности источника; кап — один
+  `cover-fire` на команду в раунд, остальные члены получают лишь мягкий
+  `team.recover.redirectTargetId` (вес `recoverRedirect`, pool не сужается).
+  Pinned демотируются в `support`+`recovering` с фактором `recoverCover`
+  (прирост coverEstimate endpoint'а к угрозе; веса rc6/hold5/assault3/
+  specOps5). Донорский пул исключает pinned/melee/gmControlled/hasActed/
+  detached flank-assault/commitment/desperate-regroup и maneuver-critical
+  роли включая focus (R7). Доктринальный наклон suppression у донора —
+  graded factor, не форсинг типа атаки; friendly-вето конусов не
+  ослабляется. Гейты `no-pinned`/`no-donors`/`all-pinned`/
+  `safe-in-cover-unreachable`/`source-dead`/`pinned-in-melee` стабильны;
+  TeamPlan несёт `recover`/`breakdown.recover`/`diagnostics.recover`,
+  активация телеграфируется bark с dedup `combat|team|round`.
 - Suppress-and-bound (issue #86): чистое ядро `tactics/suppress-and-bound.js`
   выбирает capable suppressor по полуавтоматической/полностью автоматической
   очереди, заряду, актуальному `turnIndex` и безопасному конусу. В каскаде

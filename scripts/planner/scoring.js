@@ -29,6 +29,7 @@ import {
 import {
     ATTACK_TYPE_DESIRE,
     ATTACK_TYPE_DESIRE_DEFAULT,
+    ATTACK_VARIANTS,
     DEFAULT_LOOKAHEAD_LAMBDA,
     DEFAULT_LOOKAHEAD_TOP_K,
     DEFAULT_MELEE_RANGE,
@@ -98,6 +99,18 @@ import {
  *   risk cost (`0..1`); presets weight it negatively.
  * @param {number|null} [input.disengage] Structural Disengage capability
  *   marker (`1` only for the full-action move candidate).
+ * @param {number|null} [input.recoverCover] Precomputed cover improvement
+ *   of the candidate endpoint against the pin-threat position (`0..1`,
+ *   issue #90) — zero unless the fireteam injected `team.recover` for a
+ *   recovering pinned member.
+ * @param {object|string|null} [input.redirectTarget] Soft redirect target
+ *   identity (`{tokenId, tokenUuid, actorId}` or a plain id) of the
+ *   recover-pinned overlay — attack candidates on that target light the
+ *   `recoverRedirect` factor (issue #90).
+ * @param {boolean|null} [input.redirectSuppress] Doctrinal suppression
+ *   preference of the cover-fire donor (issue #90): a suppressing-fire
+ *   candidate on the redirect target keeps the full factor while other
+ *   attack types score a reduced share.
  * @returns {object}
  */
 export function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
@@ -106,7 +119,8 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
     allyEngagedTargets = null, enemies = null, lastAttacker = null,
     orderBoost = null, lastTarget = null, shooterProfiles = null,
     withdrawal = null, coveringWithdrawal = null, freeAttackCost = null,
-    disengage = null }) {
+    disengage = null, recoverCover = null, redirectTarget = null,
+    redirectSuppress = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -344,7 +358,34 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
             ? Math.max(0, Math.min(1, freeAttackCost)) : 0,
         disengage: Number.isFinite(disengage)
             ? Math.max(0, Math.min(1, disengage))
-            : (variant === "disengage" ? 1 : 0)
+            : (variant === "disengage" ? 1 : 0),
+        // Recover-pinned overlay (issue #90): `recoverCover` is candidate
+        // metadata precomputed by the planner (endpoint cover improvement
+        // against the pin threat, exactly like the peel `withdrawal`
+        // channel); `recoverRedirect` marks attack candidates whose target
+        // is the attributed suppression source — a soft weight, never an
+        // assignment or a pool narrowing. When the cover donor carries the
+        // doctrinal suppression preference (`redirectSuppress`), a
+        // suppressing-fire answer on the source scores the full factor
+        // while any other attack type keeps a slightly reduced share —
+        // the modest contextual tilt the issue asks for: suppression is
+        // preferred, never forced, and direct fire against a lone source
+        // remains a valid pin-stopper.
+        recoverCover: Number.isFinite(recoverCover)
+            ? Math.max(0, Math.min(1, recoverCover)) : 0,
+        recoverRedirect: redirectTarget != null && target && ATTACK_VARIANTS.has(variant)
+            && ((typeof redirectTarget === "object"
+                && ((redirectTarget.tokenUuid != null
+                        && target.tokenUuid === redirectTarget.tokenUuid)
+                    || (redirectTarget.tokenId != null
+                        && target.tokenId === redirectTarget.tokenId)
+                    || (redirectTarget.actorId != null
+                        && target.actorId === redirectTarget.actorId)))
+                || (typeof redirectTarget !== "object"
+                    && [target.tokenId, target.tokenUuid, target.actorId]
+                        .some(id => id != null && String(id) === String(redirectTarget))))
+            ? (redirectSuppress === true && action?.attackType !== "suppressing_fire" ? 0.8 : 1)
+            : 0
     };
 }
 

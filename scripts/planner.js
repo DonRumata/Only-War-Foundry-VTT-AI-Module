@@ -2031,6 +2031,68 @@ export function createPlannerService({
             traitFlags: personalityBehaviorFlags(personality.traits),
             ...planContext
         };
+        // Issue #90 recover-pinned overlay: the fireteam injects
+        // `team.recover`. A recovering pinned member prices the endpoint
+        // cover improvement against the pin-threat position through the
+        // precomputed `recoverCover` candidate input (clamped delta, the
+        // pinned bot's one meaningful move); every member with a redirect
+        // entry carries the soft `recoverRedirect` weight on attack
+        // candidates against the attributed suppression source. Neither
+        // channel narrows the awareness pool, rewrites assignments or
+        // synthesizes actions — they are weights on existing candidates.
+        const recoverInjection = planContext.team?.recover ?? null;
+        let recoverCoverAt = null;
+        if (recoverInjection?.role === "recovering"
+            && Number.isFinite(recoverInjection?.threatPosition?.x)
+            && Number.isFinite(recoverInjection?.threatPosition?.y)
+            && navigation && typeof navigation.coverEstimate === "function") {
+            const threatPos = {
+                x: recoverInjection.threatPosition.x,
+                y: recoverInjection.threatPosition.y
+            };
+            const gridSize = _finiteOr(grid?.size, 100);
+            // The start cover is probed from the current footprint centre
+            // — the same coordinate conversion the end-of-turn unpin
+            // probe uses — so a stationary endpoint degenerates to an
+            // exact zero delta instead of a coordinate-space artifact.
+            const centre = Number.isFinite(selfPos?.x) && Number.isFinite(selfPos?.y)
+                ? {
+                    x: selfPos.x + (_finiteOr(tokenDoc?.width, 1) * gridSize / 2),
+                    y: selfPos.y + (_finiteOr(tokenDoc?.height, 1) * gridSize / 2)
+                }
+                : null;
+            const probeCover = point => {
+                try {
+                    return Math.max(0, Math.min(1,
+                        _finiteOr(navigation.coverEstimate(tokenDoc, point, threatPos), 0)));
+                } catch(_err) {
+                    return 0;
+                }
+            };
+            if (centre) {
+                const startCover = probeCover(centre);
+                recoverCoverAt = point => {
+                    const delta = probeCover(point) - startCover;
+                    return delta > 0 ? Math.min(1, delta) : 0;
+                };
+            }
+        }
+        const recoverRedirectId = recoverInjection?.redirectTargetId
+            ?? recoverInjection?.sourceTargetId ?? null;
+        const recoverRedirectTarget = recoverRedirectId != null
+            ? {
+                tokenId: recoverRedirectId,
+                tokenUuid: recoverInjection?.sourceTokenUuid ?? null
+            }
+            : null;
+        if (recoverInjection && typeof recoverInjection === "object"
+            && (recoverInjection.role || recoverRedirectId != null)) {
+            diagnostics.recover = {
+                role: recoverInjection.role ?? null,
+                redirectTargetId: recoverRedirectId ?? null,
+                coverProbe: recoverCoverAt !== null
+            };
+        }
         const scored = [];
         candidates.forEach((candidate, index) => {
             if (teamTurn?.phase === "draft" && candidate.variant === "charge") return;
@@ -2053,7 +2115,20 @@ export function createPlannerService({
                     character: personality.character === "disciplined"
                         || personality.character === "elite",
                     pressured: _moraleOf(combatant, context).pressured
-                }
+                },
+                // Issue #90: recover-pinned candidate inputs — the cover
+                // delta is probed per endpoint (stationary candidates are
+                // exactly zero), the redirect identity is matched inside
+                // the shared factor vector for attack variants only. The
+                // doctrinal suppression preference belongs to the cover
+                // donor alone: redirect members keep the flat weight.
+                recoverCover: recoverCoverAt && candidate.move && !candidate.move.stay
+                    && Number.isFinite(candidate.move?.x) && Number.isFinite(candidate.move?.y)
+                    ? recoverCoverAt({ x: candidate.move.x, y: candidate.move.y })
+                    : 0,
+                redirectTarget: recoverRedirectTarget,
+                redirectSuppress: recoverInjection?.role === "cover-fire"
+                    && recoverInjection?.preferSuppression === true
             });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed

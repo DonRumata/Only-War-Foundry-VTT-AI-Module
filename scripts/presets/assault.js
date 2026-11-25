@@ -97,7 +97,12 @@ export const ASSAULT_WEIGHTS = Object.freeze({
     seek: 1.5,
     // Run mechanic (smoke): burning the whole turn on a sprint to close
     // on the enemy fits assault doctrine — a mild pull below charge.
-    run: 1.5
+    run: 1.5,
+    // Recover-pinned overlay (issue #90): cover-seeking of a pinned
+    // member is real but secondary for the assault doctrine; the team
+    // redirect of fire onto the suppression source is a soft pull.
+    recoverCover: 3,
+    recoverRedirect: 2
 });
 
 /**

@@ -103,6 +103,10 @@ import {
     SUPPRESS_AND_BOUND,
     pointInSuppressionZone
 } from "./tactics/suppress-and-bound.js";
+import {
+    buildRecoverPinnedOverlay,
+    RECOVER_PINNED_ROLES
+} from "./tactics/recover-pinned.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
 export const FIRETEAM_STATUS = Object.freeze({
@@ -3064,6 +3068,297 @@ export function createFireteamService({
         return result;
     }
 
+    // --- Recover-pinned overlay (issue #90) ---------------------------------
+
+    /**
+     * Assignment roles authored by a maneuver tactic whose capture would
+     * break that maneuver's critical mass (epic #84 priority rule R3):
+     * the suppression suppressor and its bounding element, the pincer
+     * flanker/fix roles, the interdiction screen and both peel roles are
+     * never reassigned by the recovery overlay — recovery is solved by the
+     * fire of free members, not by recalling the maneuver. The `focus`
+     * marker joins them under priority rule R7: concentrate-fire is the
+     * team's deliberate fire concentration and outranks the recover
+     * redirect, so a focus executor is never pulled onto cover duty —
+     * when the pin source IS the focus target the merged redirect branch
+     * already points every free member at it, making a hard assignment
+     * unnecessary.
+     */
+    const RECOVER_CRITICAL_ROLES = new Set([
+        "suppressor", "bound", "flanker", "fixer", INTERDICT_ROLE, "withdraw", "cover", "focus"
+    ]);
+
+    /**
+     * Whether a member's loadout carries a suppression-capable ranged
+     * weapon: burst or full-auto rate of fire, the modified rate winning
+     * over the base one exactly like the suppress-and-bound capability
+     * probe reads it.
+     * @param {object|null} actor Actor document.
+     * @returns {boolean}
+     */
+    function _suppressionCapableActor(actor) {
+        for (const item of _list(actor?.items)) {
+            if (item?.type !== "weapon") continue;
+            if (String(item?.system?.class ?? "").toLowerCase() === "melee") continue;
+            const rof = item?.system?.modified?.rateOfFire ?? item?.system?.rateOfFire ?? {};
+            if (_finiteOr(rof?.burst, 0) > 0 || _finiteOr(rof?.full, 0) > 0) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Build the document-free input of the recover-pinned pure overlay and
+     * evaluate it (issue #90, epic #84 integration). The adapter reads
+     * documents/services exactly once per TeamPlan and converts them into
+     * plain DTOs: member capabilities and control facts (GM control,
+     * commitments, morale tier, turn order), the hostile contact list,
+     * every combat token for the same-side resolution, the chat log for
+     * the recorded attribution leg and LOS/cover/danger probes bound back
+     * to token documents. The pure core stays document-free; anything it
+     * cannot prove degrades to the conservative branch instead of guessing.
+     *
+     * The overlay is a one-round stateless evaluation: it never writes
+     * flags, never mutates assignments itself and never narrows the
+     * awareness pool. `null` means "no overlay this round" — either no
+     * pinned member exists (the cheap common path) or the pure evaluation
+     * itself failed, in which case team planning must continue unaffected.
+     * @param {object} input
+     * @param {object[]} input.members Living enabled member entries.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @param {object[]} input.assignments Current (post-demotion) assignments.
+     * @param {object|null} input.moraleInfo Morale evaluation with the
+     *   member-effective tier map.
+     * @param {Set<string>} input.gmControlledIds Members GM-moved this round.
+     * @param {string|null} input.leaderId Elected leader combatant id.
+     * @returns {object|null} Pure overlay descriptor or null.
+     */
+    function _recoverPinnedOverlay({ members, combat, context, assignments,
+        moraleInfo = null, gmControlledIds = new Set(), leaderId = null }) {
+        const pinnedMembers = members.filter(member =>
+            _memberStatusIds(member).includes("pinned"));
+        if (!pinnedMembers.length) return null;
+        try {
+            const scene = context.scene ?? combat?.scene ?? null;
+            const grid = _convergenceGrid(combat, context);
+            // The hostile picture mirrors the maneuver selector's
+            // precedence exactly: draft `tacticTargets` win, then the
+            // caller's injected contact list, then the live combat scan —
+            // all normalized through the same `_convergentTargets`
+            // adaptation. Injected entries with missing positions are
+            // completed from their live token documents so distance/LOS
+            // legs never degrade just because the caller injected a lean
+            // record.
+            const injectedTargets = context.tacticTargets
+                ?? (Array.isArray(context.targets) && context.targets.length
+                    ? context.targets : null);
+            const hostiles = _convergentTargets({
+                members,
+                combat,
+                context: injectedTargets ? { ...context, targets: injectedTargets } : context
+            }).map(hostile => {
+                if (Number.isFinite(hostile?.x) && Number.isFinite(hostile?.y)) return hostile;
+                const other = _combatantForTarget(combat, hostile);
+                const pos = _tokenPosition(_tokenDoc(other?.token));
+                if (!Number.isFinite(pos?.x) || !Number.isFinite(pos?.y)) return hostile;
+                return { ...hostile, x: pos.x, y: pos.y };
+            });
+            // Every combat token — both sides — feeds the same-side
+            // resolution of the attribution chain: a friendly suppressor
+            // that accidentally pinned its own member must never become
+            // the cover-fire target, and only explicit dispositions can
+            // prove that relation.
+            const tokens = [];
+            for (const other of _list(combat?.combatants)) {
+                if (!other || _isMissing(other)) continue;
+                const doc = _tokenDoc(other?.token);
+                if (!doc) continue;
+                const pos = _tokenPosition(doc);
+                const actor = other.actor ?? doc.actor ?? null;
+                tokens.push({
+                    combatantId: other.id ?? null,
+                    tokenId: other.tokenId ?? doc.id ?? null,
+                    tokenUuid: typeof doc.uuid === "string" ? doc.uuid : null,
+                    actorId: actor?.id ?? null,
+                    x: pos.x,
+                    y: pos.y,
+                    position: pos.x !== null && pos.y !== null ? { x: pos.x, y: pos.y } : null,
+                    disposition: _finiteOr(doc.disposition ?? other.disposition, 0),
+                    defeated: other.defeated === true,
+                    dead: other.defeated === true,
+                    destroyed: doc.destroyed === true,
+                    hidden: doc.hidden === true,
+                    statuses: _mergeStatusIds(other.actor?.statuses, doc.statuses, doc.actor?.statuses)
+                });
+            }
+            const assignById = new Map((assignments ?? []).map(entry =>
+                [entry.combatantId, entry]));
+            const round = _finiteOr(combat?.round, 0);
+            const memberDtos = members.map(member => {
+                const combatant = member.combatant;
+                const actor = combatant?.actor ?? null;
+                const doc = _tokenDoc(combatant?.token);
+                const assignment = assignById.get(member.combatantId) ?? null;
+                const emitters = actor ? weaponEmitters(actor) : [];
+                const pos = member.position ?? _tokenPosition(doc);
+                const inMelee = hostiles.some(hostile => {
+                    const distance = _convergenceDistance(pos, hostile, grid);
+                    return distance !== null && distance <= DEFAULT_MELEE_REACH + 1e-9;
+                });
+                const role = typeof assignment?.role === "string" ? assignment.role : null;
+                const movement = actor?.system?.movement ?? {};
+                return {
+                    combatantId: member.combatantId,
+                    tokenId: member.tokenId,
+                    tokenUuid: typeof doc?.uuid === "string" ? doc.uuid : null,
+                    actorId: member.actorId ?? actor?.id ?? null,
+                    position: Number.isFinite(pos?.x) && Number.isFinite(pos?.y)
+                        ? { x: pos.x, y: pos.y } : null,
+                    x: Number.isFinite(pos?.x) ? pos.x : null,
+                    y: Number.isFinite(pos?.y) ? pos.y : null,
+                    disposition: _finiteOr(doc?.disposition ?? combatant?.disposition, 0),
+                    statuses: _memberStatusIds(member),
+                    enabled: member.enabled !== false,
+                    defeated: member.defeated === true,
+                    initiative: Number.isFinite(member.initiative) ? member.initiative : null,
+                    turnIndex: Number.isFinite(member.turnIndex) ? member.turnIndex : null,
+                    hasActed: member.hasActed === true,
+                    leader: member.combatantId === leaderId,
+                    assignment: assignment ? {
+                        task: assignment.task ?? null,
+                        role,
+                        element: assignment.element ?? null,
+                        groupId: assignment.groupId ?? null
+                    } : null,
+                    groupId: assignment?.groupId ?? null,
+                    gmControlled: gmControlledIds.has(member.combatantId),
+                    commitment: _readFlag(combatant, FLAG_KEYS.committedPlan) ?? null,
+                    inMelee,
+                    attackCapable: emitters.length > 0,
+                    rangedCapable: emitters.some(emitter => emitter?.melee !== true),
+                    suppressionCapable: _suppressionCapableActor(actor),
+                    // Conservative v1 reachability heuristic: a member that
+                    // can move at all may find cover — the recoverCover
+                    // factor only materializes when a real endpoint
+                    // improves cover, so a false positive never misleads
+                    // the plan, it merely keeps the individual leg eligible.
+                    canReachCover: _finiteOr(movement.full, 0) > 0
+                        || _finiteOr(movement.half, 0) > 0,
+                    effectiveTier: moraleInfo?.effective?.get(member.combatantId)
+                        ?? moraleInfo?.tier ?? null,
+                    lastTarget: _readFlag(combatant, FLAG_KEYS.lastTarget) ?? null,
+                    lastAttacker: _readFlag(combatant, FLAG_KEYS.lastAttacker) ?? null,
+                    criticalAssignment: role !== null && RECOVER_CRITICAL_ROLES.has(role)
+                };
+            });
+            // LOS probes receive the pure core's plain DTOs, so the adapter
+            // closure resolves them back to token documents inside this
+            // combat; unresolvable identities answer "unknown" (null), never
+            // a guess.
+            const perception = _service("perception", context.perception);
+            const navigation = context.navigation ?? _service("navigation");
+            const resolveDoc = ref => {
+                if (!ref) return null;
+                if (typeof ref === "object" && (ref.documentName === "Token" || ref.x !== undefined)
+                    && typeof ref !== "string") {
+                    // A token document passed straight through is valid input.
+                    if (ref.documentName === "Token") return ref;
+                }
+                for (const other of _list(combat?.combatants)) {
+                    const doc = _tokenDoc(other?.token);
+                    if (!doc) continue;
+                    const ids = [other.tokenId, doc.id, doc.uuid, other.actor?.id,
+                        doc.actor?.id, other.id].filter(v => v != null).map(String);
+                    const wanted = [ref?.tokenId, ref?.tokenUuid, ref?.actorId,
+                        ref?.combatantId, ref?.id]
+                        .filter(v => v != null).map(String);
+                    if (typeof ref === "string") wanted.push(ref);
+                    if (wanted.some(id => ids.includes(id))) return doc;
+                }
+                return null;
+            };
+            const losProbe = (fromRef, toRef) => {
+                if (typeof perception?.hasLineOfSight !== "function") return null;
+                const from = resolveDoc(fromRef);
+                const to = resolveDoc(toRef);
+                if (!from || !to) return null;
+                try {
+                    return perception.hasLineOfSight(from, to) === true;
+                } catch(_err) {
+                    return null;
+                }
+            };
+            const coverProbe = (position, threatPosition, memberRef) => {
+                if (typeof navigation?.coverEstimate !== "function") return null;
+                const doc = resolveDoc(memberRef);
+                if (!doc || !Number.isFinite(position?.x) || !Number.isFinite(position?.y)
+                    || !Number.isFinite(threatPosition?.x) || !Number.isFinite(threatPosition?.y)) {
+                    return null;
+                }
+                try {
+                    const estimate = navigation.coverEstimate(doc,
+                        { x: position.x, y: position.y },
+                        { x: threatPosition.x, y: threatPosition.y });
+                    return Number.isFinite(estimate) ? estimate : null;
+                } catch(_err) {
+                    return null;
+                }
+            };
+            // Threat-map danger probe, mirroring the selector adaptation of
+            // `_resolveTactic`: the service's current map wins, a fresh build
+            // over the hostile contacts is the fallback, and everything
+            // unprobed reads as zero exposure.
+            let dangerProbe = null;
+            const threatMapService = _service("threatMap", context.threatMap);
+            if (threatMapService) {
+                try {
+                    const current = typeof threatMapService.map === "function"
+                        ? threatMapService.map() : null;
+                    if (typeof current?.dangerAt === "function") {
+                        dangerProbe = point => current.dangerAt(point);
+                    } else if (typeof threatMapService.buildMap === "function") {
+                        const built = threatMapService.buildMap({
+                            targets: hostiles,
+                            combat,
+                            scene,
+                            grid: context.grid ?? scene?.grid ?? null
+                        });
+                        if (typeof built?.dangerAt === "function") {
+                            dangerProbe = point => built.dangerAt(point);
+                        }
+                    }
+                } catch(_err) {
+                    dangerProbe = null;
+                }
+            }
+            const overlay = buildRecoverPinnedOverlay({
+                members: memberDtos,
+                hostiles,
+                tokens,
+                messages: context.messages ?? globalThis.game?.messages ?? [],
+                round,
+                turnOrder: _list(combat?.turns).map(entry =>
+                    typeof entry === "string" ? entry : (entry?.id ?? entry?.combatantId ?? null)),
+                currentTurnIndex: Number.isFinite(combat?.turn) ? combat.turn : null,
+                hasLineOfSight: losProbe,
+                losToSource: losProbe,
+                coverEstimate: coverProbe,
+                ...(dangerProbe ? { dangerAt: point => {
+                    try {
+                        return _finiteOr(dangerProbe(point), 0);
+                    } catch(_err) {
+                        return 0;
+                    }
+                } } : {})
+            });
+            return overlay ?? null;
+        } catch(err) {
+            // The overlay is advisory: a broken adaptation must never break
+            // the team plan itself.
+            return null;
+        }
+    }
+
     /**
      * Build the serializable TeamPlan for one team of a combat. Only
      * AI-enabled combatants with a matching fireteam `teamId` participate;
@@ -3078,7 +3373,8 @@ export function createFireteamService({
      *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
      *   `preferredCohesion`, `specOpsConfig`, `targets`, `actions`, `moves`, `perception`,
      *   `navigation`, `authority`, `planner`, `tactics`, `taskCapacities`,
-     *   `replanCount`. Runtime drafts use `readOnly` (no morale/GM flags,
+     *   `replanCount`, `messages` (chat scan of the issue #90 recover
+     *   attribution), `threatMap`. Runtime drafts use `readOnly` (no morale/GM flags,
      *   independent member LOS) and pass `tacticTargets` only to the
      *   maneuver selector, not as attackable targets for each member.
      * @returns {Promise<object>} `{status, teamPlan?, reason?, diagnostics?}`.
@@ -3437,6 +3733,104 @@ export function createFireteamService({
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
+
+        // Issue #90 recover-pinned overlay (epic #84): evaluated once per
+        // TeamPlan after every demotion pass and before the planning loop.
+        // The overlay never rewrites the maneuver itself — pinned members
+        // are demoted to `support`+`recovering` exactly like the GM/morale
+        // demotions above (corebook: a pinned fighter cannot execute a
+        // flank/assault push anyway), at most one free member receives the
+        // `cover-fire` role with its soft `assignedTargetId` narrowing, and
+        // every member context carries the `team.recover` injection the
+        // planner prices through `recoverCover`/`recoverRedirect` weights.
+        // Priority rules R1/R3 are structural: the donor pool of the pure
+        // core already excludes valid commitments, detached flank/assault
+        // tasks, desperate regrouping members, GM-controlled members and
+        // every maneuver-critical role, so peel/regroup/suppression/
+        // pincer/interdiction geometry is never hijacked.
+        const recoverOverlay = _recoverPinnedOverlay({
+            members,
+            combat,
+            context,
+            assignments,
+            moraleInfo,
+            gmControlledIds,
+            leaderId: election.combatantId
+        });
+        const recoverContexts = {};
+        const recoverDemotions = [];
+        if (recoverOverlay?.active === true) {
+            for (const [combatantId, overlayAssignment] of Object.entries(recoverOverlay.assignments ?? {})) {
+                const assignment = assignments.find(entry => entry.combatantId === combatantId);
+                if (!assignment || !overlayAssignment) continue;
+                if (overlayAssignment.role === RECOVER_PINNED_ROLES.recovering) {
+                    if (assignment.task !== "support") {
+                        recoverDemotions.push({
+                            combatantId,
+                            from: assignment.task,
+                            to: "support",
+                            reason: "recover-pinned"
+                        });
+                    }
+                    assignment.task = "support";
+                    assignment.groupId = "main";
+                    delete assignment.element;
+                    _clearSuppressionGeometry(assignment);
+                    _clearInterdictionGeometry(assignment);
+                    _clearPincerGeometry(assignment);
+                    _clearPeelGeometry(assignment);
+                    assignment.role = RECOVER_PINNED_ROLES.recovering;
+                    assignment.objective = overlayAssignment.objective
+                        ? _jsonClone(overlayAssignment.objective) : null;
+                } else if (overlayAssignment.role === RECOVER_PINNED_ROLES.coverFire) {
+                    // The cover donor keeps its place in the maneuver order
+                    // but becomes fire support: the role marker, the pin
+                    // objective and the soft target narrowing ride on the
+                    // existing assignment contract — no new task types.
+                    assignment.task = "support";
+                    assignment.groupId = "main";
+                    assignment.role = RECOVER_PINNED_ROLES.coverFire;
+                    assignment.objective = overlayAssignment.objective
+                        ? _jsonClone(overlayAssignment.objective) : null;
+                    assignment.assignedTargetId = overlayAssignment.assignedTargetId ?? null;
+                }
+            }
+            for (const [combatantId, injection] of Object.entries(recoverOverlay.memberContexts ?? {})) {
+                recoverContexts[combatantId] = _jsonClone(injection);
+            }
+        }
+        diagnostics.recover = recoverOverlay ? _jsonClone({
+            active: recoverOverlay.active === true,
+            gate: recoverOverlay.gate ?? null,
+            mode: recoverOverlay.mode ?? null,
+            pinned: recoverOverlay.pinned ?? [],
+            coverAssignment: recoverOverlay.coverAssignment ?? null,
+            coverReason: recoverOverlay.coverReason ?? null,
+            redirectTargetId: recoverOverlay.redirectTargetId ?? null,
+            demotions: recoverDemotions,
+            breakdown: recoverOverlay.breakdown ?? null,
+            diagnostics: recoverOverlay.diagnostics ?? null
+        }) : null;
+        // Issue #90 T5: the activation bark telegraphs the recovery branch
+        // to the table exactly like the morale transitions do — deduped
+        // per `combat|team|round`, live evaluations only (a readOnly draft
+        // never speaks), and silent when the chat channel is unavailable.
+        if (recoverOverlay?.active === true && !context.readOnly) {
+            await emitBarkOnce(_barkSeen,
+                `${combat?.id ?? "combat"}|${teamId}|${_finiteOr(combat?.round, 0)}|recover`, {
+                    key: recoverOverlay.coverAssignment ? "OWAI.Bark.Recover.Cover" : "OWAI.Bark.Recover.Active",
+                    data: { team: teamId },
+                    speaker: `AI ${teamId}`,
+                    context,
+                    flags: {
+                        recover: {
+                            teamId,
+                            round: _finiteOr(combat?.round, 0),
+                            cover: recoverOverlay.coverAssignment?.combatantId ?? null
+                        }
+                    }
+                });
+        }
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
 
@@ -3557,6 +3951,14 @@ export function createFireteamService({
                     } : {}),
                     memberObjective: assignment.objective
                         ? _jsonClone(assignment.objective) : null,
+                    // Issue #90: the recover-pinned overlay injection of
+                    // this member — `recovering` members read the pin-threat
+                    // position for their cover-seeking weight, the cover
+                    // donor reads the attributed source, everyone else at
+                    // most carries the soft redirect id. Absent when the
+                    // overlay is inactive (no stale channel survives).
+                    ...(recoverContexts[member.combatantId]
+                        ? { recover: _jsonClone(recoverContexts[member.combatantId]) } : {}),
                     assignment: _assignmentDescriptor(assignment),
                     leaderId: election.combatantId,
                     center: leaderPos,
@@ -4141,6 +4543,13 @@ export function createFireteamService({
         }
         score = Math.round((score - cohesionPenalty) * 1e6) / 1e6;
         breakdown.cohesionPenalty = Math.round(cohesionPenalty * 1e6) / 1e6;
+        // Issue #90: the overlay's explainable branch — attribution method
+        // and confidence, gate reason, triage rows and the donor selection
+        // — travels in the team breakdown exactly like the maneuver
+        // breakdowns of the tactic layer.
+        if (diagnostics.recover?.breakdown) {
+            breakdown.recover = _jsonClone(diagnostics.recover.breakdown);
+        }
         diagnostics.membersPlanned = memberEntries.length;
 
         const phases = _buildPhases({
@@ -4196,6 +4605,32 @@ export function createFireteamService({
             character,
             tactic: diagnostics.tactic?.name ?? null,
             objective: sharedObjective?.targetId ?? null,
+            // Issue #90: first-class compact recover-pinned overlay
+            // section — consumers (executor, GM preview) read the
+            // activation verdict and the single cover donor without
+            // digging into diagnostics; the full attribution/triage
+            // breakdown stays in `diagnostics.recover`.
+            recover: diagnostics.recover ? {
+                active: diagnostics.recover.active,
+                mode: diagnostics.recover.mode ?? null,
+                gate: diagnostics.recover.gate ?? null,
+                pinned: (diagnostics.recover.pinned ?? []).map(entry => ({
+                    combatantId: entry.combatantId ?? null,
+                    exposure: entry.exposure ?? null,
+                    value: entry.value ?? null,
+                    maneuverCritical: entry.maneuverCritical === true,
+                    attribution: entry.attribution
+                        ? {
+                            method: entry.attribution.method ?? null,
+                            confidence: entry.attribution.confidence ?? null,
+                            tokenId: entry.attribution.tokenId ?? null,
+                            tokenUuid: entry.attribution.tokenUuid ?? null
+                        }
+                        : null
+                })),
+                coverAssignment: diagnostics.recover.coverAssignment ?? null,
+                redirectTargetId: diagnostics.recover.redirectTargetId ?? null
+            } : null,
             convergence,
             revision,
             seed,

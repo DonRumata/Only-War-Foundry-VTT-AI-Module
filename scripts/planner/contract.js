@@ -131,7 +131,9 @@ export const SCORE_FACTORS = Object.freeze([
     "withdrawal",
     "coveringWithdrawal",
     "freeAttackCost",
-    "disengage"
+    "disengage",
+    "recoverCover",
+    "recoverRedirect"
 ]);
 
 
@@ -228,7 +230,13 @@ export const DEFAULT_PRESET_WEIGHTS = Object.freeze({
     withdrawal: 0,
     coveringWithdrawal: 0,
     freeAttackCost: 0,
-    disengage: 0
+    disengage: 0,
+    // Recover-pinned overlay (issue #90): both factors are zero without an
+    // active fireteam `team.recover` injection, so solo behaviour is
+    // bit-for-bit unchanged. The defaults keep the experimental channel
+    // visible in skeleton breakdowns without pricing doctrine.
+    recoverCover: 3,
+    recoverRedirect: 1
 });
 
 

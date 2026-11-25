@@ -141,7 +141,12 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     seek: 3,
     // Run mechanic (smoke): sprinting between cover is acceptable when
     // the next hide lies past a full move — a modest pull.
-    run: 1
+    run: 1,
+    // Recover-pinned overlay (issue #90): cover-seeking under suppression
+    // is core spec-ops craft; the redirect weight is soft so the recovery
+    // never breaks the signed maneuver geometry for it.
+    recoverCover: 5,
+    recoverRedirect: 2
 
 });
 

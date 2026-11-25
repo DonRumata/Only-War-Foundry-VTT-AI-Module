@@ -528,6 +528,12 @@ export function localizePreviewViewModel(vm, i18n = null) {
             members: vm.team.members.map(member => ({
                 ...member,
                 taskLabel: _label(i18nSource, `OWAI.Task.${member.task}`, member.task),
+                // Issue #90: role labels resolve through the localization
+                // chain with the raw role id as the fallback — overlay
+                // roles (`cover-fire`/`recovering`) read as proper rows
+                // while every legacy role keeps its historical display.
+                roleLabel: member.role
+                    ? _label(i18nSource, `OWAI.Preview.Role.${member.role}`, member.role) : null,
                 action: member.action ? {
                     ...member.action,
                     label: _label(i18nSource, `OWAI.Preview.Step.${member.action.type}`, member.action.type),

@@ -115,7 +115,13 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     outnumber: 1,
     // Run mechanic (smoke): a sprint between firing positions is a
     // fallback — useful when the next cover lies past a full move.
-    run: 0.5
+    run: 0.5,
+    // Recover-pinned overlay (issue #90): reaching cover against the pin
+    // threat is this doctrine's natural answer to suppression — the
+    // strongest recoverCover pull of the presets; the team redirect is
+    // a soft weight, never an assignment.
+    recoverCover: 6,
+    recoverRedirect: 2
 
 });
 
