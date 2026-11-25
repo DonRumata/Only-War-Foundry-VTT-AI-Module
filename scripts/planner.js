@@ -929,10 +929,10 @@ export function createPlannerService({
             }
 
             let attackFound = false;
-            // Blast weapons may strike a last-known position (room
-            // clearing) even when the remembered target is not attackable.
-            // Issue #38: shared team contacts count as memory too.
-            const memoryStrike = _isMemorySource(target.source)
+            // Tracker-only intel steers movement but is not a sighting.
+            const rememberedTarget = _isMemorySource(target.source) && target.source !== "intel"
+                ? target.tokenUuid : null;
+            const memoryStrike = rememberedTarget
                 && usableActions.some(action => _actionBlastRadius(action) > 0
                     && !_isMeleeAction(action));
             if (target.canAttack !== true && !memoryStrike) {
@@ -959,8 +959,7 @@ export function createPlannerService({
                     // a last-known memory position is allowed too — the
                     // LOS gate drops for remembered strikes.
                     if (_actionBlastRadius(action) > 0 && !melee) {
-                        const presumed = _isMemorySource(target.source)
-                            ? (target.tokenUuid ?? null) : null;
+                        const presumed = rememberedTarget;
                         const aimInput = {
                             tokenDoc,
                             target,
@@ -1034,6 +1033,7 @@ export function createPlannerService({
                         }
                         continue;
                     }
+                    if (target.canAttack !== true) continue;
                     // The weapon's own `charge` attack type — when the
                     // system API exposes one — is the canonical action
                     // for move-into-reach candidates; sibling attack
@@ -1994,7 +1994,7 @@ export function createPlannerService({
                 itemUuid: action.itemUuid,
                 range: _actionRange(action)
             })),
-            target: winner.target
+            target: winner.target && !(winner.aim && winner.target.canAttack !== true)
                 ? {
                     tokenId: winner.target.tokenId,
                     tokenUuid: winner.target.tokenUuid,

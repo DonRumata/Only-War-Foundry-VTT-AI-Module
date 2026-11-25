@@ -226,14 +226,12 @@ test("neutrals veto blast aim unless includeNeutral marks them as targets", asyn
     assert.ok(allowedAttack?.input.targetPoint);
 });
 
-test("blast memory strike hits a last-known position without live LOS", async () => {
+test("a blast can aim at a remembered point without tracking the target token", async () => {
     const { world, context } = makeBlastContext({ blastTokens: [] });
-    // Only a remembered contact — no live target is attackable.
     context.targets = [{
-        tokenUuid: "memory-uuid",
+        ...injectedTargets(world)[0],
         x: 300,
         y: 0,
-        elevation: 0,
         canAttack: false,
         source: "last-known"
     }];
@@ -244,7 +242,35 @@ test("blast memory strike hits a last-known position without live LOS", async ()
     const attack = result.plan.steps.find(step => step.type === "attack");
     assert.ok(attack, "memory-strike attack exists");
     assert.equal(attack.input.actionId, "frag");
-    assert.equal(attack.input.targetPoint.x, 300);
+    assert.deepEqual(attack.input.targetPoint, { x: 300, y: 0 });
+    assert.equal(attack.input.targetTokenId, null);
+    assert.equal(attack.input.targetTokenUuid, null);
+    world.enemies[0].token.x = 500;
+    assert.equal(planner.validateSnapshot(result.plan, world).valid, true, "the remembered point stays fixed");
+});
+
+test("a tracker-only contact cannot authorize a blast without a sighting", async () => {
+    const { world, context } = makeBlastContext();
+    context.targets = [];
+    context.seekContacts = true;
+    context.moves = [{ x: 100, y: 0, cost: 1, los: false }];
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.ok(result.plan?.snapshot.targets.some(target => target.source === "intel"));
+    assert.ok(result.plan.steps.some(step => step.type === "move"));
+    assert.ok(!result.plan.steps.some(step => step.type === "attack"));
+});
+
+test("an unsafe memory blast does not expose a last-known contact to direct fire", async () => {
+    const { world, context } = makeBlastContext({
+        blastTokens: [{ tokenId: "ally", x: 300, y: 0, disposition: -1 }]
+    });
+    context.targets = [{ ...injectedTargets(world)[0], canAttack: false, source: "last-known" }];
+    const planner = createPlannerService();
+    registerAssaultPreset(planner);
+    const result = await planner.planTurn(world.combat, world.combatant, context);
+    assert.ok(!(result.plan?.steps ?? []).some(step => step.type === "attack"));
 });
 
 test("planTurn returns disabled for a non-enabled combatant", async () => {
