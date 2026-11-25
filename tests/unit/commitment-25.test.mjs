@@ -964,11 +964,18 @@ test("buildTeamPlan: a gm-controlled flanker demotes to support, team lives", as
     });
     combat.scene = scene;
     const service = createFireteamService({ planner: createPlannerService() });
+    const objective = { type: "screen", lane: "left" };
     const result = await service.buildTeamPlan(combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
     }, {
         seed: 42,
+        assignments: {
+            [leader.combatant.id]: { task: "assault", role: "cover" },
+            [flanker.combatant.id]: {
+                task: "flank", role: "interdictor", element: "screen", objective
+            }
+        },
         targets: [{
             tokenId: enemyToken.id,
             tokenUuid: `Scene.${scene.id}.Token.${enemyToken.id}`,
@@ -983,6 +990,9 @@ test("buildTeamPlan: a gm-controlled flanker demotes to support, team lives", as
     assert.equal(byId[flanker.combatant.id].task, "support",
         "the gm-controlled flanker degrades to support");
     assert.equal(byId[flanker.combatant.id].groupId, "main");
+    assert.equal(byId[flanker.combatant.id].role, "interdictor");
+    assert.equal(byId[flanker.combatant.id].element, "screen");
+    assert.deepEqual(byId[flanker.combatant.id].objective, objective);
     assert.deepEqual(result.teamPlan.diagnostics.gmControlled,
         [flanker.combatant.id]);
     assert.equal(result.teamPlan.diagnostics.gmDemotions.length, 1);
@@ -1012,7 +1022,14 @@ test("buildTeamPlan: a fresh gm-intervention marks, demotes and replans", async 
     });
     const fakePlanner = {
         planTurn: async (combatDoc, combatant, context) => {
-            calls.push({ combatantId: combatant.id, task: context?.team?.task });
+            calls.push({
+                combatantId: combatant.id,
+                task: context?.team?.task,
+                role: context?.team?.role,
+                objective: context?.team?.objective,
+                memberObjective: context?.team?.memberObjective,
+                assignment: context?.team?.assignment
+            });
             return {
                 status: "ok",
                 plan: fakePlan(combatant, context?.team?.task)
@@ -1020,10 +1037,18 @@ test("buildTeamPlan: a fresh gm-intervention marks, demotes and replans", async 
         }
     };
     const service = createFireteamService({ planner: fakePlanner });
+    const objective = { type: "screen", lane: "left" };
     const result = await service.buildTeamPlan(combat, {
         teamId: "alpha",
         leaderId: leader.combatant.id
-    }, { seed: 5 });
+    }, {
+        seed: 5,
+        assignments: {
+            [flanker.combatant.id]: {
+                task: "flank", role: "interdictor", element: "screen", objective
+            }
+        }
+    });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     // The freshly detected member was marked for the round…
     const mark = readGmControlled(flanker.combatant);
@@ -1040,6 +1065,22 @@ test("buildTeamPlan: a fresh gm-intervention marks, demotes and replans", async 
     assert.equal(flankCalls.length, 2);
     assert.equal(flankCalls[0].task, "flank");
     assert.equal(flankCalls[1].task, "support");
+    assert.equal(flankCalls[1].role, "interdictor",
+        "the gm-intervention replan keeps the member role");
+    assert.equal(flankCalls[1].objective, null,
+        "no shared target exists here, so the legacy scalar channel stays null");
+    assert.deepEqual(flankCalls[1].memberObjective, objective);
+    assert.deepEqual(flankCalls[1].assignment, {
+        task: "support",
+        role: "interdictor",
+        element: "screen",
+        objective
+    }, "the demotion updates the canonical assignment descriptor");
+    const diagnostic = result.teamPlan.diagnostics.assignments
+        .find(a => a.combatantId === flanker.combatant.id);
+    assert.equal(diagnostic.task, "support");
+    assert.equal(diagnostic.role, "interdictor");
+    assert.deepEqual(diagnostic.objective, objective);
 });
 
 test("delay × commitment: the sync wait wins the turn, the record survives", async () => {

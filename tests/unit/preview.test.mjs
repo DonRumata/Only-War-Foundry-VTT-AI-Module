@@ -7,6 +7,7 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 
 import { createModuleApi } from "../../scripts/api.js";
 import { createPlannerService } from "../../scripts/planner.js";
@@ -303,6 +304,62 @@ test("buildPreviewViewModel produces a serializable summary of the plan", async 
     const localized = localizePreviewViewModel(vm, i18nStub);
     assert.equal(localized.steps[0].label, "Move");
     assert.ok(localized.resources.every(r => typeof r.label === "string"));
+});
+
+test("team preview view-model carries assignment role, element and objective", async () => {
+    const world = makeWorld();
+    const rig = makeController();
+    const plan = JSON.parse(JSON.stringify(await makePlan(rig, world)));
+    const objective = { type: "screen", lane: "left", targetId: world.enemy.token.id };
+    plan.teamTurn = {
+        state: {
+            teamId: "alpha",
+            leaderId: world.combatant.id,
+            tactic: null,
+            tacticReason: null,
+            score: 1,
+            objective: world.enemy.token.id,
+            required: [world.combatant.id],
+            members: [{
+                id: world.combatant.id,
+                tokenId: world.token.id,
+                task: "flank",
+                groupId: "flank-1",
+                role: "interdictor",
+                element: "screen",
+                objective,
+                position: { x: 0, y: 0 },
+                move: { destination: { x: 100, y: 0 }, halves: 1, cost: 1 },
+                action: null,
+                rejoin: null
+            }]
+        },
+        required: [world.combatant.id]
+    };
+
+    const vm = buildPreviewViewModel(plan, {
+        combat: world.combat,
+        combatant: world.combatant,
+        diagnosticsEnabled: false,
+        maxReplans: 1,
+        timeoutSeconds: 60
+    });
+    assert.deepEqual(JSON.parse(JSON.stringify(vm)), vm);
+    assert.equal(vm.team.members.length, 1);
+    assert.equal(vm.team.members[0].role, "interdictor");
+    assert.equal(vm.team.members[0].element, "screen");
+    assert.deepEqual(vm.team.members[0].objective, objective);
+    assert.notEqual(vm.team.members[0].objective, objective);
+});
+
+test("preview team metadata labels exist in English and Russian", async () => {
+    const root = new URL("../../languages/", import.meta.url);
+    const en = JSON.parse(await readFile(new URL("en.json", root), "utf8"));
+    const ru = JSON.parse(await readFile(new URL("ru.json", root), "utf8"));
+    for (const key of ["OWAI.Preview.Team.Role", "OWAI.Preview.Team.Element"]) {
+        assert.ok(en[key], `missing en label ${key}`);
+        assert.ok(ru[key], `missing ru label ${key}`);
+    }
 });
 
 test("openPreview opens a session, renders the dialog and arms the timeout", async () => {

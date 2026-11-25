@@ -285,6 +285,89 @@ function _jsonClone(value) {
 }
 
 /**
+ * Whether a value is a plain object (not an array, class instance or
+ * Document). Assignment objectives must remain JSON-only data.
+ * @param {*} value
+ * @returns {boolean}
+ */
+function _isPlainObject(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * JSON-round-trip a plain object, rejecting payloads that cannot serialize
+ * (circular references, BigInt and the like). The clone never shares object
+ * identity with the caller's input, so TeamPlan freezing cannot freeze a
+ * tactic author's working draft.
+ * @param {*} value
+ * @returns {object|null}
+ */
+function _jsonObject(value) {
+    if (!_isPlainObject(value)) return null;
+    try {
+        const clone = _jsonClone(value);
+        return _isPlainObject(clone) ? clone : null;
+    } catch(err) {
+        return null;
+    }
+}
+
+/**
+ * Non-empty normalized marker string (`role`/`element`), or null.
+ * @param {*} value
+ * @returns {string|null}
+ */
+function _markerString(value) {
+    return typeof value === "string" && value.trim()
+        ? value.trim() : null;
+}
+
+/**
+ * Normalize one explicit fireteam assignment value. The legacy form is a
+ * bare task string and means `{task: string}`; the object form is
+ * `{task, role?, element?, objective?}`. The task itself is deliberately
+ * not validated here — `assignTasks` keeps the historical fallback of an
+ * unknown task to `support` — while `objective` is cloned into plain
+ * JSON-only data or dropped when it cannot serialize.
+ * @param {*} value Raw `combatantId → assignment` value.
+ * @returns {object|null} `{task, role?, element?, objective?}` or null.
+ */
+export function normalizeFireteamAssignment(value) {
+    let source = null;
+    if (typeof value === "string") source = { task: value };
+    else if (_isPlainObject(value)) source = value;
+    if (!source) return null;
+    const normalized = {
+        task: typeof source.task === "string" ? source.task : null
+    };
+    const role = _markerString(source.role);
+    const element = _markerString(source.element);
+    if (role) normalized.role = role;
+    if (element) normalized.element = element;
+    const objective = _jsonObject(source.objective);
+    if (objective) normalized.objective = objective;
+    return normalized;
+}
+
+/**
+ * Canonical serializable assignment descriptor exposed to member planner
+ * contexts. `objective` is the member-scoped polymorphic objective; the
+ * legacy shared target id remains the separate `team.objective` channel.
+ * @param {object} assignment Assignment produced by `assignTasks`.
+ * @returns {{task: string|null, role?: string, element?: string,
+ *   objective?: object}}
+ */
+function _assignmentDescriptor(assignment) {
+    const descriptor = { task: assignment?.task ?? null };
+    if (assignment?.role) descriptor.role = assignment.role;
+    if (assignment?.element) descriptor.element = assignment.element;
+    if (assignment?.objective) descriptor.objective = _jsonClone(assignment.objective);
+    return descriptor;
+}
+
+/**
  * Morale state of a combatant for issue #38 gating (graceful #26
  * integration): reads `context.morale` first (tests/integrations), then
  * the reserved module flag `flags["only-war-ai"].morale`
@@ -849,19 +932,24 @@ export function createFireteamService({
      * Default policy — leader assaults with group `main`, the first
      * non-leader member (stable id order) flanks with group `flank-1` when
      * flanking is allowed, the rest support. `context.assignments` maps
-     * `combatantId → task` to force specific assignments;
-     * `context.regroup === true` puts everyone on `regroup`.
+     * `combatantId` either to a legacy task string or to
+     * `{task, role?, element?, objective?}`; `context.regroup === true`
+     * puts every member without an explicit assignment on `regroup`.
+     * A member objective's `targetId` is more specific than the shared
+     * objective and wins `assignedTargetId`; role/element remain metadata.
      * @param {object[]} members Entries from {@link collectMembers}.
      * @param {object} [context]
      * @param {string|null} [context.leaderId] Elected/retained leader id.
-     * @param {object} [context.assignments] Explicit `combatantId → task`.
+     * @param {object} [context.assignments] Explicit `combatantId → task`
+     *   or `combatantId → {task, role?, element?, objective?}`.
      * @param {boolean} [context.allowFlank] `false` disables the default
      *   flank group.
      * @param {boolean} [context.regroup] Force every member to `regroup`.
      * @param {object} [context.objective] `{targetId, flankTargetId}` shared
      *   team objective.
      * @returns {object[]} Assignments `{combatantId, tokenId, task, groupId,
-     *   leader, assignedTargetId}` in deterministic order.
+     *   leader, assignedTargetId, role?, element?, objective?}` in
+     *   deterministic order.
      */
     function assignTasks(members, context = {}) {
         const sorted = [...(members ?? [])].sort((a, b) =>
@@ -881,8 +969,8 @@ export function createFireteamService({
         let flankAssigned = 0;
         return sorted.map(member => {
             let task = null;
-            const forced = explicit?.[member.combatantId];
-            if (typeof forced === "string") task = forced;
+            const forced = normalizeFireteamAssignment(explicit?.[member.combatantId]);
+            if (forced) task = forced.task;
             else if (context.regroup === true) task = "regroup";
             else if (member.combatantId === context.leaderId) task = "assault";
             else if (assaultAssigned < assaultQuota) task = "assault";
@@ -901,13 +989,17 @@ export function createFireteamService({
             // Issue #16: a convergent objective may restrict the shared
             // target to the members that actually contribute kill-EV
             // (`capableMembers`); without that list the objective goes to
-            // every non-flank member as before.
+            // every non-flank member as before. Issue #91: a member-scoped
+            // objective target is more specific than every shared target
+            // channel and therefore wins `assignedTargetId`; role/element
+            // remain metadata and never enter the reservation key.
             const objectiveRestricted = Array.isArray(context.objective?.capableMembers)
                 && !context.objective.capableMembers.includes(member.combatantId);
-            const assignedTargetId = task === "flank"
+            const sharedTargetId = task === "flank"
                 ? (context.objective?.flankTargetId ?? context.objective?.targetId ?? null)
                 : (objectiveRestricted ? null : (context.objective?.targetId ?? null));
-            return {
+            const assignedTargetId = forced?.objective?.targetId ?? sharedTargetId;
+            const assignment = {
                 combatantId: member.combatantId,
                 tokenId: member.tokenId ?? null,
                 task,
@@ -915,6 +1007,10 @@ export function createFireteamService({
                 leader: member.combatantId === context.leaderId,
                 assignedTargetId
             };
+            if (forced?.role) assignment.role = forced.role;
+            if (forced?.element) assignment.element = forced.element;
+            if (forced?.objective) assignment.objective = _jsonClone(forced.objective);
+            return assignment;
         });
     }
 
@@ -2409,6 +2505,10 @@ export function createFireteamService({
         const routeLocks = [...(context.reservations ?? [])];
         const plans = new Map();
         const tokens = new Map(ordered.map(member => [member.combatantId, _tokenDoc(member.combatant.token)]));
+        // Backward-compatible legacy channel: `team.objective` is always
+        // the shared target id, never the member-scoped objective object.
+        const sharedTargetId = tactic?.objective?.targetId
+            ?? context.objective?.targetId ?? null;
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
@@ -2425,6 +2525,12 @@ export function createFireteamService({
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
+                    role: assignment.role ?? null,
+                    element: assignment.element ?? null,
+                    objective: sharedTargetId,
+                    memberObjective: assignment.objective
+                        ? _jsonClone(assignment.objective) : null,
+                    assignment: _assignmentDescriptor(assignment),
                     leaderId: election.combatantId,
                     center: leaderPos,
                     ...flankRules,
@@ -2435,8 +2541,6 @@ export function createFireteamService({
                     // the target itself — without it the task was a dead
                     // label and the member wandered (smoke finding).
                     flankPoint: tactic?.objective?.flankPoint ?? null,
-                    objective: tactic?.objective?.targetId
-                        ?? context.objective?.targetId ?? null,
                     regroupPoint: assignment.task === "regroup"
                         ? (rejoinPoints[0] ?? null) : null
                 }
@@ -2511,7 +2615,8 @@ export function createFireteamService({
                                 team: {
                                     ...memberContext.team,
                                     task: "support",
-                                    groupId: "main"
+                                    groupId: "main",
+                                    assignment: _assignmentDescriptor(assignment)
                                 }
                             });
                         const previous = diagnostics.memberStatuses[member.combatantId]
@@ -2575,6 +2680,12 @@ export function createFireteamService({
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
+                    role: assignment.role ?? null,
+                    element: assignment.element ?? null,
+                    objective: sharedTargetId,
+                    memberObjective: assignment.objective
+                        ? _jsonClone(assignment.objective) : null,
+                    assignment: _assignmentDescriptor(assignment),
                     leaderId: election.combatantId,
                     ...(flankRules ? {
                         ...flankRules, flankPoint: tactic?.objective?.flankPoint ?? null
@@ -2612,7 +2723,8 @@ export function createFireteamService({
             if (failure) {
                 const fallback = specOpsFlankFallback(members, tactic, failure);
                 const explicit = Object.entries(context.assignments ?? {})
-                    .filter(([, task]) => task !== "flank");
+                    .filter(([, assignment]) =>
+                        normalizeFireteamAssignment(assignment)?.task !== "flank");
                 return buildTeamPlan(combat, team, {
                     ...context,
                     readOnly: true,
@@ -2645,6 +2757,10 @@ export function createFireteamService({
             teamId,
             memberMorale: moraleInfo.effective
         });
+        // Fresh gm-intervention demotions can happen during member
+        // planning, after the first diagnostic snapshot. Publish the final
+        // assignment records (including role/element/objective metadata).
+        diagnostics.assignments = _jsonClone(assignments);
         const reservations = reserveResources(orderedAssignments, plans, reservationContext);
         diagnostics.reservations = _jsonClone(reservations);
         const routeConflict = reservations.conflicts.find(conflict => conflict.type !== "target");
@@ -2737,6 +2853,10 @@ export function createFireteamService({
                 task: assignment.task,
                 groupId: assignment.groupId,
                 leader: assignment.leader,
+                ...(assignment.role ? { role: assignment.role } : {}),
+                ...(assignment.element ? { element: assignment.element } : {}),
+                ...(assignment.objective
+                    ? { objective: _jsonClone(assignment.objective) } : {}),
                 detached: cohesion.detached,
                 detachedUntilPhase: cohesion.detached
                     ? _finiteOr(context.detachedUntilPhase, 1) : null,
