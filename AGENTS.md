@@ -285,7 +285,8 @@ combatant, context)` строит immutable DTO-снапшот и детерми
 оружия сохраняется до 3 типов в курируемом порядке — melee `[allOut,
 charge, standard, lightning, swift, called_shot]`, ranged `[full_auto,
 semi_auto, standard, ripper_charge, called_shot, suppressing_fire]`;
-`suppressing_fire` достижим — step-контракт несёт `targetPoint`/`template`
+`EXCLUDED_ATTACK_TYPES` пуст: `suppressing_fire` не исключается и достижим —
+step-контракт несёт `targetPoint`/`template`
 (issue #14). Вариант `charge` использует
 действие с `attackType: "charge"` того же оружия, если оно есть. Новые
 факторы: `attackType` (привлекательность типа атаки), `vulnerable` (цель
@@ -303,10 +304,28 @@ melee/blast/cone) атака по цели, стоящей в melee-reach сою
 сам бот и цель не считаются); `leaveMeleeEngage`/`engageDenial` —
 поконтактный учёт свободной атаки: выход кандидата из melee-reach врага
 и вход в него снаружи (reach — melee-эмиттеры threat-профиля, фолбэк
-`DEFAULT_MELEE_RANGE` = 2); `unpin` — синтетический full-cost WP-тест
-для pinned-бота (`test`-шаг `type:"characteristic", key:"willpower"`,
-rejected `unpin-unavailable` без характеристики); `grudge` — цель
+`DEFAULT_MELEE_RANGE` = 2); `grudge` — цель
 совпадает с записью флага `lastAttacker` (сервис `grudges`, ниже).
+
+Unpin (issue #93): по корбуке снятие pinning — не действие, а свободный
+тест Воли в конце хода (+0; +30 в укрытии от ближайшей известной угрозы —
+`navigation.coverEstimate` ≥ 0.5, probe из точки endpoint'а последнего
+move-шага плана — центр футпринта в пикселях — либо текущей позиции без
+движения; бонус «не обстреливали» не выдумывается — данных о выстрелах у
+модуля нет). Pinned-бот не тратит бюджет на кандидата:
+нулевой `test`-шаг (`halves: 0`, `input.unpin/endOfTurn`,
+`type:"characteristic", key:"willpower"`, `modifier`/`modifierBasis`)
+автоматически вставляется перед end-turn любого его плана — scored,
+replay commitment, team-координации; stunned-план шага не содержит.
+`unpin-unavailable` в rejected остаётся диагностикой для актёра без
+характеристики willpower. Фактор `unpin` и веса пресетов сохранены для
+обратной совместимости контракта скоринга, но всегда равны нулю —
+соревнующегося кандидата больше нет. Executor исполняет шаг через
+`prepareTest`/`executeTest` и снимает `pinned` только при успешном броске
+(`outcome.roll.success` — системный `removeCondition`, фолбэк
+`toggleStatusEffect("pinned", {active:false})`); неактуальный шаг
+(статус уже снят) пропускается с `not-pinned`. Нулевая стоимость не
+попадает под irreversible-бюджет и не тратит его.
 
 Blast-awareness: blast-действия (`blastRadius` из `item.system.blastRadius`
 или `traits.blast`, метры) не целятся в токен — `_bestBlastAim` перебирает
@@ -320,7 +339,9 @@ LOS до точки обязателен, кроме ударов по last-know
 `input.targetPoint` + `input.blastRadius` (issue #29 — зона для GM-
 оверлея и системного шаблона) → `prepareAttack`. Фактор `area` =
 min(blastHits/2, 1); веса в пресетах (assault 4, specOps 5, rangedCover
-3, hold 2).
+3, hold 2). С issue #93 cone-кандидаты (spray/suppressing fire) тоже
+передают `blastHits` из `_bestConeAim` — раньше `area` для конусов
+всегда читался нулём.
 
 Конусы (spray/`suppressing_fire`, overwatch): ориентация строго по
 воспринимаемым якорям (issue #30) — `_bestConeAim` наводит сектор только
@@ -366,6 +387,48 @@ half-move, цель `reactionUsed`. Фактор `attackType` несёт
 `desire × (1 − chance)`; цель с потраченной реакцией добавляет
 `vulnerable` (planner читает флаг документа её комбатанта); бот с
 потраченной реакцией не декларирует overwatch (`reaction-used`).
+
+## Tactic registry (issue #92)
+
+`scripts/tactics/registry.js` — instance-local pure-сервис `tactics`
+(`api.services`, регистрируется в `module.js` на `init`). Запись selector'а:
+`{presetId, kind:"maneuver"|"overlay", priority, select}`; shorthand
+`registerTacticSelector(presetId, select)` даёт `maneuver` с приоритетом
+`DEFAULT_TACTIC_PRIORITY = 100`. Меньший `priority` оценивается раньше,
+равный — в порядке регистрации. В v1 `resolveTactic(presetId, input)` учитывает
+только `maneuver` и возвращает первый non-null descriptor; overlay — точка
+подключения следующих инкрементов и не участвует в выборе манёвра. Selector
+обязан быть synchronous/pure/deterministic и не мутировать Document/input.
+Точное повторное внесение того же selector'а с тем же kind/priority
+идемпотентно; конфликтующее — ошибка. `fireteam._resolveTactic` сначала
+сохраняет legacy-приоритет explicit `context.tactic` (function/object;
+`null`/`false` отключают), затем обращается к registry по `teamPreset`.
+specOps, rangedCover и assault зарегистрированы как maneuver-selectors;
+hold пока получает null/fallback без новых тактик. Для тактик
+`collectMembers` дополнительно несёт `turnIndex` (индекс в `combat.turns`)
+и `hasActed` (`turnIndex < combat.turn`; `turn:null`/отсутствие индекса —
+false), не меняя solo-планировщик.
+
+Peel-withdrawal (issue #89): pure stateless ядро `scripts/tactics/peel-withdrawal.js`
+не хранит `peelActive` и не добавляет preset/`FIRETEAM_TASKS`. specOps проверяет
+его до legacy regroup-fallback, rangedCover — до suppress-and-bound, assault —
+до loose-pincer. Selector адаптирует read-only входы (positions, rates,
+morale/casualties, turn order, engagement, weapon capabilities, navigation,
+danger) без document mutations и возвращает frozen descriptor
+`objective{type:"peel-withdrawal", ttl:1, regroupPoint, threatCentroid, lane}`
++ object assignments `withdraw`/`cover` + explainable rejections. Явные
+`context.tactic`, caller objective/assignments и concentrate-fire focus имеют
+приоритет; peel не перетирает их. Member context использует существующий
+`team` канал: withdrawer получает `task:"regroup", role:"withdraw"` и
+regroup anchor, cover — `task:"support", role:"cover"` и cover mode/target.
+Planner мерджит navigation-кандидаты к regroup point, генерирует variants
+`withdraw|disengage` через обычный move step и факторы
+`withdrawal/coveringWithdrawal/freeAttackCost/disengage` (новых executor
+step types нет). Ordinary withdraw явно платит free-attack cost; `disengage`
+— только structural capability evidence, API v1.0 не считается таким
+доказательством. GM/morale demotions очищают peel role/objective geometry.
+Пороги `peel*` — world settings с experimental defaults; context overrides
+выигрывают.
 
 ## Реакции (issue #37)
 

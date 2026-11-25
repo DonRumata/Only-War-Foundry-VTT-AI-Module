@@ -56,7 +56,7 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
         // move beyond the half-move rate costs a full action; a run is
         // always the whole action economy however short the sprint.
         const moveHalves = variant === "charge" ? 0
-            : variant === "run" ? 2
+            : variant === "run" || variant === "disengage" ? 2
                 : (candidate.action === null || candidate.action === undefined)
                     ? (halfMoveLimit !== null && _finiteOr(move.cost, 0) > halfMoveLimit ? 2 : 1)
                     : 1;
@@ -69,8 +69,18 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                 waypoints: move.waypoints ?? [],
                 approximate: move.approximate === true,
                 // `run` rides the step so the executor can stamp the
-                // +20-evasion marker after the sprint lands.
-                ...(variant === "run" ? { mode: "run" } : {})
+                // +20-evasion marker after the sprint lands. Peel
+                // `disengage` is likewise move metadata, not a new step
+                // type: it is the full-action melee exit only when the
+                // selector structurally detected that capability.
+                ...(variant === "run" ? { mode: "run" } : {}),
+                ...(variant === "disengage"
+                    ? {
+                        mode: "disengage",
+                        disengagesFrom: Array.isArray(candidate.peelEngagers)
+                            ? [...candidate.peelEngagers] : []
+                    }
+                    : {})
             },
             preconditions: ["turn", "self-position", "collision"],
             projectedResourceDelta: { movement: -(_finiteOr(move.cost, 0)) }
@@ -176,7 +186,8 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                         arc: zone?.arc ?? OVERWATCH_CONE_DEG,
                         range: _actionRange(action)
                     }),
-                targetTokenUuid: target?.tokenUuid ?? null
+                targetTokenUuid: target?.tokenUuid ?? null,
+                ...(candidate.lane ? { lane: candidate.lane } : {})
             },
             preconditions: ["turn"],
             projectedResourceDelta: {}
@@ -198,27 +209,6 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
                 itemUuid: action.itemUuid ?? null
             },
             preconditions: ["turn", "resources"],
-            projectedResourceDelta: {}
-        });
-    }
-    // Issue #39: `unpin` is the DH2e full-action Willpower test clearing
-    // the pinned status. The verified `prepareTest` contract takes
-    // `type` + `key`; the step also carries the descriptive
-    // `characteristic`/`testKind` pair so the plan stays readable.
-    if (variant === "unpin") {
-        steps.push({
-            id: `step-test-${steps.length + 1}`,
-            type: "test",
-            cost: { halves: _actionCost(action) },
-            input: {
-                actionId: action?.id ?? "unpin",
-                name: action?.name ?? "Unpin",
-                type: "characteristic",
-                key: "willpower",
-                characteristic: action?.characteristic ?? "willpower",
-                testKind: action?.testKind ?? "characteristic"
-            },
-            preconditions: ["turn"],
             projectedResourceDelta: {}
         });
     }
@@ -269,4 +259,64 @@ export function _stepsFor({ candidate, carriedAim = null, halfMoveLimit = null }
         projectedResourceDelta: {}
     });
     return steps;
+}
+
+/**
+ * Issue #93: the unpin step of a pinned combatant. Per the Only War
+ * corebook pinning recovery is *not* an action — at the end of the turn
+ * the pinned character makes a free Willpower test (+0, or +30 when in
+ * cover against the nearest known threat or when it was not shot at
+ * since the last turn). The step therefore costs zero halves, carries
+ * `endOfTurn: true` and is appended ahead of the end-turn step of every
+ * plan a pinned bot receives instead of competing as an action
+ * candidate. The id is stable on purpose: a mid-plan replan re-serializes
+ * the same step, and the system operation journal then replays the
+ * first roll instead of granting a second end-of-turn test.
+ * @param {object} [input]
+ * @param {number} [input.modifier] Test modifier (+0 base, +30 in cover).
+ * @param {string} [input.modifierBasis] `base` / `in-cover` / `not-shot-at`.
+ * @returns {object} Serializable plan step.
+ */
+export function _unpinTestStep({ modifier = 0, modifierBasis = "base" } = {}) {
+    return {
+        id: "step-test-unpin",
+        type: "test",
+        cost: { halves: 0 },
+        input: {
+            actionId: "unpin",
+            name: "Unpin",
+            type: "characteristic",
+            key: "willpower",
+            characteristic: "willpower",
+            testKind: "characteristic",
+            unpin: true,
+            endOfTurn: true,
+            modifier: _finiteOr(modifier, 0),
+            modifierBasis: modifierBasis ?? "base"
+        },
+        preconditions: ["turn"],
+        projectedResourceDelta: {}
+    };
+}
+
+
+/**
+ * Issue #93 review: the position a serialized plan leaves the bot in —
+ * the `to`/`destination` point of the LAST move step. The serialized
+ * point is a footprint centre in pixels (the executor contract — see
+ * `_stepMove`), exactly the coordinate channel `navigation.coverEstimate`
+ * probes, so end-of-turn cover questions (unpin) can be asked against
+ * the position the bot actually occupies when the test is taken rather
+ * than its turn-start spot. `null` when no move step exists — the
+ * caller falls back to the current position.
+ * @param {object[]} steps Serialized plan steps.
+ * @returns {{x: number, y: number}|null}
+ */
+export function _planEndCentre(steps) {
+    const move = [...(steps ?? [])].reverse()
+        .find(step => step?.type === "move");
+    const to = move?.input?.to ?? move?.input?.destination ?? null;
+    return Number.isFinite(to?.x) && Number.isFinite(to?.y)
+        ? { x: to.x, y: to.y }
+        : null;
 }

@@ -33,10 +33,12 @@ import {
     createSpecOpsTactic,
     evaluateSpecOps,
     registerSpecOpsPreset,
+    registerSpecOpsTacticSelector,
     selectSpecOpsTactic,
     specOpsTactic,
     specOpsVeto
 } from "../../scripts/presets/spec-ops.js";
+import { createTacticRegistry } from "../../scripts/tactics/registry.js";
 import {
     makeActor,
     makeCombatant,
@@ -144,7 +146,7 @@ function makeTeamWorld(members, {
     const enemies = [];
     for (let i = 0; i < enemyCount; i++) {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemyX + i * 100;
@@ -401,6 +403,46 @@ test("selectSpecOpsTactic is deterministic and serializable", () => {
     assert.notEqual(tightResult.name, "regroup-fallback");
 });
 
+test("registered specOps selector is bit-for-bit compatible with the legacy factory", () => {
+    const registry = createTacticRegistry();
+    const record = registerSpecOpsTacticSelector(registry);
+    assert.equal(record.select, specOpsTactic);
+    const scenarios = [
+        {
+            members: [memberStub("solo", 0, 0)],
+            leaderId: "solo",
+            targets: [{ tokenId: "e1", x: 500, y: 0, canAttack: true }]
+        },
+        {
+            members: [memberStub("a", 0, 0), memberStub("b", 50, 0)],
+            leaderId: "a",
+            targets: Array.from({ length: 5 }, (_, i) => ({
+                tokenId: `e${i}`, x: 1000 + i * 50, y: 0, canAttack: true
+            }))
+        },
+        {
+            members: [memberStub("a", 0, 0), memberStub("b", 50, 50), memberStub("c", 100, 0)],
+            leaderId: "a",
+            targets: [{ tokenId: "e1", x: 1000, y: 0, canAttack: true }]
+        },
+        {
+            members: [memberStub("a", 0, 0), memberStub("b", 200, 0)],
+            leaderId: "a",
+            targets: [
+                { tokenId: "e1", x: 1000, y: 0, canAttack: true },
+                { tokenId: "e2", x: 1100, y: 0, canAttack: true },
+                { tokenId: "e3", x: 1200, y: 0, canAttack: true }
+            ]
+        }
+    ];
+    for (const input of scenarios) {
+        const direct = specOpsTactic(input);
+        const resolved = registry.resolveTactic(SPEC_OPS_PRESET_ID, input);
+        assert.deepEqual(resolved, direct);
+        assert.equal(JSON.stringify(resolved), JSON.stringify(direct));
+    }
+});
+
 test("selectSpecOpsTactic: capability-based split prefers long-range support", () => {
     const melee = { type: "weapon", system: { class: "melee", range: 2 } };
     const rifle = { type: "weapon", system: { class: "ranged", range: 150 } };
@@ -630,7 +672,9 @@ test("solo specOps NPC outside a fireteam plans with the safe fallback", async (
 function makeSpecOpsService() {
     const planner = createPlannerService();
     registerSpecOpsPreset(planner);
-    return createFireteamService({ planner });
+    const tactics = createTacticRegistry();
+    registerSpecOpsTacticSelector(tactics);
+    return createFireteamService({ planner, tactics });
 }
 
 /**
@@ -703,7 +747,11 @@ test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", 
     const flankPlan = plan.memberPlans[flanker.combatantId];
     assert.equal(flankPlan?.breakdown?.preset, SPEC_OPS_PRESET_ID);
     assert.equal(flankPlan?.breakdown?.team?.task, "flank");
-    assert.equal(flankPlan?.breakdown?.tactic, "flank-and-fix");
+    assert.deepEqual(flankPlan?.breakdown?.tactic, {
+        name: "flank-and-fix",
+        role: null,
+        reason: "outnumbered-flank-open"
+    });
     assert.equal(flankPlan.breakdown.team.flankAngle, 1);
     const [move, attack] = flankPlan.steps;
     assert.equal(move.type, "move");
@@ -823,7 +871,7 @@ test("one good flank attack cannot validate another required flanker", async () 
         assignments: {
             [leader.combatant.id]: "support",
             [good.combatant.id]: "flank",
-            [frontOn.combatant.id]: "flank"
+            [frontOn.combatant.id]: { task: "flank", role: "interdictor" }
         }
     });
     assert.equal(teamPlan.tactic, "covering-advance");
@@ -905,7 +953,11 @@ test("single specOps member gets the deterministic insufficient-members fallback
     const flag = { teamId: "alpha", teamPreset: "specOps" };
     const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
     const world = makeTeamWorld([leader], { enemyCount: 1 });
-    const service = makeSpecOpsService();
+    // Direct/headless construction has no injected registry; the service-local
+    // fallback must preserve the same specOps behaviour.
+    const planner = createPlannerService();
+    registerSpecOpsPreset(planner);
+    const service = createFireteamService({ planner });
     const result = await service.buildTeamPlan(world.combat,
         { teamId: "alpha" }, { seed: 1, targets: injectedTargets(world) });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
@@ -915,7 +967,7 @@ test("single specOps member gets the deterministic insufficient-members fallback
     assert.equal(result.teamPlan.members[0].task, "assault");
 });
 
-test("buildSpecOpsTeamPlan helper wires the tactic factory", async () => {
+test("buildSpecOpsTeamPlan helper uses the registered tactic selector", async () => {
     const { world, context } = reachableFlank();
     const service = makeSpecOpsService();
     const result = await buildSpecOpsTeamPlan(service, world.combat,
@@ -971,7 +1023,38 @@ test("explicit caller assignments and context.tactic override the spec-ops tacti
     assert.equal(tasks[leader.combatant.id], "support");
     assert.equal(tasks[second.combatant.id], "advance");
 
-    // tactic: null disables the hook → default fireteam policy.
+    // A caller-provided factory keeps the legacy highest priority and gets
+    // the same selector input shape the registry selectors receive.
+    let factoryInput = null;
+    const factory = await service.buildTeamPlan(world.combat, { teamId: "alpha" }, {
+        seed: 42,
+        targets: injectedTargets(world),
+        tactic: input => {
+            factoryInput = input;
+            return {
+                name: "covering-advance",
+                reason: "function-override",
+                assignments: {
+                    [leader.combatant.id]: "support",
+                    [second.combatant.id]: "support"
+                }
+            };
+        }
+    });
+    assert.equal(factory.teamPlan.tactic, "covering-advance");
+    assert.equal(factory.teamPlan.diagnostics.tactic.reason, "function-override");
+    assert.equal(factoryInput.members.length, 2);
+    assert.equal(factoryInput.teamId, "alpha");
+    assert.equal(factoryInput.combat, world.combat);
+
+    // tactic: false/null disables the hook → default fireteam policy.
+    const offFalse = await service.buildTeamPlan(world.combat, { teamId: "alpha" }, {
+        seed: 42,
+        targets: injectedTargets(world),
+        tactic: false
+    });
+    assert.equal(offFalse.teamPlan.tactic, null);
+    assert.equal(offFalse.teamPlan.diagnostics.tactic, null);
     const off = await service.buildTeamPlan(world.combat, { teamId: "alpha" }, {
         seed: 42,
         targets: injectedTargets(world),

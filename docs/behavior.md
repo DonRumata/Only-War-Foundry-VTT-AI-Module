@@ -15,7 +15,8 @@ los, cover, exposure, holdPosition, lastKnown, budgetOver, attackType,
 vulnerable, engaged, meleeEngage, area, aim, aimAlone, reload, overwatch,
 danger, weaponAffinity, weaponInertia, dropProne, readyWeapon,
 alliedEngagement, leaveMeleeEngage, engageDenial, unpin, grudge, order, ev,
-stickyTarget, outnumber, tieUp, seek, run`.
+stickyTarget, outnumber, tieUp, seek, run, withdrawal,
+coveringWithdrawal, freeAttackCost, disengage, laneCoverage`.
 
 Issue #37: EV-срез уклонения живёт на факторе `ev` — `damageNorm ×
 attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
@@ -27,7 +28,12 @@ attackDesire × (1 − P(dodge))`, где `damageNorm = min(damage/20, 1)`
 
 Preset-only: `rangeBand`, `aimOpportunity` (rangedCover/hold);
 `insideZone, returnToZone, moveToLos, escapeMelee, searchMove,
-anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
+anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps);
+`laneCoverage` и локальный `suppression` используются только активным
+`chokepoint-defense`-контекстом (issue #91).
+`withdrawal/freeAttackCost/disengage` создаются только для objective-driven
+peel-отхода, `coveringWithdrawal` — только для cover-роли; вне этих ролей
+веса равны нулю и факторы инертны.
 
 ### Веса пресетов
 
@@ -70,12 +76,179 @@ anchorDrift` (hold); `flankAngle, cohesionRestore` (specOps).
 | grudge | 4 | 1 | 2 | 3 |
 | seek | 1.5 | 0 | 0 | 3 |
 | run | 1.5 | 0.5 | 0 | 1 |
+| withdrawal/coveringWithdrawal/freeAttackCost/disengage | 0 | 0 | 0 | 0 |
+| recoverCover | 3 | 6 | 5 | 5 |
+| recoverRedirect | 2 | 2 | 2 | 2 |
+| laneCoverage | 0 | 0 (+3 в lane-defense) | 0 (+5 у overwatch-lane) | 0 (+3 в lane-defense) |
 
 specOps overlay-задачи `SPEC_OPS_TASK_WEIGHTS` (support/advance/flank/
 assault/regroup — мерджатся поверх базы), solo-overlay `SPEC_OPS_SOLO_WEIGHTS`.
+Роль `interdictor` (issue #87) читается как аддитивный overlay
+`SPEC_OPS_ROLE_WEIGHTS` поверх задачи assault: `charge +3` (5→8),
+`tieUp +4` (4→8), `meleeEngage +2`, `stickyTarget +2`,
+preset-only фактор `screenProgress 8` (прогресс endpoint к точке экрана
+`team.screenPoint` — зеркало `flankProgress`, без жёсткого вето) и
+`holdPosition −4`. Peel-роли (issue #89) — аддитивные overlays:
+`withdraw` (`withdrawal +7`, `freeAttackCost −6`, `disengage +3`,
+attacks/charge/hold отрицательно) и `cover` (`coveringWithdrawal +8`,
+`suppression +6`, direct/overwatch как fallback, `withdrawal −4` — прикрытие
+не убегает). Каскад манёвров: suppress-and-bound (#86) оценивается
+первым; при его деградации чистое ядро `presets/interdiction.js` пробует
+interdiction-screen до флангов/штурма — чистый стрелок противника
+(триггер A, confidence `rangedEV/(rangedEV+meleeEV) ≥ 0.7` и
+`rangedEV ≥ 6`) или ближнебоевой чарджер, угрожающий стрелкам отряда
+(триггер B, приоритет строго выше A). Выбранный интердиктор получает
+object assignment `{task:"assault", role:"interdictor", objective}` —
+objective несёт `targetId/screenPoint/protectId`; остальные члены
+сохраняют задачи базового манёвра (`breakdown.baseTactic`). Цель
+перехвата исключается из огневого пула остальных членов командным
+каналом `excludedTargets` → `excludedAttackTargetIds` (pool угроз не
+сужается) и никогда не становится целью concentrate-fire — фокус
+перевычисляется с учётом исключений. Деградация честно пишется в
+`breakdown.interdiction.rejected`, каскад продолжается базовым манёвром.
+Двойной охват (issue #88): после ветки suppression и до
+flank-and-fix/coordinated-assault каскад оценивает чистое ядро
+`presets/pincer.js` — манёвр «клещи» (`pincer`) при численном
+превосходстве, сконцентрированном противнике, минимум четырёх бойцах и
+морали не ниже `pressured`. Ядро строит два знаковых манёвренных пункта
+(`objective.elements.left/right.point`), проверяет расхождение маршрутов
+(угол ≥ 60°, без пересечений после trim, коридорная сепарация) и
+детерминированно компонует группы: лидер всегда в fix-базе (`support`,
+element `fix`), фланговые элементы `flank-left`/`flank-right` (n=4 →
+2+1+1, n=5 → 2+1+2, n=6 → 2+2+2). Element — это идентичность группы:
+`groupId` бойца равен `flank-left`/`flank-right`, ключи резерваций целей
+`task|groupId|targetId` дают каждому элементу независимую ёмкость
+(`taskCapacities.flank`), а fireteam инжектирует в member context
+собственный знаковый `team.flankPoint`/`flankSide` — scoring тянет
+флангера к его пункту без жёсткого вето. Синхронизация удара:
+`objective.sync` `elastic` (fix-база ждёт только самого раннего
+транзитного флангера; удар при готовности хотя бы одной стороны) или
+`strict` (ждутся все транзитные флангеры) — delay-записи несут
+`awaitIds[]`/`policy`, `validateTeamPlan` различает матрицу слома
+(elastic — все ожидаемые потеряны, strict — любой). Барьер фаз покрывает
+только реально движущихся членов: геометрия клещей доказана ещё при
+выборе, поэтому стоящий на месте флангер не ломает компиляцию TeamPlan.
+Деградация (одна сторона заблокирована/маршруты не расходятся) возвращает
+spec-ops `flank-and-fix` со стабильной причиной `pincer-degraded-*` и
+прежним контрактом доказательства угла; при `name: null` каскад
+байт-идентичен прежнему. Штурмовой пресет получил ослабленный вариант
+`pincer-loose` (`selectAssaultTactic`, зарегистрирован в реестре тактик):
+без fix-базы, центральный элемент штурмует (`element center`,
+`sync: "none"` — никто не ждёт), фланговое давление живёт только в
+overlay `ASSAULT_TASK_WEIGHTS.flank` (`flankProgress 6`, `advance +1`
+аддитивно). Пороги клещей — поля `pincer*` в `SPEC_OPS_CONFIG`
+(`pincerMinMembers 4, pincerSync "elastic", pincerMinMorale "pressured",
+pincerMaxTravelMeters 12` и др.), переопределяются через
+`context.specOpsConfig` как остальная доктрина.
+Peel-withdrawal (issue #89): командный манёвр отхода под прикрытием, не
+новый preset и не новый `FIRETEAM_TASKS` task. Чистое ядро
+`tactics/peel-withdrawal.js` переоценивается каждый раунд без latch/state;
+OR-trigger — morale desperate, потери total/recent либо близкая угроза с
+гистерезисом опасности. В specOps peel проверяется до legacy
+regroup-fallback; при отказе fallback сохраняет прежнее поведение, а
+`breakdown.peel` объясняет trigger/regroup/cover/role rejection. В
+rangedCover peel стоит до suppress-and-bound, в assault — до loose-pincer.
+Descriptor несёт `objective{type:"peel-withdrawal", ttl:1, regroupPoint,
+threatCentroid, lane, trigger, hysteresis}` и object assignments:
+withdrawer — `task:"regroup", role:"withdraw"`, прикрывающий —
+`task:"support", role:"cover"`. Точка перегруппировки выбирается fan-поиском
+от threat centroid через read-only navigation (`validateEndpoint`/`planRoute`);
+маршрут не должен проходить через enemy cell/центроид. Роли платят явную
+стоимость выхода из melee: ordinary withdraw всегда рискует свободной атакой,
+`disengage` — только move metadata при структурно доказанной capability
+(system trait/talent/action); v1 API не считается источником Disengage.
+Pinned вне melee может отходить только по не сокращающей дистанцию к врагам
+траектории; pinned в melee обрабатывается как ordinary engaged, stunned не
+получает withdrawal movement. Cover priority — suppression → direct →
+overwatch (reactionUsed исключает overwatch, но не создаёт shooting veto);
+при всех положительных margin desperate-отряд может уйти без прикрытия
+(`uncovered-desperate`). Явный `context.tactic`, caller `objective` и
+caller `assignments` имеют более высокий precedence: peel не перетирает их,
+а его objective без `targetId` не отменяет concentrate-fire focus. В планере
+withdrawer получает дополнительные nav-кандидаты к `regroupPoint`,
+revалидирует exact route/endpoint/threat-crossing и получает variants
+`withdraw|disengage` через обычный move step; `freeAttackCost` — отдельный
+негативный фактор, не скрытый veto. Cover-фактор — evidence только выбранного
+selector-режима (suppression/direct/overwatch/melee). GM/morale-демоции
+снимают peel role и peel-objective точечно; манёвр stateless переоценивается
+на следующем раунде.
+
+Chokepoint-defense (issue #91): оборонительный командный манёвр удержания
+подхода к anchor, не новый preset и не новый task-тип. Чистое ядро
+`presets/chokepoint-defense.js` оценивается каскадом после peel/regroup и
+потерь, но до открытых манёвров: hold участвует по hold-anchor или
+conservative centroid-fallback; rangedCover/specOps — только по
+explicit/hold defend-anchor (`preset-anchor-gate` не даёт центроиду
+захватывать открытый бой); assault не участвует. Ядро строит lanes из
+route/memory подходов к anchor, сворачивает bearing/geometry в максимум три
+lane, отбрасывает memory-only lane без live weight и деградирует честными
+причинами (`no-defense-anchor`, `no-perceived-threat`, `no-overwatcher`,
+`defense-bypassed`, `defense-outflanked`, `objective-complete`,
+`objective-mismatch`). Lane id — quantized geometry hash плюс sticky hints
+из сериализованных committed overwatch steps (`input.lane`), без нового
+persisted state. Assignments имеют object form: watcher —
+`task:"support", role:"overwatch-lane", element:laneId`, objective
+`{type:"defend", laneId, lanePoint, post}`; reserve — `role:"reserve"`;
+leader-marker не является mutex. Кап watcher'ов оставляет минимум один
+reserve. Каждый раунд пересматривается counterattack только против live
+visible vulnerable цели внутри kill zone; memory никогда не запускает
+counterattack, а активный reserve получает `task:"assault"` и objective
+`targetId` без снятия hold-radius veto. В planner lane виден только при
+`context.tactic === "chokepoint-defense"`: chokepoint становится
+высокоприоритетным overwatch-anchor kind `lane`, generic anchors фильтруются
+по `lane.threatIds`, LOS-фильтр сохраняется, overwatch остаётся declare-only.
+Suppression предпочтителен, когда legal/safe и реально покрывает live/memory
+lane-threat anchor, но никогда не стреляет в пустую synthetic lane geometry;
+fallback — overwatch/direct/hold. Позиционирование к post мягкое через
+`laneCoverage` (hold watcher ≥5, rangedCover/specOps lane-defense ≥3,
+`overwatch` у hold watcher ≥3) — невозможный same-turn reposition+overwatch
+не моделируется. Explicit objective/assignments/`context.tactic`, peel,
+regroup, recover и focus сохраняют precedence; recover считает
+`overwatch-lane` maneuver-critical ролью при выборе доноров.
+
+Recover-pinned overlay (issue #90): командное вытаскивание
+подавленного бойца — priority overlay поверх текущей тактики, не самостоятельный
+манёвр и не новый task-тип. Чистое stateless ядро `tactics/recover-pinned.js`
+переоценивается каждый раунд из `buildTeamPlan` после demotion-проходов и до
+цикла планирования членов; адаптер fireteam один раз читает документы
+(статусы, флаги `lastAttacker`/`committedPlan`, чат-лог, initiative order) и
+кормит ядру plain DTO с LOS/cover/danger-пробами. Атрибуция источника —
+confidence-лесенка: recorded (3) по suppression-карточке чата, свежий grudge
+`lastAttacker` (2, окно один раунд), los-nearest hostile (1), unknown (0);
+same-side и self-pin отклоняются на каждой ступени. Точечное cover-назначение
+делается только при confidence ≥ 2 и доказанной доступности источника в этом
+раунде; los-nearest даёт ослабленный режим `redirect-only`, unknown никогда не
+стреляет в пустоту. Кап — не более одного `cover-fire` назначения на команду в
+раунд: донор получает role-маркер и мягкий `assignedTargetId` на источник
+(пул возвращается к полному при недоступности цели), pinned-члены всегда
+демотируются в `support`+`recovering` (R5), остальные получают только
+`team.recover.redirectTargetId` — вес `recoverRedirect` на атаках по источнику,
+pool не сужается никогда. Донорский пул исключает pinned, melee-вовлечённых,
+gmControlled, уже отходивших в раунде, detached flank/assault, валидные
+L1-commitment, desperate-regroup (R4), maneuver-critical роли suppressor/
+bound/flanker/fixer/interdictor/withdraw/cover и focus-исполнителей (R7 —
+концентрация огня старше recover redirect). Тип атаки не форсируется: scoring
+сам выбирает suppression при 2+ hostiles в конусе (`area`) и прямой огонь
+против одиночного источника; для suppression-capable донора действует лишь
+скромный доктринальный наклон (`recoverRedirect` 1.0 у suppressing_fire против
+0.8 у прочих типов на источнике). Гейты неактивации — стабильные причины
+`no-pinned`/`no-donors`/`all-pinned`/`safe-in-cover-unreachable`/`source-dead`/
+`pinned-in-melee`; pinned в безопасном укрытии при недосягаемом источнике НЕ
+срывает манёвр. Триаж нескольких pinned: exposure desc (dangerAt −
+coverEstimate), ценность (лидер 4, suppression/heavy 2), maneuver-critical
+commitment (+2), combatantId asc — cover-fire получает только верхний. Фактор
+`recoverCover` у recovering-члена — clamp01 прироста `coverEstimate` endpoint'а
+относительно позиции угрозы (неподвижный endpoint ровно 0). Friendly-вето
+конусов/blast не ослабляется ни при какой confidence. TeamPlan несёт компактную
+секцию `recover` (active/mode/gate/pinned/coverAssignment/redirectTargetId),
+`breakdown.recover` (атрибуция/триаж/донор) и `diagnostics.recover` с
+demotion-записями; активация телеграфируется bark `OWAI.Bark.Recover.*` с
+dedup `combat|team|round` только на живых (не readOnly) построениях.
+
 Конфиг specOps: `flankMinAngleDegrees 60, maxDetachedRounds 2,
 highThreatRatio 2, supportWeight 6, flankWeight 8, assaultWeight 7,
-cohesionWeight 10, fallbackPreset "hold"`.
+cohesionWeight 10, interdictConfidenceMin 0.7, interdictMinRangedEV 6,
+interdictChargerConfidenceMin 0.5, fallbackPreset "hold"`.
 GM может менять эти параметры в настройках мира **Only War AI** (поля
 «Спецназ: …»). Угол проверяется из фактической позиции планируемой
 атаки, а не из расчётной точки. Без допустимой позиции и пути к ней
@@ -115,8 +288,10 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
   всё ещё считается провокацией A.
 - `engageDenial` — обратный переход: кандидат стартует вне всех reach и
   заканчивает внутри чужого (вход в ближний бой — «блокировка» цели).
-- `unpin` — кандидат `unpin` (см. п. 8a) существует только у
-  pinned-бота с WP-характеристикой; фактор =1 у него одного.
+- `unpin` — с issue #93 снятие pinning не конкурирует как кандидат:
+  нулевой end-of-turn тест автоматически вставляется в план pinned-бота
+  (см. п. 8a). Фактор сохранён в контракте скоринга для совместимости,
+  но всегда равен 0.
 - `grudge` — цель кандидата совпадает с записанным `lastAttacker`
   (`tokenUuid|tokenId|actorId`), масштаб `min(woundsLost/10, 1)`
   (дефолт 5, когда рекорд без счётчика) — царапина почти не тянет,
@@ -210,13 +385,33 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
    гарантированно падает с `system-api-missing`, бот держит hold);
    `drop-prone` — free-действие при pinned либо при `danger ≥ 0.5`
    на собственной клетке (не для уже prone).
-8a. `unpin` кандидат (issue #39): у pinned-комбатанта при наличии
-   характеристики `willpower` (`system.characteristics.willpower` либо
-   `actor.characteristics.willpower`) генерируется синтетическое
-   full-cost действие — WP-тест, снимающий pinning. Без характеристики —
-   rejected `unpin-unavailable`; при `cost > actionBudget` —
-   `over-budget`. Сериализуется шагом `test` по обычному контракту
-   executor'а (`prepareTest`/`executeTest`).
+8a. `unpin` end-of-turn шаг (issue #39, пересмотрено в issue #93): по
+   корбуке снятие pinning — не действие, а свободный тест Воли в конце
+   хода (+0; +30 в укрытии от ближайшей известной угрозы —
+   `navigation.coverEstimate` ≥ 0.5; бонус «не обстреливали» не
+   выдумывается — данных о выстрелах у модуля нет). Укрытие оценивается
+   для позиции КОНЦА хода: probe-точка — endpoint последнего move-шага
+   сериализованного плана (`input.to` — центр футпринта в пикселях,
+   контракт executor'а; helper `_planEndCentre`), а не стартовая позиция
+   — pinned-бот, легально отползающий в укрытие distance-keeping
+   move-attack'ом или replay'ящий commitment с перемещением, тестируется
+   с +30; без движения — центр футпринта текущей позиции. Никакого
+   кандидата:
+   у pinned-комбатанта при наличии характеристики `willpower`
+   (`system.characteristics.willpower` либо `actor.characteristics.willpower`)
+   нулевой шаг `test` (`halves: 0`, `input.unpin/endOfTurn: true`,
+   `modifier`/`modifierBasis`, стабильный id `step-test-unpin` —
+   идемпотентность повторного теста за ход через operation-journal)
+   автоматически вставляется перед end-turn любого плана — scored,
+   replay commitment (dedup, если шаг уже есть в записи), team-wait и
+   delay-stub. Без характеристики — rejected `unpin-unavailable` и шага
+   нет; stunned-план шага не содержит. Executor исполняет шаг через
+   `prepareTest`/`executeTest` и снимает `pinned` только при успешном
+   броске (`outcome.roll.success` — системный `removeCondition`, фолбэк
+   `toggleStatusEffect("pinned", {active:false})`); провал оставляет
+   статус, неактуальный шаг (уже не pinned) пропускается с `not-pinned`.
+   Нулевая стоимость не блокируется irreversible-бюджетом и не тратит
+   его.
 9. `hold` кандидат: `alwaysOfferHold`, или `allowNoTarget`, или
    `allowNoAction`.
 9. Скоринг: `_factorsOf` → `preset.veto` (reject в диагностику) →
@@ -227,6 +422,38 @@ Tuning-константы: `DEFAULT_LOOKAHEAD_LAMBDA 0.5`, `DEFAULT_LOOKAHEAD_TO
     seeded slip с вероятностью 0.3 берёт из следующих 3 кандидатов.
 
 Варианты атаки: `attack-in-place | move-attack | charge | aim-attack`.
+
+### Сужение пула атак (epic #84)
+
+`context.targets` — всегда ПОЛНЫЙ пул восприятия и угроз; сужать его ради
+фокус-цели нельзя. Опциональные `context.attackTargetIds` (allow-list) и
+`context.excludedAttackTargetIds` (deny-list) сужают только генерацию
+direct-attack кандидатов: `attack-in-place`, `aim-attack`, `move-attack`,
+`charge`, blast memory-strike и наведение attack-конусов
+(spray/suppression). Движение (approach/seek/run/detour), threat-map,
+`_enemyContacts` и melee-engagement (`already-engaged`), `_nearestThreat`,
+overwatch-якоря и гейт декларации, lookahead, commitment-угрозы
+`expectedState.threats` и snapshot/diagnostics продолжают читать полный
+пул. Правила `canAttack`/hidden/intel/memory не ослабляются: allow-list
+никогда не делает memory/team-contact цель атакуемой — сужение только
+убирает, ничего не добавляя. Совпадение id — точное строковое равенство с
+`tokenId`, `tokenUuid` или `actorId` нормализованной цели
+(`_normalizeTarget` кросс-заполняет `tokenId` из хвоста uuid, поэтому
+голый id токена и полный `Scene.<id>.Token.<tokenId>` совпадают с одной
+целью; `targetId` в смысле concentrate-fire — `tokenId ?? tokenUuid` —
+покрыт этими ключами); числовые id приводятся к строкам, прочие записи
+игнорируются. Сужение активно, когда allow-list — массив (даже пустой —
+тогда прямых атак нет вовсе) либо deny-list несёт хотя бы один валидный
+id; без полей, с не-массивом или с одним пустым deny-list поведение
+бит-в-бит legacy, включая диагностику. Каждая исключённая цель даёт одну
+запись `attack-pool-excluded` в rejected; сводка — JSON-safe
+`diagnostics.attackPool` (`mode`, `allow`, `deny`, `eligibleCount`,
+`excludedCount`, `excludedTargets` ≤ 8). Это планирующий ввод, а не
+состояние документов: в snapshot, stale-fingerprint и validateSnapshot
+поля не входят; в replay-захват (`CAPTURE_CONTEXT_KEYS`) они попадают как
+и прочие inputs — для идентичного офлайн-replay. Friendly-fire вето
+союзников/нейтралов и подсчёт покрытия шаблонов по сцене не меняются:
+exclusion касается цели-кандидата, а не «вредоносности» всплеска шаблона.
 
 ## 3. Сериализация шагов (`_stepsFor`)
 
@@ -242,10 +469,11 @@ ready-weapon → drop-prone → end-turn` (всегда последний). Att
 контракт, что у blast-атаки, оверлей рисует круг без нового читателя).
 `ready-weapon` несёт `weaponId`/`itemUuid` и `cost.halves` из
 записи системы; `drop-prone` — `statusId:"prone"`, `halves:0`; `unpin`
-(issue #39) — шаг `test` с `input {type:"characteristic",
+(issue #93) — шаг `test` с `input {type:"characteristic",
 key:"willpower", characteristic:"willpower", testKind:"characteristic",
-actionId:"unpin"}`, `cost.halves:2` — верифицированный контракт
-`api.rolls.prepareTest`. Preconditions: move
+actionId:"unpin", unpin:true, endOfTurn:true, modifier, modifierBasis}`,
+`cost.halves:0` — свободный end-of-turn тест по корбуке, верифицированный
+контракт `api.rolls.prepareTest`. Preconditions: move
 `["turn","self-position","collision"]`, attack
 `["turn","target","resources"]`, aim/end-turn `["turn"]`, ready-weapon
 `["turn","resources"]`, drop-prone/unpin `["turn"]`.
@@ -286,7 +514,14 @@ adjudicated-manual, adjudicated-skill-test`.
 - Цикл шагов: перед каждым — abort check → `controller-changed`;
   `attack`/`test` один раз за ход, повторы — `action-budget-spent`.
 - `_validate`: позиция с толерантностью 0.5px (`token-moved` при внешнем
-  сдвиге) + `planner.validateSnapshot`.
+  сдвиге) + `planner.validateSnapshot`. Self-inflicted сдвиги статусов
+  самого плана (issue #93: успешный unpin снял `pinned`, drop-prone
+  применил `prone`) executor накапливает в `run.selfStatusAdjust`
+  (`added`/`removed`) и передаёт в validateSnapshot — они reconcile'ятся
+  против планового baseline и не читаются как внешнее вмешательство
+  (иначе end-turn после снятия pinned проваливался бы `statuses-changed`
+  и форсировал ложный реплан). Реплан сбрасывает adjust: свежий снапшот
+  уже несёт живые статусы.
 - Шаги: `move` → `TokenDocument#move(..., {method:"api"})` с fallback
   `update({x,y})`; `attack`/`test` → `prepare*+execute*` системного API
   (`operationId.stepId`); `aim` → флаг на combatant'е, снимается
@@ -425,6 +660,20 @@ adjudicated-manual, adjudicated-skill-test`.
   характеры `[disciplined, shock, elite, rabble]`.
 - `assignTasks`: явный override > regroup-флаг > лидер → assault >
   первый не-лидер → flank (≥2 члена, `allowFlank`) > остальные support.
+  Override обратно совместим: legacy-строка `"support"` читается как
+  `{task:"support"}`, объектная форма — `{task, role?, element?, objective?}`.
+  `role`/`element` — непустые строки, `objective` — member-scoped JSON-only
+  объект; они копируются в assignment, `teamPlan.members[]`, diagnostics,
+  compiled maneuver state и `context.team` исполнения. Неизвестный `task`
+  по-прежнему деградирует в `support`; morale/GM demotion меняет только
+  task/group и сохраняет метаданные. `context.team.objective` остаётся
+  backward-compatible scalar id общей цели (`tactic.objective.targetId` или
+  `context.objective.targetId`); member-scoped polymorphic objective идёт
+  отдельно через `context.team.memberObjective` и канонический
+  `context.team.assignment = {task, role?, element?, objective?}`. Если у
+  member-objective есть `targetId`, он имеет приоритет над shared objective
+  при вычислении `assignedTargetId`. Роли/элементы не входят в ключи
+  reservations (`task|target`) и не меняют barriers.
 - `evaluateCohesion` — мягкая: flank/assault могут отходить как
   `detached-maneuver` (лимит `maxDetachedPhases`, `rejoinAvailable`,
   штраф overshoot×0.25); остальные — `beyond-cohesion` штраф.
@@ -439,9 +688,78 @@ adjudicated-manual, adjudicated-skill-test`.
   переходах. Клетки, занятые другим назначением, нельзя использовать даже
   для прохода. После перепланирования конфликтующие маршруты не принимаются.
 - Лидер: flagged > инициатива > HP > seeded-хэш > id.
-- `buildTeamPlan`: фазы 0 movement → 1 action → 2 regroup; конвергенция
-  фокус-файра когда Σ EV ≥ wounds цели (#16); `specOpsTactic` hook;
-  `leader-lost` инвалидирует план.
+- `buildTeamPlan`: фазы 0 movement → 1 action → 2 regroup; концентрация
+  огня (#85) резолвится до per-preset tactic registry, поэтому specOps
+  получает уже выбранный `objective.targetId`; explicit `context.tactic`
+  по-прежнему выше реестра, `leader-lost` инвалидирует план.
+- `collectMembers` дополнительно отдаёт тактикам `turnIndex` из
+  `combat.turns` и `hasActed` для текущего раунда (`turn:null` — false).
+- Suppress-and-bound (issue #86): specOps пробует тактику после веток
+  regroup/losses/pressure/no-contacts и до flank-and-fix/coordinated-assault;
+  rangedCover использует каскад suppress-or-null. Если ядро отказывает
+  (`no-suppressor`, `low-ammo`, `no-safe-cone`, `coverage-insufficient`, …),
+  каскад продолжается, а reason/candidates сохраняются в breakdown. Подавитель
+  назначается объектом `{task:"support", role:"suppressor", element:"fire"}`,
+  bound-элемент — `advance`/`flank` с `role:"bound", element:"maneuver"`;
+  `maxDetachedPhases` наследует ограничение манёвра. Конусная цель внешне
+  остаётся обычным attack target: если focus target покрыт конусом, descriptor
+  сохраняет именно его identity, а явный `context.objective.targetId` сильнее
+  cone-anchor metadata. Для suppressor-члена конусные кандидаты получают
+  `suppression = min(covered/2,1)` с весом ×8 без запрета direct fire.
+- Зона подавления действует только против teammates: не-подавители получают
+  `team.exclusionZones`; planner veto отклоняет move endpoint внутри конуса,
+  но не stay/attack-in-place. После сборки TeamPlan authoritative cone берётся
+  из реального suppression attack step (template/covered или serialized zone);
+  endpoints и waypoints чужих move steps проверяются в центрах footprint.
+  Первое нарушение вызывает один replan с исходными objective/focus pools;
+  повторное сначала выдаёт `zone/suppression-zone` conflict, затем пересобирает
+  план нарушителя без moves. Диагностика лежит в
+  `diagnostics.suppressionZones`.
+
+### Концентрация огня (issue #85)
+
+`scripts/presets/concentrate-fire.js` остаётся чистым селектором; fireteam
+лишь обогащает вход документами боя. Кандидатом может стать только живая
+видимая hostile-цель: для scan-пути хотя бы один живой enabled член должен
+иметь LOS через perception, а в injected `context.targets` memory/relay
+(`last-known`, `team-contact`, `relay`, `intel`) и явно невидимые/
+неатакуемые записи отбрасываются. Это не ограничивает morale headcount или
+плановое восприятие — gate касается только выбора focus.
+
+Wounds читаются по исправленной семантике: объект `{value,max}` даёт
+эффективный запас `max − value`; plain number и value-only инъекции — уже
+эффективный запас. Scan-путь не предлагает цель с неположительным запасом
+как новую (она считается уже лежащей), но injected critical-target может
+быть передан явно. Kill-EV считается per member/per target через лучший
+достижимый weapon emitter; отсутствие LOS не обнуляет killEV, а лишь не
+даёт преимущества `losCapable` при детерминированном ранжировании.
+
+Режим `kill` — legacy-случай гарантированного добивания: все capable
+members назначаются, cap/exclusions нет, `diagnostics.convergence`
+сохраняется как backward-compatible alias. Режим `focus` — scored выбор
+(угроза, уязвимые статусы, потраченная реакция, friendly-fire/gang-up,
+exposure и hysteresis). Прежде всего действует приоритет objective:
+`context.objective` → независимый `tactic.objective` → focus. Если тактика
+лишь наследует focus target, она сохраняет `assignedMembers`/`mode`; если
+она связывает другую цель, focus остаётся только в диагностике.
+`assignedMembers` получают shared `assignedTargetId` и, если role ещё не
+задана, additive `role:"focus"`; capable overflow не получает
+`assignedTargetId`. Member-scoped `assignment.objective.targetId` сильнее
+focus: redirect не перетирается и не сужается обратно.
+
+Minimal split awareness действует и здесь: `context.targets` члена
+остаётся полным reservation-filtered threat/engagement pool. Assigned
+members получают `attackTargetIds` с identity ключами focus
+(`targetId/tokenUuid/actorId`), overflow — focus в
+`excludedAttackTargetIds`. Caller allow-list — hard constraint и
+пересекается с focus (пустое пересечение остаётся активным пустым
+allow-list); caller deny-list всегда сохраняется и дополняется для
+overflow. Per-task target reservation не вытесняет назначенных focus
+members, потому что ёмкость уже задана `focusCap`. Target-conflict и target-gone replan
+сохраняют team/assignment metadata, но восстанавливают исходный caller
+allow-list (обычно отсутствует) вместо derived focus allow-list; deny-list
+остаётся в силе. Полный scored result, coefficients, candidate list,
+assignment/exclusion и visibility summary лежат в `diagnostics.focus`.
 
 ### Исполнение TeamPlan в бою
 
@@ -508,7 +826,8 @@ adjudicated-manual, adjudicated-skill-test`.
 - `_syncDelay` — post-pass `buildTeamPlan` после планов членов (и после
   retry перераспределения): если есть конвергентная цель и флангер с
   move-only планом (ETA ≥ 1 хода), main-члены, чей план атакует
-  `convergence.targetId`, получают delay-stub план `[delay, end-turn]`.
+  `convergence.targetId`, получают delay-stub план `[delay, end-turn]`
+  (unpin-шаг pinned-члена сохраняется перед end-turn, issue #93).
 - Флангер никогда не ждёт сам; `morale`-desperate (#26 graceful) не ждёт;
   `delaySync.count ≥ maxSyncRounds` (default 2) снимает ожидание для
   того же `until`; `context.syncDelay === false` отключает проход.

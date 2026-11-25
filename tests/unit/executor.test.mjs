@@ -94,7 +94,7 @@ function makeWorld({ enemy = { x: 300, y: 0 }, preset = "assault", enabled = tru
     combatant.initiative = 10;
 
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = enemy.x;
@@ -206,7 +206,10 @@ function mockRolls() {
     const state = {
         prepareCalls: [],
         executeCalls: [],
+        testPrepareCalls: [],
+        testExecuteCalls: [],
         outcome: null,
+        testOutcome: null,
         onExecute: null
     };
     game.darkHeresy.api.rolls = {
@@ -222,6 +225,20 @@ function mockRolls() {
                 operationId: options?.operationId,
                 chatMessageIds: ["chat-msg-1"],
                 resourceDelta: { ammo: -1 }
+            };
+        },
+        prepareTest: async input => {
+            state.testPrepareCalls.push(input);
+            return { fingerprint: "fp-test", rollData: {}, input };
+        },
+        executeTest: async (prepared, options) => {
+            state.testExecuteCalls.push({ prepared, options });
+            return state.testOutcome ?? {
+                status: "ok",
+                operationId: options?.operationId,
+                chatMessageIds: ["chat-msg-test"],
+                resourceDelta: {},
+                roll: { success: true }
             };
         }
     };
@@ -999,5 +1016,320 @@ test("broken i18n/chat helpers never crash the executor diagnostics card", async
         game.i18n.format = originalFormat;
         globalThis.ChatMessage = originalChatMessage;
         game.settings._values.delete("only-war-ai.diagnosticsEnabled");
+    }
+});
+
+/* ------------------------------------------------------------------ */
+/* Issue #93: unpin end-to-end — free end-of-turn Willpower test       */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Injected plan carrying the issue #93 unpin step ahead of end-turn.
+ * @param {object} world
+ * @param {object} [options]
+ * @param {boolean} [options.withAttack] Prepend a half-cost attack step.
+ * @returns {object}
+ */
+function unpinPlan(world, { operationId = "op-unpin", withAttack = false } = {}) {
+    const steps = [];
+    if (withAttack) {
+        steps.push({
+            id: "step-attack-1",
+            type: "attack",
+            cost: { halves: 1 },
+            preconditions: ["turn"],
+            input: {
+                actionId: "attack-1",
+                name: "Lasgun shot",
+                itemUuid: `Actor.${world.actor.id}.Item.w1`,
+                targetTokenUuid: `Scene.${world.scene.id}.Token.${world.enemy.token.id}`,
+                range: 30
+            }
+        });
+    }
+    steps.push({
+        id: "step-test-unpin",
+        type: "test",
+        cost: { halves: 0 },
+        preconditions: ["turn"],
+        input: {
+            actionId: "unpin",
+            name: "Unpin",
+            type: "characteristic",
+            key: "willpower",
+            unpin: true,
+            endOfTurn: true,
+            modifier: 30,
+            modifierBasis: "in-cover"
+        }
+    });
+    steps.push({ id: "step-end-9", type: "end-turn", input: { reason: "done" } });
+    return {
+        id: "plan-unpin",
+        operationId,
+        steps,
+        snapshot: {
+            self: {
+                tokenId: world.token.id,
+                tokenUuid: `Scene.${world.scene.id}.Token.${world.token.id}`,
+                actorUuid: `Actor.${world.actor.id}`,
+                x: 0,
+                y: 0
+            },
+            revision: "unpin-rev"
+        }
+    };
+}
+
+test("a successful unpin test clears the pinned status through removeCondition", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    const removals = [];
+    world.actor.removeCondition = async id => {
+        removals.push(id);
+        world.actor.statuses.delete(id);
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(rolls.testPrepareCalls.length, 1);
+        // The step contract reaches the system verbatim: characteristic
+        // willpower test with the cover modifier riding the input.
+        const input = rolls.testPrepareCalls[0];
+        assert.equal(input.type, "characteristic");
+        assert.equal(input.key, "willpower");
+        assert.equal(input.modifier, 30);
+        assert.equal(input.modifierBasis, "in-cover");
+        assert.equal(input.unpin, true);
+        assert.equal(input.endOfTurn, true);
+        assert.deepEqual(removals, ["pinned"], "the passed test removes pinned exactly once");
+        const unpinRecord = result.stepsDone.find(s => s.stepId === "step-test-unpin");
+        assert.equal(unpinRecord.status, "done");
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a failed unpin test keeps the pinned status", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    const removals = [];
+    world.actor.removeCondition = async id => {
+        removals.push(id);
+    };
+    rolls.testOutcome = {
+        status: "ok",
+        operationId: "unused",
+        chatMessageIds: [],
+        resourceDelta: {},
+        roll: { success: false }
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed,
+            "the failed test still completed the step — the roll executed");
+        assert.equal(removals.length, 0, "pinned survives a failed Willpower test");
+        assert.equal(world.actor.statuses.has("pinned"), true);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("the unpin step skips when the combatant is no longer pinned", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    // No statuses at all: a replayed commitment's stale unpin step.
+    world.actor.statuses = new Set();
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(rolls.testPrepareCalls.length, 0, "no pointless Willpower roll");
+        const unpinRecord = result.stepsDone.find(s => s.stepId === "step-test-unpin");
+        assert.equal(unpinRecord.status, "skipped");
+        assert.equal(unpinRecord.reason, "not-pinned");
+        assert.equal(world.nextTurnCalls.count, 1);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("the free unpin test survives a spent attack budget", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    world.actor.removeCondition = async () => {};
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id, withAttack: true }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.equal(rolls.executeCalls.length, 1, "the attack rolled");
+        assert.equal(rolls.testExecuteCalls.length, 1,
+            "the zero-cost end-of-turn test is not blocked by the irreversible budget");
+        const unpinRecord = result.stepsDone.find(s => s.stepId === "step-test-unpin");
+        assert.equal(unpinRecord.status, "done");
+    } finally {
+        clearRolls();
+    }
+});
+
+test("pinned removal falls back to toggleStatusEffect without removeCondition", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    const toggles = [];
+    world.actor.toggleStatusEffect = async (id, options) => {
+        toggles.push({ id, options });
+        world.actor.statuses.delete(id);
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner: stubPlanner()
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.deepEqual(toggles, [{ id: "pinned", options: { active: false } }]);
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a successful unpin reports the self-inflicted removal to later validations", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    world.actor.removeCondition = async id => {
+        world.actor.statuses.delete(id);
+    };
+    // Snapshot-capturing validation spy: the adjust object is mutated
+    // across the run, so every call must record a deep copy.
+    const validations = [];
+    const planner = {
+        validateSnapshot: (_plan, ctx) => {
+            validations.push({
+                added: [...(ctx?.selfStatusAdjust?.added ?? [])],
+                removed: [...(ctx?.selfStatusAdjust?.removed ?? [])]
+            });
+            return { valid: true, reason: null };
+        },
+        shouldReplan: () => ({ replan: false })
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.ok(validations.length >= 2,
+            "validation runs before the unpin test and the end-turn step");
+        // Before the unpin step no self-inflicted change exists yet …
+        assert.deepEqual(validations[0], { added: [], removed: [] });
+        // … but the end-turn validation reconciles the cleared `pinned`
+        // instead of reading it as external drift — the plan's own hand
+        // must never trigger a spurious replan.
+        const last = validations[validations.length - 1];
+        assert.deepEqual(last, { added: [], removed: ["pinned"] });
+    } finally {
+        clearRolls();
+    }
+});
+
+test("a failed unpin test reports no self-inflicted status change", async () => {
+    const world = makeWorld();
+    const { api } = makeApi();
+    const rolls = mockRolls();
+    world.actor.statuses = new Set(["pinned"]);
+    rolls.testOutcome = {
+        status: "ok",
+        operationId: "unused",
+        chatMessageIds: [],
+        resourceDelta: {},
+        roll: { success: false }
+    };
+    const validations = [];
+    const planner = {
+        validateSnapshot: (_plan, ctx) => {
+            validations.push({
+                added: [...(ctx?.selfStatusAdjust?.added ?? [])],
+                removed: [...(ctx?.selfStatusAdjust?.removed ?? [])]
+            });
+            return { valid: true, reason: null };
+        },
+        shouldReplan: () => ({ replan: false })
+    };
+    try {
+        const executor = createExecutorService({ api, getMode: () => "automatic" });
+        const operation = { id: `op-${++_opId}`, combatantId: world.combatant.id, phase: "executing" };
+        const result = await executor.runPlan({
+            combat: world.combat,
+            combatant: world.combatant,
+            operation,
+            plan: unpinPlan(world, { operationId: operation.id }),
+            planner
+        });
+
+        assert.equal(result.status, EXECUTOR_STATUS.completed);
+        assert.ok(validations.length >= 2);
+        for (const captured of validations) {
+            assert.deepEqual(captured, { added: [], removed: [] },
+                "the failed test never cleared pinned — nothing to reconcile");
+        }
+    } finally {
+        clearRolls();
     }
 });

@@ -117,7 +117,12 @@ export const HOLD_WEIGHTS = Object.freeze({
     // Target inertia for defenders — keep holding the line against the
     // same enemy rather than spreading attention every round.
     stickyTarget: 5,
-    outnumber: 3
+    outnumber: 3,
+    // Recover-pinned overlay (issue #90): a pinned defender reaching
+    // cover against the pin threat fits the hold doctrine exactly; the
+    // redirect stays a soft weight so the line is never abandoned for it.
+    recoverCover: 5,
+    recoverRedirect: 2
 
 });
 
@@ -326,6 +331,17 @@ function _holdZone(context = {}) {
         radius,
         grid
     };
+}
+
+/**
+ * Public read-only hold-zone helper shared by tactic integrations
+ * (issue #91). It performs no document writes and never throws for a
+ * malformed configured anchor — the status channel carries the failure.
+ * @param {object} context Planner/TeamPlan member context.
+ * @returns {object} `{status, configured, anchor, radius, grid}`.
+ */
+export function resolveHoldZone(context = {}) {
+    return _holdZone(context);
 }
 
 /**
@@ -619,6 +635,11 @@ function _aimAvailable(context = {}) {
  * @returns {string|null} Rejection reason or null when acceptable.
  */
 export function holdVeto({ candidate = {}, context = {} } = {}) {
+    // The veto predicate is a hot-path policy hook: malformed tactical
+    // input must degrade to a safe absence of vetoes/rejections, never
+    // throw through the planner funnel (issue #91 integration contract).
+    candidate = candidate && typeof candidate === "object" ? candidate : {};
+    context = context && typeof context === "object" ? context : {};
     const zone = _holdZone(context);
     const moving = _moves(candidate);
     if (zone.status === "invalid-anchor") {
@@ -711,13 +732,44 @@ export function evaluateHold({
         aimOpportunity: aimAvailable && candidate.variant === "attack-in-place"
             && effectiveLos === 1 ? 1 : 0
     };
-    const evaluation = evaluateFactors(enriched, weights);
+    // Issue #91 chokepoint-defense overlays apply only while the
+    // fireteam actually selected that tactic. Lane overwatch is a full
+    // action, so `laneCoverage` is a soft future-post score rather than a
+    // fabricated reposition+declare combination. A reserve counterattack
+    // strengthens ordinary attack/close factors; the hard hold-zone veto
+    // below is deliberately untouched.
+    const team = context.team ?? {};
+    const laneDefense = context.tactic === "chokepoint-defense"
+        && team.memberObjective?.type === "defend";
+    const effectiveWeights = { ...(weights ?? HOLD_WEIGHTS) };
+    if (laneDefense && team.role === "overwatch-lane") {
+        // Suppression is the preferred legal/safe lane answer; overwatch
+        // remains the declare-only fallback when no lane threat anchor or
+        // safe cone exists. The factor is local metadata, not a veto.
+        enriched.suppression = candidate.action?.attackType === "suppressing_fire" ? 1 : 0;
+        effectiveWeights.laneCoverage = Math.max(_finiteOr(effectiveWeights.laneCoverage, 0), 5);
+        effectiveWeights.overwatch = Math.max(_finiteOr(effectiveWeights.overwatch, 0), 3);
+        effectiveWeights.suppression = Math.max(_finiteOr(effectiveWeights.suppression, 0), 4);
+    }
+    if (laneDefense && team.role === "reserve" && team.task === "assault") {
+        effectiveWeights.attackAfterMove = Math.max(_finiteOr(effectiveWeights.attackAfterMove, 0), 7);
+        effectiveWeights.charge = Math.max(_finiteOr(effectiveWeights.charge, 0), 2);
+        effectiveWeights.advance = Math.max(_finiteOr(effectiveWeights.advance, 0), 3);
+    }
+    const evaluation = evaluateFactors(enriched, effectiveWeights);
     return {
         score: evaluation.score,
         breakdown: {
             ...evaluation.breakdown,
             preset: HOLD_PRESET_ID,
             variant: candidate.variant ?? null,
+            ...(laneDefense ? {
+                lane: {
+                    id: team.memberObjective?.laneId ?? null,
+                    role: team.role ?? null,
+                    coverage: _finiteOr(factors.laneCoverage, 0)
+                }
+            } : {}),
             position: {
                 los: effectiveLos,
                 meleeContact: contact !== null

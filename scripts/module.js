@@ -24,10 +24,21 @@ import { createReactionsService } from "./reactions.js";
 import { createGrudgesService } from "./grudges.js";
 import { createPlanOverlayService } from "./ui/plan-overlay.js";
 import { createThreatMapService } from "./threat-map.js";
-import { registerAssaultPreset } from "./presets/assault.js";
-import { registerRangedCoverPreset } from "./presets/ranged-cover.js";
+import { createTacticRegistry } from "./tactics/registry.js";
+import {
+    registerAssaultPreset,
+    registerAssaultTacticSelector
+} from "./presets/assault.js";
+import {
+    registerRangedCoverPreset,
+    registerRangedCoverTacticSelector
+} from "./presets/ranged-cover.js";
 import { registerHoldPreset } from "./presets/hold.js";
-import { registerSpecOpsPreset } from "./presets/spec-ops.js";
+import { registerHoldTacticSelector } from "./presets/chokepoint-defense.js";
+import {
+    registerSpecOpsPreset,
+    registerSpecOpsTacticSelector
+} from "./presets/spec-ops.js";
 import { registerSettings } from "./settings.js";
 import { registerSheetControls } from "./ui/npc-sheet.js";
 import { registerCombatTrackerControls } from "./ui/combat-tracker.js";
@@ -74,6 +85,12 @@ Hooks.once("init", () => {
         _registerPlannerService(mod?.api);
     } catch(err) {
         console.error(`${MODULE_ID} | Failed to register planner service`, err);
+    }
+
+    try {
+        _registerTacticsService(mod?.api);
+    } catch(err) {
+        console.error(`${MODULE_ID} | Failed to register tactic registry`, err);
     }
 
     try {
@@ -285,6 +302,26 @@ function _registerPlannerService(api) {
         // Issue #412: replace the spec-ops skeleton with the real preset.
         registerSpecOpsPreset(planner);
         api.services.register("planner", planner);
+    }
+}
+
+/**
+ * Register the per-preset `tactics` registry on the module API (issue #92).
+ * The registry is pure/deterministic and has no lifecycle. specOps,
+ * rangedCover and assault (issue #88 loose pincer) register their baseline
+ * maneuver selectors; hold registers chokepoint-defense (issue #91). Every
+ * selector still degrades to an explainable null maneuver outside its gates.
+ * @param {object} api Module API object.
+ */
+function _registerTacticsService(api) {
+    if (!api?.services) return;
+    if (!api.services.has("tactics")) {
+        const tactics = createTacticRegistry();
+        registerSpecOpsTacticSelector(tactics);
+        registerRangedCoverTacticSelector(tactics);
+        registerAssaultTacticSelector(tactics);
+        registerHoldTacticSelector(tactics);
+        api.services.register("tactics", tactics);
     }
 }
 

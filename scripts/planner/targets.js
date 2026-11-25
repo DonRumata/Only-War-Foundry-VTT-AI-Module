@@ -31,6 +31,154 @@ import {
 
 
 /**
+ * Bounded count of excluded target ids the attack-pool diagnostics
+ * list — enough to explain a focus assignment, small enough to keep a
+ * serialized plan lean.
+ */
+export const ATTACK_POOL_DIAGNOSTICS_CAP = 8;
+
+
+/**
+ * Identity keys of a normalized target for attack-pool matching (epic
+ * #84): the exact string forms of `tokenId`, `tokenUuid` and `actorId`,
+ * deduplicated in that priority order. `_normalizeTarget`
+ * cross-populates `tokenId` from the uuid tail (and vice versa), so a
+ * bare token id and the full `Scene.<id>.Token.<tokenId>` uuid both
+ * match the same token; `targetId` in the concentrate-fire sense
+ * (`tokenId ?? tokenUuid`) is covered by construction. Numeric inputs
+ * are stringified — fixture ids are not always strings.
+ * @param {object|null} target Normalized target.
+ * @returns {string[]}
+ */
+export function _targetIdentityKeys(target) {
+    const keys = [];
+    const push = value => {
+        if (value == null) return;
+        const string = typeof value === "string" ? value
+            : (typeof value === "number" && Number.isFinite(value) ? String(value) : null);
+        if (string && !keys.includes(string)) keys.push(string);
+    };
+    push(target?.tokenId);
+    push(target?.tokenUuid);
+    push(target?.actorId);
+    return keys;
+}
+
+
+/**
+ * Normalize one attack-pool id list: strings pass through, finite
+ * numbers stringify, everything else drops out. Entries are
+ * deduplicated and sorted so equal inputs diagnose and compare
+ * identically regardless of caller ordering.
+ * @param {*} raw `context.attackTargetIds`/`context.excludedAttackTargetIds`.
+ * @returns {string[]|null} Null when the input is not an array at all.
+ */
+export function _attackPoolIdList(raw) {
+    if (!Array.isArray(raw)) return null;
+    const ids = new Set();
+    for (const entry of raw) {
+        if (typeof entry === "string" && entry) ids.add(entry);
+        else if (typeof entry === "number" && Number.isFinite(entry)) ids.add(String(entry));
+    }
+    return [...ids].sort();
+}
+
+
+/**
+ * Attack-pool narrowing spec of a plan context (epic #84 minimal split
+ * awareness/attack pools). `context.attackTargetIds` is an allow-list:
+ * when present as an array — even empty — only matching targets stay
+ * eligible direct-attack objectives. `context.excludedAttackTargetIds`
+ * is a deny-list that always filters. The spec is ACTIVE when an
+ * allow-list array is present or the deny-list carries at least one
+ * valid entry; missing keys, non-array garbage and an empty deny-list
+ * alone are the legacy behaviour, bit-for-bit.
+ *
+ * The pool only gates direct attack candidate generation
+ * (attack-in-place, aim-attack, move-attack, charge, blast
+ * memory-strikes and attack-cone orientation anchors). Movement,
+ * approach/seek/run, threat-map reads, melee engagement, nearest
+ * threat, overwatch anchors, lookahead, the commitment threat
+ * fingerprint and snapshot/diagnostics keep using the FULL perception
+ * pool. The narrowing never widens anything: `canAttack`/hidden/
+ * intel/memory rules still apply on top — an allow-listed memory or
+ * team-contact target never becomes directly attackable.
+ * @param {object|null} context Planning context.
+ * @returns {{active: boolean, allow: string[]|null, deny: string[],
+ *   allowSet: Set<string>|null, denySet: Set<string>}}
+ */
+export function _attackPoolSpec(context) {
+    const allow = _attackPoolIdList(context?.attackTargetIds);
+    const deny = _attackPoolIdList(context?.excludedAttackTargetIds) ?? [];
+    return {
+        active: allow !== null || deny.length > 0,
+        allow,
+        deny,
+        allowSet: allow !== null ? new Set(allow) : null,
+        denySet: new Set(deny)
+    };
+}
+
+
+/**
+ * Whether a normalized target stays eligible as a direct-attack
+ * objective under the attack-pool spec. Matching is exact string
+ * equality against the target's identity keys
+ * ({@link _targetIdentityKeys}): with an allow-list present a non-match
+ * excludes, and a deny hit always excludes. An inactive spec allows
+ * everything — identical to the legacy behaviour.
+ * @param {object|null} spec `_attackPoolSpec` result.
+ * @param {object|null} target Normalized target.
+ * @returns {boolean}
+ */
+export function _attackPoolAllows(spec, target) {
+    if (!spec?.active) return true;
+    const keys = _targetIdentityKeys(target);
+    if (spec.allowSet !== null && !keys.some(key => spec.allowSet.has(key))) {
+        return false;
+    }
+    if (keys.some(key => spec.denySet.has(key))) return false;
+    return true;
+}
+
+
+/**
+ * Serialization-safe diagnostics of the attack-pool narrowing (epic
+ * #84), or null when the spec is inactive — absent narrowing inputs
+ * keep legacy plans bit-for-bit identical, diagnostics included.
+ * `excludedTargets` names the pool entries the narrowing filtered out
+ * of attack generation (`tokenId` falling back to `tokenUuid`, sorted,
+ * bounded at {@link ATTACK_POOL_DIAGNOSTICS_CAP}).
+ * @param {object|null} spec `_attackPoolSpec` result.
+ * @param {object[]} targets Normalized FULL-pool targets.
+ * @returns {object|null}
+ */
+export function _attackPoolDiagnostics(spec, targets) {
+    if (!spec?.active) return null;
+    const excluded = [];
+    let eligible = 0;
+    for (const target of targets ?? []) {
+        if (_attackPoolAllows(spec, target)) {
+            eligible++;
+        } else {
+            excluded.push(String(target?.tokenId ?? target?.tokenUuid ?? "?"));
+        }
+    }
+    excluded.sort();
+    return {
+        mode: spec.allow !== null
+            ? (spec.deny.length ? "allow+deny" : "allow-list")
+            : "deny-list",
+        allow: spec.allow !== null ? [...spec.allow] : null,
+        deny: [...spec.deny],
+        eligibleCount: eligible,
+        excludedCount: excluded.length,
+        excludedTargets: excluded.slice(0, ATTACK_POOL_DIAGNOSTICS_CAP)
+    };
+}
+
+
+/**
  * Whether a target provenance is a memory record (issue #38): the bot's
  * own `last-known` entry or a shared `team-contact` sighting. Memory
  * targets are never directly attackable but may steer approach moves,

@@ -163,6 +163,15 @@ function _finiteOr(value, fallback) {
 }
 
 /**
+ * JSON round-trip helper for serializable preview metadata.
+ * @param {*} value
+ * @returns {*}
+ */
+function _jsonClone(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+/**
  * Find a combatant of the combat by its own id.
  * @param {object} combat
  * @param {string|null} combatantId
@@ -447,6 +456,9 @@ function _teamPreview(plan, combat, scene) {
         members: state.members.map(member => ({
             name: (_findCombatant(combat, member.id)?.name ?? name(member.tokenId)) || member.id,
             task: member.task, group: member.groupId,
+            role: member.role ?? null,
+            element: member.element ?? null,
+            objective: member.objective ? _jsonClone(member.objective) : null,
             active: member.id === plan.snapshot?.combatantId,
             waitsForMovement: state.required.includes(member.id) && Boolean(member.move),
             move: member.move,
@@ -516,6 +528,12 @@ export function localizePreviewViewModel(vm, i18n = null) {
             members: vm.team.members.map(member => ({
                 ...member,
                 taskLabel: _label(i18nSource, `OWAI.Task.${member.task}`, member.task),
+                // Issue #90: role labels resolve through the localization
+                // chain with the raw role id as the fallback — overlay
+                // roles (`cover-fire`/`recovering`) read as proper rows
+                // while every legacy role keeps its historical display.
+                roleLabel: member.role
+                    ? _label(i18nSource, `OWAI.Preview.Role.${member.role}`, member.role) : null,
                 action: member.action ? {
                     ...member.action,
                     label: _label(i18nSource, `OWAI.Preview.Step.${member.action.type}`, member.action.type),

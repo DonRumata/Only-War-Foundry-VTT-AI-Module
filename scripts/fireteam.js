@@ -28,7 +28,7 @@
  *   elected deterministically by initiative, then hit points, then a
  *   seed-scoped hash tie-break — identical input elects the identical leader.
  * - Sibling services are resolved lazily (`api.services.get("planner" |
- *   "authority")`) or injected via `context`; every lookup degrades safely
+ *   "authority" | "tactics")`) or injected via `context`; every lookup degrades safely
  *   so the service works before/without the other stacked branches.
  */
 import {
@@ -61,22 +61,64 @@ import {
     fnv1a,
     stableStringify
 } from "./planner.js";
+import {
+    _actionRange,
+    _isMeleeAction,
+    _resolveActions
+} from "./planner/actions.js";
+import {
+    reactionUsed
+} from "./reactions.js";
 import { emitBarkOnce } from "./barks.js";
 import {
     getAIDifficulty,
     getMoraleDesperateRatio,
+    getPeelThresholds,
     getPreferredCohesion,
     getSpecOpsConfig,
     logDiagnostics
 } from "./settings.js";
-import { weaponEmitters } from "./threat-map.js";
+import {
+    DEFAULT_MELEE_REACH,
+    expectedDamageOf,
+    weaponEmitters
+} from "./threat-map.js";
+import { createTacticRegistry } from "./tactics/registry.js";
+import {
+    normalizeFocusWounds,
+    selectFocusTarget
+} from "./presets/concentrate-fire.js";
 import {
     SPEC_OPS_PRESET_ID,
     checkSpecOpsFlank,
+    registerSpecOpsTacticSelector,
     specOpsFlankFallback,
-    specOpsTactic,
     specOpsTokenCenter
 } from "./presets/spec-ops.js";
+import {
+    PEEL_WITHDRAWAL_NAME
+} from "./tactics/peel-withdrawal.js";
+import {
+    INTERDICTION_TACTIC,
+    INTERDICT_OBJECTIVE_TYPE,
+    INTERDICT_ROLE
+} from "./presets/interdiction.js";
+import {
+    PINCER_LOOSE_TACTIC,
+    PINCER_TACTIC
+} from "./presets/pincer.js";
+import {
+    SUPPRESS_AND_BOUND,
+    pointInSuppressionZone
+} from "./tactics/suppress-and-bound.js";
+import {
+    buildRecoverPinnedOverlay,
+    RECOVER_PINNED_ROLES
+} from "./tactics/recover-pinned.js";
+import {
+    CHOKEPOINT_TACTIC_NAME,
+    registerHoldTacticSelector
+} from "./presets/chokepoint-defense.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
 export const FIRETEAM_STATUS = Object.freeze({
@@ -164,6 +206,129 @@ const MORALE_TASK_REMAP = Object.freeze({
  */
 const MORALE_CONFIDENT_ASSAULT_CAP = 2;
 const MORALE_CONFIDENT_FLANK_CAP = 2;
+
+/**
+ * Targeted suppress-and-bound demotion policy (issue #86): once a bound or
+ * suppressor assignment is demoted by GM intervention/morale, the geometric
+ * fire/maneuver role no longer exists and must not keep steering scoring or
+ * zone ownership. The member objective is deliberately preserved — it is
+ * serializable tactical metadata and the shared-objective precedence rules
+ * decide whether it still narrows targets. Generic roles such as `focus`
+ * are untouched.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearSuppressionGeometry(assignment) {
+    if (!assignment || !["suppressor", "bound"].includes(assignment.role)) return;
+    delete assignment.role;
+    delete assignment.element;
+}
+
+/**
+ * Targeted interdiction demotion policy (issue #87): once an interdictor
+ * assignment is demoted by GM intervention/morale, the screen role no
+ * longer exists and its geometry must not keep steering the member. The
+ * whole member objective goes with the role — unlike the suppression
+ * cone metadata it is not inert: its `targetId` both pins
+ * `assignedTargetId` onto an enemy the demoted member is now
+ * command-denied and feeds `screenPoint` movement scoring. The target
+ * pin is cleared with it so the demoted member rejoins the shared focus
+ * pool as ordinary support. The gate deliberately requires genuine
+ * interdiction geometry (`objective.type === "interdict"`): object-form
+ * assignments are a public caller contract, so an arbitrary injected
+ * role label with foreign objective metadata passes through untouched.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearInterdictionGeometry(assignment) {
+    if (!assignment || assignment.role !== INTERDICT_ROLE) return;
+    if (assignment.objective?.type !== INTERDICT_OBJECTIVE_TYPE) return;
+    delete assignment.role;
+    delete assignment.objective;
+    assignment.assignedTargetId = null;
+}
+
+/**
+ * Targeted pincer demotion policy (issue #88): once a flanker/fixer
+ * assignment is demoted by GM intervention/morale, its signed element no
+ * longer exists and must not keep resolving the per-member flank point.
+ * Only genuine pincer markers are cleared — the gate requires both a
+ * pincer role (`flanker`/`fixer`) and a pincer element
+ * (`flank-left`/`flank-right`/`fix`/`center`), so an arbitrary injected
+ * object-form assignment with foreign metadata passes through untouched.
+ * The member objective is preserved: it is serializable tactical metadata
+ * and the shared-objective precedence rules decide whether it still
+ * narrows targets.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearPincerGeometry(assignment) {
+    if (!assignment || !["flanker", "fixer"].includes(assignment.role)) return;
+    if (!["flank-left", "flank-right", "fix", "center"].includes(assignment.element)) return;
+    delete assignment.role;
+    delete assignment.element;
+}
+
+/**
+ * Targeted peel-withdrawal demotion policy (issue #89): once a withdraw or
+ * cover assignment is demoted by GM intervention/morale, the peel role and
+ * its cost/geometry channel must not keep steering the member. Peel has no
+ * latch — clearing the object-form role is sufficient; the next round's
+ * selector re-evaluates the whole team statelessly.
+ * @param {object} assignment Mutable assignment entry during demotion.
+ */
+function _clearPeelGeometry(assignment) {
+    if (!assignment || !["withdraw", "cover"].includes(assignment.role)) return;
+    // `withdraw` remains meaningful on the regroup task and `cover` on
+    // support. Morale's flank→regroup/assault→support remap therefore does
+    // not destroy explicit peel-shaped assignments; a demotion that leaves
+    // the role/task pair invalid (notably GM→support for a withdrawer)
+    // clears both the role and the peel objective geometry.
+    if ((assignment.role === "withdraw" && assignment.task === "regroup")
+        || (assignment.role === "cover" && assignment.task === "support")) {
+        return;
+    }
+    delete assignment.role;
+    if (assignment.objective?.type === "peel-withdrawal") delete assignment.objective;
+}
+
+/**
+ * Pincer maneuver test (issue #88): the strict/loose tactic itself or the
+ * interdiction composite over a pincer base. Drives the multi-await sync
+ * policy and the reservation geometry downstream.
+ * @param {string|null} tacticName Committed tactic name.
+ * @param {object|null} [tactic] Tactic descriptor.
+ * @returns {boolean}
+ */
+function _isPincerManeuver(tacticName, tactic = null) {
+    if (tacticName === PINCER_TACTIC || tacticName === PINCER_LOOSE_TACTIC) return true;
+    const base = tactic?.breakdown?.baseTactic ?? null;
+    return tacticName === INTERDICTION_TACTIC
+        && (base === PINCER_TACTIC || base === PINCER_LOOSE_TACTIC);
+}
+
+/**
+ * Per-member flank maneuver anchor (issue #88): a pincer objective
+ * carries two signed maneuver points under `elements.left/right.point`;
+ * the member's own element selects its side's point. Members without a
+ * flank element — fix base, legacy single flank group — keep the legacy
+ * shared `objective.flankPoint` (absent on a true pincer objective).
+ * @param {object|null} assignment Member assignment (`element`).
+ * @param {object|null} objective Shared/member objective.
+ * @returns {{point: object|null, side: string|null}}
+ */
+function _memberFlankAnchor(assignment, objective) {
+    const side = assignment?.element === "flank-left" ? "left"
+        : assignment?.element === "flank-right" ? "right" : null;
+    if (side) {
+        const point = objective?.elements?.[side]?.point ?? null;
+        if (Number.isFinite(point?.x) && Number.isFinite(point?.y)) {
+            return { point: { x: point.x, y: point.y }, side };
+        }
+    }
+    const legacy = objective?.flankPoint ?? null;
+    if (Number.isFinite(legacy?.x) && Number.isFinite(legacy?.y)) {
+        return { point: legacy, side: objective?.flankSide ?? side };
+    }
+    return { point: null, side };
+}
 
 /**
  * Normalize a Foundry collection/Map/array/iterable into a plain array.
@@ -282,6 +447,90 @@ function _deepFreeze(value) {
  */
 function _jsonClone(value) {
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+}
+
+/**
+ * Whether a value is a plain object (not an array, class instance or
+ * Document). Assignment objectives must remain JSON-only data.
+ * @param {*} value
+ * @returns {boolean}
+ */
+function _isPlainObject(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+/**
+ * JSON-round-trip a plain object, rejecting payloads that cannot serialize
+ * (circular references, BigInt and the like). The clone never shares object
+ * identity with the caller's input, so TeamPlan freezing cannot freeze a
+ * tactic author's working draft.
+ * @param {*} value
+ * @returns {object|null}
+ */
+function _jsonObject(value) {
+    if (!_isPlainObject(value)) return null;
+    try {
+        const clone = _jsonClone(value);
+        return _isPlainObject(clone) ? clone : null;
+    } catch(err) {
+        return null;
+    }
+}
+
+/**
+ * Non-empty normalized marker string (`role`/`element`), or null.
+ * @param {*} value
+ * @returns {string|null}
+ */
+function _markerString(value) {
+    return typeof value === "string" && value.trim()
+        ? value.trim() : null;
+}
+
+/**
+ * Normalize one explicit fireteam assignment value. The legacy form is a
+ * bare task string and means `{task: string}`; the object form is
+ * `{task, role?, element?, objective?}`. The task itself is deliberately
+ * not validated here — `assignTasks` keeps the historical fallback of an
+ * unknown task to `support` — while `objective` is cloned into plain
+ * JSON-only data or dropped when it cannot serialize.
+ * @param {*} value Raw `combatantId → assignment` value.
+ * @returns {object|null} `{task, role?, element?, objective?}` or null.
+ */
+export function normalizeFireteamAssignment(value) {
+    let source = null;
+    if (typeof value === "string") source = { task: value };
+    else if (_isPlainObject(value)) source = value;
+    if (!source) return null;
+    const normalized = {
+        task: typeof source.task === "string" ? source.task : null
+    };
+    const role = _markerString(source.role);
+    const element = _markerString(source.element);
+    if (role) normalized.role = role;
+    if (element) normalized.element = element;
+    if (source.leader === true) normalized.leader = true;
+    const objective = _jsonObject(source.objective);
+    if (objective) normalized.objective = objective;
+    return normalized;
+}
+
+/**
+ * Canonical serializable assignment descriptor exposed to member planner
+ * contexts. `objective` is the member-scoped polymorphic objective; the
+ * legacy shared target id remains the separate `team.objective` channel.
+ * @param {object} assignment Assignment produced by `assignTasks`.
+ * @returns {{task: string|null, role?: string, element?: string,
+ *   objective?: object}}
+ */
+function _assignmentDescriptor(assignment) {
+    const descriptor = { task: assignment?.task ?? null };
+    if (assignment?.role) descriptor.role = assignment.role;
+    if (assignment?.element) descriptor.element = assignment.element;
+    if (assignment?.objective) descriptor.objective = _jsonClone(assignment.objective);
+    return descriptor;
 }
 
 /**
@@ -409,6 +658,80 @@ function _orderCandidateOf({ member, memberCount, combat, context }) {
  * @param {object|null} input.perception Perception service.
  * @returns {object[]|null} Sorted `{tokenUuid, ...entry}` records.
  */
+/**
+ * Read-only member capability profiles for defensive tactic selectors
+ * (issue #91). The helper adapts Document data once per TeamPlan into
+ * plain DTOs; tactic cores never receive or retain Document references.
+ * Action probing uses the same normalized action pipeline as the planner,
+ * with failures degrading to the weapon-item fallback rather than breaking
+ * the team plan.
+ * @param {object} input
+ * @param {object[]} input.members Member entries of `collectMembers`.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context Caller context.
+ * @param {object|null} input.perception Perception service.
+ * @returns {Promise<object>} combatantId → serializable member profile.
+ */
+async function _memberDefenseProfiles({ members, combat, context, perception }) {
+    const profiles = {};
+    const round = _finiteOr(combat?.round, null);
+    for (const member of members ?? []) {
+        const token = _tokenDoc(member.combatant?.token);
+        const actor = member.combatant?.actor ?? token?.actor ?? null;
+        let actions = [];
+        try {
+            actions = await _resolveActions(actor, {
+                ...context,
+                combatant: member.combatant,
+                token
+            });
+        } catch(_err) {
+            actions = [];
+        }
+        const attacks = actions.filter(action => action?.type === "attack");
+        const ranged = attacks.filter(action => !_isMeleeAction(action) && _actionRange(action) > 0);
+        const suppressionActions = ranged.filter(action => {
+            if (action.attackType === "suppressing_fire") return true;
+            const rof = action.rateOfFire ?? {};
+            return [rof.semi, rof.full, rof.burst, rof.auto, action.rateOfFire]
+                .some(value => Number.isFinite(value) && value > 0);
+        });
+        let visibleTargetIds = null;
+        if (perception && typeof perception.visibleTargets === "function" && token) {
+            try {
+                visibleTargetIds = (perception.visibleTargets(token, {
+                    combat,
+                    includeNeutral: resolveConfig(member.combatant)?.includeNeutral === true
+                }) ?? []).flatMap(target => [target.tokenId, target.tokenUuid, target.actorId])
+                    .filter(id => id !== null && id !== undefined)
+                    .map(String);
+            } catch(_err) {
+                visibleTargetIds = null;
+            }
+        }
+        profiles[member.combatantId] = {
+            bestRangeM: ranged.reduce((best, action) => Math.max(best, _actionRange(action)), 0),
+            suppressionCapable: suppressionActions.length > 0,
+            suppressionRangeM: suppressionActions.reduce(
+                (best, action) => Math.max(best, _actionRange(action)), 0),
+            meleeOnly: attacks.length > 0 && ranged.length === 0,
+            reactionUsed: reactionUsed(_readFlag(member.combatant, FLAG_KEYS.reactionUsed), round),
+            visibleTargetIds
+        };
+    }
+    return profiles;
+}
+
+/**
+ * Shared squad contacts of one TeamPlan. Returns null when sharing is
+ * disabled/unavailable; callers normalize to an empty list at use sites.
+ * @param {object} input
+ * @param {object[]} input.members Fireteam member entries.
+ * @param {object} input.combat Combat document.
+ * @param {object} input.context `buildTeamPlan` context.
+ * @param {object|null} input.perception Perception service.
+ * @returns {object[]|null}
+ */
 function _teamContacts({ members, combat, context, perception }) {
     if (context?.shareContacts === false) return null;
     if (typeof perception?.lastKnownPositions !== "function") return null;
@@ -450,6 +773,9 @@ function _teamContacts({ members, combat, context, perception }) {
  */
 function _delayStubPlan(plan, { delay, teamId, round }) {
     const clone = _jsonClone(plan) ?? {};
+    // Issue #93: the pinned member's free end-of-turn recovery test
+    // survives the stub — delaying the strike never costs the test.
+    const unpinStep = (plan?.steps ?? []).find(step => step?.input?.unpin === true);
     clone.steps = [
         {
             id: "step-delay-1",
@@ -464,6 +790,7 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
             preconditions: ["turn"],
             projectedResourceDelta: {}
         },
+        ...(unpinStep ? [_jsonClone(unpinStep)] : []),
         {
             id: "step-end-turn-2",
             type: "end-turn",
@@ -501,40 +828,87 @@ function _delayStubPlan(plan, { delay, teamId, round }) {
  * @param {string} input.teamId Team id.
  * @param {Map<string,string>} [input.memberMorale]
  *   `combatantId → effective tier` from the team evaluation.
+ * @param {string|null} [input.sync] Pincer sync policy of the committed
+ *   objective (`elastic`/`strict`/`none`); null keeps the legacy
+ *   single-flanker semantics.
  * @returns {Map} `combatantId → {reason, until, syncRound, awaitId}`.
  */
 function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
-    diagnostics, teamId, memberMorale = null }) {
+    diagnostics, teamId, memberMorale = null, sync = null }) {
     const result = new Map();
     if (context?.syncDelay === false) return result;
     if (!convergence?.targetId) return result;
-    let flanker = null;
+    // Issue #88: the loose assault pincer carries `sync: "none"` — its
+    // flank pressure is scoring-only and the squad never holds a strike
+    // for it. Legacy flank-and-fix passes no policy at all.
+    if (sync === "none") return result;
+    const strikesTargetOf = plan => plan?.target?.tokenId === convergence.targetId
+        || (plan?.steps ?? []).some(step =>
+            (step?.type === "attack" || step?.type === "test")
+            && (step?.input?.targetTokenId === convergence.targetId
+                || step?.input?.targetTokenUuid
+                    === (convergence.targetUuid ?? convergence.targetId)));
+    // Transit cost proxy of one member plan: the summed movement cost of
+    // its move steps — the remaining-route approximation the elastic
+    // policy sorts on (issue #88). Ties resolve by combatant id.
+    const transitCostOf = member => {
+        const steps = plans?.get(member.combatantId)?.plan?.steps ?? [];
+        let total = 0;
+        for (const step of steps) {
+            if (step?.type !== "move") continue;
+            total += _finiteOr(step?.cost?.movement, 0);
+        }
+        return total;
+    };
+    const transitFlankers = [];
     for (const member of ordered ?? []) {
         if (assignMap?.get(member.combatantId)?.task !== "flank") continue;
         const steps = plans?.get(member.combatantId)?.plan?.steps ?? [];
         const moves = steps.some(step => step?.type === "move");
         const strikes = steps.some(step => step?.type === "attack" || step?.type === "test");
-        if (moves && !strikes) {
-            flanker = member;
-            break;
-        }
+        if (moves && !strikes) transitFlankers.push(member);
     }
-    if (!flanker) return result;
+    if (!transitFlankers.length) return result;
+    // Issue #88 pincer sync policies. `elastic` releases the strike as
+    // soon as one flank side is ready: when any flank member already
+    // attacks the target this round nobody waits at all, and the fix
+    // base otherwise awaits only the earliest transit flanker. `strict`
+    // awaits every transit flanker. Without a pincer policy the legacy
+    // single-flanker behavior stands: the first transit flanker in
+    // maneuver order is the one awaited member.
+    let awaitIds;
+    let policy = null;
+    if (sync === "elastic" || sync === "strict") {
+        policy = sync;
+        if (sync === "elastic") {
+            const flankerStrikes = (ordered ?? []).some(member => {
+                if (assignMap?.get(member.combatantId)?.task !== "flank") return false;
+                return strikesTargetOf(plans?.get(member.combatantId)?.plan);
+            });
+            if (flankerStrikes) return result;
+            const earliest = [...transitFlankers].sort((a, b) =>
+                (transitCostOf(a) - transitCostOf(b))
+                || String(a.combatantId).localeCompare(String(b.combatantId)))[0];
+            awaitIds = [earliest.combatantId];
+        } else {
+            awaitIds = transitFlankers
+                .map(member => member.combatantId)
+                .sort((a, b) => String(a).localeCompare(String(b)));
+        }
+    } else {
+        awaitIds = [transitFlankers[0].combatantId];
+    }
+    const awaitSet = new Set(awaitIds);
     const maxSyncRounds = _finiteOr(context?.maxSyncRounds, DEFAULT_MAX_SYNC_ROUNDS);
     const round = Number.isFinite(combat?.round) ? combat.round : null;
     for (const member of ordered ?? []) {
-        if (member.combatantId === flanker.combatantId) continue;
+        if (awaitSet.has(member.combatantId)) continue;
         // Flankers are never delayed — they are the wait condition.
         if (assignMap?.get(member.combatantId)?.task === "flank") continue;
         const entry = plans?.get(member.combatantId);
         const plan = entry?.plan;
         if (!plan) continue;
-        const strikesTarget = plan.target?.tokenId === convergence.targetId
-            || (plan.steps ?? []).some(step =>
-                (step?.type === "attack" || step?.type === "test")
-                && (step?.input?.targetTokenId === convergence.targetId
-                    || step?.input?.targetTokenUuid
-                        === (convergence.targetUuid ?? convergence.targetId)));
+        const strikesTarget = strikesTargetOf(plan);
         if (!strikesTarget) continue;
         // Issue #26: a member whose *effective* morale tier is `desperate`
         // cannot be trusted to hold position for the synchronized
@@ -557,7 +931,11 @@ function _syncDelay({ ordered, assignMap, plans, convergence, combat, context,
             reason: "await-sync",
             until: "flank-ready",
             syncRound: round,
-            awaitId: flanker.combatantId
+            // `awaitId` stays the first awaited id for backward
+            // compatibility; the full multi-await list and the pincer
+            // policy ride along (issue #88).
+            awaitId: awaitIds[0],
+            ...(policy ? { awaitIds: [...awaitIds], policy } : {})
         };
         plans.set(member.combatantId, {
             ...entry,
@@ -672,6 +1050,7 @@ export function resolveTeamConfig(document) {
  * @param {object} [deps]
  * @param {object} [deps.api] Module API for lazy service lookups.
  * @param {object} [deps.planner] Injected planner service.
+ * @param {object} [deps.tactics] Injected tactic registry service.
  * @param {Function} [deps.resolveConfig] Effective AI config resolver.
  * @param {Function} [deps.log] Diagnostic logger.
  * @returns {object} Fireteam service.
@@ -679,6 +1058,7 @@ export function resolveTeamConfig(document) {
 export function createFireteamService({
     api = null,
     planner = null,
+    tactics = null,
     resolveConfig = resolveEffectiveConfig,
     log = (...args) => logDiagnostics(...args)
 } = {}) {
@@ -695,6 +1075,26 @@ export function createFireteamService({
         } catch(err) {
             return null;
         }
+    }
+
+    // Headless/direct-use fallback mirroring `_fallbackPlanner`: the canonical
+    // registry lives in `api.services`, but a standalone fireteam service must
+    // keep the historical specOps behaviour without introducing module-global
+    // mutable state.
+    const _fallbackTactics = createTacticRegistry();
+    registerSpecOpsTacticSelector(_fallbackTactics);
+    registerHoldTacticSelector(_fallbackTactics);
+
+    /**
+     * Tactic registry used for preset maneuvers: explicit dependency first,
+     * then the module service registry, then the private specOps fallback.
+     * @param {*} override Injected registry (undefined = registry/fallback).
+     * @returns {object}
+     */
+    function _tactics(override) {
+        if (override !== undefined) return override;
+        if (tactics !== null && tactics !== undefined) return tactics;
+        return _service("tactics") ?? _service("tacticRegistry") ?? _fallbackTactics;
     }
 
     /**
@@ -722,6 +1122,14 @@ export function createFireteamService({
     function _memberPlanner(teamPreset, plannerOverride) {
         const base = _planner(plannerOverride);
         if (!teamPreset || !AI_PRESETS.includes(teamPreset)) return base;
+        // A bare injected planner (`{planTurn}` in tests/integrations) is an
+        // explicit service override, not a preset-registry donor. Replacing it
+        // with a freshly constructed real planner would silently discard the
+        // caller's injection whenever a shared team preset is active.
+        if (typeof base?.listPresets !== "function"
+            || typeof base?.getPreset !== "function") {
+            return base;
+        }
         const wrapped = createPlannerService({
             api,
             resolveConfig: doc => {
@@ -729,12 +1137,9 @@ export function createFireteamService({
                 return cfg?.enabled ? { ...cfg, preset: teamPreset } : cfg;
             }
         });
-        if (typeof base?.listPresets === "function"
-            && typeof base?.getPreset === "function") {
-            for (const id of base.listPresets()) {
-                const def = base.getPreset(id);
-                if (def) wrapped.registerPreset(id, def);
-            }
+        for (const id of base.listPresets()) {
+            const def = base.getPreset(id);
+            if (def) wrapped.registerPreset(id, def);
         }
         return wrapped;
     }
@@ -746,10 +1151,20 @@ export function createFireteamService({
      * @param {object} combat Combat document.
      * @param {string} teamId
      * @returns {object[]} Member entries `{combatant, combatantId, tokenId,
-     *   actorId, ids, initiative, hp, defeated, enabled, position}`.
+     *   actorId, ids, initiative, hp, defeated, enabled, position, turnIndex,
+     *   hasActed}`.
      */
     function collectMembers(combat, teamId) {
         if (!combat || !teamId) return [];
+        const turns = _list(combat.turns);
+        const turnIndexes = new Map();
+        turns.forEach((entry, index) => {
+            const id = typeof entry === "string" ? entry : entry?.id;
+            if (id === null || id === undefined) return;
+            const key = String(id);
+            if (!turnIndexes.has(key)) turnIndexes.set(key, index);
+        });
+        const currentTurn = Number.isFinite(combat.turn) ? combat.turn : null;
         const members = [];
         for (const combatant of _list(combat.combatants)) {
             if (!combatant || _isMissing(combatant)) continue;
@@ -763,6 +1178,10 @@ export function createFireteamService({
                 ? token.uuid : null;
             const actorUuid = typeof actor?.uuid === "string" && actor.uuid
                 ? actor.uuid : (actor?.id ? `Actor.${actor.id}` : null);
+            const turnKey = combatant.id === null || combatant.id === undefined
+                ? null : String(combatant.id);
+            const turnIndex = turnKey !== null && turnIndexes.has(turnKey)
+                ? turnIndexes.get(turnKey) : null;
             members.push({
                 combatant,
                 combatantId: combatant.id ?? null,
@@ -776,6 +1195,8 @@ export function createFireteamService({
                 enabled: config?.enabled === true,
                 preset: config?.preset ?? null,
                 team,
+                turnIndex,
+                hasActed: turnIndex !== null && currentTurn !== null && turnIndex < currentTurn,
                 position: _tokenPosition(token)
             });
         }
@@ -849,19 +1270,26 @@ export function createFireteamService({
      * Default policy — leader assaults with group `main`, the first
      * non-leader member (stable id order) flanks with group `flank-1` when
      * flanking is allowed, the rest support. `context.assignments` maps
-     * `combatantId → task` to force specific assignments;
-     * `context.regroup === true` puts everyone on `regroup`.
+     * `combatantId` either to a legacy task string or to
+     * `{task, role?, element?, objective?}`; `context.regroup === true`
+     * puts every member without an explicit assignment on `regroup`.
+     * A member objective's `targetId` is more specific than the shared
+     * objective and wins `assignedTargetId`; role/element remain metadata.
      * @param {object[]} members Entries from {@link collectMembers}.
      * @param {object} [context]
      * @param {string|null} [context.leaderId] Elected/retained leader id.
-     * @param {object} [context.assignments] Explicit `combatantId → task`.
+     * @param {object} [context.assignments] Explicit `combatantId → task`
+     *   or `combatantId → {task, role?, element?, objective?}`.
      * @param {boolean} [context.allowFlank] `false` disables the default
      *   flank group.
      * @param {boolean} [context.regroup] Force every member to `regroup`.
      * @param {object} [context.objective] `{targetId, flankTargetId}` shared
      *   team objective.
+     * @param {string|null} [context.explicitTargetId] Hard caller-ordered
+     *   shared target; suppress-and-bound cone metadata may not redirect it.
      * @returns {object[]} Assignments `{combatantId, tokenId, task, groupId,
-     *   leader, assignedTargetId}` in deterministic order.
+     *   leader, assignedTargetId, role?, element?, objective?}` in
+     *   deterministic order.
      */
     function assignTasks(members, context = {}) {
         const sorted = [...(members ?? [])].sort((a, b) =>
@@ -881,8 +1309,8 @@ export function createFireteamService({
         let flankAssigned = 0;
         return sorted.map(member => {
             let task = null;
-            const forced = explicit?.[member.combatantId];
-            if (typeof forced === "string") task = forced;
+            const forced = normalizeFireteamAssignment(explicit?.[member.combatantId]);
+            if (forced) task = forced.task;
             else if (context.regroup === true) task = "regroup";
             else if (member.combatantId === context.leaderId) task = "assault";
             else if (assaultAssigned < assaultQuota) task = "assault";
@@ -897,17 +1325,35 @@ export function createFireteamService({
                 assaultAssigned++;
             }
             if (task === "flank") flankAssigned++;
-            const groupId = task === "flank" ? "flank-1" : "main";
-            // Issue #16: a convergent objective may restrict the shared
-            // target to the members that actually contribute kill-EV
-            // (`capableMembers`); without that list the objective goes to
-            // every non-flank member as before.
-            const objectiveRestricted = Array.isArray(context.objective?.capableMembers)
-                && !context.objective.capableMembers.includes(member.combatantId);
-            const assignedTargetId = task === "flank"
+            // Issue #88: the pincer composition signs its flank elements
+            // (`flank-left`/`flank-right`) and the element is the group
+            // identity — the barrier, reservation keys and planning order
+            // follow it. Legacy assignments without an element keep the
+            // historical single `flank-1` group.
+            const groupId = task === "flank"
+                ? (/^flank-.+/.test(forced?.element ?? "") ? forced.element : "flank-1")
+                : "main";
+            // Issue #16/#85: a shared objective may restrict its target to
+            // the members that actually contribute kill-EV. Scored focus is
+            // stricter: `assignedMembers` is the capacity-limited assignment
+            // set and overflow members receive no `assignedTargetId` even
+            // though they remain in informational `capableMembers`. Issue #91:
+            // a member-scoped objective target is more specific than every
+            // shared target channel and therefore wins `assignedTargetId`;
+            // role/element remain metadata and never enter the reservation key.
+            const assignedList = context.objective?.assignedMembers;
+            const objectiveRestricted = Array.isArray(assignedList)
+                ? !assignedList.includes(member.combatantId)
+                : (Array.isArray(context.objective?.capableMembers)
+                    && !context.objective.capableMembers.includes(member.combatantId));
+            const sharedTargetId = objectiveRestricted ? null : (task === "flank"
                 ? (context.objective?.flankTargetId ?? context.objective?.targetId ?? null)
-                : (objectiveRestricted ? null : (context.objective?.targetId ?? null));
-            return {
+                : (context.objective?.targetId ?? null));
+            const suppressionConeMetadata = forced?.objective?.type === SUPPRESS_AND_BOUND;
+            const assignedTargetId = suppressionConeMetadata && context.explicitTargetId != null
+                ? context.explicitTargetId
+                : (forced?.objective?.targetId ?? sharedTargetId);
+            const assignment = {
                 combatantId: member.combatantId,
                 tokenId: member.tokenId ?? null,
                 task,
@@ -915,6 +1361,21 @@ export function createFireteamService({
                 leader: member.combatantId === context.leaderId,
                 assignedTargetId
             };
+            if (forced?.role) assignment.role = forced.role;
+            if (forced?.element) assignment.element = forced.element;
+            if (forced?.objective) assignment.objective = _jsonClone(forced.objective);
+            // Focus is additive metadata, never a rewrite of an explicit or
+            // tactic-authored role/element/objective. Only an otherwise
+            // unroled member actually assigned to the focus target receives
+            // the marker; kill mode stays the legacy unmarked convergence.
+            if (!assignment.role && context.objective?.mode === "focus"
+                && Array.isArray(assignedList)
+                && assignedList.includes(member.combatantId)
+                && assignedTargetId != null
+                && String(assignedTargetId) === String(context.objective.targetId)) {
+                assignment.role = "focus";
+            }
+            return assignment;
         });
     }
 
@@ -1122,10 +1583,12 @@ export function createFireteamService({
             const plan = planOf(assignment.combatantId);
             const targetId = plan?.target?.tokenId ?? assignment.assignedTargetId ?? null;
             if (targetId) {
-                const key = `${assignment.task}|${targetId}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${targetId}`;
                 const capacity = _finiteOr(capacities[assignment.task], 1);
                 const used = targetCount.get(key) ?? 0;
-                if (used < capacity) {
+                const focusExempt = _focusAssigned(assignment, context.focus)
+                    && _idListsOverlap([targetId], _focusIdentityIds(context.focus));
+                if (used < capacity || focusExempt) {
                     targetCount.set(key, used + 1);
                     targets.push({
                         key,
@@ -1334,16 +1797,151 @@ export function createFireteamService({
     }
 
     /**
+     * Unique string id list, preserving first-seen order.
+     * @param {*} values
+     * @returns {string[]}
+     */
+    function _uniqueIdList(values) {
+        const seen = new Set();
+        const out = [];
+        for (const value of Array.isArray(values) ? values : []) {
+            if (value == null) continue;
+            const id = String(value);
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            out.push(id);
+        }
+        return out;
+    }
+
+    /**
+     * Every planner identity key of the focus target. The planner matches
+     * token ids, token uuid tails and actor ids; carrying all three keeps an
+     * allow-list usable even when a caller used a different identity form.
+     * @param {object|null} focus Focus descriptor.
+     * @returns {string[]}
+     */
+    function _focusIdentityIds(focus) {
+        return _uniqueIdList([focus?.targetId, focus?.targetUuid, focus?.actorId]);
+    }
+
+    /**
+     * Whether two id lists overlap exactly or through a token-uuid tail.
+     * @param {string[]} left
+     * @param {string[]} right
+     * @returns {boolean}
+     */
+    function _idListsOverlap(left, right) {
+        const forms = id => {
+            const text = String(id);
+            const tail = text.includes(".") ? text.split(".").pop() : text;
+            return [text, tail];
+        };
+        const wanted = new Set((right ?? []).flatMap(forms));
+        return (left ?? []).some(id => wanted.has(String(id))
+            || wanted.has(String(id).split(".").pop()));
+    }
+
+    /**
+     * Whether the assignment belongs to the focus target's assigned set.
+     * @param {object} assignment Assignment entry.
+     * @param {object|null} focus Focus descriptor.
+     * @returns {boolean}
+     */
+    function _focusAssigned(assignment, focus) {
+        return Boolean(focus?.targetId != null
+            && Array.isArray(focus?.assignedMembers)
+            && focus.assignedMembers.includes(assignment?.combatantId)
+            && assignment?.assignedTargetId != null
+            && _idListsOverlap([assignment.assignedTargetId], _focusIdentityIds(focus)));
+    }
+
+    /**
+     * Focus allow-list with hard caller constraints preserved: without a
+     * caller allow-list the focus identities become the allow-list; with one,
+     * the result is the semantic intersection. An empty intersection stays an
+     * active empty list — the caller's stricter pool wins over the heuristic
+     * focus rather than being silently widened.
+     * @param {*} existing Caller `attackTargetIds`.
+     * @param {object} focus Focus descriptor.
+     * @returns {string[]}
+     */
+    function _focusAllowList(existing, focus) {
+        const focusIds = _focusIdentityIds(focus);
+        if (!Array.isArray(existing)) return focusIds;
+        const caller = _uniqueIdList(existing);
+        return _idListsOverlap(caller, focusIds) ? focusIds : [];
+    }
+
+    /**
+     * Merge a focus deny-list into the caller's deny-list without dropping
+     * any existing exclusions.
+     * @param {*} existing Caller `excludedAttackTargetIds`.
+     * @param {object} focus Focus descriptor.
+     * @returns {string[]}
+     */
+    function _focusDenyList(existing, focus) {
+        return _uniqueIdList([
+            ...(Array.isArray(existing) ? existing : []),
+            ..._focusIdentityIds(focus)
+        ]);
+    }
+
+    /**
+     * Attack-pool overrides of one member for the minimal split-awareness
+     * focus contract. Assigned members keep full awareness and receive a
+     * direct-attack allow-list; capable overflow keeps full awareness and
+     * receives the focus target as a deny-list entry.
+     * @param {string} combatantId
+     * @param {object|null} focus Focus descriptor.
+     * @param {object} context Original build context (caller pools win ties).
+     * @param {object|null} [assignment] Resolved member assignment. A
+     *   member-scoped objective target is an explicit order: when it redirects
+     *   the member away from the focus it wins over both focus allow and
+     *   overflow deny narrowing; when it names the focus target it simply
+     *   aligns with the normal focus pool.
+     * @returns {object}
+     */
+    function _focusAttackPoolOverrides(combatantId, focus, context, assignment = null) {
+        if (!focus?.targetId) return {};
+        const focusIds = _focusIdentityIds(focus);
+        const memberObjectiveTarget = assignment?.objective?.targetId ?? null;
+        const redirected = memberObjectiveTarget != null
+            && !_idListsOverlap([memberObjectiveTarget], focusIds);
+        if (redirected) return {};
+        if (Array.isArray(focus.assignedMembers) && focus.assignedMembers.includes(combatantId)) {
+            return { attackTargetIds: _focusAllowList(context.attackTargetIds, focus) };
+        }
+        if (!redirected && memberObjectiveTarget != null
+            && Array.isArray(focus.excludedMembers) && focus.excludedMembers.includes(combatantId)
+            && _idListsOverlap([memberObjectiveTarget], focusIds)) {
+            return {};
+        }
+        if (Array.isArray(focus.excludedMembers) && focus.excludedMembers.includes(combatantId)) {
+            return {
+                excludedAttackTargetIds: _focusDenyList(context.excludedAttackTargetIds, focus)
+            };
+        }
+        return {};
+    }
+
+    /**
      * Whether a task/target key already reached its reservation capacity.
      * @param {Map} counts `key → used` map.
      * @param {object} capacities Task capacities.
      * @param {string} task
      * @param {string|null} targetId
+     * @param {string} [groupId] Maneuver group of the reservation key
+     *   (issue #88 — the two signed pincer elements hold independent
+     *   per-element capacities).
      * @returns {boolean}
      */
-    function _targetAtCapacity(counts, capacities, task, targetId) {
+    function _targetAtCapacity(counts, capacities, task, targetId, groupId = "main") {
         if (!targetId) return false;
-        const key = `${task}|${targetId}`;
+        // Issue #88: the reservation key carries the maneuver group so the
+        // two signed pincer flank elements hold independent per-element
+        // capacities instead of competing for one shared flank slot.
+        const key = `${task}|${groupId ?? "main"}|${targetId}`;
         const used = counts.get(key) ?? 0;
         return used >= _finiteOr(capacities[task], 1);
     }
@@ -1355,31 +1953,44 @@ export function createFireteamService({
      * @param {Map} counts Reservation counts.
      * @param {object} capacities Task capacities.
      * @param {object} assignment Member assignment.
+     * @param {object|null} [focus] Active concentrate-fire descriptor.
      * @returns {object[]}
      */
-    function _availableTargets(targets, counts, capacities, assignment) {
+    function _availableTargets(targets, counts, capacities, assignment, focus = null) {
+        const focusIds = _focusIdentityIds(focus);
         return (targets ?? []).filter(target => {
             const id = target?.tokenId
                 ?? (typeof target?.tokenUuid === "string"
                     ? target.tokenUuid.split(".").pop() : null);
-            return !_targetAtCapacity(counts, capacities, assignment.task, id);
+            const targetIds = _uniqueIdList([target?.tokenId, target?.tokenUuid, target?.actorId, id]);
+            // Focus assignment capacity is already enforced by the selector's
+            // focusCap. The ordinary per-task reservation cap must not evict
+            // members the selector deliberately concentrated on the target.
+            if (_focusAssigned(assignment, focus)
+                && _idListsOverlap(targetIds, focusIds)) {
+                return true;
+            }
+            return !_targetAtCapacity(counts, capacities, assignment.task, id, assignment.groupId);
         });
     }
 
     /**
-     * Member target list for one `planTurn` call: the assignment's explicit
-     * target wins, then the reservation-filtered shared/injected list.
+     * Member target list for one `planTurn` call: a legacy non-focus explicit
+     * target keeps the historical singleton narrowing, while a focus-assigned
+     * member deliberately keeps the full reservation-filtered awareness pool —
+     * its direct attacks are narrowed separately through `attackTargetIds`.
      * @param {object} input
      * @param {object[]} input.base Shared/injected normalized targets.
      * @param {Map} input.counts Reservation counts.
      * @param {object} input.capacities Task capacities.
      * @param {object} input.assignment Member assignment.
+     * @param {object|null} [input.focus] Concentrate-fire descriptor.
      * @returns {object[]|undefined} Undefined lets the planner resolve.
      */
-    function _memberTargets({ base, counts, capacities, assignment }) {
+    function _memberTargets({ base, counts, capacities, assignment, focus = null }) {
         if (!Array.isArray(base)) return undefined;
-        const targets = _availableTargets(base, counts, capacities, assignment);
-        if (assignment.assignedTargetId) {
+        const targets = _availableTargets(base, counts, capacities, assignment, focus);
+        if (assignment.assignedTargetId && !_focusAssigned(assignment, focus)) {
             const assigned = targets.filter(target => {
                 const id = target?.tokenId
                     ?? (typeof target?.tokenUuid === "string"
@@ -1428,6 +2039,86 @@ export function createFireteamService({
     }
 
     /**
+     * Authoritative suppression cone of the selected suppressor plan. The
+     * executable attack step carries direction/angle/range but not an origin;
+     * the origin is therefore the endpoint of the move preceding that attack,
+     * or the suppressor token footprint centre when the shot is in place.
+     * Range is serialized in scene units by the planner step contract and is
+     * converted to pixels with the scene grid.
+     * @param {object} input
+     * @param {object} input.member Suppressor member entry.
+     * @param {object} input.result Member planner result.
+     * @param {object} input.tactic Suppress-and-bound descriptor.
+     * @param {object|null} input.scene Planning scene.
+     * @returns {object|null} Serialized zone `{x,y,direction,angleDeg,rangePx}`.
+     */
+    function _authoritativeSuppressionCone({ member, result, tactic, scene }) {
+        const steps = result?.plan?.steps ?? [];
+        const index = steps.findIndex(step =>
+            (step?.type === "attack" || step?.type === "test")
+            && step.input?.suppressionFire === true
+            && step.input?.template);
+        if (index < 0) return null;
+        const input = steps[index].input;
+        const priorMove = steps.slice(0, index).reverse()
+            .find(step => step?.type === "move" && step.input?.to);
+        let origin = null;
+        if (priorMove && Number.isFinite(priorMove.input.to?.x) && Number.isFinite(priorMove.input.to?.y)) {
+            origin = { x: priorMove.input.to.x, y: priorMove.input.to.y };
+        } else {
+            const token = _tokenDoc(member?.combatant?.token);
+            origin = specOpsTokenCenter(token, scene, member?.position);
+        }
+        if (!Number.isFinite(origin?.x) || !Number.isFinite(origin?.y)) return null;
+        const grid = scene?.grid ?? {};
+        const size = _finiteOr(grid.size, 0);
+        const distance = _finiteOr(grid.distance, 0);
+        const pxPerUnit = size > 0 && distance > 0 ? size / distance : 1;
+        const fallbackCone = tactic?.cone ?? tactic?.objective?.suppressionCone ?? {};
+        const direction = _finiteOr(input.template.direction, fallbackCone.direction);
+        const angleDeg = _finiteOr(input.template.angle ?? input.template.angleDeg,
+            fallbackCone.angleDeg ?? fallbackCone.angle);
+        const rangePx = Number.isFinite(input.template.range)
+            ? input.template.range * pxPerUnit
+            : _finiteOr(fallbackCone.rangePx, NaN);
+        if (!Number.isFinite(direction) || !(angleDeg > 0) || !(rangePx > 0)) return null;
+        return {
+            x: Math.round(origin.x * 1e4) / 1e4,
+            y: Math.round(origin.y * 1e4) / 1e4,
+            direction,
+            angleDeg,
+            rangePx: Math.round(rangePx * 1e4) / 1e4,
+            ownerId: member?.combatantId ?? tactic?.suppressorId ?? null,
+            kind: "suppression"
+        };
+    }
+
+    /**
+     * First point of a member move entering a suppression zone. Both the
+     * serialized endpoint and every route waypoint are checked; stay plans
+     * and attack-in-place plans have no move step and are legal by contract.
+     * @param {object} result Member planner result.
+     * @param {object} zone Authoritative serialized suppression zone.
+     * @returns {object|null} `{point, stepId}` or null.
+     */
+    function _suppressionMoveViolation(result, zone) {
+        if (!zone) return null;
+        for (const step of result?.plan?.steps ?? []) {
+            if (step?.type !== "move") continue;
+            const points = [
+                ...(Array.isArray(step.input?.waypoints) ? step.input.waypoints : []),
+                step.input?.to
+            ].filter(point => Number.isFinite(point?.x) && Number.isFinite(point?.y));
+            for (const point of points) {
+                if (pointInSuppressionZone(point, zone)) {
+                    return { point: { x: point.x, y: point.y }, stepId: step.id ?? null };
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Build the phased execution layout. Flank-group members always precede
      * the main group inside every phase; the action phase is gated by a
      * synchronization barrier that requires the detached/mover assignments
@@ -1470,8 +2161,14 @@ export function createFireteamService({
             });
         }
         const moverIds = movement.map(step => step.combatantId);
+        // Issue #88: every signed flank group (`flank-` prefix), not only
+        // the legacy `flank-1`, joins the barrier requirement while the
+        // maneuver is unproven.
         const flankIds = flankProven ? [] : sorted
-            .filter(member => assignMap.get(member.combatantId)?.groupId === "flank-1")
+            .filter(member => {
+                const group = assignMap.get(member.combatantId)?.groupId ?? "main";
+                return typeof group === "string" && group.startsWith("flank-");
+            })
             .map(member => member.combatantId);
         const required = [...new Set([...flankIds, ...moverIds])];
         const barrier = required.length
@@ -1492,16 +2189,6 @@ export function createFireteamService({
         ];
     }
 
-    /**
-     * Normalize a wounds spec: plain number or `{value}` object.
-     * @param {*} raw
-     * @returns {number|null}
-     */
-    function _woundsValue(raw) {
-        if (Number.isFinite(raw)) return raw;
-        if (Number.isFinite(raw?.value)) return raw.value;
-        return null;
-    }
 
     /**
      * Grid info `{size, distance}` for pixel→scene-unit conversion inside
@@ -1532,25 +2219,145 @@ export function createFireteamService({
     }
 
     /**
-     * Convergence target list: injected `context.targets` win (they may
-     * carry `wounds` directly); otherwise the combat scan returns every
-     * living non-hidden combatant hostile to the team's shared
-     * disposition.
+     * Merge status id views (`Set`/array/iterable or truthy-map) into a
+     * sorted deterministic list. Used for the focus selector's normalized
+     * vulnerability input.
+     * @param {...*} sources Status collections.
+     * @returns {string[]}
+     */
+    function _mergeStatusIds(...sources) {
+        const ids = new Set();
+        for (const source of sources) {
+            if (!source) continue;
+            if (typeof source[Symbol.iterator] === "function") {
+                for (const id of source) ids.add(String(id));
+            } else if (typeof source === "object") {
+                for (const key of Object.keys(source)) {
+                    if (source[key]) ids.add(String(key));
+                }
+            }
+        }
+        return [...ids].sort();
+    }
+
+    /**
+     * Combatant lookup for a target identity. Matches token id against the
+     * combatant/token document id, token uuid exactly and actor id when the
+     * injection carries it.
+     * @param {object} combat Combat document.
+     * @param {object} target `{tokenId, tokenUuid, actorId}`.
+     * @returns {object|null}
+     */
+    function _combatantForTarget(combat, target) {
+        for (const other of _list(combat?.combatants)) {
+            const doc = _tokenDoc(other?.token);
+            if (!doc && !other?.actor) continue;
+            if (target?.tokenId != null && (other?.tokenId === target.tokenId
+                || doc?.id === target.tokenId
+                || String(other?.tokenId ?? "") === String(target.tokenId)
+                || String(doc?.id ?? "") === String(target.tokenId))) {
+                return other;
+            }
+            if (target?.tokenUuid && doc?.uuid === target.tokenUuid) return other;
+            if (target?.actorId != null
+                && String((other?.actor ?? doc?.actor)?.id ?? "") === String(target.actorId)) {
+                return other;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Expected damage output of a target for focus scoring. Explicit
+     * normalized `threatEv` wins, then injected emitter/profile shorthand,
+     * then the live actor loadout. Unknown loadouts contribute 0 (the pure
+     * selector still applies its small unknown-threat floor in exposure).
+     * @param {object|null} raw Injected target or profile carrier.
+     * @param {object|null} actor Live actor document.
+     * @returns {number}
+     */
+    function _threatEvOf(raw = null, actor = null) {
+        const profile = raw?.threatProfile ?? raw ?? null;
+        for (const value of [raw?.threatEv, profile?.threatEv, raw?.ev, profile?.ev]) {
+            if (Number.isFinite(value)) return Math.max(0, value);
+        }
+        let best = 0;
+        const emitters = Array.isArray(profile?.emitters) ? profile.emitters : [];
+        for (const emitter of emitters) {
+            const ev = Number.isFinite(emitter?.ev)
+                ? emitter.ev : expectedDamageOf(emitter?.damage ?? 0);
+            if (ev > best) best = ev;
+        }
+        if (!(best > 0)) {
+            const damage = expectedDamageOf(profile?.damage ?? 0);
+            if (damage > best) best = damage;
+        }
+        if (!(best > 0) && actor) {
+            for (const emitter of weaponEmitters(actor)) {
+                if (emitter.ev > best) best = emitter.ev;
+            }
+        }
+        return Math.max(0, best);
+    }
+
+    /**
+     * Convergence/focus target list: injected `context.targets` win as the
+     * caller's perceived contact list; otherwise the combat scan returns
+     * every living non-hidden combatant hostile to the team's shared
+     * disposition. Both paths normalize the inputs the pure concentrate-fire
+     * selector needs (corrected effective wounds, statuses, reaction record,
+     * threat EV and allied melee engagement). Injected wounds stay
+     * authoritative — a missing wounds field means unknown, even when a
+     * matching live document happens to exist.
      * @param {object} input
      * @param {object[]} input.members Team member entries.
      * @param {object} input.combat Combat document.
      * @param {object} input.context `buildTeamPlan` context.
-     * @returns {object[]} `{tokenId, tokenUuid, x, y, wounds}` entries.
+     * @returns {object[]} Normalized target entries.
      */
     function _convergentTargets({ members, combat, context }) {
         if (Array.isArray(context.targets) && context.targets.length) {
-            return context.targets.map(target => ({
-                tokenId: target?.tokenId ?? null,
-                tokenUuid: target?.tokenUuid ?? null,
-                x: _finiteOr(target?.x, null),
-                y: _finiteOr(target?.y, null),
-                wounds: _woundsValue(target?.wounds)
-            })).filter(entry => entry.tokenId || entry.tokenUuid);
+            return context.targets.map(target => {
+                const other = _combatantForTarget(combat, target);
+                const doc = _tokenDoc(other?.token);
+                const actor = other?.actor ?? doc?.actor ?? null;
+                const wounds = normalizeFocusWounds(target?.wounds, target?.woundsKnown);
+                return {
+                    tokenId: target?.tokenId ?? null,
+                    tokenUuid: target?.tokenUuid ?? null,
+                    actorId: target?.actorId ?? actor?.id ?? null,
+                    x: _finiteOr(target?.x, null),
+                    y: _finiteOr(target?.y, null),
+                    wounds: wounds.effective,
+                    woundsKnown: wounds.known,
+                    statuses: _mergeStatusIds(target?.statuses, other?.actor?.statuses,
+                        doc?.statuses, doc?.actor?.statuses),
+                    reactionUsed: target?.reactionUsed
+                        ?? _readFlag(other, FLAG_KEYS.reactionUsed) ?? null,
+                    threatEv: _threatEvOf(target, actor),
+                    allyEngaged: target?.allyEngaged === true ? true
+                        : (target?.allyEngaged === false ? false : null),
+                    source: target?.source ?? "injected",
+                    hidden: target?.hidden === true,
+                    visible: target?.visible,
+                    seen: target?.seen,
+                    los: target?.los,
+                    canAttack: target?.canAttack,
+                    attackable: target?.attackable,
+                    // Issue #87: the interdiction shooter projection reads
+                    // per-class EVs and the charge rate. Explicitly
+                    // injected fields win; otherwise derive them from the
+                    // live actor so visible contacts carry the profile
+                    // the trigger gates need. Extra keys are inert for
+                    // the concentrate-fire selector.
+                    ...(target?.emitters !== undefined ? { emitters: target.emitters }
+                        : actor ? { emitters: weaponEmitters(actor) } : {}),
+                    ...(Number.isFinite(target?.rangedEV) ? { rangedEV: target.rangedEV } : {}),
+                    ...(Number.isFinite(target?.meleeEV) ? { meleeEV: target.meleeEV } : {}),
+                    chargeRate: _finiteOr(target?.chargeRate,
+                        _finiteOr(actor?.system?.movement?.charge, null))
+                };
+            }).filter(entry => entry.tokenId || entry.tokenUuid);
         }
         const memberIds = new Set(members.map(m => m.combatantId));
         const leaderDoc = _tokenDoc(members[0]?.combatant?.token);
@@ -1572,12 +2379,30 @@ export function createFireteamService({
             }
             const pos = _tokenPosition(doc);
             const actor = other.actor ?? doc.actor ?? null;
+            const wounds = normalizeFocusWounds(actor?.system?.wounds);
+            // The live scan treats non-positive remaining wounds as an
+            // already-down corpse and never offers it as a fresh focus
+            // candidate. Injected callers may still deliberately inject such
+            // a critical-but-valid target; the pure selector then applies its
+            // finishable-zero semantics.
+            if (wounds.known && Number.isFinite(wounds.effective)
+                && wounds.effective <= 0) continue;
             targets.push({
                 tokenId: other.tokenId ?? doc.id ?? null,
                 tokenUuid: typeof doc.uuid === "string" ? doc.uuid : null,
+                actorId: actor?.id ?? null,
                 x: pos.x,
                 y: pos.y,
-                wounds: _woundsValue(actor?.system?.wounds)
+                wounds: wounds.effective,
+                woundsKnown: wounds.known,
+                statuses: _mergeStatusIds(other.actor?.statuses, doc.statuses, doc.actor?.statuses),
+                reactionUsed: _readFlag(other, FLAG_KEYS.reactionUsed) ?? null,
+                threatEv: _threatEvOf(null, actor),
+                allyEngaged: null,
+                // Issue #87: visible live hostiles carry their shooter
+                // projection for the interdiction trigger gates.
+                ...(actor ? { emitters: weaponEmitters(actor) } : {}),
+                chargeRate: _finiteOr(actor?.system?.movement?.charge, null)
             });
         }
         return targets;
@@ -1613,76 +2438,208 @@ export function createFireteamService({
     }
 
     /**
-     * Kill-EV convergence objective (issue #16): when the summed expected
-     * damage of the members that can actually engage a target reaches its
-     * wounds total, the whole team converges on that target instead of
-     * distributing. Explicit `context.objective.targetId` orders win;
-     * `context.convergence === false`/`context.killEV === false` disable
-     * the pass. Deterministic: ties resolve on margin, then target id.
+     * Melee reach used for the concentrate-fire gang-up input. A member's
+     * best melee emitter wins; any combatant can otherwise swing unarmed at
+     * the standard melee reach. Distance unknown means not engaged.
+     * @param {object[]} emitters Member weapon emitters.
+     * @returns {number} Reach in scene units.
+     */
+    function _memberMeleeReach(emitters) {
+        let best = 0;
+        for (const emitter of emitters ?? []) {
+            if (emitter?.melee === true && Number.isFinite(emitter.range)) {
+                best = Math.max(best, emitter.range);
+            }
+        }
+        return best > 0 ? best : DEFAULT_MELEE_REACH;
+    }
+
+    /**
+     * Whether any living enabled team member is in melee reach of the
+     * target. This is deliberately team-local (not a full scene scan): it
+     * feeds both the ranged-cover friendly-fire penalty and the assault
+     * gang-up bonus of the pure selector.
+     * @param {object[]} profiles `{member, emitters}` entries.
+     * @param {object} target Normalized target.
+     * @param {object|null} grid Grid info.
+     * @returns {boolean}
+     */
+    function _teamAllyEngaged(profiles, target, grid) {
+        for (const { member, emitters } of profiles ?? []) {
+            const distance = _convergenceDistance(member?.position, target, grid);
+            if (distance !== null
+                && distance <= _memberMeleeReach(emitters) + 1e-9) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Injected-contact visibility gate. An injected list is the caller's
+     * perceived contact list, but memory/relay entries and entries explicitly
+     * marked invisible/unattackable still cannot become the live focus. A
+     * missing `canAttack` flag is neutral for backward compatibility with the
+     * legacy minimal convergence fixtures.
+     * @param {object} target Normalized injected target.
+     * @returns {boolean}
+     */
+    function _injectedFocusEligible(target) {
+        if (!target || target.hidden === true) return false;
+        if (target.visible === false || target.seen === false || target.los === false) return false;
+        if (target.canAttack === false || target.attackable === false) return false;
+        return !["last-known", "team-contact", "relay", "intel", "memory"]
+            .includes(target.source);
+    }
+
+    /**
+     * Honest per-member LOS capability for deterministic focus assignment
+     * ordering. The perception service's token-to-token probe is authoritative;
+     * an explicit point probe (`context.los`, already used by planner tests and
+     * integrations) is the fallback. Unknown/unproven LOS is simply not marked
+     * capable — it never zeroes the member's kill-EV contribution.
+     * @param {object} member Team member entry.
+     * @param {object} target Normalized target.
+     * @param {object|null} perception Perception service.
+     * @param {object} combat Combat document.
+     * @param {object} context Build context.
+     * @returns {boolean}
+     */
+    function _memberLosCapable(member, target, perception, combat, context) {
+        const memberDoc = _tokenDoc(member?.combatant?.token) ?? _tokenDoc(member?.token);
+        const targetDoc = _combatTokenDoc(combat, target);
+        if (memberDoc && targetDoc && typeof perception?.hasLineOfSight === "function") {
+            try {
+                return perception.hasLineOfSight(memberDoc, targetDoc) === true;
+            } catch(_err) {
+                // Fall through to the explicit point probe.
+            }
+        }
+        if (typeof context?.los === "function"
+            && Number.isFinite(member?.position?.x) && Number.isFinite(member?.position?.y)
+            && Number.isFinite(target?.x) && Number.isFinite(target?.y)) {
+            try {
+                return context.los(member.position, target) === true;
+            } catch(_err) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Concentrate-fire adapter (issue #85): enrich the fireteam scan into
+     * normalized pure-selector inputs, apply the live visibility gate, compute
+     * per-member kill-EV capabilities and invoke `selectFocusTarget`. The
+     * selector stays document-free; this function is the only place that reads
+     * actor loadouts/statuses/reaction flags. Its return object keeps the full
+     * pure result for diagnostics while augmenting the descriptor with
+     * `actorId` for planner attack-pool identity matching.
      * @param {object} input
-     * @param {object[]} input.members Filtered team members.
+     * @param {object[]} input.members Filtered living/enabled team members.
      * @param {object} input.combat Combat document.
      * @param {object} input.context `buildTeamPlan` context.
-     * @returns {object|null} Descriptor `{targetId, targetUuid, killEV,
-     *   wounds, margin, capableMembers}` or null.
+     * @param {string|null} input.teamPreset Resolved shared preset.
+     * @param {number} [input.casualties] Defeated team members this combat.
+     * @returns {{focus: object|null, result: object, targets: object[],
+     *   allTargets: object[]}}
      */
-    function _convergentObjective({ members, combat, context }) {
-        if (context.convergence === false || context.killEV === false) return null;
-        if (context.objective?.targetId) return null;
-        const targets = _convergentTargets({ members, combat, context });
-        if (!targets.length) return null;
-        const grid = _convergenceGrid(combat, context);
-        const capable = (members ?? [])
+    function _focusSelection({ members, combat, context, teamPreset, casualties = null }) {
+        const allTargets = _convergentTargets({ members, combat, context });
+        const injected = Array.isArray(context.targets) && context.targets.length > 0;
+        const perception = injected ? null : _service("perception", context.perception);
+        const live = (members ?? [])
             .filter(member => member.enabled !== false && member.defeated !== true);
-        const profiles = capable.map(member => ({
+        const profiles = live.map(member => ({
             member,
             emitters: weaponEmitters(member.combatant?.actor
                 ?? _tokenDoc(member.combatant?.token)?.actor ?? null)
         }));
-        let best = null;
-        for (const target of targets) {
-            // A target whose wounds cannot be read is never converged on:
-            // committing a focus-fire on an enemy of unknown toughness is
-            // exactly the premature commitment the feature avoids.
-            const wounds = _woundsValue(target.wounds);
-            if (!(wounds > 0)) continue;
-            let killEV = 0;
-            const capableMembers = [];
-            for (const { member, emitters } of profiles) {
-                const ev = _memberKillEV(member, emitters, target, grid);
-                if (ev > 0) {
-                    killEV += ev;
-                    capableMembers.push(member.combatantId);
-                }
+        const grid = _convergenceGrid(combat, context);
+        const visible = allTargets.filter(target => injected
+            ? _injectedFocusEligible(target)
+            : _memberSees(live, target, perception, combat));
+        const unseenTargetIds = allTargets
+            .filter(target => !visible.includes(target))
+            .map(target => target.tokenId ?? target.tokenUuid)
+            .filter(id => id != null)
+            .map(String)
+            .sort();
+        const targets = visible.map(target => ({
+            ...target,
+            allyEngaged: target.allyEngaged == null
+                ? _teamAllyEngaged(profiles, target, grid)
+                : target.allyEngaged === true
+        }));
+        const selectorMembers = profiles.map(({ member, emitters }) => {
+            const capability = {};
+            for (const target of targets) {
+                const killEV = _memberKillEV(member, emitters, target, grid);
+                if (!(killEV > 0)) continue;
+                const entry = {
+                    killEV,
+                    losCapable: _memberLosCapable(member, target, perception, combat, context)
+                };
+                if (target.tokenId != null) capability[String(target.tokenId)] = entry;
+                if (target.tokenUuid != null) capability[String(target.tokenUuid)] = entry;
             }
-            killEV = Math.round(killEV * 1e4) / 1e4;
-            const margin = Math.round((killEV - wounds) * 1e4) / 1e4;
-            if (margin < 0) continue;
-            const candidate = {
-                targetId: target.tokenId ?? target.tokenUuid,
-                targetUuid: target.tokenUuid ?? null,
-                killEV,
-                wounds,
-                margin,
-                capableMembers
+            return {
+                combatantId: member.combatantId,
+                enabled: member.enabled,
+                defeated: member.defeated,
+                capability,
+                lastTarget: _readFlag(member.combatant, FLAG_KEYS.lastTarget) ?? null
             };
-            if (!best || margin > best.margin + 1e-9
-                || (Math.abs(margin - best.margin) <= 1e-9
-                    && String(candidate.targetId) < String(best.targetId))) {
-                best = candidate;
-            }
-        }
-        return best;
+        });
+        const result = selectFocusTarget({
+            targets,
+            members: selectorMembers,
+            casualties: _finiteOr(context.casualties, casualties ?? 0),
+            round: _finiteOr(combat?.round, context.round),
+            preset: teamPreset,
+            context,
+            config: context.focusConfig ?? context.concentrateFire ?? null
+        });
+        const winner = result.focus
+            ? targets.find(target => String(target.tokenId ?? target.tokenUuid ?? "")
+                === String(result.focus.targetId)
+                || String(target.tokenUuid ?? "") === String(result.focus.targetId))
+            : null;
+        const focus = result.focus
+            ? { ...result.focus, actorId: winner?.actorId ?? null }
+            : null;
+        return {
+            focus,
+            result: {
+                ...result,
+                focus,
+                diagnostics: {
+                    ...result.diagnostics,
+                    visibility: injected ? "injected" : "perception",
+                    inputTargets: allTargets.length,
+                    visibleTargets: targets.length,
+                    unseenTargetIds,
+                    attackPoolPolicy: {
+                        callerAllowList: "intersect-focus",
+                        callerDenyList: "preserved",
+                        overflow: "append-focus-deny"
+                    }
+                }
+            },
+            targets,
+            allTargets
+        };
     }
 
     /**
-     * Resolve the bounded team tactic for this plan (issue #412).
-     * `context.tactic` may be a tactic factory `(input) => descriptor` or
-     * a ready serializable descriptor `{name, reason, assignments,
-     * allowFlank, regroup, objective, maxDetachedPhases, breakdown}`; it
-     * defaults to the spec-ops selector when the team runs on
-     * `teamPreset === "specOps"` or every member resolves to `specOps`.
-     * `context.tactic === null`/`false` explicitly disables the hook.
+     * Resolve the bounded team tactic for this plan (issues #412/#92).
+     * Explicit `context.tactic` keeps the legacy caller-override contract: a
+     * tactic factory `(input) => descriptor` or a ready serializable
+     * descriptor `{name, reason, assignments, allowFlank, regroup, objective,
+     * maxDetachedPhases, breakdown}`; `null`/`false` explicitly disables the
+     * hook. Without an explicit override the per-preset tactic registry is
+     * consulted; selectors that do not pass their gates return an
+     * explainable null maneuver and the default fireteam policy applies.
      * @param {object} input
      * @param {object[]} input.members Filtered member entries.
      * @param {string|null} input.leaderId Elected leader combatant id.
@@ -1691,33 +2648,131 @@ export function createFireteamService({
      * @param {number} input.seed Plan seed.
      * @param {object} input.combat Combat document.
      * @param {object} input.context `buildTeamPlan` context.
+     * @param {object|null} [input.character] Party character reference
+     *   forwarded to tactic selectors (interdiction memory rejection).
+     * @param {object|null} [input.focusObjective] Concentrate-fire objective
+     *   selected before the maneuver registry.
+     * @param {object[]} [input.teamContacts] Shared team-contact memory entries.
+     * @param {object} [input.memberProfiles] Per-member tactical capability profiles.
+     * @param {*} [input.moraleTier] Committed team morale tier forwarded to
+     *   the tactic selectors (issue #88 pincer morale gate).
+     * @param {object|null} [input.moraleInfo] Full morale evaluation forwarded
+     *   to stateless tactics (peel reads tier/counters without re-deriving them).
+     * @param {object|null} [input.casualtyDetail] Total/recent/initial casualty
+     *   counts for peel-withdrawal trigger evaluation.
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
-    function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context }) {
-        let source = context.tactic;
-        if (source === undefined) {
-            if (teamPreset === SPEC_OPS_PRESET_ID) source = specOpsTactic;
-        }
-        if (source === undefined || source === null || source === false) return null;
-        if (typeof source === "function") {
+    function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context,
+        focusObjective = null, character = null, teamContacts = [], memberProfiles = {},
+        moraleTier = null, moraleInfo = null,
+        casualtyDetail = null }) {
+        const targets = context.tacticTargets ?? (Array.isArray(context.targets)
+            ? context.targets
+            : _convergentTargets({ members, combat, context }));
+        // Issue #89 peel inputs: adaptation happens here, once, before the
+        // preset cascades. Selectors remain pure — this block only reads
+        // documents/services and builds plain data. In particular it does
+        // not narrow `context.targets`; attack-pool narrowing stays in the
+        // focus/interdiction channels.
+        const scene = context.scene ?? combat?.scene ?? null;
+        const navigation = context.navigation ?? _service("navigation");
+        const threatMapService = context.threatMap ?? _service("threatMap");
+        let threatMap = threatMapService;
+        let dangerAt = typeof context.dangerAt === "function" ? context.dangerAt : null;
+        if (!dangerAt && threatMapService) {
             try {
-                return source({
-                    members,
-                    leaderId,
-                    teamId,
-                    seed,
-                    targets: context.tacticTargets ?? (Array.isArray(context.targets) ? context.targets : null),
-                    objective: context.objective ?? null,
-                    casualties: _finiteOr(context.casualties, 0),
-                    scene: context.scene ?? combat?.scene ?? null,
-                    combat,
-                    context
-                }) ?? null;
+                const current = typeof threatMapService.map === "function"
+                    ? threatMapService.map() : null;
+                if (typeof current?.dangerAt === "function") {
+                    threatMap = current;
+                    dangerAt = point => current.dangerAt(point);
+                } else if (typeof threatMapService.buildMap === "function") {
+                    const built = threatMapService.buildMap({
+                        targets,
+                        combat,
+                        scene,
+                        grid: context.grid ?? scene?.grid ?? null
+                    });
+                    if (typeof built?.dangerAt === "function") {
+                        threatMap = built;
+                        dangerAt = point => built.dangerAt(point);
+                    }
+                }
             } catch(err) {
-                return { name: null, reason: "tactic-error" };
+                dangerAt = null;
             }
         }
-        return typeof source === "object" ? source : null;
+        const defeatedCount = _finiteOr(casualtyDetail?.total, 0);
+        const casualtyOverride = context.casualties;
+        const casualties = casualtyOverride && typeof casualtyOverride === "object"
+            ? casualtyOverride
+            : {
+                // Legacy `context.casualties` means recent defeats (the
+                // specOps fallback adds live defeated members itself); the
+                // peel core needs total/recent/initialStrength explicitly.
+                total: defeatedCount,
+                recent: Math.max(0, _finiteOr(casualtyOverride,
+                    _finiteOr(context.casualtiesRecent, 0))),
+                initialStrength: Math.max(1, _finiteOr(context.initialStrength,
+                    members.length + defeatedCount))
+            };
+        const selectorContext = {
+            ...context,
+            navigation,
+            threatMap,
+            ...(dangerAt ? { dangerAt } : {}),
+            scene,
+            grid: context.grid ?? scene?.grid ?? null,
+            casualties,
+            peel: { ...getPeelThresholds(), ...(context.peel ?? {}) },
+            moraleInfo: moraleInfo ? {
+                tier: moraleInfo.tier ?? moraleTier ?? null,
+                effectiveTeamTier: moraleInfo.tier ?? moraleTier ?? null,
+                record: moraleInfo.record ?? null,
+                counters: moraleInfo.record?.counters ?? null,
+                diagnostics: moraleInfo.diagnostics ?? null
+            } : (moraleTier ? { tier: moraleTier, effectiveTeamTier: moraleTier } : null)
+        };
+        const selectorInput = {
+            members,
+            leaderId,
+            teamId,
+            seed,
+            // Issue #88: the pincer morale gate reads the committed team
+            // tier — the selector never re-derives morale itself.
+            moraleTier,
+            moraleInfo: selectorContext.moraleInfo,
+            targets,
+            objective: context.objective ?? focusObjective ?? null,
+            focusObjective,
+            teamContacts: Array.isArray(teamContacts) ? teamContacts : [],
+            memberProfiles: memberProfiles ?? {},
+            casualties,
+            scene,
+            combat,
+            context: selectorContext,
+            character
+        };
+        const source = context.tactic;
+        if (source !== undefined) {
+            if (source === null || source === false) return null;
+            if (typeof source === "function") {
+                try {
+                    return source(selectorInput) ?? null;
+                } catch(err) {
+                    return { name: null, reason: "tactic-error" };
+                }
+            }
+            return typeof source === "object" ? source : null;
+        }
+        if (!teamPreset) return null;
+        const tactics = _tactics(context.tactics ?? context.tacticRegistry);
+        if (!tactics || typeof tactics.resolveTactic !== "function") return null;
+        try {
+            return tactics.resolveTactic(teamPreset, selectorInput) ?? null;
+        } catch(err) {
+            return { name: null, reason: "tactic-error" };
+        }
     }
 
     // --- L2 morale (issue #26) ------------------------------------------------
@@ -2106,6 +3161,298 @@ export function createFireteamService({
         return result;
     }
 
+    // --- Recover-pinned overlay (issue #90) ---------------------------------
+
+    /**
+     * Assignment roles authored by a maneuver tactic whose capture would
+     * break that maneuver's critical mass (epic #84 priority rule R3):
+     * the suppression suppressor and its bounding element, the pincer
+     * flanker/fix roles, the interdiction screen and both peel roles are
+     * never reassigned by the recovery overlay — recovery is solved by the
+     * fire of free members, not by recalling the maneuver. The `focus`
+     * marker joins them under priority rule R7: concentrate-fire is the
+     * team's deliberate fire concentration and outranks the recover
+     * redirect, so a focus executor is never pulled onto cover duty —
+     * when the pin source IS the focus target the merged redirect branch
+     * already points every free member at it, making a hard assignment
+     * unnecessary.
+     */
+    const RECOVER_CRITICAL_ROLES = new Set([
+        "suppressor", "bound", "flanker", "fixer", INTERDICT_ROLE, "withdraw", "cover", "focus",
+        "overwatch-lane"
+    ]);
+
+    /**
+     * Whether a member's loadout carries a suppression-capable ranged
+     * weapon: burst or full-auto rate of fire, the modified rate winning
+     * over the base one exactly like the suppress-and-bound capability
+     * probe reads it.
+     * @param {object|null} actor Actor document.
+     * @returns {boolean}
+     */
+    function _suppressionCapableActor(actor) {
+        for (const item of _list(actor?.items)) {
+            if (item?.type !== "weapon") continue;
+            if (String(item?.system?.class ?? "").toLowerCase() === "melee") continue;
+            const rof = item?.system?.modified?.rateOfFire ?? item?.system?.rateOfFire ?? {};
+            if (_finiteOr(rof?.burst, 0) > 0 || _finiteOr(rof?.full, 0) > 0) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Build the document-free input of the recover-pinned pure overlay and
+     * evaluate it (issue #90, epic #84 integration). The adapter reads
+     * documents/services exactly once per TeamPlan and converts them into
+     * plain DTOs: member capabilities and control facts (GM control,
+     * commitments, morale tier, turn order), the hostile contact list,
+     * every combat token for the same-side resolution, the chat log for
+     * the recorded attribution leg and LOS/cover/danger probes bound back
+     * to token documents. The pure core stays document-free; anything it
+     * cannot prove degrades to the conservative branch instead of guessing.
+     *
+     * The overlay is a one-round stateless evaluation: it never writes
+     * flags, never mutates assignments itself and never narrows the
+     * awareness pool. `null` means "no overlay this round" — either no
+     * pinned member exists (the cheap common path) or the pure evaluation
+     * itself failed, in which case team planning must continue unaffected.
+     * @param {object} input
+     * @param {object[]} input.members Living enabled member entries.
+     * @param {object} input.combat Combat document.
+     * @param {object} input.context `buildTeamPlan` context.
+     * @param {object[]} input.assignments Current (post-demotion) assignments.
+     * @param {object|null} input.moraleInfo Morale evaluation with the
+     *   member-effective tier map.
+     * @param {Set<string>} input.gmControlledIds Members GM-moved this round.
+     * @param {string|null} input.leaderId Elected leader combatant id.
+     * @returns {object|null} Pure overlay descriptor or null.
+     */
+    function _recoverPinnedOverlay({ members, combat, context, assignments,
+        moraleInfo = null, gmControlledIds = new Set(), leaderId = null }) {
+        const pinnedMembers = members.filter(member =>
+            _memberStatusIds(member).includes("pinned"));
+        if (!pinnedMembers.length) return null;
+        try {
+            const scene = context.scene ?? combat?.scene ?? null;
+            const grid = _convergenceGrid(combat, context);
+            // The hostile picture mirrors the maneuver selector's
+            // precedence exactly: draft `tacticTargets` win, then the
+            // caller's injected contact list, then the live combat scan —
+            // all normalized through the same `_convergentTargets`
+            // adaptation. Injected entries with missing positions are
+            // completed from their live token documents so distance/LOS
+            // legs never degrade just because the caller injected a lean
+            // record.
+            const injectedTargets = context.tacticTargets
+                ?? (Array.isArray(context.targets) && context.targets.length
+                    ? context.targets : null);
+            const hostiles = _convergentTargets({
+                members,
+                combat,
+                context: injectedTargets ? { ...context, targets: injectedTargets } : context
+            }).map(hostile => {
+                if (Number.isFinite(hostile?.x) && Number.isFinite(hostile?.y)) return hostile;
+                const other = _combatantForTarget(combat, hostile);
+                const pos = _tokenPosition(_tokenDoc(other?.token));
+                if (!Number.isFinite(pos?.x) || !Number.isFinite(pos?.y)) return hostile;
+                return { ...hostile, x: pos.x, y: pos.y };
+            });
+            // Every combat token — both sides — feeds the same-side
+            // resolution of the attribution chain: a friendly suppressor
+            // that accidentally pinned its own member must never become
+            // the cover-fire target, and only explicit dispositions can
+            // prove that relation.
+            const tokens = [];
+            for (const other of _list(combat?.combatants)) {
+                if (!other || _isMissing(other)) continue;
+                const doc = _tokenDoc(other?.token);
+                if (!doc) continue;
+                const pos = _tokenPosition(doc);
+                const actor = other.actor ?? doc.actor ?? null;
+                tokens.push({
+                    combatantId: other.id ?? null,
+                    tokenId: other.tokenId ?? doc.id ?? null,
+                    tokenUuid: typeof doc.uuid === "string" ? doc.uuid : null,
+                    actorId: actor?.id ?? null,
+                    x: pos.x,
+                    y: pos.y,
+                    position: pos.x !== null && pos.y !== null ? { x: pos.x, y: pos.y } : null,
+                    disposition: _finiteOr(doc.disposition ?? other.disposition, 0),
+                    defeated: other.defeated === true,
+                    dead: other.defeated === true,
+                    destroyed: doc.destroyed === true,
+                    hidden: doc.hidden === true,
+                    statuses: _mergeStatusIds(other.actor?.statuses, doc.statuses, doc.actor?.statuses)
+                });
+            }
+            const assignById = new Map((assignments ?? []).map(entry =>
+                [entry.combatantId, entry]));
+            const round = _finiteOr(combat?.round, 0);
+            const memberDtos = members.map(member => {
+                const combatant = member.combatant;
+                const actor = combatant?.actor ?? null;
+                const doc = _tokenDoc(combatant?.token);
+                const assignment = assignById.get(member.combatantId) ?? null;
+                const emitters = actor ? weaponEmitters(actor) : [];
+                const pos = member.position ?? _tokenPosition(doc);
+                const inMelee = hostiles.some(hostile => {
+                    const distance = _convergenceDistance(pos, hostile, grid);
+                    return distance !== null && distance <= DEFAULT_MELEE_REACH + 1e-9;
+                });
+                const role = typeof assignment?.role === "string" ? assignment.role : null;
+                const movement = actor?.system?.movement ?? {};
+                return {
+                    combatantId: member.combatantId,
+                    tokenId: member.tokenId,
+                    tokenUuid: typeof doc?.uuid === "string" ? doc.uuid : null,
+                    actorId: member.actorId ?? actor?.id ?? null,
+                    position: Number.isFinite(pos?.x) && Number.isFinite(pos?.y)
+                        ? { x: pos.x, y: pos.y } : null,
+                    x: Number.isFinite(pos?.x) ? pos.x : null,
+                    y: Number.isFinite(pos?.y) ? pos.y : null,
+                    disposition: _finiteOr(doc?.disposition ?? combatant?.disposition, 0),
+                    statuses: _memberStatusIds(member),
+                    enabled: member.enabled !== false,
+                    defeated: member.defeated === true,
+                    initiative: Number.isFinite(member.initiative) ? member.initiative : null,
+                    turnIndex: Number.isFinite(member.turnIndex) ? member.turnIndex : null,
+                    hasActed: member.hasActed === true,
+                    leader: member.combatantId === leaderId,
+                    assignment: assignment ? {
+                        task: assignment.task ?? null,
+                        role,
+                        element: assignment.element ?? null,
+                        groupId: assignment.groupId ?? null
+                    } : null,
+                    groupId: assignment?.groupId ?? null,
+                    gmControlled: gmControlledIds.has(member.combatantId),
+                    commitment: _readFlag(combatant, FLAG_KEYS.committedPlan) ?? null,
+                    inMelee,
+                    attackCapable: emitters.length > 0,
+                    rangedCapable: emitters.some(emitter => emitter?.melee !== true),
+                    suppressionCapable: _suppressionCapableActor(actor),
+                    // Conservative v1 reachability heuristic: a member that
+                    // can move at all may find cover — the recoverCover
+                    // factor only materializes when a real endpoint
+                    // improves cover, so a false positive never misleads
+                    // the plan, it merely keeps the individual leg eligible.
+                    canReachCover: _finiteOr(movement.full, 0) > 0
+                        || _finiteOr(movement.half, 0) > 0,
+                    effectiveTier: moraleInfo?.effective?.get(member.combatantId)
+                        ?? moraleInfo?.tier ?? null,
+                    lastTarget: _readFlag(combatant, FLAG_KEYS.lastTarget) ?? null,
+                    lastAttacker: _readFlag(combatant, FLAG_KEYS.lastAttacker) ?? null,
+                    criticalAssignment: role !== null && RECOVER_CRITICAL_ROLES.has(role)
+                };
+            });
+            // LOS probes receive the pure core's plain DTOs, so the adapter
+            // closure resolves them back to token documents inside this
+            // combat; unresolvable identities answer "unknown" (null), never
+            // a guess.
+            const perception = _service("perception", context.perception);
+            const navigation = context.navigation ?? _service("navigation");
+            const resolveDoc = ref => {
+                if (!ref) return null;
+                if (typeof ref === "object" && (ref.documentName === "Token" || ref.x !== undefined)
+                    && typeof ref !== "string") {
+                    // A token document passed straight through is valid input.
+                    if (ref.documentName === "Token") return ref;
+                }
+                for (const other of _list(combat?.combatants)) {
+                    const doc = _tokenDoc(other?.token);
+                    if (!doc) continue;
+                    const ids = [other.tokenId, doc.id, doc.uuid, other.actor?.id,
+                        doc.actor?.id, other.id].filter(v => v != null).map(String);
+                    const wanted = [ref?.tokenId, ref?.tokenUuid, ref?.actorId,
+                        ref?.combatantId, ref?.id]
+                        .filter(v => v != null).map(String);
+                    if (typeof ref === "string") wanted.push(ref);
+                    if (wanted.some(id => ids.includes(id))) return doc;
+                }
+                return null;
+            };
+            const losProbe = (fromRef, toRef) => {
+                if (typeof perception?.hasLineOfSight !== "function") return null;
+                const from = resolveDoc(fromRef);
+                const to = resolveDoc(toRef);
+                if (!from || !to) return null;
+                try {
+                    return perception.hasLineOfSight(from, to) === true;
+                } catch(_err) {
+                    return null;
+                }
+            };
+            const coverProbe = (position, threatPosition, memberRef) => {
+                if (typeof navigation?.coverEstimate !== "function") return null;
+                const doc = resolveDoc(memberRef);
+                if (!doc || !Number.isFinite(position?.x) || !Number.isFinite(position?.y)
+                    || !Number.isFinite(threatPosition?.x) || !Number.isFinite(threatPosition?.y)) {
+                    return null;
+                }
+                try {
+                    const estimate = navigation.coverEstimate(doc,
+                        { x: position.x, y: position.y },
+                        { x: threatPosition.x, y: threatPosition.y });
+                    return Number.isFinite(estimate) ? estimate : null;
+                } catch(_err) {
+                    return null;
+                }
+            };
+            // Threat-map danger probe, mirroring the selector adaptation of
+            // `_resolveTactic`: the service's current map wins, a fresh build
+            // over the hostile contacts is the fallback, and everything
+            // unprobed reads as zero exposure.
+            let dangerProbe = null;
+            const threatMapService = _service("threatMap", context.threatMap);
+            if (threatMapService) {
+                try {
+                    const current = typeof threatMapService.map === "function"
+                        ? threatMapService.map() : null;
+                    if (typeof current?.dangerAt === "function") {
+                        dangerProbe = point => current.dangerAt(point);
+                    } else if (typeof threatMapService.buildMap === "function") {
+                        const built = threatMapService.buildMap({
+                            targets: hostiles,
+                            combat,
+                            scene,
+                            grid: context.grid ?? scene?.grid ?? null
+                        });
+                        if (typeof built?.dangerAt === "function") {
+                            dangerProbe = point => built.dangerAt(point);
+                        }
+                    }
+                } catch(_err) {
+                    dangerProbe = null;
+                }
+            }
+            const overlay = buildRecoverPinnedOverlay({
+                members: memberDtos,
+                hostiles,
+                tokens,
+                messages: context.messages ?? globalThis.game?.messages ?? [],
+                round,
+                turnOrder: _list(combat?.turns).map(entry =>
+                    typeof entry === "string" ? entry : (entry?.id ?? entry?.combatantId ?? null)),
+                currentTurnIndex: Number.isFinite(combat?.turn) ? combat.turn : null,
+                hasLineOfSight: losProbe,
+                losToSource: losProbe,
+                coverEstimate: coverProbe,
+                ...(dangerProbe ? { dangerAt: point => {
+                    try {
+                        return _finiteOr(dangerProbe(point), 0);
+                    } catch(_err) {
+                        return 0;
+                    }
+                } } : {})
+            });
+            return overlay ?? null;
+        } catch(err) {
+            // The overlay is advisory: a broken adaptation must never break
+            // the team plan itself.
+            return null;
+        }
+    }
+
     /**
      * Build the serializable TeamPlan for one team of a combat. Only
      * AI-enabled combatants with a matching fireteam `teamId` participate;
@@ -2119,8 +3466,9 @@ export function createFireteamService({
      *   `objective`, `assignments`, `allowFlank`, `regroup`, `tactic`,
      *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
      *   `preferredCohesion`, `specOpsConfig`, `targets`, `actions`, `moves`, `perception`,
-     *   `navigation`, `authority`, `planner`, `taskCapacities`,
-     *   `replanCount`. Runtime drafts use `readOnly` (no morale/GM flags,
+     *   `navigation`, `authority`, `planner`, `tactics`, `taskCapacities`,
+     *   `replanCount`, `messages` (chat scan of the issue #90 recover
+     *   attribution), `threatMap`. Runtime drafts use `readOnly` (no morale/GM flags,
      *   independent member LOS) and pass `tacticTargets` only to the
      *   maneuver selector, not as attackable targets for each member.
      * @returns {Promise<object>} `{status, teamPlan?, reason?, diagnostics?}`.
@@ -2254,9 +3602,47 @@ export function createFireteamService({
         });
         diagnostics.morale = moraleInfo.diagnostics;
 
+        // Issue #91: squad memory and member capability profiles are
+        // collected before tactic selection, not after assignments. The
+        // chokepoint lane inference must see the same read-only threat and
+        // reaction/suppression evidence that member planners receive; the
+        // pure selector itself never probes documents.
+        const perception = _service("perception", context.perception);
+        const teamContacts = _teamContacts({ members, combat, context, perception });
+        const memberDefenseProfiles = await _memberDefenseProfiles({
+            members, combat, context, perception
+        });
+        diagnostics.defenseInputs = _jsonClone({
+            teamContactCount: Array.isArray(teamContacts) ? teamContacts.length : 0,
+            memberProfiles: memberDefenseProfiles
+        });
+
+        // Concentrate-fire pre-pass (issue #85): focus selection is an
+        // objective overlay, not a maneuver. It must run before the preset
+        // tactic registry so specOps `flank-and-fix`/coordinated assault sees
+        // the identical target instead of independently picking another one.
+        // The pure selector receives only visible live hostiles (or explicitly
+        // perceived injected contacts) plus normalized member capabilities.
+        const focusSelection = _focusSelection({
+            members,
+            combat,
+            context,
+            teamPreset,
+            casualties: allMembers.filter(member => member.defeated === true).length
+        });
+        const selectedFocus = focusSelection.focus;
+        let convergence = selectedFocus;
+        diagnostics.focus = _jsonClone({
+            ...focusSelection.result.diagnostics,
+            focus: selectedFocus,
+            candidates: focusSelection.result.candidates
+        });
+
         // Team tactic (issue #412): a preset tactic factory may bind the
         // maneuver — assignments, flank policy, regroup and the shared
-        // objective. Explicit caller context fields always win.
+        // objective. Explicit caller context fields always win; the focus
+        // descriptor is only the registry input objective when the caller did
+        // not order one explicitly.
         const tactic = _resolveTactic({
             members,
             leaderId: election.combatantId,
@@ -2264,10 +3650,27 @@ export function createFireteamService({
             teamPreset,
             seed,
             combat,
-            context
+            context,
+            focusObjective: selectedFocus,
+            character,
+            teamContacts: Array.isArray(teamContacts) ? teamContacts : [],
+            memberProfiles: memberDefenseProfiles,
+            moraleTier: moraleInfo.tier,
+            moraleInfo,
+            casualtyDetail: {
+                total: allMembers.filter(member => member.defeated === true).length,
+                initialStrength: allMembers.length
+            }
         });
         const tacticName = tactic?.name ?? tactic?.tactic ?? null;
-        if (teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+        // Issue #87: the interdiction screen is a composite maneuver — its
+        // breakdown records the base attack maneuver it screens, and the
+        // flank doctrine/proof machinery applies when that base is a
+        // flank-and-fix.
+        const baseTacticName = tactic?.breakdown?.baseTactic ?? null;
+        const isFlankManeuver = tacticName === "flank-and-fix"
+            || (tacticName === INTERDICTION_TACTIC && baseTacticName === "flank-and-fix");
+        if (teamPreset === SPEC_OPS_PRESET_ID && isFlankManeuver
             && Number.isFinite(tactic.flankMinAngleDegrees)) {
             // Factories can bind a stricter doctrine than the saved
             // setting; publish precisely the cutoff used by the draft.
@@ -2289,21 +3692,94 @@ export function createFireteamService({
             context.maxDetachedPhases ?? tactic?.maxDetachedPhases,
             DEFAULT_MAX_DETACHED_PHASES);
 
-        // Issue #16 kill-EV convergence: when the summed expected damage
-        // of the members able to engage a target reaches its wounds
-        // total, the team converges — every capable member shares the
-        // convergent objective and no flank group detaches. Explicit
-        // `context.objective`/`context.assignments`/a tactic-bound
-        // objective keep precedence; `context.convergence === false`
-        // disables the pass.
-        const convergence = _convergentObjective({ members, combat, context });
-        diagnostics.convergence = convergence ? _jsonClone(convergence) : null;
+        // Issue #87: interdiction exclusions are objective constraints,
+        // not scoring weights. The concentrate-fire focus is recomputed
+        // with the interception targets removed from candidacy whenever
+        // the tactic carries exclusions — a screened target can never
+        // stay the team's focus, and only the exclusion channels (never
+        // target-pool narrowing) carry the ban into every member's
+        // attack pool below.
+        const tacticExclusions = Array.isArray(tactic?.excludedTargets)
+            ? tactic.excludedTargets.filter(entry =>
+                entry && ((entry.targetId !== null && entry.targetId !== undefined)
+                    || (typeof entry.tokenUuid === "string" && entry.tokenUuid)))
+            : [];
+        const exclusionIds = _uniqueIdList(tacticExclusions.flatMap(entry =>
+            [entry.targetId, entry.tokenUuid]));
+        if (convergence && exclusionIds.length) {
+            const refocus = _focusSelection({
+                members,
+                combat,
+                context: {
+                    ...context,
+                    excludeTargetIds: _uniqueIdList([
+                        ...(Array.isArray(context.excludeTargetIds) ? context.excludeTargetIds : []),
+                        ...exclusionIds
+                    ])
+                },
+                teamPreset,
+                casualties: allMembers.filter(member => member.defeated === true).length
+            });
+            convergence = refocus.focus;
+            diagnostics.focus = _jsonClone({
+                ...refocus.result.diagnostics,
+                focus: convergence,
+                candidates: refocus.result.candidates,
+                interdictionExclusions: exclusionIds
+            });
+        }
+
+        // Objective precedence is explicit caller order → independent tactic
+        // objective → focus. A tactic that merely inherits the focus target
+        // (specOps does) keeps the focus assignment metadata; a tactic that
+        // deliberately binds another target wins and the focus overlay stays
+        // diagnostic-only for this draft. The interdiction objective is
+        // role-scoped (issue #87): its `targetId` is the interception target
+        // of the interdictor alone, so the shared focus channel must not
+        // collapse onto it — non-interdictor members keep engaging the
+        // recomputed focus or the remaining enemies.
+        const interdictObjective = tactic?.objective?.type === INTERDICT_OBJECTIVE_TYPE
+            ? tactic.objective : null;
+        const tacticTargetId = interdictObjective ? null : (tactic?.objective?.targetId ?? null);
+        const tacticInheritsFocus = Boolean(convergence && tacticTargetId
+            && _idListsOverlap([tacticTargetId], _focusIdentityIds(convergence)));
+        if (convergence && tacticTargetId && !tacticInheritsFocus) convergence = null;
+        const focusObjectiveFields = convergence
+            ? {
+                capableMembers: [...(convergence.capableMembers ?? [])],
+                assignedMembers: [...(convergence.assignedMembers ?? [])],
+                mode: convergence.mode
+            }
+            : null;
+        const sharedObjective = context.objective
+            ?? (tactic?.objective
+                ? (interdictObjective
+                    ? {
+                        ...tactic.objective,
+                        targetId: convergence?.targetId ?? null,
+                        ...(focusObjectiveFields ?? {})
+                    }
+                    : (tacticInheritsFocus && focusObjectiveFields
+                        ? { ...tactic.objective, ...focusObjectiveFields }
+                        : tactic.objective))
+                : (convergence
+                    ? {
+                        targetId: convergence.targetId,
+                        ...focusObjectiveFields
+                    }
+                    : undefined));
+        // `teamPlan.convergence` remains the backward-compatible descriptor
+        // channel in both modes. `diagnostics.convergence` is narrower by
+        // design: only kill mode is the legacy binary convergence alias;
+        // scored-focus details live in `diagnostics.focus`.
+        diagnostics.convergence = convergence?.mode === "kill"
+            ? _jsonClone(convergence) : null;
 
         const assignments = assignTasks(members, {
             leaderId: election.combatantId,
             assignments: context.assignments ?? tactic?.assignments,
             allowFlank: context.allowFlank ?? tactic?.allowFlank
-                ?? (convergence ? false : undefined),
+                ?? (convergence?.mode === "kill" ? false : undefined),
             regroup: context.regroup ?? tactic?.regroup,
             // Issue #26: a confident team pushes a second assault column
             // and a wider flank group.
@@ -2311,13 +3787,8 @@ export function createFireteamService({
                 ? MORALE_CONFIDENT_ASSAULT_CAP : undefined,
             flankCap: moraleInfo.tier === "confident"
                 ? MORALE_CONFIDENT_FLANK_CAP : undefined,
-            objective: context.objective ?? tactic?.objective
-                ?? (convergence
-                    ? {
-                        targetId: convergence.targetId,
-                        capableMembers: convergence.capableMembers
-                    }
-                    : undefined)
+            objective: sharedObjective,
+            explicitTargetId: context.objective?.targetId ?? null
         });
         // Issue #25 gm-controlled degradation: members the GM moved this
         // round are demoted from detached/complex tasks to `support`
@@ -2336,6 +3807,10 @@ export function createFireteamService({
                 });
                 assignment.task = "support";
                 assignment.groupId = "main";
+                _clearSuppressionGeometry(assignment);
+                _clearInterdictionGeometry(assignment);
+                _clearPincerGeometry(assignment);
+                _clearPeelGeometry(assignment);
             }
         }
         diagnostics.gmControlled = [...gmControlledIds];
@@ -2362,9 +3837,111 @@ export function createFireteamService({
                 });
                 assignment.task = to;
                 assignment.groupId = "main";
+                _clearSuppressionGeometry(assignment);
+                _clearInterdictionGeometry(assignment);
+                _clearPincerGeometry(assignment);
+                _clearPeelGeometry(assignment);
             }
         }
         diagnostics.moraleDemotions = moraleDemotions;
+
+        // Issue #90 recover-pinned overlay (epic #84): evaluated once per
+        // TeamPlan after every demotion pass and before the planning loop.
+        // The overlay never rewrites the maneuver itself — pinned members
+        // are demoted to `support`+`recovering` exactly like the GM/morale
+        // demotions above (corebook: a pinned fighter cannot execute a
+        // flank/assault push anyway), at most one free member receives the
+        // `cover-fire` role with its soft `assignedTargetId` narrowing, and
+        // every member context carries the `team.recover` injection the
+        // planner prices through `recoverCover`/`recoverRedirect` weights.
+        // Priority rules R1/R3 are structural: the donor pool of the pure
+        // core already excludes valid commitments, detached flank/assault
+        // tasks, desperate regrouping members, GM-controlled members and
+        // every maneuver-critical role, so peel/regroup/suppression/
+        // pincer/interdiction geometry is never hijacked.
+        const recoverOverlay = _recoverPinnedOverlay({
+            members,
+            combat,
+            context,
+            assignments,
+            moraleInfo,
+            gmControlledIds,
+            leaderId: election.combatantId
+        });
+        const recoverContexts = {};
+        const recoverDemotions = [];
+        if (recoverOverlay?.active === true) {
+            for (const [combatantId, overlayAssignment] of Object.entries(recoverOverlay.assignments ?? {})) {
+                const assignment = assignments.find(entry => entry.combatantId === combatantId);
+                if (!assignment || !overlayAssignment) continue;
+                if (overlayAssignment.role === RECOVER_PINNED_ROLES.recovering) {
+                    if (assignment.task !== "support") {
+                        recoverDemotions.push({
+                            combatantId,
+                            from: assignment.task,
+                            to: "support",
+                            reason: "recover-pinned"
+                        });
+                    }
+                    assignment.task = "support";
+                    assignment.groupId = "main";
+                    delete assignment.element;
+                    _clearSuppressionGeometry(assignment);
+                    _clearInterdictionGeometry(assignment);
+                    _clearPincerGeometry(assignment);
+                    _clearPeelGeometry(assignment);
+                    assignment.role = RECOVER_PINNED_ROLES.recovering;
+                    assignment.objective = overlayAssignment.objective
+                        ? _jsonClone(overlayAssignment.objective) : null;
+                } else if (overlayAssignment.role === RECOVER_PINNED_ROLES.coverFire) {
+                    // The cover donor keeps its place in the maneuver order
+                    // but becomes fire support: the role marker, the pin
+                    // objective and the soft target narrowing ride on the
+                    // existing assignment contract — no new task types.
+                    assignment.task = "support";
+                    assignment.groupId = "main";
+                    assignment.role = RECOVER_PINNED_ROLES.coverFire;
+                    assignment.objective = overlayAssignment.objective
+                        ? _jsonClone(overlayAssignment.objective) : null;
+                    assignment.assignedTargetId = overlayAssignment.assignedTargetId ?? null;
+                }
+            }
+            for (const [combatantId, injection] of Object.entries(recoverOverlay.memberContexts ?? {})) {
+                recoverContexts[combatantId] = _jsonClone(injection);
+            }
+        }
+        diagnostics.recover = recoverOverlay ? _jsonClone({
+            active: recoverOverlay.active === true,
+            gate: recoverOverlay.gate ?? null,
+            mode: recoverOverlay.mode ?? null,
+            pinned: recoverOverlay.pinned ?? [],
+            coverAssignment: recoverOverlay.coverAssignment ?? null,
+            coverReason: recoverOverlay.coverReason ?? null,
+            redirectTargetId: recoverOverlay.redirectTargetId ?? null,
+            demotions: recoverDemotions,
+            breakdown: recoverOverlay.breakdown ?? null,
+            diagnostics: recoverOverlay.diagnostics ?? null
+        }) : null;
+        // Issue #90 T5: the activation bark telegraphs the recovery branch
+        // to the table exactly like the morale transitions do — deduped
+        // per `combat|team|round`, live evaluations only (a readOnly draft
+        // never speaks), and silent when the chat channel is unavailable.
+        if (recoverOverlay?.active === true && !context.readOnly) {
+            await emitBarkOnce(_barkSeen,
+                `${combat?.id ?? "combat"}|${teamId}|${_finiteOr(combat?.round, 0)}|recover`, {
+                    key: recoverOverlay.coverAssignment ? "OWAI.Bark.Recover.Cover" : "OWAI.Bark.Recover.Active",
+                    data: { team: teamId },
+                    speaker: `AI ${teamId}`,
+                    context,
+                    flags: {
+                        recover: {
+                            teamId,
+                            round: _finiteOr(combat?.round, 0),
+                            cover: recoverOverlay.coverAssignment?.combatantId ?? null
+                        }
+                    }
+                });
+        }
         const assignMap = new Map(assignments.map(a => [a.combatantId, a]));
         diagnostics.assignments = _jsonClone(assignments);
 
@@ -2374,7 +3951,7 @@ export function createFireteamService({
         const leader = members.find(m => m.combatantId === election.combatantId);
         const leaderPos = leader?.position ?? null;
         const scene = context.scene ?? combat.scene ?? null;
-        const flankRules = teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+        const flankRules = teamPreset === SPEC_OPS_PRESET_ID && isFlankManeuver
             ? {
                 flankCenter: specOpsTokenCenter(_tokenDoc(leader?.combatant?.token), scene, leaderPos),
                 flankMinAngleDegrees: context.specOpsConfig.flankMinAngleDegrees
@@ -2385,7 +3962,11 @@ export function createFireteamService({
         // reservation priority follows maneuver priority.
         const orderOf = member => {
             if (member.combatantId === election.combatantId) return 0;
-            return assignMap.get(member.combatantId)?.groupId === "flank-1" ? 1 : 2;
+            // Issue #88: every signed flank group (`flank-left`/
+            // `flank-right` and the legacy `flank-1`) plans before the
+            // fix base — reservation priority follows maneuver priority.
+            const group = assignMap.get(member.combatantId)?.groupId ?? "main";
+            return typeof group === "string" && group.startsWith("flank-") ? 1 : 2;
         };
         const ordered = [...members].sort((a, b) =>
             (orderOf(a) - orderOf(b))
@@ -2393,6 +3974,10 @@ export function createFireteamService({
 
         const capacities = {
             ...TARGET_TASK_CAPACITY,
+            // Issue #88: the pincer composition caps its flank elements
+            // (`taskCapacities.flank = maxFlankSize`); explicit caller
+            // overrides still win over the tactic-authored capacities.
+            ...(tactic?.taskCapacities ?? {}),
             ...(context.taskCapacities ?? {})
         };
 
@@ -2402,19 +3987,55 @@ export function createFireteamService({
         // contact one member saw propagates to the whole squad. The
         // planner dedups freshness against the member's own last-known
         // entries (fresher wins, own wins at equal ts).
-        const perception = _service("perception", context.perception);
-        const teamContacts = _teamContacts({ members, combat, context, perception });
-
+        // `perception`/`teamContacts` were collected before tactic
+        // selection (issue #91) and are reused verbatim here so every
+        // member receives the identical merged contact list.
         const reservedTargets = new Map();
         const routeLocks = [...(context.reservations ?? [])];
         const plans = new Map();
+        // Issue #93: every member's planner context is kept so the
+        // target-conflict retry below replans with the identical team
+        // metadata (`center`, `objective`, `flankPoint`, `regroupPoint`,
+        // the leader's `orderCandidate`) instead of a partial rebuild.
+        const memberContexts = new Map();
         const tokens = new Map(ordered.map(member => [member.combatantId, _tokenDoc(member.combatant.token)]));
+        // Backward-compatible legacy channel: `team.objective` is always
+        // the shared target id, never the member-scoped objective object.
+        const sharedTargetId = sharedObjective?.targetId ?? null;
+        const suppressionZones = tacticName === SUPPRESS_AND_BOUND
+            && Array.isArray(tactic?.exclusionZones)
+            ? _jsonClone(tactic.exclusionZones) ?? [] : [];
+        const suppressionCone = tacticName === SUPPRESS_AND_BOUND
+            ? (_jsonClone(tactic?.objective?.suppressionCone ?? tactic?.cone ?? null))
+            : null;
+        const peelObjective = tacticName === PEEL_WITHDRAWAL_NAME
+            ? _jsonClone(tactic?.objective ?? null) : null;
+        const peelCosts = new Map((tacticName === PEEL_WITHDRAWAL_NAME
+            ? (tactic?.breakdown?.costs ?? []) : [])
+            .map(cost => [String(cost.combatantId), cost]));
+        const peelStranded = new Set((tacticName === PEEL_WITHDRAWAL_NAME
+            ? (tactic?.breakdown?.stranded ?? []) : [])
+            .map(entry => String(entry.combatantId ?? entry)));
+        const chokepointObjective = tacticName === CHOKEPOINT_TACTIC_NAME
+            ? _jsonClone(tactic?.objective ?? null) : null;
+        const chokepointLanes = new Map((chokepointObjective?.lanes ?? [])
+            .map(lane => [String(lane.id), lane]));
         let baseTargets = Array.isArray(context.targets) ? context.targets : null;
         for (const member of ordered) {
             const assignment = assignMap.get(member.combatantId);
+            // Issue #88: the maneuver anchor is per-member — a pincer
+            // objective signs two maneuver points and the member's own
+            // flank element selects its side's point; legacy single-point
+            // objectives resolve exactly as before.
+            const flankAnchor = _memberFlankAnchor(assignment, tactic?.objective ?? null);
+            const defenseLaneId = assignment.objective?.laneId ?? null;
+            const defenseLane = chokepointObjective && defenseLaneId !== null
+                ? chokepointLanes.get(String(defenseLaneId)) ?? null
+                : null;
             const memberContext = {
                 ...context,
                 seed,
+                ...(chokepointObjective ? { objective: _jsonClone(chokepointObjective) } : {}),
                 reservations: routeLocks.slice(),
                 replanCount: _finiteOr(context.replanCount, 0),
                 ...(context.readOnly ? {
@@ -2425,6 +4046,48 @@ export function createFireteamService({
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
+                    role: assignment.role ?? null,
+                    element: assignment.element ?? null,
+                    ...(chokepointObjective ? {
+                        defense: {
+                            anchor: _jsonClone(chokepointObjective.anchor ?? null),
+                            laneId: defenseLaneId,
+                            lane: defenseLane ? _jsonClone(defenseLane) : null
+                        },
+                        defenseObjective: _jsonClone(chokepointObjective)
+                    } : {}),
+                    ...(assignment.role === "suppressor" && suppressionCone
+                        ? { suppressionCone: _jsonClone(suppressionCone) } : {}),
+                    ...(assignment.role !== "suppressor" && suppressionZones.length
+                        ? { exclusionZones: _jsonClone(suppressionZones) } : {}),
+                    objective: sharedTargetId,
+                    ...(tacticName === PEEL_WITHDRAWAL_NAME ? {
+                        peel: {
+                            objective: _jsonClone(peelObjective),
+                            regroupPoint: _jsonClone(peelObjective?.regroupPoint ?? null),
+                            threatCentroid: _jsonClone(peelObjective?.threatCentroid ?? null),
+                            lane: _jsonClone(peelObjective?.lane ?? null),
+                            coverMode: tactic?.cover?.mode ?? null,
+                            coverTargetId: tactic?.cover?.target?.tokenId
+                                ?? tactic?.cover?.target?.targetId ?? null,
+                            coverTargetUuid: tactic?.cover?.target?.tokenUuid
+                                ?? tactic?.cover?.target?.targetUuid ?? null,
+                            cost: peelCosts.has(String(member.combatantId))
+                                ? _jsonClone(peelCosts.get(String(member.combatantId))) : null,
+                            stranded: peelStranded.has(String(member.combatantId))
+                        }
+                    } : {}),
+                    memberObjective: assignment.objective
+                        ? _jsonClone(assignment.objective) : null,
+                    // Issue #90: the recover-pinned overlay injection of
+                    // this member — `recovering` members read the pin-threat
+                    // position for their cover-seeking weight, the cover
+                    // donor reads the attributed source, everyone else at
+                    // most carries the soft redirect id. Absent when the
+                    // overlay is inactive (no stale channel survives).
+                    ...(recoverContexts[member.combatantId]
+                        ? { recover: _jsonClone(recoverContexts[member.combatantId]) } : {}),
+                    assignment: _assignmentDescriptor(assignment),
                     leaderId: election.combatantId,
                     center: leaderPos,
                     ...flankRules,
@@ -2434,13 +4097,59 @@ export function createFireteamService({
                     // `flankPoint` (perpendicular strike position), not
                     // the target itself — without it the task was a dead
                     // label and the member wandered (smoke finding).
-                    flankPoint: tactic?.objective?.flankPoint ?? null,
-                    objective: tactic?.objective?.targetId
-                        ?? context.objective?.targetId ?? null,
+                    // Issue #88: per-member signed point/side of the
+                    // pincer elements (see `_memberFlankAnchor`).
+                    flankPoint: flankAnchor.point,
+                    ...(flankAnchor.side ? { flankSide: flankAnchor.side } : {}),
+                    // Issue #87: the interdictor's screen anchor travels
+                    // with the team context so the movement generator can
+                    // merge screen-point candidates and `screenProgress`
+                    // can score the approach.
+                    screenPoint: assignment.role === INTERDICT_ROLE
+                        ? (assignment.objective?.screenPoint ?? null) : null,
                     regroupPoint: assignment.task === "regroup"
-                        ? (rejoinPoints[0] ?? null) : null
+                        ? (peelObjective?.regroupPoint ?? rejoinPoints[0] ?? null) : null
                 }
             };
+            // Issue #85 minimal split awareness: `targets` remains the full
+            // threat/engagement pool. Focus narrowing is expressed only in
+            // the planner's additive direct-attack pools; caller allow-lists
+            // are hard constraints and are intersected, caller deny-lists are
+            // preserved verbatim and appended for overflow members.
+            const focusPoolOverrides = _focusAttackPoolOverrides(
+                member.combatantId, convergence, context, assignment);
+            Object.assign(memberContext, focusPoolOverrides);
+            // Issue #87: interdiction exclusions join the attack-pool
+            // deny-list additively — caller exclusions stay preserved and
+            // the threat pool is never narrowed. The interdictor's own
+            // interception target is the one exclusion that does not apply
+            // to them: they exist to charge and tie up exactly that enemy.
+            if (exclusionIds.length) {
+                const ownInterception = assignment?.role === INTERDICT_ROLE
+                    ? _uniqueIdList([assignment?.objective?.targetId, assignment?.objective?.targetUuid])
+                    : [];
+                const denyIds = ownInterception.length
+                    ? exclusionIds.filter(id => !_idListsOverlap([id], ownInterception))
+                    : exclusionIds;
+                if (denyIds.length) {
+                    memberContext.excludedAttackTargetIds = _uniqueIdList([
+                        ...(Array.isArray(memberContext.excludedAttackTargetIds)
+                            ? memberContext.excludedAttackTargetIds : []),
+                        ...denyIds
+                    ]);
+                }
+            }
+            if (Object.hasOwn(focusPoolOverrides, "attackTargetIds")) {
+                // Provenance for executor target-gone replans: the derived
+                // focus allow-list must not strand the member on a dead
+                // target, while a caller-supplied hard allow-list is restored
+                // rather than widened.
+                memberContext.focusAttackPool = {
+                    allow: true,
+                    fallbackAttackTargetIds: Array.isArray(context.attackTargetIds)
+                        ? [...context.attackTargetIds] : null
+                };
+            }
             // Issue #38 orders: the elected leader receives the team's
             // `orderCandidate` (Command test of the best order option);
             // absent options/cooldown simply leave the field unset.
@@ -2459,9 +4168,11 @@ export function createFireteamService({
                 base: baseTargets,
                 counts: reservedTargets,
                 capacities,
-                assignment
+                assignment,
+                focus: convergence
             });
             if (memberTargets !== undefined) memberContext.targets = memberTargets;
+            memberContexts.set(member.combatantId, memberContext);
             let result;
             try {
                 result = await memberPlanner.planTurn(
@@ -2501,17 +4212,42 @@ export function createFireteamService({
                         reason: "gm-intervention"
                     });
                     diagnostics.gmDemotions = gmDemotions;
+                    // Issue #87: capture the interception ids before the
+                    // geometry clear — a demoted interdictor becomes an
+                    // ordinary member and the command denial now applies
+                    // to them as well.
+                    const lostInterception = assignment.role === INTERDICT_ROLE
+                        ? _uniqueIdList([assignment.objective?.targetId, assignment.objective?.targetUuid])
+                            .filter(id => exclusionIds.some(ex => String(ex) === String(id)))
+                        : [];
                     assignment.task = "support";
                     assignment.groupId = "main";
+                    _clearSuppressionGeometry(assignment);
+                    _clearInterdictionGeometry(assignment);
+                    _clearPincerGeometry(assignment);
+                    _clearPeelGeometry(assignment);
                     try {
                         const retry = await memberPlanner.planTurn(combat,
                             member.combatant, {
                                 ...memberContext,
                                 replanCount: _finiteOr(context.replanCount, 0) + 1,
+                                ...(lostInterception.length ? {
+                                    excludedAttackTargetIds: _uniqueIdList([
+                                        ...(Array.isArray(memberContext.excludedAttackTargetIds)
+                                            ? memberContext.excludedAttackTargetIds : []),
+                                        ...lostInterception
+                                    ])
+                                } : {}),
                                 team: {
                                     ...memberContext.team,
                                     task: "support",
-                                    groupId: "main"
+                                    groupId: "main",
+                                    role: assignment.role ?? null,
+                                    element: assignment.element ?? null,
+                                    memberObjective: assignment.objective
+                                        ? _jsonClone(assignment.objective) : null,
+                                    screenPoint: null,
+                                    assignment: _assignmentDescriptor(assignment)
                                 }
                             });
                         const previous = diagnostics.memberStatuses[member.combatantId]
@@ -2536,7 +4272,7 @@ export function createFireteamService({
             const targetId = result?.plan?.target?.tokenId
                 ?? assignment.assignedTargetId ?? null;
             if (targetId && result?.plan) {
-                const key = `${assignment.task}|${targetId}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${targetId}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
             // One member's LOS is not another member's permission to fire.
@@ -2546,7 +4282,14 @@ export function createFireteamService({
             }
         }
 
-        const reservationContext = { taskCapacities: context.taskCapacities, tokens };
+        const reservationContext = {
+            // Issue #88: already merged with the tactic-authored
+            // capacities above — `reserveResources` merges them over the
+            // defaults idempotently.
+            taskCapacities: capacities,
+            tokens,
+            focus: convergence
+        };
         const orderedAssignments = ordered.map(member => assignMap.get(member.combatantId));
         const initialReservations = reserveResources(orderedAssignments, plans, reservationContext);
         const targetLosers = new Set(
@@ -2563,24 +4306,46 @@ export function createFireteamService({
                 reservedTargets,
                 capacities,
                 { ...assignment, assignedTargetId: null });
+            // Issue #93: replan from the member's original context so the
+            // retry keeps the team metadata the first pass assembled —
+            // `center`/`objective`/`flankPoint`/`regroupPoint` drive the
+            // flank geometry and cohesion of spec-ops presets and were
+            // silently dropped by the partial rebuild. Only the inputs
+            // that legitimately change (reservations, target pool, replan
+            // count, a demoted task/group) are overridden.
+            const stored = memberContexts.get(member.combatantId);
             const retry = await memberPlanner.planTurn(combat, member.combatant, {
-                ...context,
-                seed,
+                ...(stored ?? { ...context, seed }),
                 reservations: [...(context.reservations ?? []), ...initialReservations.routes
                     .filter(cell => cell.memberId !== member.combatantId)],
                 replanCount: _finiteOr(context.replanCount, 0) + 1,
                 targets: retryTargets,
-                ...(flankRules ? { tactic: tacticName } : {}),
+                // A target-conflict retry is intentionally no longer
+                // assigned-narrowed. Restore the caller's original allow-list
+                // (usually none) instead of inheriting the focus-derived one
+                // from the stored first-pass context; focus/caller deny-lists
+                // remain in force through the spread.
+                attackTargetIds: Array.isArray(context.attackTargetIds)
+                    ? [...context.attackTargetIds] : undefined,
                 team: {
-                    teamId,
+                    ...(stored?.team ?? {
+                        teamId,
+                        leaderId: election.combatantId,
+                        character,
+                        contacts: teamContacts
+                    }),
                     task: assignment.task,
                     groupId: assignment.groupId,
-                    leaderId: election.combatantId,
-                    ...(flankRules ? {
-                        ...flankRules, flankPoint: tactic?.objective?.flankPoint ?? null
-                    } : {}),
-                    character,
-                    contacts: teamContacts
+                    role: assignment.role ?? null,
+                    element: assignment.element ?? null,
+                    ...(assignment.role === "suppressor" && suppressionCone
+                        ? { suppressionCone: _jsonClone(suppressionCone) } : {}),
+                    ...(assignment.role !== "suppressor" && suppressionZones.length
+                        ? { exclusionZones: _jsonClone(suppressionZones) } : {}),
+                    objective: sharedTargetId,
+                    memberObjective: assignment.objective
+                        ? _jsonClone(assignment.objective) : null,
+                    assignment: _assignmentDescriptor(assignment)
                 }
             });
             plans.set(member.combatantId, retry);
@@ -2589,10 +4354,137 @@ export function createFireteamService({
                 `${previousStatus}->${retry?.status ?? "error"}`;
             const retryTarget = retry?.plan?.target?.tokenId ?? null;
             if (retryTarget) {
-                const key = `${assignment.task}|${retryTarget}`;
+                const key = `${assignment.task}|${assignment.groupId ?? "main"}|${retryTarget}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
         }
+
+        // Issue #86 post-plan verification: the pre-plan exclusion zones are
+        // only the selector's proposal. Once the suppressor has actually
+        // chosen (or honestly fallen back from) a suppression attack, the
+        // serialized attack step defines the authoritative cone. Other
+        // members get one context-preserving replan against that cone; a
+        // repeat violation is recorded as a zone conflict and the move is
+        // excluded by a final no-movement degradation.
+        const suppressionZoneDiagnostics = {
+            checked: false,
+            cone: null,
+            violations: [],
+            replans: [],
+            conflicts: []
+        };
+        if (tacticName === SUPPRESS_AND_BOUND) {
+            const suppressorId = tactic?.suppressorId
+                ?? assignments.find(entry => entry.role === "suppressor")?.combatantId
+                ?? null;
+            const suppressorMember = ordered.find(member => member.combatantId === suppressorId) ?? null;
+            const authoritativeCone = suppressorMember
+                ? _authoritativeSuppressionCone({
+                    member: suppressorMember,
+                    result: plans.get(suppressorId),
+                    tactic,
+                    scene
+                })
+                : null;
+            suppressionZoneDiagnostics.checked = authoritativeCone !== null;
+            suppressionZoneDiagnostics.cone = authoritativeCone;
+            if (authoritativeCone) {
+                for (const member of ordered) {
+                    if (member.combatantId === authoritativeCone.ownerId) continue;
+                    let violation = _suppressionMoveViolation(
+                        plans.get(member.combatantId), authoritativeCone);
+                    if (!violation) continue;
+                    suppressionZoneDiagnostics.violations.push({
+                        combatantId: member.combatantId,
+                        point: violation.point,
+                        stepId: violation.stepId,
+                        attempt: "initial"
+                    });
+                    const stored = memberContexts.get(member.combatantId);
+                    const preZoneReservations = reserveResources(
+                        orderedAssignments, plans, reservationContext);
+                    const retryContext = {
+                        ...(stored ?? { ...context, seed }),
+                        reservations: [
+                            ...(context.reservations ?? []),
+                            ...preZoneReservations.routes
+                                .filter(cell => cell.memberId !== member.combatantId)
+                        ],
+                        replanCount: _finiteOr(context.replanCount, 0) + 1,
+                        team: {
+                            ...(stored?.team ?? {
+                                teamId,
+                                leaderId: election.combatantId,
+                                character,
+                                contacts: teamContacts
+                            }),
+                            exclusionZones: [authoritativeCone]
+                        }
+                    };
+                    let retry = null;
+                    try {
+                        retry = await memberPlanner.planTurn(
+                            combat, member.combatant, retryContext);
+                    } catch(err) {
+                        retry = null;
+                    }
+                    suppressionZoneDiagnostics.replans.push({
+                        combatantId: member.combatantId,
+                        attempt: "zone-replan",
+                        status: retry?.status ?? "error"
+                    });
+                    if (retry?.plan) {
+                        plans.set(member.combatantId, retry);
+                        const previousStatus = diagnostics.memberStatuses[member.combatantId];
+                        diagnostics.memberStatuses[member.combatantId] =
+                            `${previousStatus}->${retry?.status ?? "error"}`;
+                        violation = _suppressionMoveViolation(retry, authoritativeCone);
+                    }
+                    if (!violation) continue;
+                    const conflict = {
+                        type: "zone",
+                        reason: "suppression-zone",
+                        loserId: member.combatantId,
+                        winnerId: authoritativeCone.ownerId,
+                        point: violation.point
+                    };
+                    suppressionZoneDiagnostics.conflicts.push(conflict);
+                    suppressionZoneDiagnostics.violations.push({
+                        combatantId: member.combatantId,
+                        point: violation.point,
+                        stepId: violation.stepId,
+                        attempt: "zone-replan"
+                    });
+                    // The one maneuver replan failed to clear the cone. Do
+                    // not loop indefinitely: degrade this member to the
+                    // planner's ordinary stay/attack-in-place candidates by
+                    // injecting an empty movement set. This is the safe
+                    // “move excluded” fallback, not another tactical replan.
+                    let holdRetry = null;
+                    try {
+                        holdRetry = await memberPlanner.planTurn(combat, member.combatant, {
+                            ...retryContext,
+                            moves: [],
+                            replanCount: _finiteOr(context.replanCount, 0) + 2
+                        });
+                    } catch(err) {
+                        holdRetry = null;
+                    }
+                    suppressionZoneDiagnostics.replans.push({
+                        combatantId: member.combatantId,
+                        attempt: "move-excluded",
+                        status: holdRetry?.status ?? "error"
+                    });
+                    if (holdRetry?.plan) {
+                        plans.set(member.combatantId, holdRetry);
+                        const previousStatus = diagnostics.memberStatuses[member.combatantId];
+                        diagnostics.memberStatuses[member.combatantId] =
+                            `${previousStatus}->${holdRetry?.status ?? "error"}`;
+                    }
+                }
+            }
+        }
+        diagnostics.suppressionZones = _jsonClone(suppressionZoneDiagnostics);
 
         if (flankRules) {
             // Check every assigned flanker after all demotions/retargets.
@@ -2612,7 +4504,8 @@ export function createFireteamService({
             if (failure) {
                 const fallback = specOpsFlankFallback(members, tactic, failure);
                 const explicit = Object.entries(context.assignments ?? {})
-                    .filter(([, task]) => task !== "flank");
+                    .filter(([, assignment]) =>
+                        normalizeFireteamAssignment(assignment)?.task !== "flank");
                 return buildTeamPlan(combat, team, {
                     ...context,
                     readOnly: true,
@@ -2643,11 +4536,23 @@ export function createFireteamService({
             context,
             diagnostics,
             teamId,
-            memberMorale: moraleInfo.effective
+            memberMorale: moraleInfo.effective,
+            // Issue #88: the pincer objective carries the committed sync
+            // mode (`elastic`/`strict`/`none`); legacy flank-and-fix
+            // objectives carry none and keep single-flanker semantics.
+            sync: tactic?.objective?.sync ?? null
         });
+        // Fresh gm-intervention demotions can happen during member
+        // planning, after the first diagnostic snapshot. Publish the final
+        // assignment records (including role/element/objective metadata).
+        diagnostics.assignments = _jsonClone(assignments);
         const reservations = reserveResources(orderedAssignments, plans, reservationContext);
+        for (const conflict of suppressionZoneDiagnostics.conflicts) {
+            reservations.conflicts.push(_jsonClone(conflict));
+        }
         diagnostics.reservations = _jsonClone(reservations);
-        const routeConflict = reservations.conflicts.find(conflict => conflict.type !== "target");
+        const routeConflict = reservations.conflicts.find(conflict =>
+            conflict.type === "endpoint" || conflict.type === "route");
         const reject = reason => {
             if (!context.teamFallback && tactic?.name !== "regroup-fallback") {
                 return buildTeamPlan(combat, team, {
@@ -2737,6 +4642,11 @@ export function createFireteamService({
                 task: assignment.task,
                 groupId: assignment.groupId,
                 leader: assignment.leader,
+                ...(assignment.role ? { role: assignment.role } : {}),
+                ...(assignment.element ? { element: assignment.element } : {}),
+                ...(assignment.objective
+                    ? { objective: _jsonClone(assignment.objective) } : {}),
+                ...(peelStranded.has(String(member.combatantId)) ? { stranded: true } : {}),
                 detached: cohesion.detached,
                 detachedUntilPhase: cohesion.detached
                     ? _finiteOr(context.detachedUntilPhase, 1) : null,
@@ -2761,6 +4671,13 @@ export function createFireteamService({
         }
         score = Math.round((score - cohesionPenalty) * 1e6) / 1e6;
         breakdown.cohesionPenalty = Math.round(cohesionPenalty * 1e6) / 1e6;
+        // Issue #90: the overlay's explainable branch — attribution method
+        // and confidence, gate reason, triage rows and the donor selection
+        // — travels in the team breakdown exactly like the maneuver
+        // breakdowns of the tactic layer.
+        if (diagnostics.recover?.breakdown) {
+            breakdown.recover = _jsonClone(diagnostics.recover.breakdown);
+        }
         diagnostics.membersPlanned = memberEntries.length;
 
         const phases = _buildPhases({
@@ -2768,12 +4685,33 @@ export function createFireteamService({
             assignMap,
             plans,
             members: memberEntries,
-            flankProven: flankRules !== null
+            // Issue #88 barrier decision: a pincer's flank geometry is
+            // proven at selection time (corridor/divergence checks of the
+            // pure core), exactly like the spec-ops angle proof — so only
+            // genuinely moving members hold the movement barrier. A
+            // stationary in-position flanker must not break the compile;
+            // its side's readiness is what the sync-delay pass watches.
+            flankProven: flankRules !== null || _isPincerManeuver(tacticName, tactic)
         });
         const memberPlans = {};
         for (const member of ordered) {
             const plan = plans.get(member.combatantId)?.plan ?? null;
-            memberPlans[member.combatantId] = plan ? _jsonClone(plan) : null;
+            if (!plan) {
+                memberPlans[member.combatantId] = null;
+                continue;
+            }
+            const serialized = _jsonClone(plan);
+            // Issue #89 descriptor contract: every member plan explains the
+            // team tactic compactly without duplicating the pure breakdown.
+            serialized.breakdown = {
+                ...(serialized.breakdown ?? {}),
+                tactic: {
+                    name: tacticName ?? null,
+                    role: assignMap.get(member.combatantId)?.role ?? null,
+                    reason: tactic?.reason ?? null
+                }
+            };
+            memberPlans[member.combatantId] = serialized;
         }
 
         const revision = _teamRevision(combat, members, {
@@ -2794,7 +4732,33 @@ export function createFireteamService({
             ...(teamPreset === SPEC_OPS_PRESET_ID ? { specOpsConfig: context.specOpsConfig } : {}),
             character,
             tactic: diagnostics.tactic?.name ?? null,
-            objective: tactic?.objective?.targetId ?? context.objective?.targetId ?? null,
+            objective: sharedObjective?.targetId ?? null,
+            // Issue #90: first-class compact recover-pinned overlay
+            // section — consumers (executor, GM preview) read the
+            // activation verdict and the single cover donor without
+            // digging into diagnostics; the full attribution/triage
+            // breakdown stays in `diagnostics.recover`.
+            recover: diagnostics.recover ? {
+                active: diagnostics.recover.active,
+                mode: diagnostics.recover.mode ?? null,
+                gate: diagnostics.recover.gate ?? null,
+                pinned: (diagnostics.recover.pinned ?? []).map(entry => ({
+                    combatantId: entry.combatantId ?? null,
+                    exposure: entry.exposure ?? null,
+                    value: entry.value ?? null,
+                    maneuverCritical: entry.maneuverCritical === true,
+                    attribution: entry.attribution
+                        ? {
+                            method: entry.attribution.method ?? null,
+                            confidence: entry.attribution.confidence ?? null,
+                            tokenId: entry.attribution.tokenId ?? null,
+                            tokenUuid: entry.attribution.tokenUuid ?? null
+                        }
+                        : null
+                })),
+                coverAssignment: diagnostics.recover.coverAssignment ?? null,
+                redirectTargetId: diagnostics.recover.redirectTargetId ?? null
+            } : null,
             convergence,
             revision,
             seed,
@@ -2875,13 +4839,25 @@ export function createFireteamService({
         // awaited member is gone or defeated/disabled the wait is broken:
         // report `sync-broken` before the generic member check so the
         // caller sees the actual reason.
+        // Issue #88 multi-await matrix: a strict pincer wait breaks when
+        // ANY awaited flanker is lost, an elastic wait only when ALL of
+        // them are (the strike releases on the first ready side). The
+        // legacy single-`awaitId` record is both at once — conservative
+        // strict is the default for policy-less records.
         for (const entry of teamPlan.members ?? []) {
-            const awaitedId = entry?.delayed?.awaitId ?? null;
-            if (!awaitedId) continue;
-            const awaited = members.find(m => m.combatantId === awaitedId);
-            if (!awaited || awaited.defeated === true || awaited.enabled === false) {
-                return fail(TEAM_PLAN_REASONS.syncBroken);
-            }
+            const delayed = entry?.delayed ?? null;
+            const awaitedIds = Array.isArray(delayed?.awaitIds) && delayed.awaitIds.length
+                ? delayed.awaitIds
+                : (delayed?.awaitId ? [delayed.awaitId] : []);
+            if (!awaitedIds.length) continue;
+            const lost = id => {
+                const awaited = members.find(m => m.combatantId === id);
+                return !awaited || awaited.defeated === true || awaited.enabled === false;
+            };
+            const broken = delayed?.policy === "elastic"
+                ? awaitedIds.every(lost)
+                : awaitedIds.some(lost);
+            if (broken) return fail(TEAM_PLAN_REASONS.syncBroken);
         }
         for (const entry of teamPlan.members ?? []) {
             const live = members.find(m => m.combatantId === entry.combatantId);

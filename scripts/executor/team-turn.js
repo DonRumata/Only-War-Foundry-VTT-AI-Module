@@ -38,6 +38,16 @@ const rejoinLocks = (state, memberId, combat) => state.members
         [other.rejoin.point]));
 const sameProgress = (a, b) => a?.id === b?.id
     && a?.last?.id === b?.last?.id && a?.inFlight === b?.inFlight;
+const jsonClone = value => value === undefined
+    ? undefined : JSON.parse(JSON.stringify(value));
+const legacyObjectiveId = objective => typeof objective === "string"
+    ? objective : objective?.targetId ?? null;
+const assignmentOf = member => ({
+    task: member.task,
+    ...(member.role ? { role: member.role } : {}),
+    ...(member.element ? { element: member.element } : {}),
+    ...(member.objective ? { objective: jsonClone(member.objective) } : {})
+});
 
 /**
  * Find a member's next slot, counting turn indices across round boundaries.
@@ -243,6 +253,9 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
                 && step.type !== "end-turn" && !(step.type === "aim" && act))) return null;
             members.push({
                 id, tokenId: entry.tokenId, task: assignment.task, groupId: assignment.groupId,
+                ...(assignment.role ? { role: assignment.role } : {}),
+                ...(assignment.element ? { element: assignment.element } : {}),
+                ...(assignment.objective ? { objective: jsonClone(assignment.objective) } : {}),
                 position: positionOf(token),
                 move: move ? { destination: { i: to.i, j: to.j }, mode: move.input.mode ?? null,
                     route: move.input.waypoints, cost: move.cost?.movement, halves: move.cost?.halves,
@@ -349,6 +362,10 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         const center = state.members.find(member => member.id === state.leaderId)?.position;
         const forMember = member => ({
             teamId: state.teamId, task: member.task, groupId: member.groupId,
+            role: member.role ?? null, element: member.element ?? null,
+            objective: legacyObjectiveId(state.objective),
+            memberObjective: member.objective ? jsonClone(member.objective) : null,
+            assignment: assignmentOf(member),
             character: state.character, leaderId: state.leaderId, center, preset: state.teamPreset,
             ...(member.task === "flank" && state.tactic === "flank-and-fix" && state.specOpsConfig ? {
                 flankCenter: specOpsTokenCenter(_tokenDoc(_findCombatant(combat, state.leaderId)?.token),

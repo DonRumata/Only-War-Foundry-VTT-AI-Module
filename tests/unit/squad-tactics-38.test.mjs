@@ -137,7 +137,7 @@ function makeMember({
 function makeTeamWorld(members, { enemyX = 2000, enemyY = 0, wounds = 10, round = 1 } = {}) {
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: wounds, max: wounds } };
+    enemyActor.system = { wounds: { value: 0, max: wounds } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = enemyX;

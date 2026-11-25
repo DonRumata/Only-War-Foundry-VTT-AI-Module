@@ -6,9 +6,9 @@
  *   inside a fireteam (`context.team` injected by `buildTeamPlan`) each
  *   member's individual evaluation is biased by its temporary task
  *   (`support`/`advance`/`flank`/`assault`/`regroup`); the shared TeamPlan
- *   itself is assembled by `fireteam.buildTeamPlan` fed with the
- *   deterministic tactic factory {@link specOpsTactic} (or
- *   {@link selectSpecOpsTactic} via `context.tactic`).
+ *   itself is assembled by `fireteam.buildTeamPlan`; the deterministic
+ *   {@link specOpsTactic} factory is registered as the preset maneuver in
+ *   the per-preset tactic registry (explicit `context.tactic` still wins).
  * - The tactic selector is a pure, deterministic situation assessment:
  *   member count, attackable contacts, casualties, threat pressure and
  *   flank geometry (maneuver hints). It proposes a serializable tactic;
@@ -34,11 +34,38 @@
  */
 import { evaluateFactors } from "../planner.js";
 import { _findToken, _tokenDoc, _tokenPosition } from "../planner/documents.js";
+import { _deepFreeze } from "../planner/util.js";
+import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
+import {
+    SUPPRESS_AND_BOUND,
+    SUPPRESSION_ZONE_VETO,
+    alignSuppressAndBoundTarget,
+    explainSuppressAndBound,
+    suppressionFactorOf,
+    suppressionZoneViolation
+} from "../tactics/suppress-and-bound.js";
 import {
     SPEC_OPS_CONFIG,
     SPEC_OPS_PRESET_ID,
     resolveSpecOpsConfig
 } from "./spec-ops-config.js";
+import {
+    INTERDICTION_TACTIC,
+    INTERDICT_ROLE,
+    selectInterdiction
+} from "./interdiction.js";
+import {
+    PINCER_TACTIC,
+    selectPincerTactic
+} from "./pincer.js";
+import {
+    PEEL_WITHDRAWAL_NAME,
+    evaluatePeelCascade
+} from "../tactics/peel-withdrawal.js";
+import {
+    CHOKEPOINT_TACTIC_NAME,
+    evaluateChokepointCascade
+} from "./chokepoint-defense.js";
 
 export { SPEC_OPS_CONFIG, SPEC_OPS_PRESET_ID };
 
@@ -47,6 +74,10 @@ export const SPEC_OPS_VETO_HIDDEN_TARGET = "hidden-target";
 
 /** Bounded team maneuvers the tactic selector may commit to. */
 export const SPEC_OPS_TACTICS = Object.freeze([
+    SUPPRESS_AND_BOUND,
+    INTERDICTION_TACTIC,
+    PEEL_WITHDRAWAL_NAME,
+    CHOKEPOINT_TACTIC_NAME,
     "flank-and-fix",
     "coordinated-assault",
     "covering-advance",
@@ -115,7 +146,12 @@ export const SPEC_OPS_WEIGHTS = Object.freeze({
     seek: 3,
     // Run mechanic (smoke): sprinting between cover is acceptable when
     // the next hide lies past a full move — a modest pull.
-    run: 1
+    run: 1,
+    // Recover-pinned overlay (issue #90): cover-seeking under suppression
+    // is core spec-ops craft; the redirect weight is soft so the recovery
+    // never breaks the signed maneuver geometry for it.
+    recoverCover: 5,
+    recoverRedirect: 2
 
 });
 
@@ -177,7 +213,51 @@ export const SPEC_OPS_TASK_WEIGHTS = Object.freeze({
         proximity: 0.5,
         threat: 3,
         holdPosition: 0,
-        cohesionRestore: 10
+        cohesionRestore: 10,
+        withdrawal: 8,
+        freeAttackCost: -7,
+        disengage: 3
+    })
+});
+
+/**
+ * Per-role additive deltas merged over the task overlay when the fireteam
+ * injects `context.team.role` (issue #87). Only `interdictor` exists in
+ * v1: the additive reading of the spec table (`charge +3` lifts the
+ * assault overlay 5 → 8, `tieUp +4` lifts 4 → 8) — the role sharpens the
+ * assault task it rides on, it never replaces it. `screenProgress` is a
+ * preset-only factor only the interdictor carries: when the charge is
+ * illegal the screen point must still beat chaotic approaches.
+ */
+export const SPEC_OPS_ROLE_WEIGHTS = Object.freeze({
+    interdictor: Object.freeze({
+        charge: 3,
+        tieUp: 4,
+        meleeEngage: 2,
+        stickyTarget: 2,
+        screenProgress: 8,
+        holdPosition: -4
+    }),
+    // Issue #89 peel roles: withdrawers buy movement toward the validated
+    // regroup point and explicitly pay the ordinary free-attack cost; the
+    // rare structural Disengage capability is only a mitigation bonus.
+    withdraw: Object.freeze({
+        withdrawal: 7,
+        freeAttackCost: -6,
+        disengage: 3,
+        attackNow: -4,
+        attackAfterMove: -6,
+        charge: -8,
+        holdPosition: -5
+    }),
+    cover: Object.freeze({
+        coveringWithdrawal: 8,
+        suppression: 6,
+        attackNow: 2,
+        overwatch: 1,
+        holdPosition: 2,
+        charge: -4,
+        withdrawal: -4
     })
 });
 
@@ -266,6 +346,18 @@ function _targetCenter(target, context) {
     const topLeft = _tokenPosition(token);
     return target.source === "fallback" || (target.x === topLeft.x && target.y === topLeft.y)
         ? specOpsTokenCenter(token, context.scene, target) : target;
+}
+
+/**
+ * Shared normalized-target centre helper for tactic adapters. Kept as a thin
+ * export over the spec-ops implementation so rangedCover does not duplicate
+ * the top-left/centre normalization rules.
+ * @param {object|null} target Normalized target record.
+ * @param {object} context Planning scene and combat for token lookup.
+ * @returns {{x: number, y: number}|null}
+ */
+export function specOpsTargetCenter(target, context) {
+    return _targetCenter(target, context);
 }
 
 /**
@@ -593,6 +685,62 @@ function _flankProgress(candidate, context) {
 }
 
 /**
+ * Shared flank geometry helper for team-tasked ranged presets. The
+ * implementation stays the spec-ops one — rangedCover imports this wrapper
+ * instead of copying the angle/side math.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Evaluation context.
+ * @returns {object} `{angle, side}`.
+ */
+export function specOpsFlankGeometry(candidate, context) {
+    return _flankGeometry(candidate, context);
+}
+
+/**
+ * Shared flank-progress helper for team-tasked ranged presets.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Evaluation context.
+ * @returns {number} 0..1.
+ */
+export function specOpsFlankProgress(candidate, context) {
+    return _flankProgress(candidate, context);
+}
+
+/**
+ * Interdictor screen point of the evaluation context (issue #87): the
+ * explicit team field first, then the member objective's serialized
+ * geometry — the team-turn compile path carries only the objective.
+ * @param {object} context Evaluation context (`team`).
+ * @returns {{x: number, y: number}|null}
+ */
+export function specOpsScreenPoint(context = {}) {
+    if (context.team?.role !== INTERDICT_ROLE) return null;
+    const point = context.team?.screenPoint
+        ?? context.team?.memberObjective?.screenPoint ?? null;
+    return _isPoint(point) ? { x: point.x, y: point.y } : null;
+}
+
+/**
+ * `screenProgress` factor (issue #87): how much closer the candidate
+ * endpoint lands to the interdictor's screen point relative to the
+ * current position — the mirror of `_flankProgress` for the screen
+ * fallback geometry. Zero without a screen point, so the factor never
+ * competes with a legal charge.
+ * @param {object} candidate
+ * @param {object} context
+ * @returns {number}
+ */
+function _screenProgress(candidate, context) {
+    const point = specOpsScreenPoint(context);
+    const self = specOpsTokenCenter(context.token, context.scene, context.selfPos);
+    const endpoint = candidate.move && !candidate.move.stay ? candidate.move : self;
+    if (!_isPoint(point) || !_isPoint(self) || !endpoint) return 0;
+    const base = _dist(self, point);
+    if (!(base > 0)) return 0;
+    return Math.round(_clamp01((base - _dist(endpoint, point)) / base) * 1e4) / 1e4;
+}
+
+/**
  * Cohesion-restoration progress of the candidate endpoint toward the
  * team's regroup point (or centre): 1 when the endpoint lands on it,
  * 0 when it keeps or extends the distance. Feeds the
@@ -780,11 +928,21 @@ export function specOpsFlankFallback(members, tactic, failure) {
  * @param {string|null} [input.leaderId] Elected leader combatant id.
  * @param {object[]|null} [input.targets] Normalized shared target list.
  * @param {object|null} [input.objective] Shared objective `{targetId, x, y}`.
+ * @param {object|null} [input.character] Party character reference used
+ *   by interdiction target validation (memory-source rejection).
  * @param {number} [input.casualties] Defeated teammates this round.
  * @param {object|null} [input.scene] Planning scene.
  * @param {object|null} [input.combat] Combat document for geometry lookup.
  * @param {object} [input.context] Planning context (`walls`, `scene`,
  *   `regroup`, `specOpsConfig`, `seed`).
+ * @param {*} [input.moraleTier] Committed team morale tier of the fireteam
+ *   (issue #88 pincer morale gate; `context.moraleTier` is the fallback).
+ * @param {object|null} [input.moraleInfo] Full morale evaluation for the
+ *   stateless peel trigger.
+ * @param {object|null} [input.focusObjective] Concentrate-fire objective
+ *   visible to cascade gates.
+ * @param {object} [input.memberProfiles] Per-member tactical capability profiles.
+ * @param {object[]} [input.teamContacts] Shared team-contact memory entries.
  * @param {object} [input.config] `SpecOpsConfig` overrides.
  * @returns {object} `{name, reason, assignments, allowFlank, regroup,
  *   objective, maxDetachedPhases, breakdown}`; `name: null` means the
@@ -799,7 +957,13 @@ export function selectSpecOpsTactic({
     scene = null,
     combat = null,
     context = {},
-    config = null
+    config = null,
+    character = null,
+    moraleTier = null,
+    moraleInfo = null,
+    focusObjective = null,
+    memberProfiles = {},
+    teamContacts = []
 } = {}) {
     const cfg = resolveSpecOpsConfig(config, context.specOpsConfig);
     const available = (members ?? [])
@@ -836,6 +1000,42 @@ export function selectSpecOpsTactic({
         // members ⇒ the configured individual preset handles the plan).
         return finish(null, "insufficient-members");
     }
+    // Issue #89: peel-withdrawal is evaluated before every legacy
+    // regroup-fallback branch. The pure core owns trigger/hysteresis,
+    // regroup validation, role allocation and cost margins; a rejection is
+    // diagnostic-only and the legacy fallback below remains available.
+    const peel = evaluatePeelCascade({
+        members: available,
+        leaderId,
+        targets,
+        casualties,
+        moraleInfo: moraleInfo ?? context.moraleInfo
+            ?? (moraleTier ?? context.moraleTier
+                ? { tier: moraleTier ?? context.moraleTier }
+                : null),
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        scene,
+        combat,
+        context
+    });
+    breakdown.peel = {
+        selected: peel.status === "ok",
+        reason: peel.reason ?? null,
+        rejections: [...(peel.rejections ?? [])],
+        ...(peel.status === "ok" ? {} : { breakdown: peel.breakdown ?? null })
+    };
+    if (peel.descriptor) {
+        return _deepFreeze({
+            ...peel.descriptor,
+            maxDetachedPhases: cfg.maxDetachedRounds,
+            breakdown: {
+                ...breakdown,
+                ...(peel.breakdown ?? {}),
+                peel: { ...breakdown.peel }
+            }
+        });
+    }
+
     if (context.regroup === true) {
         return finish("regroup-fallback", "forced-regroup",
             { regroup: true, assignments: all("regroup") });
@@ -848,6 +1048,38 @@ export function selectSpecOpsTactic({
         return finish("regroup-fallback", "overwhelming-threat",
             { regroup: true, assignments: all("regroup") });
     }
+
+    const planningCombat = combat ?? context.combat ?? null;
+    const geometryContext = {
+        ...context, scene: context.scene ?? scene ?? planningCombat?.scene, combat: planningCombat
+    };
+    // Issue #91: spec-ops participates in chokepoint-defense only for an
+    // explicit defensive posture/anchor. The evaluation runs after
+    // peel/regroup/casualty precedence and before every open-battle attack
+    // maneuver; `preset-anchor-gate` keeps centroid-only open fights on
+    // the legacy cascade.
+    const defense = evaluateChokepointCascade({
+        members: available,
+        leaderId,
+        targets,
+        objective: objective ?? null,
+        casualties: casualtyCount,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        context: geometryContext,
+        character: character ?? context.character ?? null,
+        focusObjective: focusObjective ?? null,
+        memberProfiles: memberProfiles ?? {},
+        teamContacts: teamContacts ?? []
+    }, { presetId: SPEC_OPS_PRESET_ID });
+    breakdown.chokepoint = {
+        selected: defense.active === true,
+        reason: defense.reason ?? null,
+        ...(defense.breakdown ?? {})
+    };
+    if (defense.descriptor) {
+        return { ...defense.descriptor, breakdown: { ...breakdown } };
+    }
     if (!enemyCount) {
         // No attackable contact: last-known/search objective or a bare
         // advance — covering advance keeps overwatch while moving.
@@ -856,16 +1088,17 @@ export function selectSpecOpsTactic({
             { assignments: _coveringAssignments(available) });
     }
 
-    const planningCombat = combat ?? context.combat ?? null;
-    const geometryContext = {
-        ...context, scene: context.scene ?? scene ?? planningCombat?.scene, combat: planningCombat
-    };
     const positioned = available.map(member => ({
         ...member,
         position: specOpsTokenCenter(_tokenDoc(member.combatant?.token),
-            geometryContext.scene, member.position)
+            geometryContext.scene, member.position),
+        positionIsCenter: true
     }));
     const leader = positioned.find(m => m.combatantId === leaderId) ?? positioned[0];
+    const centerTargets = (targets ?? []).map(target => {
+        const center = _targetCenter(target, geometryContext);
+        return center ? { ...target, x: center.x, y: center.y } : target;
+    });
     const objectivePos = _objectivePosition(objective, hostiles.map(target => ({
         ...target, ..._targetCenter(target, geometryContext)
     })));
@@ -882,10 +1115,98 @@ export function selectSpecOpsTactic({
     const flank = context.allowFlank !== false && objectivePos
         && (enemyCount > memberCount || frontalBlocked)
         ? _flankOptions(positioned, leader.combatantId, frontPos, objectivePos, walls, cfg) : null;
-    if (flank) {
+
+    // Issue #86: suppression is evaluated after the retreat/no-contact
+    // branches and before every attack maneuver. A degradation does not end
+    // the cascade — its stable reason and candidate scan stay in the
+    // breakdown while flank/assault/covering-advance continue below.
+    let suppressionObjective = objective && typeof objective === "object"
+        ? { ...objective } : null;
+    if (flank && !suppressionObjective?.flankPoint) {
+        suppressionObjective = {
+            ...(suppressionObjective ?? {}),
+            flankPoint: {
+                x: Math.round(flank.point.x * 1e2) / 1e2,
+                y: Math.round(flank.point.y * 1e2) / 1e2
+            }
+        };
+    }
+    const suppression = explainSuppressAndBound({
+        members: positioned,
+        leaderId: leader?.combatantId ?? leaderId,
+        targets: centerTargets,
+        objective: suppressionObjective,
+        casualties: casualtyCount,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        context: {
+            ...geometryContext,
+            objective: suppressionObjective,
+            frontalBlocked,
+            boundTask: flank ? "flank" : geometryContext.boundTask
+        }
+    });
+    breakdown.suppression = {
+        reason: suppression.reason,
+        selected: suppression.selected,
+        ...suppression.breakdown
+    };
+    if (suppression.selected) {
+        return {
+            ...alignSuppressAndBoundTarget(suppression.descriptor, suppressionObjective),
+            breakdown: { ...breakdown }
+        };
+    }
+    // Issue #88: the pincer is the first attack maneuver of the cascade —
+    // evaluated after suppression and before flank-and-fix/coordinated
+    // assault. The pure core owns the gates (member floor, superiority,
+    // morale, enemy concentration), the signed maneuver points and the
+    // group composition. Three outcomes: a committed `pincer` descriptor,
+    // a degraded one-side `flank-and-fix` (stable `pincer-degraded-*`
+    // reason) which IS the base maneuver, or a `null` fallthrough that
+    // leaves the legacy cascade below byte-identical. Navigation probes
+    // are as honest as the synchronous contract allows — the pure core
+    // records its straight-line approximation in the breakdown instead of
+    // faking exactness when no synchronous route search is available.
+    const pincer = selectPincerTactic({
+        members: positioned,
+        leaderId: leader?.combatantId ?? leaderId,
+        targets: centerTargets,
+        objective: objective ?? null,
+        moraleTier: moraleTier ?? context.moraleTier ?? null,
+        scene: geometryContext.scene,
+        combat: planningCombat,
+        navigation: geometryContext.navigation ?? context.navigation ?? null,
+        context: geometryContext,
+        config: cfg
+    });
+    breakdown.pincer = {
+        name: pincer.name ?? null,
+        reason: pincer.reason ?? null,
+        selected: pincer.name === PINCER_TACTIC,
+        ...(pincer.breakdown ?? {})
+    };
+
+    // The base maneuver is the ordinary flank/assault/covering cascade of
+    // the squad. It is computed first so the interdiction pass below can
+    // compose over it; when interception degrades the base descriptor is
+    // returned unchanged apart from the recorded degradation breakdown.
+    let base;
+    if (pincer.name === PINCER_TACTIC
+        || (pincer.name === "flank-and-fix" && pincer.objective)) {
+        // Committed pincer or its specified degradation: the pure
+        // descriptor is the base maneuver, re-rooted on the spec-ops
+        // breakdown so the cascade diagnostics keep their single shape.
+        // `maxDetachedPhases`/`taskCapacities`/`flankMinAngleDegrees` of
+        // the pure core travel with it unchanged.
+        base = {
+            ...pincer,
+            breakdown: { ...breakdown }
+        };
+    } else if (flank) {
         breakdown.flank = { side: flank.side, flankerId: flank.flanker.combatantId };
         const targetId = _objectiveTargetId(objective, hostiles);
-        return finish("flank-and-fix",
+        base = finish("flank-and-fix",
             frontalBlocked ? "frontal-blocked-flank-open" : "outnumbered-flank-open",
             {
                 allowFlank: true,
@@ -900,21 +1221,91 @@ export function selectSpecOpsTactic({
                     }
                 }
             });
-    }
-    if (enemyCount <= memberCount) {
+    } else if (enemyCount <= memberCount) {
         // Parity or superiority: a synchronized assault — unless the only
         // corridor is blocked and no flank route exists.
-        if (frontalBlocked) {
-            return finish("covering-advance", "frontal-blocked-no-flank",
-                { assignments: _coveringAssignments(available) });
-        }
-        return finish("coordinated-assault",
-            enemyCount < memberCount ? "superiority" : "parity",
-            { assignments: all("assault") });
+        base = frontalBlocked
+            ? finish("covering-advance", "frontal-blocked-no-flank",
+                { assignments: _coveringAssignments(available) })
+            : finish("coordinated-assault",
+                enemyCount < memberCount ? "superiority" : "parity",
+                { assignments: all("assault") });
+    } else {
+        // Outnumbered below the regroup threshold with no flank route.
+        base = finish("covering-advance", "outnumbered-no-flank",
+            { assignments: _coveringAssignments(available) });
     }
-    // Outnumbered below the regroup threshold with no flank route.
-    return finish("covering-advance", "outnumbered-no-flank",
-        { assignments: _coveringAssignments(available) });
+
+    // Issue #87: interdiction-screen is evaluated after suppression and
+    // before committing to the attack maneuver it screens. The pure core
+    // picks at most two interdictors out of the base assignments; a
+    // degradation stays visible in the breakdown while the cascade
+    // continues with the base maneuver unchanged. `positionIsCenter` is
+    // already true here — the selector normalized every position to the
+    // token centre the pure geometry expects.
+    const interdiction = selectInterdiction({
+        // `collectMembers` copies `system.wounds.value` — damage TAKEN —
+        // into `hp`, but the survival model reads the remaining health.
+        // Correct the shadowing field here; the pure core performs the
+        // same conversion on the actor-derived fallback path.
+        members: positioned.map(member => {
+            const wounds = member?.combatant?.actor?.system?.wounds
+                ?? member?.actor?.system?.wounds ?? null;
+            const remaining = wounds && Number.isFinite(wounds.max) && Number.isFinite(wounds.value)
+                ? wounds.max - wounds.value : null;
+            return remaining === null ? member : { ...member, hp: remaining };
+        }),
+        targets: centerTargets,
+        leaderId: leader?.combatantId ?? leaderId,
+        character: character ?? context.character ?? null,
+        round: _finiteOr(planningCombat?.round, null),
+        grid: geometryContext.scene?.grid ?? null,
+        walls,
+        base: { name: base.name, assignments: base.assignments },
+        config: {
+            confidenceMin: cfg.interdictConfidenceMin,
+            minRangedEV: cfg.interdictMinRangedEV,
+            chargerConfidenceMin: cfg.interdictChargerConfidenceMin,
+            ...(context.interdiction ?? {})
+        }
+    });
+    const interdictionBreakdown = interdiction.breakdown?.interdiction ?? null;
+    breakdown.interdiction = interdictionBreakdown;
+    if (!interdiction.name) {
+        return { ...base, breakdown: { ...base.breakdown, interdiction: interdictionBreakdown } };
+    }
+    // Composite descriptor: the interdiction objective carries the
+    // interception geometry (`type`/`targetId`/`screenPoint`/`protectId`/
+    // `mode`) and, when the base maneuver was a flank, the flank proof
+    // fields the fireteam needs downstream. The base `targetId` never
+    // overrides the interception target — the fireteam treats it as
+    // role-scoped.
+    const baseObjective = base.objective && typeof base.objective === "object" ? base.objective : {};
+    const flankFields = {};
+    // Issue #88: the pincer objective contract (`elements`/`sync`/
+    // `syncPolicy`/`targetPoint`) travels through the composite exactly
+    // like the legacy flank proof fields — the interception keys always
+    // win conflicts through the spread below.
+    for (const key of ["flankTargetId", "flankSide", "flankPoint",
+        "elements", "sync", "syncPolicy", "targetPoint"]) {
+        if (baseObjective[key] !== undefined && baseObjective[key] !== null) {
+            flankFields[key] = baseObjective[key];
+        }
+    }
+    return {
+        ...interdiction,
+        allowFlank: base.allowFlank === true,
+        ...(base.flankMinAngleDegrees !== undefined
+            ? { flankMinAngleDegrees: base.flankMinAngleDegrees } : {}),
+        // Issue #88: the pincer per-element capacity cap survives the
+        // composition — interdictors are picked out of the fix/base
+        // assignments, so the flank element sizes still hold.
+        ...(base.taskCapacities && typeof base.taskCapacities === "object"
+            ? { taskCapacities: { ...base.taskCapacities } } : {}),
+        objective: { ...flankFields, ...interdiction.objective },
+        maxDetachedPhases: cfg.maxDetachedRounds,
+        breakdown: { ...breakdown, baseTactic: base.name }
+    };
 }
 
 /**
@@ -945,6 +1336,9 @@ export function createSpecOpsTactic(config = {}) {
  * @returns {string|null} Rejection reason or null when acceptable.
  */
 export function specOpsVeto({ candidate = {}, context = {} } = {}) {
+    if (suppressionZoneViolation(candidate, context.team?.exclusionZones)) {
+        return SUPPRESSION_ZONE_VETO;
+    }
     const attack = ATTACK_VARIANTS.has(candidate.variant);
     if (context.team?.task === "flank" && Number.isFinite(context.team.flankMinAngleDegrees)) {
         return attack ? checkSpecOpsFlank(candidate, context).reason : "flank-attack-unavailable";
@@ -960,6 +1354,37 @@ export function specOpsVeto({ candidate = {}, context = {} } = {}) {
         return SPEC_OPS_VETO_HIDDEN_TARGET;
     }
     return null;
+}
+
+/**
+ * Evidence that a cover-role candidate performs the peel cover mode chosen
+ * by the pure selector. Mode feasibility/lane evidence is selection-time
+ * doctrine; this factor only sharpens execution scoring and is zero for
+ * withdrawers.
+ * @param {object} candidate Scored candidate.
+ * @param {object} context Planning context.
+ * @returns {number} `0..1` cover evidence.
+ */
+function _coveringWithdrawal(candidate, context) {
+    if (context.team?.role !== "cover") return 0;
+    const peel = context.team?.peel ?? null;
+    const mode = peel?.coverMode ?? peel?.cover?.mode ?? null;
+    if (mode === "suppression") return suppressionFactorOf(candidate);
+    if (mode === "overwatch") return candidate.variant === "overwatch" ? 1 : 0;
+    if (mode === "melee") {
+        return candidate.action && (candidate.action.class === "melee"
+            || candidate.variant === "charge" || candidate.action.attackType === "charge") ? 1 : 0;
+    }
+    if (mode === "direct") {
+        if (!ATTACK_VARIANTS.has(candidate.variant) || candidate.cone) return 0;
+        const ids = [peel?.coverTargetId, peel?.coverTargetUuid, peel?.coverTarget]
+            .filter(value => value !== null && value !== undefined).map(String);
+        if (!ids.length) return 1;
+        const targetIds = [candidate.target?.tokenId, candidate.target?.tokenUuid]
+            .filter(value => value !== null && value !== undefined).map(String);
+        return ids.some(id => targetIds.includes(id)) ? 1 : 0;
+    }
+    return 0;
 }
 
 /**
@@ -988,6 +1413,18 @@ export function evaluateSpecOps({
     const cfg = task && context.specOpsConfig
         ? resolveSpecOpsConfig(context.specOpsConfig) : SPEC_OPS_CONFIG;
     const enriched = { ...factors };
+    if (context.team?.role === "suppressor") {
+        enriched.suppression = suppressionFactorOf(candidate);
+    }
+    if (context.team?.role === "cover") {
+        enriched.coveringWithdrawal = _coveringWithdrawal(candidate, context);
+    }
+    if (context.team?.role === INTERDICT_ROLE) {
+        // Issue #87: the screen pull only exists for the interdictor. It
+        // is zero without a screen point, so a legal charge never has to
+        // compete with the fallback geometry.
+        enriched.screenProgress = _screenProgress(candidate, context);
+    }
     if (task === "flank") {
         const { angle } = _flankGeometry(candidate, context);
         const minAngle = context.team.flankMinAngleDegrees ?? cfg.flankMinAngleDegrees;
@@ -1005,12 +1442,29 @@ export function evaluateSpecOps({
     }
     const overlay = task ? SPEC_OPS_TASK_WEIGHTS[task] : SPEC_OPS_SOLO_WEIGHTS;
     const effective = { ...weights, ...overlay };
+    if (context.team?.role === "suppressor") effective.suppression = 8;
+    const roleOverlay = SPEC_OPS_ROLE_WEIGHTS[context.team?.role] ?? null;
+    if (roleOverlay) {
+        // Role overlays are additive deltas over the task weights — a role
+        // sharpens the assigned task instead of replacing the maneuver.
+        for (const [key, delta] of Object.entries(roleOverlay)) {
+            effective[key] = (effective[key] ?? 0) + delta;
+        }
+    }
     if (task === "support") effective.cover = cfg.supportWeight;
     if (task === "flank") effective.flankAngle = cfg.flankWeight;
     if (task === "assault") {
         effective.attackAfterMove = (cfg.assaultWeight / SPEC_OPS_CONFIG.assaultWeight) * overlay.attackAfterMove;
     }
     if (task === "regroup") effective.cohesionRestore = cfg.cohesionWeight;
+    const laneDefense = context.tactic === "chokepoint-defense"
+        && context.team?.memberObjective?.type === "defend"
+        && context.team?.role === "overwatch-lane";
+    if (laneDefense) {
+        enriched.suppression = candidate.action?.attackType === "suppressing_fire" ? 1 : 0;
+        effective.laneCoverage = Math.max(_finiteOr(effective.laneCoverage, 0), 3);
+        effective.suppression = Math.max(_finiteOr(effective.suppression, 0), 3);
+    }
     const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,
@@ -1025,7 +1479,13 @@ export function evaluateSpecOps({
                 reason: task ? null : "no-fireteam",
                 flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
                 flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null,
-                cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null
+                cohesionRestore: task === "regroup" ? (enriched.cohesionRestore ?? 0) : null,
+                suppression: context.team?.role === "suppressor"
+                    ? (enriched.suppression ?? 0) : null,
+                screenProgress: context.team?.role === INTERDICT_ROLE
+                    ? (enriched.screenProgress ?? 0) : null,
+                coveringWithdrawal: context.team?.role === "cover"
+                    ? (enriched.coveringWithdrawal ?? 0) : null
             }
         }
     };
@@ -1066,16 +1526,36 @@ export function registerSpecOpsPreset(planner) {
 }
 
 /**
+ * Register the baseline spec-ops maneuver selector on a tactic registry
+ * (issue #92). The selector remains the exact {@link specOpsTactic} factory:
+ * the registry only supplies the deterministic per-preset dispatch point.
+ * @param {object} tactics Tactic registry service.
+ * @returns {object} The frozen registration record.
+ */
+export function registerSpecOpsTacticSelector(tactics) {
+    if (!tactics || typeof tactics.registerTacticSelector !== "function") {
+        throw new Error("[only-war-ai] Spec-ops tactic requires a tactic registry");
+    }
+    return tactics.registerTacticSelector({
+        presetId: SPEC_OPS_PRESET_ID,
+        kind: "maneuver",
+        priority: DEFAULT_TACTIC_PRIORITY,
+        select: specOpsTactic
+    });
+}
+
+/**
  * Convenience wrapper (issue #412): build the shared TeamPlan for a
- * spec-ops fireteam through `fireteam.buildTeamPlan` with the spec-ops
- * tactic factory. Without a fireteam service the caller should fall back
- * to an individual `planner.planTurn` — the solo preset behaviour keeps
+ * spec-ops fireteam through `fireteam.buildTeamPlan`. The default maneuver
+ * comes from the tactic registry; explicit `context.tactic` keeps its
+ * caller-override meaning. Without a fireteam service the caller should fall
+ * back to an individual `planner.planTurn` — the solo preset behaviour keeps
  * the NPC functional (`no-fireteam` diagnostics).
  * @param {object|null} fireteam Fireteam service.
  * @param {object} combat Combat document.
  * @param {object|string} team Team reference (see `buildTeamPlan`).
  * @param {object} [context] `buildTeamPlan` context; `tactic` may
- *   override the default spec-ops factory.
+ *   override the registered spec-ops selector.
  * @returns {Promise<object>} `buildTeamPlan` result.
  */
 export async function buildSpecOpsTeamPlan(fireteam, combat, team, context = {}) {
@@ -1084,7 +1564,6 @@ export async function buildSpecOpsTeamPlan(fireteam, combat, team, context = {})
     }
     return fireteam.buildTeamPlan(combat, team, {
         teamPreset: SPEC_OPS_PRESET_ID,
-        ...context,
-        tactic: context.tactic !== undefined ? context.tactic : specOpsTactic
+        ...context
     });
 }

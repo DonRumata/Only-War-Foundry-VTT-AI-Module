@@ -129,7 +129,7 @@ function makeTeamWorld(members, { enemyCount = 1, round = 1 } = {}) {
     const enemies = [];
     for (let i = 0; i < enemyCount; i++) {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = 2000 + (i * 100);
@@ -417,7 +417,7 @@ test("planTurn: a desperate record shifts the scoring weights (L2 narrowing)", a
     const combatant = makeCombatant({ actor, token });
     combatant.tokenId = token.id;
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;
@@ -581,11 +581,19 @@ test("buildTeamPlan: desperate team remaps assault/flank to support/regroup", as
     // 3 members vs 6 enemies — the 2:1 desperation ratio is met.
     const world = makeTeamWorld(members, { enemyCount: 6 });
     const service = createFireteamService({ planner: createPlannerService() });
+    const objective = { type: "peel-withdrawal", lane: "left" };
     const context = {
         seed: 5,
         personality: false,
         allowFlank: true,
-        targets: injectedTargets(world)
+        targets: injectedTargets(world),
+        assignments: {
+            [members[0].combatant.id]: { task: "assault", role: "cover" },
+            [members[1].combatant.id]: { task: "assault", role: "cover" },
+            [members[2].combatant.id]: {
+                task: "flank", role: "withdraw", element: "maneuver", objective
+            }
+        }
     };
     await service.buildTeamPlan(world.combat, "alpha", context);
     world.combat.round = 2;
@@ -598,6 +606,17 @@ test("buildTeamPlan: desperate team remaps assault/flank to support/regroup", as
     // assault→support, flank→regroup, support stays.
     const tasks = result.teamPlan.members.map(m => m.task).sort();
     assert.deepEqual(tasks, ["regroup", "support", "support"]);
+    const flanker = result.teamPlan.members
+        .find(m => m.combatantId === members[2].combatant.id);
+    assert.equal(flanker.task, "regroup");
+    assert.equal(flanker.role, "withdraw");
+    assert.equal(flanker.element, "maneuver");
+    assert.deepEqual(flanker.objective, objective);
+    const diagnostic = result.teamPlan.diagnostics.assignments
+        .find(a => a.combatantId === members[2].combatant.id);
+    assert.equal(diagnostic.task, "regroup");
+    assert.equal(diagnostic.role, "withdraw");
+    assert.deepEqual(diagnostic.objective, objective);
 });
 
 test("buildTeamPlan: leader death forces the transition without hysteresis", async () => {
@@ -852,7 +871,7 @@ test("executor: a fresh committed plan barks once per round", async () => {
     const combatant = makeCombatant({ actor, token });
     combatant.tokenId = token.id;
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: 10, max: 10 } };
+    enemyActor.system = { wounds: { value: 0, max: 10 } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = 300;

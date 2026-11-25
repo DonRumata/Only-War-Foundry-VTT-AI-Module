@@ -238,8 +238,8 @@ export async function _resolveActions(actor, context) {
     // (standard/charge/allOut/…) — curate per weapon: keep all available
     // attack types but cap each weapon to MAX_ATTACK_TYPES_PER_WEAPON
     // picks in curated preference order so a multi-type weapon cannot
-    // crowd others out under DEFAULT_MAX_ACTIONS. `suppressing_fire` is
-    // excluded outright (it needs a targetPoint/template).
+    // crowd others out under DEFAULT_MAX_ACTIONS. `suppressing_fire` is not
+    // excluded: the step contract carries its targetPoint/template geometry.
     // Injected/custom actions (no attackType) always pass through.
     const apiGroups = new Map();
     const passthrough = [];
@@ -471,10 +471,16 @@ export function _readyWeaponActions({ allActions, actor, usableActions, readyCap
 
 
 /**
- * Synthesized `unpin` action entry (issue #39): the DH2e full-action
- * Willpower test that clears pinning. The candidate only exists when the
- * actor actually has a `willpower` characteristic — `null` otherwise, so
- * the planner can record a `unpin-unavailable` rejection instead.
+ * Synthesized `unpin` availability descriptor (issue #39, revised by
+ * issue #93): per the Only War corebook pinning recovery is not an
+ * action at all — at the end of the turn the pinned character makes a
+ * free Willpower test (+0, +30 in cover against the nearest known
+ * threat or when not shot at). The planner therefore never offers unpin
+ * as an action candidate; it auto-appends the zero-cost end-of-turn
+ * test step instead (see `_unpinTestStep`). This descriptor is the
+ * availability gate: `null` when the actor has no `willpower`
+ * characteristic, so the planner can record a `unpin-unavailable`
+ * rejection and skip the step.
  * @param {object|null} actor Actor document.
  * @returns {object|null}
  */
@@ -487,7 +493,8 @@ export function _unpinAction(actor) {
         name: "Unpin",
         characteristic: "willpower",
         testKind: "characteristic",
-        cost: "full",
+        cost: "free",
+        endOfTurn: true,
         synthesized: true
     };
 }

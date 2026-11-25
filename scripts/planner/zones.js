@@ -473,10 +473,12 @@ export function _overwatchRoutePoint({ threat, selfPos, pxPerUnit,
  * @param {object|null} input.scene Active scene.
  * @param {object|null} input.tokenDoc Viewer token document (LOS probes).
  * @param {object|null} input.perception Perception service (LOS probes).
+ * @param {object|null} [input.lane] Active chokepoint-defense lane contract;
+ *   its chokepoint becomes the priority synthetic orientation anchor.
  * @returns {object[]} `{x, y, kind, tokenUuid, tokenId}` anchors.
  */
 export function _overwatchAnchors({ targets, threatTarget, selfPos, pxPerUnit,
-    navigation, combat, scene, tokenDoc, perception }) {
+    navigation, combat, scene, tokenDoc, perception, lane = null }) {
     const anchors = [];
     const seen = new Set();
     const push = (point, kind, target) => {
@@ -494,14 +496,34 @@ export function _overwatchAnchors({ targets, threatTarget, selfPos, pxPerUnit,
             tokenId: target?.tokenId ?? null
         });
     };
+    // Issue #91: the lane chokepoint is the high-priority synthetic
+    // orientation anchor. Generic route/lead/memory anchors are narrowed
+    // to the lane threat ids when those ids are known; the lane anchor
+    // itself may remain as the declare-only orientation point even when
+    // every concrete threat is currently outside this member's LOS.
+    const laneIds = new Set((lane?.threatIds ?? []).map(String));
+    const inLane = target => {
+        if (!lane || !laneIds.size) return true;
+        return [target?.tokenId, target?.tokenUuid, target?.actorId]
+            .filter(id => id !== null && id !== undefined)
+            .some(id => laneIds.has(String(id)));
+    };
+    const laneTargets = (targets ?? []).filter(inLane);
+    push(lane?.chokepoint ?? lane?.lanePoint ?? null, "lane", null);
+    const routeTarget = lane
+        ? (laneTargets.find(target => target === threatTarget)
+            ?? laneTargets.find(target => target?.canAttack === true && target?.hidden !== true)
+            ?? laneTargets[0]
+            ?? threatTarget)
+        : threatTarget;
     push(_overwatchRoutePoint({
-        threat: threatTarget, selfPos, pxPerUnit, navigation, combat, scene
-    }), "route", threatTarget);
-    for (const target of targets ?? []) {
+        threat: routeTarget, selfPos, pxPerUnit, navigation, combat, scene
+    }), "route", routeTarget);
+    for (const target of laneTargets) {
         if (target?.canAttack !== true || target?.hidden === true) continue;
         push(_leadPointOf(target, selfPos, pxPerUnit), "lead", target);
     }
-    for (const target of targets ?? []) {
+    for (const target of laneTargets) {
         if (!_isMemorySource(target?.source) || target?.hidden === true) continue;
         push({ x: target.x, y: target.y }, "memory", target);
     }
@@ -599,11 +621,13 @@ export function _overwatchBlastZone({ anchors, threatTarget, selfPos, tokenDoc,
  * @param {object[]} input.tokens Coverage scan (`_blastTokens` shape).
  * @param {number} input.viewerDisposition Self disposition.
  * @param {object} input.options `{includeNeutral, dispositions}`.
+ * @param {object|null} [input.fallbackPoint] Lane chokepoint orientation point
+ *   used when no concrete anchor produces a cone aim.
  * @returns {object|null} `{shape, direction?, arc?, range?, targetPoint?,
  *   blastRadius?}`.
  */
 export function _overwatchZone({ kind, action, anchors, threatTarget, selfPos,
-    pxPerUnit, tokenDoc, tokens, viewerDisposition, options }) {
+    pxPerUnit, tokenDoc, tokens, viewerDisposition, options, fallbackPoint = null }) {
     const range = _actionRange(action);
     const rangePx = range * pxPerUnit;
     if (kind === "blast") {
@@ -629,7 +653,7 @@ export function _overwatchZone({ kind, action, anchors, threatTarget, selfPos,
         requireLos: false
     });
     if (aim) return { shape: "cone", direction: aim.direction, arc, range };
-    const direction = _bearingTo(selfPos, threatTarget);
+    const direction = _bearingTo(selfPos, fallbackPoint ?? threatTarget);
     return Number.isFinite(direction)
         ? { shape: "cone", direction, arc, range }
         : null;

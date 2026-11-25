@@ -49,6 +49,7 @@ export function _normalizeMove(raw, { selfPos, targetPos, grid, stay = false }) 
         los: raw.los === true ? true : (raw.los === false ? false : null),
         cover: Number.isFinite(raw.cover) ? raw.cover : 0,
         approximate: raw.approximate === true,
+        withdrawal: raw.withdrawal === true,
         stay: stay || !moved,
         waypoints: Array.isArray(raw.waypoints) ? _jsonClone(raw.waypoints) : null
     };
@@ -195,6 +196,45 @@ export function _resolveMoves({ tokenDoc, target, range, bandRange = null,
                 if (seen.has(key)) continue;
                 seen.add(key);
                 raw.push({ ...entry, distance: null });
+            }
+        }
+        // Issue #87: the interdictor's screen anchor is the team's
+        // `screenPoint` (falling back to the serialized member objective
+        // on the team-turn compile path). Merging cells toward it lets
+        // `screenProgress` pick a legal endpoint when the charge lane is
+        // blocked — added candidates never replace the charge probes.
+        const screenPoint = context.team?.role === "interdictor"
+            ? (context.team?.screenPoint ?? context.team?.memberObjective?.screenPoint ?? null)
+            : null;
+        if (Number.isFinite(screenPoint?.x) && Number.isFinite(screenPoint?.y)) {
+            const seen = new Set(raw.map(entry =>
+                `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`));
+            for (const entry of find({ target: screenPoint })) {
+                const key = `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                raw.push({ ...entry, distance: null });
+            }
+        }
+        // Issue #89: a peel withdrawer's objective anchor is the validated
+        // regroup point, not the hostile contact. Merging those cells into
+        // the ordinary bounded move enumeration keeps wall routing,
+        // reservations, movement budgets and collision legality in the
+        // existing navigation service — no peel-specific pathfinder. The
+        // marker survives normalization so the planner can turn these
+        // endpoints into explicit `withdraw`/`disengage` candidates instead
+        // of misreading them as enemy approaches.
+        const regroupPoint = context.team?.role === "withdraw"
+            ? (context.team?.peel?.regroupPoint ?? context.team?.regroupPoint ?? null)
+            : null;
+        if (Number.isFinite(regroupPoint?.x) && Number.isFinite(regroupPoint?.y)) {
+            const seen = new Set(raw.map(entry =>
+                `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`));
+            for (const entry of find({ target: regroupPoint })) {
+                const key = `${_finiteOr(entry?.i, null)}|${_finiteOr(entry?.j, null)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                raw.push({ ...entry, distance: null, withdrawal: true });
             }
         }
     }

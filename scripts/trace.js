@@ -742,6 +742,11 @@ export const CAPTURE_CONTEXT_KEYS = Object.freeze([
     "replanCount",
     "fallbackPreset",
     "targets",
+    // Epic #84: attack-pool narrowing is a planning input exactly like
+    // `targets` — captured for offline-replay fidelity, but never read
+    // by the snapshot/stale-fingerprint validation path.
+    "attackTargetIds",
+    "excludedAttackTargetIds",
     "actions",
     "moves",
     "approximateMoves",

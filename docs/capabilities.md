@@ -113,13 +113,22 @@ execute: расхождение — `stale-state` (перемещение, см�
 - Типы атаки из `actions.list`: на оружие кандидатизируется до 3 типов в
   курируемом порядке (ranged: `full_auto, semi_auto, standard, ripper_charge,
   called_shot, suppressing_fire`; melee: `allOut, charge, standard, lightning,
-  swift, called_shot`); `suppressing_fire` — отдельная роль, проходит всегда
-  (issue #14). Дальние атаки с пустым клипом исключаются (`no-ammo`).
+  swift, called_shot`); `EXCLUDED_ATTACK_TYPES` пуст — `suppressing_fire`
+  как отдельная роль area-denial проходит всегда (issue #14). Дальние атаки
+  с пустым клипом исключаются (`no-ammo`).
 - Статусы: `stunned` → короткий `end-turn`-план; `pinned` — вето charge,
   run и сближающих перемещений; `prone` — бюджет движения пополам,
   вето charge и run.
 - `vulnerable`-фактор за цель pinned/prone/stunned; `engaged`/`meleeEngage`
   за контакт ближнего боя.
+- Сужение пула атак (epic #84): опциональные `context.attackTargetIds` /
+  `context.excludedAttackTargetIds` ограничивают только direct-attack
+  кандидатов (включая blast memory-strike и наведение attack-конусов);
+  осведомлённость — движение, threat-map, melee-engagement, nearest
+  threat, overwatch, commitment-угрозы — читает полный пул восприятия.
+  Точное строковое совпадение по `tokenId`/`tokenUuid`/`actorId`; сужение
+  не ослабляет `canAttack`/memory-правила и не входит в
+  snapshot/validate; без полей поведение бит-в-бит прежнее.
 - `validateSnapshot` перед каждым шагом: `turn-stale | token-moved |
   target-gone | resources-changed | collision-changed | statuses-changed |
   combat-ended`. `shouldReplan` — не более `maxReplans` (1) за ход.
@@ -195,15 +204,42 @@ execute: расхождение — `stale-state` (перемещение, см�
   `hard` — дополнительно lookahead по умолчанию. `plan.difficulty` и
   `diagnostics.difficulty/easyPick` отражают выбор. Настройка — точка
   опоры для личностей ботов (issue #19).
-- **Fireteam kill-EV конвергенция**: `buildTeamPlan` суммирует ожидаемый
-  урон членов, чьё оружие достаёт до цели (ranged — по дальности, melee —
-  reach + полоса), и сравнивает с `wounds` цели (из snapshot/инъекции).
-  `killEV ≥ wounds` → конвергентный объект: `teamPlan.convergence
-  {targetId, targetUuid, killEV, wounds, margin, capableMembers}`,
-  общий `assignedTargetId` всем способным, flank-группа не выделяется
-  (если не задана явно). Цель без читаемых wounds не конвергентна;
-  приоритет — `context.objective`/тактика/`context.assignments`,
-  отключение — `context.convergence === false`.
+- **Fireteam concentrate-fire / kill-EV конвергенция** (issues #16/#85):
+  `buildTeamPlan` нормализует видимых hostile в pure selector
+  `scripts/presets/concentrate-fire.js`. Семантика wounds — *оставшийся*
+  запас здоровья: `system.wounds.value` — нанесённый урон, поэтому объект
+  `{value, max}` читается как `max − value`; plain-число и value-only
+  инъекции уже считаются эффективным запасом. Живой scan требует, чтобы
+  хотя бы один живой enabled член видел цель через perception; injected
+  memory/relay/hidden контакты кандидатами не являются. Команда читает
+  statuses, `reactionUsed`, threat EV из weapon emitters, melee gang-up и
+  `lastTarget` hysteresis; killEV считается per member/per target по
+  дальности лучшего emitter.
+  Гарантированный kill остаётся legacy-режимом `mode:"kill"`: все capable
+  members получают цель, cap/exclusions нет, flank не выделяется (если не
+  задан явно), а `diagnostics.convergence` остаётся backward-compatible
+  alias. Scored `mode:"focus"` выбирает приоритетную цель по угрозе,
+  уязвимости, потраченной реакции, friendly-fire/gang-up доктрине пресета,
+  exposure и hysteresis. Descriptor — backward-compatible superset:
+  `targetId, targetUuid, killEV, wounds, margin, capableMembers` плюс
+  `mode, focusScore, focusCap, assignedMembers, excludedMembers,
+  woundsKnown, breakdown, runnerUp` (и `actorId` для planner identity).
+  Objective precedence: explicit `context.objective` → independent
+  `tactic.objective` → focus; focus выбирается до registry и подаётся в
+  specOps как входной objective. Назначенные члены получают additive
+  `role:"focus"` только если role не задана; member-scoped objective target
+  сильнее focus. Отключение — `context.convergence === false`,
+  `context.killEV === false` или `context.focus === false`;
+  `excludeTargetIds` убирает candidacy, но не threat mass. Диагностика —
+  JSON-safe `diagnostics.focus` с coefficients, candidates, visibility и
+  assignment/exclusion summary.
+- **Focus attack pools**: назначенные члены сохраняют полный
+  threat/engagement `targets` и получают direct-attack `attackTargetIds`;
+  capable overflow сохраняет полный pool и получает focus target в
+  `excludedAttackTargetIds`. Caller allow-list является hard constraint и
+  пересекается с focus, caller deny-list сохраняется; member-objective
+  redirect важнее focus pool. Target-conflict и target-gone replan не наследуют
+  derived focus allow-list.
 
 #### Личности ботов (issue #19)
 
@@ -389,11 +425,17 @@ execute: расхождение — `stale-state` (перемещение, см�
   reach врага снаружи оцениваются *по каждому врагу отдельно* — уйти от
   противника A в контакт к противнику B всё равно провоцирует A. Reach —
   melee-эмиттеры threat-профиля цели с фолбэком `DEFAULT_MELEE_RANGE`.
-- **`unpin`** — синтетическое full-cost действие для pinned-бота с
-  характеристикой `willpower`: WP-тест, снимающий pinning
-  (`test`-шаг `type:"characteristic", key:"willpower"` →
-  `api.rolls.prepareTest`/`executeTest`). Без характеристики — rejected
-  `unpin-unavailable`; альтернатива — `drop-prone` из issue #37.
+- **`unpin`** (issue #93) — по корбуке снятие pinning не действие, а
+  свободный тест Воли в конце хода: нулевой `test`-шаг
+  (`halves: 0`, `type:"characteristic", key:"willpower"`,
+  `unpin/endOfTurn: true`, `modifier` +0 либо +30 в укрытии от ближайшей
+  известной угрозы — probe из endpoint'а последнего move-шага плана,
+  т.к. тест идёт в конце хода) автоматически вставляется перед end-turn
+  любого плана pinned-бота → `api.rolls.prepareTest`/`executeTest`;
+  executor снимает
+  `pinned` только при успешном броске. Без характеристики — rejected
+  `unpin-unavailable` и шага нет; активная альтернатива в бюджете хода —
+  `drop-prone` из issue #37.
 - **`grudge` / `lastAttacker`** — Combatant-флаг `{tokenUuid, tokenId,
   actorId, round, turn, woundsLost, attribution}`, controller-only.
   Сервис `grudges` (`api.services`): вотчер `updateActor` + кэш wounds
@@ -443,6 +485,138 @@ execute: расхождение — `stale-state` (перемещение, см�
   character}` на актёре и/или токене (TokenConfig отображает только
   token-флаги). `character` (issue #19) — общий темперамент группы,
   overlay на веса всех членов.
+- Per-preset tactic registry (issue #92, сервис `api.services.get("tactics")`):
+  selector `{presetId, kind, priority, select}` — pure/deterministic;
+  меньший priority раньше, tie-break — порядок регистрации, в v1 побеждает
+  первый non-null `maneuver` descriptor. Явный `context.tactic` function/object
+  сохраняет более высокий приоритет, `null`/`false` отключают тактику. specOps
+  использует прежний `specOpsTactic`; rangedCover теперь тоже имеет
+  зарегистрированный maneuver-selector. assault (issue #88) регистрирует
+  loose-pincer selector; hold (issue #91) регистрирует chokepoint-defense.
+  Все selector'ы деградируют explainable `name:null`, когда их входные
+  gates не выполнены.
+- Pincer / двойной охват (issue #88): чистое ядро `presets/pincer.js` —
+  два знаковых манёвренных пункта (`elements.left/right.point`), проверка
+  расхождения маршрутов (угол/пересечения/коридор, синхронные
+  navigation-пробы с честным straight-line fallback в `probes`),
+  детерминированная композиция групп (лидер в fix-базе; n=4 → 2+1+1,
+  n=5 → 2+1+2, n=6 → 2+2+2). specOps оценивает `pincer` после suppression
+  и до flank-and-fix/coordinated-assault; деградация — spec-ops
+  flank-and-fix с причиной `pincer-degraded-*`, fallthrough `name: null`
+  сохраняет прежний каскад. Element флангера — его `groupId`
+  (`flank-left`/`flank-right`); резервации целей ключируются
+  `task|groupId|targetId`, ёмкости элементов независимы
+  (`taskCapacities.flank`). Member context несёт per-member знаковый
+  `team.flankPoint`/`flankSide` — scoring-only, без жёсткого вето.
+  Синхронизация удара `objective.sync`: `elastic` (ждём только самого
+  раннего транзитного флангера, удар при готовности одной стороны) /
+  `strict` (ждём всех) / `none` (loose — не ждём); delay-записи несут
+  `awaitIds[]`/`policy`, `validateTeamPlan` различает elastic/strict
+  матрицу слома `sync-broken`. Барьер фаз покрывает только движущихся.
+  Assault-пресет — ослабленный `pincer-loose` (`sync: "none"`, центральный
+  элемент штурмует) с overlay `ASSAULT_TASK_WEIGHTS.flank`
+  (`flankProgress 6`, `advance +1` аддитивно). Пороги — поля `pincer*`
+  в `SPEC_OPS_CONFIG`.
+- Peel-withdrawal (issue #89): чистое stateless ядро
+  `tactics/peel-withdrawal.js` оценивает командный отход под прикрытием по
+  OR-trigger (desperate morale, total/recent losses, close threat с
+  гистерезисом danger enter/exit). В specOps peel идёт до legacy
+  regroup-fallback; в rangedCover — до suppress-and-bound, в assault — до
+  loose-pincer. Selector выдаёт ttl=1 `regroupPoint/threatCentroid/lane`,
+  explainable rejections и object assignments `withdraw`/`cover`; persistent
+  state и `peelActive` нет. Withdrawer получает objective-driven move
+  candidates к regroup point; ordinary withdraw несёт явный
+  `freeAttackCost`, а `disengage` существует только при structural
+  capability evidence и сериализуется как move metadata. Cover priority —
+  suppression → direct → overwatch (reaction-used veto); pinned/stunned и
+  invalid/trap regroup geometry проверяются без пустых ходов. Explicit
+  objective/assignments/`context.tactic`/focus/suppression/interdiction/
+  pincer не перетираются silently; GM/morale demotion снимает peel role и
+  peel objective. Пороги `peel*` — экспериментальные world settings с
+  pure-core defaults и context overrides.
+- Chokepoint-defense (issue #91): командная оборона подхода к anchor через
+  чистое stateless ядро `presets/chokepoint-defense.js` и serializable
+  TeamPlan contract. Fireteam собирает per-member profiles (range,
+  suppression capability, reaction), threat routes/memory, leader/character
+  и lane hints из committed plans; selector возвращает objective
+  `{type:"defend", anchor, lanePoint, lanes, counterattack}` и object
+  assignments `overwatch-lane`/`reserve`/`leader`. `assignTasks`
+  нормализует эти объекты в legacy execution shape без расширения
+  reservation key: member-scoped `objective.targetId` конкретнее shared
+  target-каналов, role/element остаются metadata. Member context получает
+  root `objective`, `team.defenseObjective`, `team.defense.lane`,
+  `team.memberObjective` и descriptor assignment; вне активного
+  `chokepoint-defense` lane-scoring инертен.
+  Planner использует lane только как soft positioning и overwatch evidence:
+  `laneCoverage` — новый score factor с baseline weight 0; hold overlay даёт
+  watcher `laneCoverage ≥5`, `overwatch ≥3`, `suppression ≥4`, а
+  rangedCover/specOps — conservative `laneCoverage/suppression ≥3`.
+  `planner/zones.js` добавляет lane chokepoint как overwatch anchor
+  `kind:"lane"`, фильтрует generic anchors по `lane.threatIds`, сохраняет
+  обязательный LOS filter и сериализует lane metadata в
+  `overwatch.input.lane`. Suppression cone никогда не создаётся по пустому
+  synthetic anchor: без live/memory lane-threat anchor кандидат отклоняется
+  `lane-threat-anchor-missing`. Counterattack reserve gate активируется
+  только для live visible vulnerable intruder внутри kill zone и даёт
+  reserve `task:"assault"`+target objective; hold-radius veto остаётся
+  жёстким. Module bootstrap регистрирует hold selector в общем tactics
+  service; fallback fireteam registry поддерживает specOps/hold для
+  headless direct use.
+- Recover-pinned overlay (issue #90): priority overlay командного
+  вытаскивания pinned-бойца поверх всех четырёх пресетов — не манёвр и не
+  новый task-тип. Чистое stateless ядро `tactics/recover-pinned.js`
+  (`attributePinSource`/`scorePinnedTriage`/`evaluateRecoverGate`/
+  `selectCoverMember`/`buildRecoverPinnedOverlay`) получает от fireteam
+  plain DTO: атрибуция по confidence-лесенке recorded (3, suppression
+  карточка чата) → grudge `lastAttacker` (2, окно раунд) → los-nearest (1)
+  → unknown (0) с same-side/self-pin отклонениями. Точечное cover-назначение
+  только при confidence ≥ 2 и доказанной доступности источника; кап — один
+  `cover-fire` на команду в раунд, остальные члены получают лишь мягкий
+  `team.recover.redirectTargetId` (вес `recoverRedirect`, pool не сужается).
+  Pinned демотируются в `support`+`recovering` с фактором `recoverCover`
+  (прирост coverEstimate endpoint'а к угрозе; веса rc6/hold5/assault3/
+  specOps5). Донорский пул исключает pinned/melee/gmControlled/hasActed/
+  detached flank-assault/commitment/desperate-regroup и maneuver-critical
+  роли включая focus (R7). Доктринальный наклон suppression у донора —
+  graded factor, не форсинг типа атаки; friendly-вето конусов не
+  ослабляется. Гейты `no-pinned`/`no-donors`/`all-pinned`/
+  `safe-in-cover-unreachable`/`source-dead`/`pinned-in-melee` стабильны;
+  TeamPlan несёт `recover`/`breakdown.recover`/`diagnostics.recover`,
+  активация телеграфируется bark с dedup `combat|team|round`.
+- Suppress-and-bound (issue #86): чистое ядро `tactics/suppress-and-bound.js`
+  выбирает capable suppressor по полуавтоматической/полностью автоматической
+  очереди, заряду, актуальному `turnIndex` и безопасному конусу. В каскаде
+  specOps тактика стоит после regroup/casualty/pressure/no-contacts, но до
+  flank-and-fix/coordinated-assault; rangedCover v1 — suppress-or-null.
+  Descriptor отдаёт object assignments `{task,role,element,objective}` —
+  suppressor `support/fire`, maneuver element `advance|flank/bound` — и
+  сериализуемые `exclusionZones`. Участник с role `suppressor` получает preset-only
+  suppression factor `min(covered/2,1) × 8`; обычная стрельба не запрещена и
+  остаётся fallback. Остальные member contexts получают `team.exclusionZones`:
+  preset veto отклоняет только move endpoint в конусе (`suppression-zone`),
+  stay/attack-in-place легальны. После сборки TeamPlan проверяется фактический
+  cone step подавителя и waypoints/endpoints остальных маршрутов; повторное
+  нарушение после одного replan становится конфликтом `type:"zone"` с безопасной
+  деградацией без движения.
+- Interdiction-screen (issue #87): чистое ядро `presets/interdiction.js`
+  выбирает интердиктора по профилю ближнего боя, выживаемости (`rtd` —
+  раунды до гибели против порога темперамента) и предпроверке чарджа;
+  в каскаде specOps оно стоит после suppression и до flank/assault, композитно
+  переопределяя до двух членов базового манёвра. Триггер A — видимый
+  attackable «чистый стрелок» (confidence ≥ `interdictConfidenceMin`,
+  rangedEV ≥ `interdictMinRangedEV`), триггер B — melee-чарджер,
+  угрожающий стрелкам отряда; B строго приоритетнее A, memory/relay/intel
+  и hidden цели не участвуют. При нелегальном чардже интердиктор идёт к
+  точке экрана на сегменте «враг → защищаемый стрелок» (fallback-цепочка
+  contact/mid/deep): `team.screenPoint` мерджит nav-кандидаты в
+  `planner/moves.js`, а preset-only фактор `screenProgress` оценивает
+  приближение без жёстких вето. Цель перехвата исключается из direct-attack
+  pool всех остальных членов через `excludedAttackTargetIds` (pool угроз
+  остаётся полным), не может быть focus-целью concentrate-fire (фокус
+  перевычисляется с исключениями как входными ограничениями) и при
+  gm/morale-демоции роль вместе с objective-геометрией и target-pin
+  снимается, а командный запрет начинает действовать и на демотированного.
+  Превью видит триггер/confidence/rtd в `diagnostics.tactic.breakdown.interdiction`.
 - `TeamPlan` координирует временные задания и мягкую связность. Для
   жизнеспособного отряда с назначенной инициативой исполнитель сохраняет
   прогресс манёвра на Combat и строит свежий план только для текущего хода.

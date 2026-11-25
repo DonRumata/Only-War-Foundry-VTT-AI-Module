@@ -65,6 +65,7 @@ export function createModuleApi() {
             "reactions.flags": true,
             "services.register": true,
             "services.get": true,
+            "tactics.registry": true,
             "ui.npcSheet": true,
             "ui.tokenConfig": true,
             "ui.combatTracker": true,

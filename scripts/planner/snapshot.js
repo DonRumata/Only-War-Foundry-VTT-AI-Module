@@ -10,6 +10,7 @@ import {
     _collisionRevision,
     _findCombatantByToken,
     _itemSummaries,
+    _reconcileSelfStatuses,
     _resourcesFingerprint,
     _resourcesOf,
     _sceneOf,
@@ -79,15 +80,24 @@ export function _turnRevision(combat, combatant, authority) {
  * @param {string|null} input.collision Live collision revision.
  * @param {string[]|null} [input.selfStatuses] Injected fixture statuses
  *   (`context.selfStatuses`) that must merge into the live computation.
+ * @param {object|null} [input.statusAdjust] Self-inflicted status changes
+ *   of the plan's own steps (issue #93: `{added, removed}`) — reconciled
+ *   against the snapshot baseline before hashing so the fast-path
+ *   fingerprint stays valid after the plan's own unpin/drop-prone ran.
  * @param {object} input.snapshot Stored plan snapshot.
  * @returns {string}
  */
 export function _staleFingerprint(input) {
     const { combat, combatant, token, actor, targetToken, collision,
-        selfStatuses, snapshot } = input;
+        selfStatuses, statusAdjust, snapshot } = input;
     const position = _tokenPosition(token);
     const targetPosition = _tokenPosition(targetToken);
     const targetCombatant = _findCombatantByToken(combat, snapshot?.target?.tokenId ?? null);
+    const statuses = _reconcileSelfStatuses(
+        _selfStatuses(actor, token, selfStatuses),
+        Array.isArray(snapshot?.self?.statuses) ? snapshot.self.statuses : [],
+        statusAdjust ?? null
+    );
     return fnv1a(stableStringify({
         round: combat?.round ?? null,
         turn: combat?.turn ?? null,
@@ -98,7 +108,7 @@ export function _staleFingerprint(input) {
             token?.elevation ?? null,
             token?.hidden === true,
             combatant?.defeated === true,
-            _selfStatuses(actor, token, selfStatuses)
+            statuses
         ],
         target: snapshot?.target
             ? (targetToken

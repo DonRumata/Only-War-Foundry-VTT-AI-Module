@@ -87,7 +87,7 @@ function makeWorld({ enemies = [{ x: 3000, y: 0 }] } = {}) {
 
     const enemyCombatants = enemies.map(enemy => {
         const enemyActor = makeActor();
-        enemyActor.system = { wounds: { value: 10, max: 10 } };
+        enemyActor.system = { wounds: { value: 0, max: 10 } };
         enemyActor.items = enemy.items ?? [];
         const enemyToken = makeToken({ actor: enemyActor });
         enemyToken.x = enemy.x;
@@ -662,7 +662,7 @@ function makeMember({ fireteam, x = 0, y = 0, initiative = 10, items } = {}) {
 function makeTeamWorld(members, { wounds = 10, enemyX = 2000 } = {}) {
     const scene = makeScene({ grid: "square" });
     const enemyActor = makeActor();
-    enemyActor.system = { wounds: { value: wounds, max: wounds } };
+    enemyActor.system = { wounds: { value: 0, max: wounds } };
     enemyActor.items = [];
     const enemyToken = makeToken({ actor: enemyActor });
     enemyToken.x = enemyX;
@@ -743,6 +743,75 @@ test("fireteam: without a readable kill-EV the team keeps distributing", async (
         objective: { targetId: "other-target" }
     });
     assert.equal(ordered.teamPlan.convergence, null);
+});
+
+test("fireteam: scan convergence reads live wounds as max − value (issue #93)", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, x: 0, initiative: 20 });
+    const second = makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 15 });
+    const third = makeMember({ fireteam: { teamId: "alpha" }, x: 200, initiative: 5 });
+    const world = makeTeamWorld([leader, second, third], { wounds: 10 });
+    const service = createFireteamService({ planner: createPlannerService() });
+    // No injected targets — the combat scan reads the enemy actor's
+    // wounds. only-war counts `wounds.value` as damage taken: a fresh
+    // enemy (value 0, max 10) owns a pool of 10 and converges.
+    const perception = { hasLineOfSight: () => true };
+    const fresh = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, { seed: 5, perception });
+    assert.equal(fresh.status, FIRETEAM_STATUS.ok);
+    assert.ok(fresh.teamPlan.convergence, "a fresh enemy converges through the scan path");
+    assert.equal(fresh.teamPlan.convergence.wounds, 10);
+
+    // Eight damage taken of ten — the remaining pool is 2.
+    world.enemy.actor.system.wounds.value = 8;
+    const hurt = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, { seed: 5, perception });
+    assert.equal(hurt.teamPlan.convergence.wounds, 2,
+        "damage already taken shrinks the convergence pool");
+    assert.ok(hurt.teamPlan.convergence.margin
+        > fresh.teamPlan.convergence.margin,
+        "a wounded enemy is easier to focus down");
+
+    // A dead enemy (damage taken == max) never converges at all — before
+    // the fix the inverted read treated it as a full-health target.
+    world.enemy.actor.system.wounds.value = 10;
+    const dead = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, { seed: 5, perception });
+    assert.equal(dead.teamPlan.convergence, null);
+});
+
+test("fireteam: object wounds on injected targets follow the same semantics", async () => {
+    const leader = makeMember({ fireteam: { teamId: "alpha" }, x: 0, initiative: 20 });
+    const second = makeMember({ fireteam: { teamId: "alpha" }, x: 100, initiative: 15 });
+    const third = makeMember({ fireteam: { teamId: "alpha" }, x: 200, initiative: 5 });
+    const world = makeTeamWorld([leader, second, third], { wounds: 10 });
+    const service = createFireteamService({ planner: createPlannerService() });
+    // Injected `{value, max}` wounds read max − value; a plain number
+    // stays an already-effective pool (backwards compatibility).
+    const objectForm = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, {
+        seed: 5,
+        targets: [{
+            tokenId: world.enemyToken.id, x: 2000, y: 0,
+            wounds: { value: 6, max: 10 }
+        }]
+    });
+    assert.equal(objectForm.teamPlan.convergence.wounds, 4);
+    const plainForm = await service.buildTeamPlan(world.combat, {
+        teamId: "alpha",
+        leaderId: leader.combatant.id
+    }, {
+        seed: 5,
+        targets: [{ tokenId: world.enemyToken.id, x: 2000, y: 0, wounds: 10 }]
+    });
+    assert.equal(plainForm.teamPlan.convergence.wounds, 10);
 });
 
 test("planner: run offers a full-action sprint beyond the full move", async () => {

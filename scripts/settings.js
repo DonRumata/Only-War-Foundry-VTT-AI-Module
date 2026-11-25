@@ -56,6 +56,9 @@ import {
     SPEC_OPS_NUMERIC_RANGES,
     resolveSpecOpsConfig
 } from "./presets/spec-ops-config.js";
+import {
+    PEEL_DEFAULT_THRESHOLDS
+} from "./tactics/peel-withdrawal.js";
 
 const SPEC_OPS_SETTINGS = {
     flankMinAngleDegrees: SETTING_KEYS.specOpsFlankMinAngleDegrees,
@@ -67,6 +70,9 @@ const SPEC_OPS_SETTINGS = {
     cohesionWeight: SETTING_KEYS.specOpsCohesionWeight,
     fallbackPreset: SETTING_KEYS.specOpsFallbackPreset
 };
+
+/** World-setting keys of the peel-withdrawal threshold contract (issue #89). */
+const PEEL_SETTING_FIELDS = Object.keys(PEEL_DEFAULT_THRESHOLDS);
 
 /** Register the module's world settings. Called on `init`. */
 export function registerSettings() {
@@ -300,6 +306,22 @@ export function registerSettings() {
         default: 2
     });
 
+    // Issue #89: every peel threshold is a GM-tunable world setting. The
+    // tactical defaults remain experimental and documented; context
+    // overrides still win inside `buildTeamPlan`/selector tests.
+    for (const field of PEEL_SETTING_FIELDS) {
+        const label = field === "peelAllowUncovered" ? "PeelAllowUncovered"
+            : `Peel${field.slice(4)}`;
+        game.settings.register(MODULE_ID, SETTING_KEYS[field], {
+            name: `OWAI.Settings.${label}.Name`,
+            hint: `OWAI.Settings.${label}.Hint`,
+            scope: "world",
+            config: true,
+            type: field === "peelAllowUncovered" ? Boolean : Number,
+            default: PEEL_DEFAULT_THRESHOLDS[field]
+        });
+    }
+
     for (const [field, key] of Object.entries(SPEC_OPS_SETTINGS)) {
         const range = SPEC_OPS_NUMERIC_RANGES[field];
         game.settings.register(MODULE_ID, key, {
@@ -358,6 +380,27 @@ export function getPreferredCohesion() {
     } catch(_err) {
         return DEFAULT_PREFERRED_COHESION;
     }
+}
+
+/**
+ * Resolved peel-withdrawal thresholds (issue #89): world settings with
+ * hard pure-core defaults as fallback. Returned as a plain object suitable
+ * for `context.peel`; callers may still override individual keys.
+ * @returns {object}
+ */
+export function getPeelThresholds() {
+    const resolved = { ...PEEL_DEFAULT_THRESHOLDS };
+    for (const field of PEEL_SETTING_FIELDS) {
+        try {
+            const value = globalThis.game?.settings?.get(MODULE_ID, SETTING_KEYS[field]);
+            resolved[field] = field === "peelAllowUncovered"
+                ? value === true
+                : (Number.isFinite(Number(value)) ? Number(value) : PEEL_DEFAULT_THRESHOLDS[field]);
+        } catch(_err) {
+            resolved[field] = PEEL_DEFAULT_THRESHOLDS[field];
+        }
+    }
+    return resolved;
 }
 
 /**

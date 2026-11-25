@@ -41,6 +41,25 @@
  * tie-breaking live in the planner.
  */
 import { evaluateFactors } from "../planner.js";
+import { DEFAULT_TACTIC_PRIORITY } from "../tactics/registry.js";
+import {
+    SUPPRESSION_ZONE_VETO,
+    alignSuppressAndBoundTarget,
+    explainSuppressAndBound,
+    suppressionFactorOf,
+    suppressionZoneViolation
+} from "../tactics/suppress-and-bound.js";
+import {
+    specOpsFlankGeometry,
+    specOpsFlankProgress,
+    specOpsTargetCenter
+} from "./spec-ops.js";
+import {
+    evaluatePeelCascade
+} from "../tactics/peel-withdrawal.js";
+import {
+    evaluateChokepointCascade
+} from "./chokepoint-defense.js";
 
 /** Preset id registered in the planner preset registry. */
 export const RANGED_COVER_PRESET_ID = "rangedCover";
@@ -99,8 +118,83 @@ export const RANGED_COVER_WEIGHTS = Object.freeze({
     outnumber: 1,
     // Run mechanic (smoke): a sprint between firing positions is a
     // fallback — useful when the next cover lies past a full move.
-    run: 0.5
+    run: 0.5,
+    // Recover-pinned overlay (issue #90): reaching cover against the pin
+    // threat is this doctrine's natural answer to suppression — the
+    // strongest recoverCover pull of the presets; the team redirect is
+    // a soft weight, never an assignment.
+    recoverCover: 6,
+    recoverRedirect: 2
 
+});
+
+/**
+ * Temporary fireteam-task overlays for rangedCover (issue #86). They are
+ * merged only when `context.team.task` exists; a solo rangedCover NPC keeps
+ * the historical base weights bit-for-bit. `flankAngle`/`flankProgress` reuse
+ * the spec-ops geometry helpers instead of a copied implementation.
+ */
+export const RANGED_COVER_TASK_WEIGHTS = Object.freeze({
+    support: Object.freeze({
+        attackNow: 11,
+        attackAfterMove: 4,
+        charge: -8,
+        melee: -14,
+        advance: 0,
+        los: 7,
+        cover: 9,
+        exposure: -4,
+        holdPosition: 3,
+        rangeBand: 7
+    }),
+    advance: Object.freeze({
+        attackNow: 8,
+        attackAfterMove: 6,
+        advance: 4,
+        proximity: 1.5,
+        los: 6,
+        cover: 5,
+        exposure: -2,
+        holdPosition: 0,
+        rangeBand: 5
+    }),
+    flank: Object.freeze({
+        attackNow: 8,
+        attackAfterMove: 7,
+        advance: 3,
+        proximity: 1.5,
+        los: 6,
+        cover: 4,
+        exposure: -2,
+        holdPosition: -1,
+        rangeBand: 5,
+        flankAngle: 6,
+        flankProgress: 5
+    }),
+    regroup: Object.freeze({
+        attackNow: 3,
+        attackAfterMove: 1,
+        advance: 0,
+        los: 4,
+        cover: 8,
+        exposure: -4,
+        holdPosition: -2,
+        withdrawal: 11,
+        freeAttackCost: -8,
+        disengage: 4
+    })
+});
+
+/** Role overlays; suppression is a role bonus, never a hard direct-fire veto. */
+export const RANGED_COVER_ROLE_WEIGHTS = Object.freeze({
+    suppressor: Object.freeze({ suppression: 8 }),
+    withdraw: Object.freeze({
+        withdrawal: 5, freeAttackCost: -4, attackNow: -5, attackAfterMove: -6, holdPosition: -4
+    }),
+    cover: Object.freeze({
+        coveringWithdrawal: 8, suppression: 7, attackNow: 3, overwatch: 1, holdPosition: 2,
+        withdrawal: -4
+    })
 });
 
 /** Candidate variants whose action produces an attack/test step. */
@@ -509,6 +603,101 @@ function _aimAvailable(context = {}) {
 }
 
 /**
+ * Ranged-cover maneuver cascade (issue #86). v1 intentionally has one real
+ * maneuver — suppress-and-bound — and otherwise returns a diagnostic
+ * `name:null` descriptor so the default fireteam policy remains unchanged.
+ * The shape leaves a stable insertion point for future rangedCover maneuvers
+ * (notably chokepoint defense) without changing registry semantics.
+ * @param {object} input Selector input supplied by `fireteam._resolveTactic`.
+ * @returns {object} Serializable tactic descriptor or a `name:null` cascade
+ *   degradation.
+ */
+export function selectRangedCoverTactic(input = {}) {
+    const context = input.context ?? {};
+    const combat = input.combat ?? context.combat ?? null;
+    const scene = input.scene ?? context.scene ?? combat?.scene ?? null;
+    const geometryContext = { ...context, combat, scene };
+    // Issue #89: peel outranks suppress-and-bound — suppression can be the
+    // peel cover mode, but the squad must not recommit to a normal bounding
+    // maneuver once withdrawal doctrine has triggered.
+    const peel = evaluatePeelCascade({
+        members: input.members ?? [],
+        leaderId: input.leaderId ?? null,
+        targets: input.targets ?? context.targets ?? [],
+        casualties: input.casualties ?? context.casualties ?? 0,
+        moraleInfo: input.moraleInfo ?? context.moraleInfo ?? null,
+        moraleTier: input.moraleTier ?? context.moraleTier ?? null,
+        scene,
+        combat,
+        context: geometryContext
+    });
+    if (peel.descriptor) return peel.descriptor;
+    // Issue #91: an explicit defensive anchor/posture outranks the
+    // offensive suppress-and-bound maneuver. The preset gate below keeps
+    // centroid-only open battles on the legacy cascade unchanged.
+    const defense = evaluateChokepointCascade({
+        ...input,
+        scene,
+        combat,
+        context: geometryContext
+    }, { presetId: RANGED_COVER_PRESET_ID });
+    if (defense.descriptor) return defense.descriptor;
+    const targets = (input.targets ?? context.targets ?? []).map(target => {
+        const center = specOpsTargetCenter(target, geometryContext);
+        return center ? { ...target, x: center.x, y: center.y } : target;
+    });
+    const suppression = explainSuppressAndBound({
+        members: input.members ?? [],
+        leaderId: input.leaderId ?? null,
+        targets,
+        objective: input.objective ?? context.objective ?? null,
+        casualties: input.casualties ?? 0,
+        scene,
+        combat,
+        context: geometryContext
+    });
+    const breakdown = {
+        peel: {
+            selected: false,
+            reason: peel.reason ?? null,
+            rejections: [...(peel.rejections ?? [])]
+        },
+        chokepoint: {
+            selected: false,
+            reason: defense.reason ?? null,
+            ...(defense.breakdown ?? {})
+        },
+        suppression: {
+            reason: suppression.reason,
+            selected: suppression.selected,
+            ...suppression.breakdown
+        }
+    };
+    if (suppression.selected) {
+        return {
+            ...alignSuppressAndBoundTarget(
+                suppression.descriptor, input.objective ?? context.objective ?? null),
+            breakdown
+        };
+    }
+    return {
+        name: null,
+        reason: suppression.reason,
+        assignments: {},
+        breakdown
+    };
+}
+
+/**
+ * Default rangedCover tactic factory registered in the tactic registry.
+ * @param {object} input Team selector input.
+ * @returns {object} Suppress-and-bound descriptor or a serializable null result.
+ */
+export function rangedCoverTactic(input = {}) {
+    return selectRangedCoverTactic(input);
+}
+
+/**
  * Preset veto predicate (planner contract, issue #405): an attack
  * candidate whose LOS is positively blocked — adapter verdict, perception
  * probe or the geometric wall fallback — is rejected with
@@ -520,6 +709,9 @@ function _aimAvailable(context = {}) {
  * @returns {string|null} Rejection reason or null when acceptable.
  */
 export function rangedCoverVeto({ candidate = {}, context = {} } = {}) {
+    if (suppressionZoneViolation(candidate, context.team?.exclusionZones)) {
+        return SUPPRESSION_ZONE_VETO;
+    }
     if (!ATTACK_VARIANTS.has(candidate.variant)) return null;
     // Blast memory strikes need no live LOS — the throw lands on a
     // remembered position (room clearing); friendlies were already
@@ -558,6 +750,11 @@ export function evaluateRangedCover({
     const rawLos = probe.los ?? (_finiteOr(factors.los, 0)
         || (target && target.source !== "last-known" ? 1 : 0));
     const effectiveLos = rawLos ? 1 : 0;
+    const task = typeof context.team?.task === "string"
+        && RANGED_COVER_TASK_WEIGHTS[context.team?.task]
+        ? context.team.task
+        : null;
+    const role = typeof context.team?.role === "string" ? context.team.role : null;
     const enriched = {
         ...factors,
         los: effectiveLos,
@@ -566,7 +763,37 @@ export function evaluateRangedCover({
         aimOpportunity: aimAvailable && candidate.variant === "attack-in-place"
             && effectiveLos === 1 ? 1 : 0
     };
-    const evaluation = evaluateFactors(enriched, weights);
+    if (role === "suppressor") {
+        enriched.suppression = suppressionFactorOf(candidate);
+    }
+    if (role === "cover") {
+        const mode = context.team?.peel?.coverMode ?? null;
+        enriched.coveringWithdrawal = mode === "suppression"
+            ? suppressionFactorOf(candidate)
+            : mode === "overwatch"
+                ? (candidate.variant === "overwatch" ? 1 : 0)
+                : (ATTACK_VARIANTS.has(candidate.variant) ? 1 : 0);
+    }
+    if (task === "flank") {
+        const { angle } = specOpsFlankGeometry(candidate, context);
+        const minAngle = context.team?.flankMinAngleDegrees ?? 90;
+        enriched.flankAngle = Math.round(_clamp01(angle / minAngle) * 1e4) / 1e4;
+        enriched.flankProgress = specOpsFlankProgress(candidate, context);
+    }
+    const effective = {
+        ...weights,
+        ...(task ? RANGED_COVER_TASK_WEIGHTS[task] : {}),
+        ...(RANGED_COVER_ROLE_WEIGHTS[role] ?? {})
+    };
+    const laneDefense = context.tactic === "chokepoint-defense"
+        && context.team?.memberObjective?.type === "defend"
+        && context.team?.role === "overwatch-lane";
+    if (laneDefense) {
+        enriched.suppression = candidate.action?.attackType === "suppressing_fire" ? 1 : 0;
+        effective.laneCoverage = Math.max(_finiteOr(effective.laneCoverage, 0), 3);
+        effective.suppression = Math.max(_finiteOr(effective.suppression, 0), 3);
+    }
+    const evaluation = evaluateFactors(enriched, effective);
     return {
         score: evaluation.score,
         breakdown: {
@@ -578,7 +805,18 @@ export function evaluateRangedCover({
                 cover: probe.cover,
                 rangeBand
             },
-            aimAvailable
+            aimAvailable,
+            ...(context.team ? {
+                team: {
+                    mode: "fireteam",
+                    task: task ?? context.team.task ?? null,
+                    role,
+                    suppression: role === "suppressor" ? (enriched.suppression ?? 0) : null,
+                    coveringWithdrawal: role === "cover" ? (enriched.coveringWithdrawal ?? 0) : null,
+                    flankAngle: task === "flank" ? (enriched.flankAngle ?? 0) : null,
+                    flankProgress: task === "flank" ? (enriched.flankProgress ?? 0) : null
+                }
+            } : {})
         }
     };
 }
@@ -610,4 +848,23 @@ export function registerRangedCoverPreset(planner) {
         throw new Error("[only-war-ai] Ranged-cover preset requires a planner service");
     }
     return planner.registerPreset(RANGED_COVER_PRESET_ID, rangedCoverPresetDefinition());
+}
+
+/**
+ * Register the rangedCover maneuver selector (issue #86). v1 is the
+ * suppress-and-bound-or-null cascade; overlay selectors and future maneuvers
+ * keep their own priority slots in the registry.
+ * @param {object} tactics Tactic registry service.
+ * @returns {object} The frozen registration record.
+ */
+export function registerRangedCoverTacticSelector(tactics) {
+    if (!tactics || typeof tactics.registerTacticSelector !== "function") {
+        throw new Error("[only-war-ai] Ranged-cover tactic requires a tactic registry");
+    }
+    return tactics.registerTacticSelector({
+        presetId: RANGED_COVER_PRESET_ID,
+        kind: "maneuver",
+        priority: DEFAULT_TACTIC_PRIORITY,
+        select: rangedCoverTactic
+    });
 }

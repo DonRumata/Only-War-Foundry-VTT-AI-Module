@@ -29,6 +29,7 @@ import {
 import {
     ATTACK_TYPE_DESIRE,
     ATTACK_TYPE_DESIRE_DEFAULT,
+    ATTACK_VARIANTS,
     DEFAULT_LOOKAHEAD_LAMBDA,
     DEFAULT_LOOKAHEAD_TOP_K,
     DEFAULT_MELEE_RANGE,
@@ -90,13 +91,38 @@ import {
  * @param {Map<string,object>|null} [input.shooterProfiles] tokenUuid →
  *   `{threat, distance}` of visible enemies — feeds the `counterThreat`
  *   factor weighting safer firing angles.
+ * @param {number|null} [input.withdrawal] Precomputed regroup progress
+ *   of a peel withdrawal candidate (`0..1`).
+ * @param {number|null} [input.coveringWithdrawal] Cover-role lane/mode
+ *   evidence (`0..1`).
+ * @param {number|null} [input.freeAttackCost] Explicit ordinary melee-exit
+ *   risk cost (`0..1`); presets weight it negatively.
+ * @param {number|null} [input.disengage] Structural Disengage capability
+ *   marker (`1` only for the full-action move candidate).
+ * @param {number|null} [input.recoverCover] Precomputed cover improvement
+ *   of the candidate endpoint against the pin-threat position (`0..1`,
+ *   issue #90) — zero unless the fireteam injected `team.recover` for a
+ *   recovering pinned member.
+ * @param {object|string|null} [input.redirectTarget] Soft redirect target
+ *   identity (`{tokenId, tokenUuid, actorId}` or a plain id) of the
+ *   recover-pinned overlay — attack candidates on that target light the
+ *   `recoverRedirect` factor (issue #90).
+ * @param {boolean|null} [input.redirectSuppress] Doctrinal suppression
+ *   preference of the cover-fire donor (issue #90): a suppressing-fire
+ *   candidate on the redirect target keeps the full factor while other
+ *   attack types score a reduced share.
+ * @param {number|null} [input.laneCoverage] Soft post/lane coverage score
+ *   of the candidate endpoint (`0..1`, issue #91); inert at weight zero.
  * @returns {object}
  */
 export function _factorsOf({ variant, target, move, action, moveBudget = null, blastHits = 0,
     dangerAt = null, selfPos = null, dodge = null, preferredWeapon = null,
     lastUsedWeapon = null, traits = [], dodgeTN = null,
     allyEngagedTargets = null, enemies = null, lastAttacker = null,
-    orderBoost = null, lastTarget = null, shooterProfiles = null }) {
+    orderBoost = null, lastTarget = null, shooterProfiles = null,
+    withdrawal = null, coveringWithdrawal = null, freeAttackCost = null,
+    disengage = null, recoverCover = null, redirectTarget = null,
+    redirectSuppress = null, laneCoverage = null }) {
     const targetDistance = _finiteOr(target?.distance, null);
     const postDistance = _finiteOr(move?.distance, targetDistance);
     const canAttack = target?.canAttack === true;
@@ -316,7 +342,58 @@ export function _factorsOf({ variant, target, move, action, moveBudget = null, b
         // Run mechanic (smoke request): a full-action sprint beyond the
         // full-move rate — the doctrine weight prices burning the whole
         // turn on ground gain.
-        run: variant === "run" ? 1 : 0
+        run: variant === "run" ? 1 : 0,
+        // Peel-withdrawal (issue #89): candidate-generation metadata,
+        // already normalized by the planner/pure selector. `withdrawal`
+        // measures progress toward the validated regroup point (1 = exact
+        // arrival), `freeAttackCost` is the explicit positive cost of an
+        // ordinary melee exit (the preset weight is negative), and
+        // `disengage` marks the rare structurally detected full-action
+        // capability. `coveringWithdrawal` is lane/mode evidence computed
+        // for cover-role candidates.
+        withdrawal: Number.isFinite(withdrawal)
+            ? Math.max(0, Math.min(1, withdrawal))
+            : (variant === "withdraw" || variant === "disengage" ? 1 : 0),
+        coveringWithdrawal: Number.isFinite(coveringWithdrawal)
+            ? Math.max(0, Math.min(1, coveringWithdrawal)) : 0,
+        freeAttackCost: Number.isFinite(freeAttackCost)
+            ? Math.max(0, Math.min(1, freeAttackCost)) : 0,
+        disengage: Number.isFinite(disengage)
+            ? Math.max(0, Math.min(1, disengage))
+            : (variant === "disengage" ? 1 : 0),
+        // Recover-pinned overlay (issue #90): `recoverCover` is candidate
+        // metadata precomputed by the planner (endpoint cover improvement
+        // against the pin threat, exactly like the peel `withdrawal`
+        // channel); `recoverRedirect` marks attack candidates whose target
+        // is the attributed suppression source — a soft weight, never an
+        // assignment or a pool narrowing. When the cover donor carries the
+        // doctrinal suppression preference (`redirectSuppress`), a
+        // suppressing-fire answer on the source scores the full factor
+        // while any other attack type keeps a slightly reduced share —
+        // the modest contextual tilt the issue asks for: suppression is
+        // preferred, never forced, and direct fire against a lone source
+        // remains a valid pin-stopper.
+        recoverCover: Number.isFinite(recoverCover)
+            ? Math.max(0, Math.min(1, recoverCover)) : 0,
+        recoverRedirect: redirectTarget != null && target && ATTACK_VARIANTS.has(variant)
+            && ((typeof redirectTarget === "object"
+                && ((redirectTarget.tokenUuid != null
+                        && target.tokenUuid === redirectTarget.tokenUuid)
+                    || (redirectTarget.tokenId != null
+                        && target.tokenId === redirectTarget.tokenId)
+                    || (redirectTarget.actorId != null
+                        && target.actorId === redirectTarget.actorId)))
+                || (typeof redirectTarget !== "object"
+                    && [target.tokenId, target.tokenUuid, target.actorId]
+                        .some(id => id != null && String(id) === String(redirectTarget))))
+            ? (redirectSuppress === true && action?.attackType !== "suppressing_fire" ? 0.8 : 1)
+            : 0,
+        // Chokepoint-defense (issue #91): precomputed endpoint/post lane
+        // coverage. The value is exactly zero unless a TeamPlan injected a
+        // defense lane, so solo presets and all non-defense tactics remain
+        // bit-for-bit unchanged.
+        laneCoverage: Number.isFinite(laneCoverage)
+            ? Math.max(0, Math.min(1, laneCoverage)) : 0
     };
 }
 

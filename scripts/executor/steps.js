@@ -12,6 +12,9 @@ import {
     STALE_REASONS
 } from "../planner.js";
 import {
+    _selfStatuses
+} from "../planner/documents.js";
+import {
     EXECUTOR_REASONS,
     ROLL_API
 } from "./contract.js";
@@ -162,7 +165,11 @@ export function createStepHandlers({
             delta: outcome.resourceDelta ?? {},
             chatMessageIds: Array.isArray(outcome.chatMessageIds) ? outcome.chatMessageIds : [],
             duplicate: outcome.duplicate === true,
-            hits: Number.isFinite(outcome.roll?.hits) ? outcome.roll.hits : null
+            hits: Number.isFinite(outcome.roll?.hits) ? outcome.roll.hits : null,
+            // Issue #93: the roll's success flag rides the outcome so
+            // result-dependent follow-ups (unpin clearing `pinned` only
+            // on a passed Willpower test) never guess from hit counts.
+            success: outcome.roll?.success === true
         };
     }
 
@@ -486,6 +493,43 @@ export function createStepHandlers({
 
 
     /**
+     * Clear the `pinned` status after a successful unpin Willpower test
+     * (issue #93). The system canonical `removeCondition` channel wins
+     * when present; the Foundry `toggleStatusEffect(..., {active:
+     * false})` pipeline is the fallback. Both channels are best-effort —
+     * the roll itself already landed, so a missing status API never
+     * fails the step; the outcome records whether the status actually
+     * cleared.
+     * @param {object} context
+     * @param {object} run Shared execution state.
+     * @returns {Promise<boolean>} True when a removal channel ran.
+     */
+    async function _clearPinned(context, run) {
+        const actor = run.combatant?.actor
+            ?? _tokenDoc(run.combatant?.token)?.actor
+            ?? null;
+        if (!actor) return false;
+        if (typeof actor.removeCondition === "function") {
+            try {
+                await actor.removeCondition("pinned");
+                return true;
+            } catch(err) {
+                // Fall through to the toggle channel.
+            }
+        }
+        if (typeof actor.toggleStatusEffect === "function") {
+            try {
+                await actor.toggleStatusEffect("pinned", { active: false });
+                return true;
+            } catch(err) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+
+    /**
      * Record the weapon of a successful attack on the combatant
      * `lastUsedWeapon` flag (issue #37): the planner's `weaponInertia`
      * factor reads it next turn. Controller-only writes — the executor
@@ -544,6 +588,20 @@ export function createStepHandlers({
                 return _stepMove(step, context, run.combatant);
             case "attack":
             case "test": {
+                // Issue #93: an unpin step only makes sense while the
+                // combatant is actually pinned. A replayed commitment may
+                // still carry the step after last turn's test already
+                // cleared the status — skip it instead of rolling a
+                // pointless Willpower test.
+                if (step.type === "test" && step?.input?.unpin === true) {
+                    const actor = run.combatant?.actor
+                        ?? _tokenDoc(run.combatant?.token)?.actor ?? null;
+                    const statuses = _selfStatuses(actor,
+                        _tokenDoc(run.combatant?.token), context.selfStatuses);
+                    if (!statuses.includes("pinned")) {
+                        return { ok: true, skipped: true, reason: "not-pinned" };
+                    }
+                }
                 const outcome = await _stepRoll(step.type, step, context,
                     run.plan, run.operationId);
                 // AimedUntil: a taken shot consumes the combatant `aim`
@@ -565,6 +623,17 @@ export function createStepHandlers({
                 // `lastOrder` — the fireteam cooldown gate reads it.
                 if (outcome.ok && step.type === "test" && step?.input?.orderId) {
                     await _recordLastOrder(step, context, run);
+                }
+                // Issue #93: the unpin test clears `pinned` only when the
+                // Willpower roll actually succeeded — a failed test keeps
+                // the status (corebook pinning recovery). The step itself
+                // is ok either way: the roll executed.
+                if (outcome.ok && step.type === "test" && step?.input?.unpin === true) {
+                    if (outcome.success === true) {
+                        outcome.unpinCleared = await _clearPinned(context, run);
+                    } else {
+                        outcome.unpinCleared = false;
+                    }
                 }
                 return outcome;
             }
@@ -597,6 +666,7 @@ export function createStepHandlers({
         _stepOverwatch,
         _stepReadyWeapon,
         _stepDropProne,
+        _clearPinned,
         _recordLastUsedWeapon,
         _runStep
     };

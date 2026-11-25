@@ -107,6 +107,7 @@ import {
     _findCombatantByToken,
     _findToken,
     _moraleOf,
+    _reconcileSelfStatuses,
     _resourcesFingerprint,
     _sceneOf,
     _selfStatuses,
@@ -136,11 +137,16 @@ import {
     buildPlanSnapshot
 } from "./planner/snapshot.js";
 import {
-    _stepsFor
+    _planEndCentre,
+    _stepsFor,
+    _unpinTestStep
 } from "./planner/steps.js";
 import { SPEC_OPS_FALLBACK_PRESETS } from "./presets/spec-ops-config.js";
 import {
     _allyEngagedTargets,
+    _attackPoolAllows,
+    _attackPoolDiagnostics,
+    _attackPoolSpec,
     _enemyContacts,
     _isMemorySource,
     _nearestThreat,
@@ -171,7 +177,118 @@ import {
     _overwatchAnchors,
     _overwatchZone
 } from "./planner/zones.js";
+import {
+    compactLaneMetadata,
+    defenseLaneOf,
+    laneCoverageScore,
+    laneIncludesTarget
+} from "./tactics/lane-coverage.js";
 
+
+/**
+ * Distance from a point to a segment in pixels. Used only for defensive
+ * peel-route vetoes; tactical geometry remains in the pure selector.
+ * @param {object} point
+ * @param {object} a
+ * @param {object} b
+ * @returns {number}
+ */
+function _pointSegmentDistancePx(point, a, b) {
+    if (!point || !a || !b) return Number.POSITIVE_INFINITY;
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const length2 = (dx * dx) + (dy * dy);
+    if (length2 <= 0) return Math.hypot(point.x - a.x, point.y - a.y);
+    const t = Math.max(0, Math.min(1,
+        (((point.x - a.x) * dx) + ((point.y - a.y) * dy)) / length2));
+    return Math.hypot(point.x - (a.x + (t * dx)), point.y - (a.y + (t * dy)));
+}
+
+/**
+ * Polyline of a withdrawal move. Candidate cells from `findCandidates`
+ * may lack waypoints; the endpoint-only fallback still allows an enemy
+ * cell/consolidated threat-centroid crossing check.
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @returns {object[]}
+ */
+function _withdrawalPolyline(move, selfPos) {
+    const points = [{ x: selfPos.x, y: selfPos.y }];
+    for (const point of move?.waypoints ?? []) {
+        if (Number.isFinite(point?.x) && Number.isFinite(point?.y)) {
+            points.push({ x: point.x, y: point.y });
+        }
+    }
+    if (Number.isFinite(move?.x) && Number.isFinite(move?.y)) {
+        const last = points[points.length - 1];
+        if (!last || Math.hypot(last.x - move.x, last.y - move.y) > 1e-9) {
+            points.push({ x: move.x, y: move.y });
+        }
+    }
+    return points;
+}
+
+/**
+ * Whether the withdrawal polyline crosses an enemy cell or the consolidated
+ * threat centroid. This is a conservative runtime revalidation of the pure
+ * selector's vetoes, not a second tactical geometry engine.
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @param {object[]} enemies Enemy contacts `{x,y}` in pixels.
+ * @param {object|null} threatCentroid Peel threat centroid in pixels.
+ * @param {number} pxPerUnit Pixels per scene unit.
+ * @returns {boolean}
+ */
+function _withdrawalRouteCrossesThreat(move, selfPos, enemies, threatCentroid, pxPerUnit) {
+    const points = _withdrawalPolyline(move, selfPos);
+    if (points.length < 2) return false;
+    const radius = Math.max(1, 0.5 * (pxPerUnit > 0 ? pxPerUnit : 1));
+    const blockers = [
+        ...(enemies ?? []).filter(enemy => Number.isFinite(enemy?.x) && Number.isFinite(enemy?.y)),
+        ...(Number.isFinite(threatCentroid?.x) && Number.isFinite(threatCentroid?.y)
+            ? [threatCentroid] : [])
+    ];
+    for (const blocker of blockers) {
+        for (let index = 0; index < points.length - 1; index += 1) {
+            if (_pointSegmentDistancePx(blocker, points[index], points[index + 1]) <= radius + 1e-9) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Pinned-withdrawal legality outside melee: no route point may reduce the
+ * distance to any enemy, and the endpoint must not end closer to the
+ * nearest enemy than the start. Engaged members are treated as ordinary
+ * melee withdrawals (pinning is suppressed by melee per the corebook).
+ * @param {object} move Normalized move candidate.
+ * @param {object} selfPos Self centre in pixels.
+ * @param {object[]} enemies Enemy contacts `{x,y,reachPx}`.
+ * @returns {boolean}
+ */
+function _pinnedWithdrawalRouteLegal(move, selfPos, enemies) {
+    const points = _withdrawalPolyline(move, selfPos);
+    let startNearest = Number.POSITIVE_INFINITY;
+    let endNearest = Number.POSITIVE_INFINITY;
+    for (const enemy of enemies ?? []) {
+        if (!Number.isFinite(enemy?.x) || !Number.isFinite(enemy?.y)) continue;
+        const startDistance = Math.hypot(enemy.x - selfPos.x, enemy.y - selfPos.y);
+        startNearest = Math.min(startNearest, startDistance);
+        const engagedAtStart = Number.isFinite(enemy.reachPx)
+            && startDistance <= enemy.reachPx + 1e-9;
+        if (engagedAtStart) continue;
+        for (const point of points.slice(1)) {
+            if (Math.hypot(enemy.x - point.x, enemy.y - point.y) < startDistance - 1e-9) {
+                return false;
+            }
+        }
+        const end = points[points.length - 1];
+        if (end) endNearest = Math.min(endNearest, Math.hypot(enemy.x - end.x, enemy.y - end.y));
+    }
+    return !Number.isFinite(startNearest) || endNearest >= startNearest - 1e-9;
+}
 
 /**
  * Create the `planner` service published as `api.services.get("planner")`.
@@ -244,7 +361,11 @@ export function createPlannerService({
      *   `collisionRevision`, `maxTargets`, `maxActions`,
      *   `approximateMoves`, `selfStatuses`, `difficulty`,
      *   `personality` (trait list or `false` to disable, issue #19),
-     *   `team` (`{task, character, center, regroupPoint, ...}`).
+     *   `team` (`{task, character, center, regroupPoint, ...}`),
+     *   `attackTargetIds`/`excludedAttackTargetIds` (epic #84 — narrow
+     *   the direct-attack pool by tokenId/tokenUuid/actorId while the
+     *   full perception pool keeps feeding movement, threat reads and
+     *   overwatch; see `_attackPoolSpec`).
      * @returns {Promise<object>} `{status, plan?, reason?, diagnostics?}`.
      */
     async function planTurn(combat, combatant, context = {}) {
@@ -430,6 +551,77 @@ export function createPlannerService({
         }
         const isPinned = selfStatuses.includes("pinned");
         const isProne = selfStatuses.includes("prone");
+        // Services resolve ahead of L1: the committed-attack staleness
+        // check (los-broken) needs the perception probe inside the live
+        // view, and navigation feeds the flank move probe further down.
+        // They are hoisted above the team-coordination short-circuits so
+        // the pinned recovery step below can probe cover in every path.
+        const perception = _service("perception", context.perception);
+        const navigation = _service("navigation", context.navigation);
+        // Issue #93: pinning recovery is not an action — per the Only War
+        // corebook the pinned character makes a free Willpower test at
+        // the end of its turn (+0 base, +30 when in cover against the
+        // nearest known threat; the not-shot-at bonus needs shot data the
+        // module does not track, so it is never assumed). The test never
+        // competes as a full-cost action candidate: every plan a pinned
+        // bot receives — scored, replayed commitment or team-coordinated —
+        // carries the zero-cost `endOfTurn` step ahead of the end-turn
+        // step instead. Actors without a willpower characteristic cannot
+        // test and simply stay pinned.
+        const unpinAvailable = isPinned && _unpinAction(actor) !== null;
+        // `endCentre` — the footprint centre (pixels) the plan leaves the
+        // bot in: the test is taken at the END of the turn, so cover is
+        // probed from the endpoint of the planned movement, never from
+        // the turn-start spot (review finding: a pinned bot legally
+        // crawling into cover must see the +30). Null/absent means the
+        // plan has no move — the current position stands.
+        const unpinModifierSpec = (threatTargets, endCentre = null) => {
+            const spec = { modifier: 0, modifierBasis: "base" };
+            const threat = _nearestThreat(threatTargets, selfPos, grid);
+            if (!threat || !navigation || typeof navigation.coverEstimate !== "function"
+                || !Number.isFinite(threat?.x) || !Number.isFinite(threat?.y)) {
+                return spec;
+            }
+            // The serialized move endpoint is already a footprint centre
+            // in pixels (the executor contract — see `_stepMove`), exactly
+            // what `coverEstimate` probes. `selfPos` on the other hand is
+            // the token's top-left document point, so the no-move fallback
+            // converts it to the footprint centre.
+            const size = _finiteOr(grid?.size, 100);
+            const centre = Number.isFinite(endCentre?.x) && Number.isFinite(endCentre?.y)
+                ? { x: endCentre.x, y: endCentre.y }
+                : (Number.isFinite(selfPos?.x) && Number.isFinite(selfPos?.y)
+                    ? {
+                        x: selfPos.x + (_finiteOr(tokenDoc?.width, 1) * size / 2),
+                        y: selfPos.y + (_finiteOr(tokenDoc?.height, 1) * size / 2)
+                    }
+                    : null);
+            if (!centre) return spec;
+            try {
+                const cover = navigation.coverEstimate(tokenDoc, centre,
+                    { x: threat.x, y: threat.y });
+                if (_finiteOr(cover, 0) >= 0.5) {
+                    spec.modifier = 30;
+                    spec.modifierBasis = "in-cover";
+                }
+            } catch(_err) {
+                // Cover probing is best-effort — the base +0 test stands.
+            }
+            return spec;
+        };
+        const appendUnpinStep = (steps, spec) => {
+            if (!unpinAvailable || !spec) return steps;
+            if ((steps ?? []).some(step => step?.input?.unpin === true)) return steps;
+            const step = _unpinTestStep(spec);
+            const list = [...(steps ?? [])];
+            // The test is taken at the end of the turn: it rides ahead of
+            // the end-turn step, after everything the budget paid for.
+            const endIndex = list.reduce((acc, entry, index) =>
+                (entry?.type === "end-turn" ? index : acc), -1);
+            if (endIndex >= 0) list.splice(endIndex, 0, step);
+            else list.push(step);
+            return list;
+        };
         const teamTurn = context.teamTurn;
         const coordinationPlan = (steps, reason) => {
             diagnostics.chosenStep = steps[0].id;
@@ -443,13 +635,13 @@ export function createPlannerService({
         if (teamTurn?.phase === "wait") {
             const steps = _stepsFor({ candidate: { variant: "hold" } });
             steps[0].input.reason = teamTurn.reason;
-            return coordinationPlan(steps, teamTurn.reason);
+            // A hold carries no movement — `_planEndCentre` yields null
+            // and the cover probe falls back to the current position.
+            return coordinationPlan(
+                appendUnpinStep(steps,
+                    unpinModifierSpec(context.targets ?? [], _planEndCentre(steps))),
+                teamTurn.reason);
         }
-        // Services resolve ahead of L1: the committed-attack staleness
-        // check (los-broken) needs the perception probe inside the live
-        // view, and navigation feeds the flank move probe further down.
-        const perception = _service("perception", context.perception);
-        const navigation = _service("navigation", context.navigation);
         // Resolve the personality before L1 too: a commitment replay
         // used to show a blank personality line in the preview — the
         // profile is a cheap flag/seeded read, and the replayed plan now
@@ -480,7 +672,14 @@ export function createPlannerService({
             interventions: _finiteOr(commitment.interventions, 0)
         };
         if (commitment.decision) {
-            const steps = commitment.decision.steps;
+            // Issue #93: a pinned bot still takes its free end-of-turn
+            // recovery test when replaying a commitment — the dedup in
+            // `appendUnpinStep` no-ops when the committed plan already
+            // carries the step. The replayed steps are copied so the
+            // commitment record itself is never mutated.
+            const steps = appendUnpinStep([...commitment.decision.steps],
+                unpinModifierSpec(context.targets ?? [],
+                    _planEndCentre(commitment.decision.steps)));
             diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id
                 ?? steps[0]?.id ?? null;
             // Preview readability (smoke finding): a replayed commitment
@@ -648,6 +847,19 @@ export function createPlannerService({
             lastSeenRound: t.lastSeenRound ?? null,
             via: t.sourceCombatantId ?? null
         }));
+        // Epic #84 minimal split awareness/attack pools: `targets` above
+        // is ALWAYS the full perception/threat pool — movement, threat
+        // reads, engagement, nearest-threat, overwatch anchors,
+        // lookahead, the commitment threat fingerprint and this snapshot
+        // all keep using it. `attackTargetIds`/`excludedAttackTargetIds`
+        // are planning-time doctrine inputs (never document state): they
+        // gate only the direct attack candidate generation below and
+        // never enter the snapshot, the stale fingerprint or validation.
+        // Without the inputs the spec is inactive and every code path
+        // below behaves bit-for-bit as before.
+        const attackPool = _attackPoolSpec(context);
+        const attackPoolDiagnostics = _attackPoolDiagnostics(attackPool, targets);
+        if (attackPoolDiagnostics) diagnostics.attackPool = attackPoolDiagnostics;
         // Issue #16 threat map: one aggregated danger field built once per
         // plan from the resolved enemies' weapon loadouts (weapon EV +
         // range emitters). `context.threatMap` injects a ready map or a
@@ -834,6 +1046,11 @@ export function createPlannerService({
         const targetPosOf = target => ({ x: target?.x ?? null, y: target?.y ?? null });
 
         const candidates = [];
+        // Peel withdrawers need their withdrawal anchor before the target
+        // loop: the nearest contact supplies commitment/unpin context, while
+        // the move itself is generated toward the regroup objective.
+        const threatTarget = _nearestThreat(targets, selfPos, grid);
+        const withdrawalMoves = new Map();
         let routesMissing = false;
         // L0 hard vetoes (issue #24): every candidate rejection is
         // absolute — no personality or morale layer may revive it, and
@@ -863,6 +1080,19 @@ export function createPlannerService({
         const viewerDisposition = _finiteOr(
             _tokenDoc(combatant?.token)?.disposition ?? combatant?.disposition, 0);
         const pxPerUnit = _pxPerUnit(grid);
+        // Issue #91: the TeamPlan defense contract is plain data. The
+        // assigned lane narrows cone orientation honestly (never the
+        // threat pool), steers overwatch at the lane chokepoint and feeds
+        // the soft laneCoverage positioning factor below.
+        const defenseLane = defenseLaneOf(context);
+        const defenseLaneMeta = compactLaneMetadata(defenseLane);
+        const laneThreatTarget = defenseLane
+            ? (targets.find(target => laneIncludesTarget(target, defenseLane)
+                && target?.canAttack === true && target?.hidden !== true)
+                ?? targets.find(target => laneIncludesTarget(target, defenseLane)
+                    && target?.hidden !== true)
+                ?? threatTarget)
+            : threatTarget;
         // Issue #39: the same scene token scan backs two pure factor
         // inputs — hostiles engaged in melee with an ally
         // (`alliedEngagement`) and enemy contact reaches for the
@@ -918,6 +1148,11 @@ export function createPlannerService({
                 grid, navigation, perception, context: planContext
             }).filter(_withinRemaining);
             diagnostics.metrics.movesEvaluated += moves.length;
+            for (const move of moves) {
+                if (move?.withdrawal === true && !move.stay) {
+                    withdrawalMoves.set(`${move.key}|${move.x}|${move.y}`, move);
+                }
+            }
 
             let approachMove = null;
             for (const move of moves) {
@@ -932,10 +1167,18 @@ export function createPlannerService({
             // Tracker-only intel steers movement but is not a sighting.
             const rememberedTarget = _isMemorySource(target.source) && target.source !== "intel"
                 ? target.tokenUuid : null;
-            const memoryStrike = rememberedTarget
+            // Epic #84: pool-excluded targets generate no direct attack
+            // candidates at all — blast memory-strikes included — while
+            // their approach/seek/run movement below is untouched. The
+            // narrowing only removes: a memory/intel contact inside the
+            // pool still fails the `canAttack` gate as before.
+            const inAttackPool = _attackPoolAllows(attackPool, target);
+            const memoryStrike = inAttackPool && rememberedTarget
                 && usableActions.some(action => _actionBlastRadius(action) > 0
                     && !_isMeleeAction(action));
-            if (target.canAttack !== true && !memoryStrike) {
+            if (!inAttackPool) {
+                rejectL0(`attack|${target.tokenUuid}`, "attack-pool-excluded");
+            } else if (target.canAttack !== true && !memoryStrike) {
                 rejectL0(`attack|${target.tokenUuid}`, "target-not-attackable");
             } else if (!usableActions.length) {
                 rejectL0(`attack|${target.tokenUuid}`, "no-action");
@@ -1355,6 +1598,133 @@ export function createPlannerService({
             }
         }
 
+        // Peel-withdrawal candidates (issue #89): the regroup anchor was
+        // merged into the bounded navigation enumeration as marked
+        // withdrawal cells. They are scored once per turn rather than once
+        // per hostile target — withdrawal is objective-driven movement, not
+        // an approach toward the contact that happens to own the probe.
+        const peelContext = planContext.team?.peel ?? null;
+        const peelCost = peelContext?.cost ?? null;
+        const peelRegroupPoint = peelContext?.regroupPoint
+            ?? planContext.team?.regroupPoint ?? null;
+        if (planContext.team?.role === "withdraw" && withdrawalMoves.size
+            && Number.isFinite(peelRegroupPoint?.x) && Number.isFinite(peelRegroupPoint?.y)) {
+            const peelMode = peelCost?.mode === "disengage" ? "disengage" : "withdraw";
+            const threatCentroid = peelContext?.threatCentroid
+                ?? peelContext?.objective?.threatCentroid ?? null;
+            for (const originalMove of withdrawalMoves.values()) {
+                let move = { ...originalMove };
+                const candidateKey = `${peelMode}|${move.key ?? `${move.x},${move.y}`}`;
+                if (move.stay) continue;
+                const cost = _finiteOr(move.cost, 0);
+                const ordinaryHalves = halfMoveLimit !== null && cost > halfMoveLimit + 1e-9 ? 2 : 1;
+                const requiredHalves = peelMode === "disengage" ? ACTION_BUDGET_HALVES : ordinaryHalves;
+                if (requiredHalves > actionBudget) {
+                    rejectOnce(`withdraw|${candidateKey}`, "over-budget");
+                    continue;
+                }
+                if (peelMode === "disengage" && halfMoveLimit !== null
+                    && cost > halfMoveLimit + 1e-9) {
+                    rejectOnce(`withdraw|${candidateKey}`, "disengage-beyond-half-move");
+                    continue;
+                }
+                const remainingLimit = spentMove > 0 && totalMoveBudget !== null
+                    ? Math.max(0, totalMoveBudget - spentMove) : null;
+                if (remainingLimit !== null && cost > remainingLimit + 1e-9) {
+                    rejectOnce(`withdraw|${candidateKey}`, "over-budget");
+                    continue;
+                }
+                // Revalidate the exact serialized route when navigation is
+                // available. Candidate cells prove reachability in general;
+                // the executor must still receive the concrete waypoint
+                // contract and threat-crossing vetoes must inspect the same
+                // path the move step will execute.
+                if (navigation && typeof navigation.planRoute === "function"
+                    && !Array.isArray(move.waypoints)) {
+                    const budget = peelMode === "disengage"
+                        ? halfMoveLimit
+                        : (requiredHalves === 1 ? halfMoveLimit : totalMoveBudget);
+                    let route = null;
+                    try {
+                        route = budget !== null
+                            ? navigation.planRoute(tokenDoc, { x: move.x, y: move.y }, budget,
+                                { rates: planContext.rates, reservations: planContext.reservations })
+                            : null;
+                    } catch(err) {
+                        route = null;
+                    }
+                    if (!route || route.exact !== true || !route.endpoint) {
+                        rejectOnce(`withdraw|${candidateKey}`, "no-exact-route");
+                        continue;
+                    }
+                    move = {
+                        ...move,
+                        x: route.endpoint.x,
+                        y: route.endpoint.y,
+                        cost: _finiteOr(route.cost, cost),
+                        costCells: _finiteOr(route.costCells, move.costCells),
+                        waypoints: Array.isArray(route.waypoints) ? route.waypoints : null
+                    };
+                }
+                if (navigation && typeof navigation.validateEndpoint === "function") {
+                    let endpointValid = true;
+                    try {
+                        endpointValid = navigation.validateEndpoint(tokenDoc,
+                            { x: move.x, y: move.y }, {
+                                rates: planContext.rates,
+                                reservations: planContext.reservations
+                            })?.valid !== false;
+                    } catch(err) {
+                        endpointValid = true;
+                    }
+                    if (!endpointValid) {
+                        rejectOnce(`withdraw|${candidateKey}`, "invalid-endpoint");
+                        continue;
+                    }
+                }
+                if (_withdrawalRouteCrossesThreat(move, selfPos, enemyContacts,
+                    threatCentroid, pxPerUnit)) {
+                    rejectOnce(`withdraw|${candidateKey}`, "route-through-threat");
+                    continue;
+                }
+                if (isPinned && peelMode !== "disengage"
+                    && !_pinnedWithdrawalRouteLegal(move, selfPos, enemyContacts)) {
+                    rejectOnce(`withdraw|${candidateKey}`, "pinned-no-safe-exit");
+                    continue;
+                }
+                if (peelMode === "disengage") {
+                    const countEngagers = point => (enemyContacts ?? []).filter(enemy =>
+                        Number.isFinite(enemy?.reachPx)
+                        && Math.hypot(enemy.x - point.x, enemy.y - point.y)
+                            <= enemy.reachPx + 1e-9).length;
+                    if (countEngagers({ x: move.x, y: move.y }) >= countEngagers(selfPos)) {
+                        rejectOnce(`withdraw|${candidateKey}`, "disengage-endpoint-engagers");
+                        continue;
+                    }
+                }
+                const startToRegroup = _pixelDistance(selfPos, peelRegroupPoint, grid);
+                const endToRegroup = _pixelDistance({ x: move.x, y: move.y }, peelRegroupPoint, grid);
+                const withdrawalProgress = endToRegroup <= 1e-9 ? 1
+                    : (Number.isFinite(startToRegroup) && startToRegroup > 0 && Number.isFinite(endToRegroup)
+                        ? Math.max(0, Math.min(1, (startToRegroup - endToRegroup) / startToRegroup))
+                        : 1);
+                const risk = _finiteOr(peelCost?.freeAttackRisk, 0);
+                const stayRisk = _finiteOr(peelCost?.stayRisk, 0);
+                const freeAttackCost = peelMode === "disengage" ? 0
+                    : Math.max(0, Math.min(1, risk / Math.max(risk, stayRisk, 1)));
+                candidates.push({
+                    target: threatTarget ?? targets[0] ?? null,
+                    action: null,
+                    move,
+                    variant: peelMode,
+                    withdrawal: withdrawalProgress,
+                    freeAttackCost,
+                    disengage: peelMode === "disengage" ? 1 : 0,
+                    peelEngagers: Array.isArray(peelCost?.engagers) ? [...peelCost.engagers] : []
+                });
+            }
+        }
+
         // Directed-cone weapons (spray, suppressing fire) cover a sector
         // rather than a token: `_bestConeAim` sweeps firing directions for
         // maximum hostile coverage under a strict friendly/neutral veto.
@@ -1366,9 +1736,13 @@ export function createPlannerService({
         // remembered point. Hostiles present on the scene but unknown to
         // the bot (no LOS, no memory) never steer the template; the
         // friendly/neutral veto still scans every scene token for safety.
+        // Epic #84: attack-cone anchors follow the narrowed attack pool —
+        // an excluded contact never steers an attack template — while the
+        // overwatch anchors further below keep reading the full pool.
         const coneAnchors = targets
             .filter(target => target?.hidden !== true
-                && Number.isFinite(target?.x) && Number.isFinite(target?.y))
+                && Number.isFinite(target?.x) && Number.isFinite(target?.y)
+                && _attackPoolAllows(attackPool, target))
             .map(target => ({
                 tokenUuid: target.tokenUuid ?? null,
                 tokenId: target.tokenId ?? null,
@@ -1380,13 +1754,26 @@ export function createPlannerService({
         for (const action of usableActions) {
             const spec = _coneSpecOf(action);
             if (!spec) continue;
+            // Issue #91 lane suppression contract: suppression is never
+            // fired at the synthetic lane geometry. It requires a live or
+            // memory lane-threat anchor; unknown/empty lanes therefore
+            // honestly produce no suppression template. Ordinary spray
+            // cones keep the normal perceived-target anchors.
+            const actionConeAnchors = defenseLane && spec.suppression === true
+                ? coneAnchors.filter(anchor => laneIncludesTarget(anchor, defenseLane))
+                : coneAnchors;
+            if (defenseLane && spec.suppression === true
+                && defenseLane.threatIds.length && !actionConeAnchors.length) {
+                rejectL0(`cone|${action.id}`, "lane-threat-anchor-missing");
+                continue;
+            }
             const range = _actionRange(action);
             const aimInput = {
                 tokenDoc,
                 rangePx: range * pxPerUnit,
                 angleDeg: spec.angle,
                 tokens: blastTokens,
-                anchors: coneAnchors,
+                anchors: actionConeAnchors,
                 viewerDisposition,
                 options: blastOptions,
                 perception
@@ -1400,7 +1787,11 @@ export function createPlannerService({
             candidates.push({
                 target: coneTarget, action, move: null,
                 variant: "attack-in-place",
-                cone: { ...aim, spec }
+                cone: { ...aim, spec },
+                // Issue #93: cone coverage feeds the `area` factor exactly
+                // like a blast template — without it cones always scored
+                // zero area and lost to single-target shots.
+                blastHits: aim.hits
             });
             if (!spec.spray || isPinned) continue;
             // Spray move-attack: aim is recomputed from each route
@@ -1427,7 +1818,8 @@ export function createPlannerService({
                 candidates.push({
                     target: coneTarget, action, move,
                     variant: "move-attack",
-                    cone: { ...aimFromMove, spec }
+                    cone: { ...aimFromMove, spec },
+                    blastHits: aimFromMove.hits
                 });
             }
         }
@@ -1438,7 +1830,6 @@ export function createPlannerService({
         // persists on the combatant `aim` flag until the shot is taken
         // (aimedUntil). Worth planning when no shot is available now or
         // the preset explicitly prefers it.
-        const threatTarget = _nearestThreat(targets, selfPos, grid);
         // Standalone aim only makes sense for a ranged loadout facing a
         // live contact — for last-known memories a search move or an
         // overwatch declaration is the meaningful turn instead.
@@ -1519,19 +1910,28 @@ export function createPlannerService({
         // bot's stale own memory (own `last-known` stays excluded).
         if (!isPinned) {
             const owWeapons = _overwatchWeapons(usableActions);
-            const owGate = threatTarget
-                && (threatTarget.canAttack === true
-                    || threatTarget.source === "team-contact")
-                && threatTarget.hidden !== true;
+            const owTarget = defenseLane ? laneThreatTarget : threatTarget;
+            // A defense lane is already the TeamPlan's bounded threat
+            // assessment: its chokepoint may steer a declare-only watch
+            // zone even when this member only has squad memory of the
+            // lane threat. Own-memory-only solo behaviour is unchanged.
+            const owGate = defenseLane
+                ? Boolean(defenseLaneMeta && owTarget && owTarget.hidden !== true)
+                : threatTarget
+                    && (threatTarget.canAttack === true
+                        || threatTarget.source === "team-contact")
+                    && threatTarget.hidden !== true;
             // Anchors are computed once — only while an overwatch
             // candidate is actually built, and the route probe stays
             // limited to the single nearest threat (issue #54 bound).
             const owAnchors = owWeapons.length && owGate
                 ? _overwatchAnchors({
-                    targets, threatTarget, selfPos, pxPerUnit,
-                    navigation, combat, scene, tokenDoc, perception
+                    targets, threatTarget: owTarget, selfPos, pxPerUnit,
+                    navigation, combat, scene, tokenDoc, perception,
+                    lane: defenseLane
                 })
                 : [];
+            let laneOwDiagnostics = null;
             for (const { action: owAction, kind } of owWeapons) {
                 if (selfReactionUsed) {
                     // Issue #37: the reaction slot is spent — a
@@ -1543,19 +1943,46 @@ export function createPlannerService({
                 if (!owGate || ACTION_BUDGET_HALVES > actionBudget) continue;
                 const zone = _overwatchZone({
                     kind, action: owAction, anchors: owAnchors,
-                    threatTarget, selfPos, pxPerUnit, tokenDoc,
+                    threatTarget: owTarget, selfPos, pxPerUnit, tokenDoc,
                     tokens: blastTokens, viewerDisposition,
-                    options: blastOptions
+                    options: blastOptions,
+                    fallbackPoint: defenseLane?.chokepoint ?? null
                 });
                 if (!zone) continue;
+                laneOwDiagnostics = {
+                    laneId: defenseLane?.id ?? null,
+                    anchors: owAnchors.map(anchor => ({
+                        x: anchor.x,
+                        y: anchor.y,
+                        kind: anchor.kind,
+                        tokenUuid: anchor.tokenUuid ?? null,
+                        tokenId: anchor.tokenId ?? null
+                    })),
+                    laneAnchorKept: owAnchors.some(anchor => anchor.kind === "lane"),
+                    orientation: Number.isFinite(zone.direction)
+                        && Number.isFinite(defenseLane?.bearingDeg)
+                        ? Math.abs(zone.direction - defenseLane.bearingDeg) <= 1e-6
+                            ? "lane-bearing" : "anchor-sweep"
+                        : "weapon-zone"
+                };
                 candidates.push({
                     variant: "overwatch",
                     action: owAction,
-                    target: threatTarget,
+                    target: owTarget,
                     move: null,
                     direction: zone.direction ?? null,
-                    zone
+                    zone,
+                    lane: defenseLaneMeta,
+                    laneDiagnostics: laneOwDiagnostics
                 });
+            }
+            if (defenseLane) {
+                diagnostics.laneOverwatch = laneOwDiagnostics ?? {
+                    laneId: defenseLane.id ?? null,
+                    anchors: [],
+                    laneAnchorKept: false,
+                    orientation: "unavailable"
+                };
             }
         }
 
@@ -1594,25 +2021,13 @@ export function createPlannerService({
             });
         }
 
-        // Issue #39 `unpin`: a pinned combatant may spend a full action
-        // on the Willpower test that clears pinning — the recovery
-        // alternative to the drop-prone cover answer. Actors without a
-        // `willpower` characteristic never get the candidate; a pinned
-        // bot that cannot even try logs `unpin-unavailable`.
-        if (isPinned) {
-            const unpin = _unpinAction(actor);
-            if (!unpin) {
-                rejectL0("unpin", "unpin-unavailable");
-            } else if (_actionCost(unpin) > actionBudget) {
-                rejectL0(`unpin|${unpin.id}`, "over-budget");
-            } else {
-                candidates.push({
-                    variant: "unpin",
-                    action: unpin,
-                    target: threatTarget,
-                    move: null
-                });
-            }
+        // Issue #93 `unpin`: pinning recovery is a free end-of-turn
+        // Willpower test, not an action — no candidate competes here; the
+        // zero-cost step is appended to the winning plan below. An actor
+        // without a `willpower` characteristic cannot even try, so the
+        // plan trace records why no recovery step appears.
+        if (isPinned && !unpinAvailable) {
+            rejectL0("unpin", "unpin-unavailable");
         }
 
         // Issue #38 orders: a fireteam leader may spend the turn giving an
@@ -1684,6 +2099,68 @@ export function createPlannerService({
             traitFlags: personalityBehaviorFlags(personality.traits),
             ...planContext
         };
+        // Issue #90 recover-pinned overlay: the fireteam injects
+        // `team.recover`. A recovering pinned member prices the endpoint
+        // cover improvement against the pin-threat position through the
+        // precomputed `recoverCover` candidate input (clamped delta, the
+        // pinned bot's one meaningful move); every member with a redirect
+        // entry carries the soft `recoverRedirect` weight on attack
+        // candidates against the attributed suppression source. Neither
+        // channel narrows the awareness pool, rewrites assignments or
+        // synthesizes actions — they are weights on existing candidates.
+        const recoverInjection = planContext.team?.recover ?? null;
+        let recoverCoverAt = null;
+        if (recoverInjection?.role === "recovering"
+            && Number.isFinite(recoverInjection?.threatPosition?.x)
+            && Number.isFinite(recoverInjection?.threatPosition?.y)
+            && navigation && typeof navigation.coverEstimate === "function") {
+            const threatPos = {
+                x: recoverInjection.threatPosition.x,
+                y: recoverInjection.threatPosition.y
+            };
+            const gridSize = _finiteOr(grid?.size, 100);
+            // The start cover is probed from the current footprint centre
+            // — the same coordinate conversion the end-of-turn unpin
+            // probe uses — so a stationary endpoint degenerates to an
+            // exact zero delta instead of a coordinate-space artifact.
+            const centre = Number.isFinite(selfPos?.x) && Number.isFinite(selfPos?.y)
+                ? {
+                    x: selfPos.x + (_finiteOr(tokenDoc?.width, 1) * gridSize / 2),
+                    y: selfPos.y + (_finiteOr(tokenDoc?.height, 1) * gridSize / 2)
+                }
+                : null;
+            const probeCover = point => {
+                try {
+                    return Math.max(0, Math.min(1,
+                        _finiteOr(navigation.coverEstimate(tokenDoc, point, threatPos), 0)));
+                } catch(_err) {
+                    return 0;
+                }
+            };
+            if (centre) {
+                const startCover = probeCover(centre);
+                recoverCoverAt = point => {
+                    const delta = probeCover(point) - startCover;
+                    return delta > 0 ? Math.min(1, delta) : 0;
+                };
+            }
+        }
+        const recoverRedirectId = recoverInjection?.redirectTargetId
+            ?? recoverInjection?.sourceTargetId ?? null;
+        const recoverRedirectTarget = recoverRedirectId != null
+            ? {
+                tokenId: recoverRedirectId,
+                tokenUuid: recoverInjection?.sourceTokenUuid ?? null
+            }
+            : null;
+        if (recoverInjection && typeof recoverInjection === "object"
+            && (recoverInjection.role || recoverRedirectId != null)) {
+            diagnostics.recover = {
+                role: recoverInjection.role ?? null,
+                redirectTargetId: recoverRedirectId ?? null,
+                coverProbe: recoverCoverAt !== null
+            };
+        }
         const scored = [];
         candidates.forEach((candidate, index) => {
             if (teamTurn?.phase === "draft" && candidate.variant === "charge") return;
@@ -1706,7 +2183,34 @@ export function createPlannerService({
                     character: personality.character === "disciplined"
                         || personality.character === "elite",
                     pressured: _moraleOf(combatant, context).pressured
-                }
+                },
+                // Issue #90: recover-pinned candidate inputs — the cover
+                // delta is probed per endpoint (stationary candidates are
+                // exactly zero), the redirect identity is matched inside
+                // the shared factor vector for attack variants only. The
+                // doctrinal suppression preference belongs to the cover
+                // donor alone: redirect members keep the flat weight.
+                recoverCover: recoverCoverAt && candidate.move && !candidate.move.stay
+                    && Number.isFinite(candidate.move?.x) && Number.isFinite(candidate.move?.y)
+                    ? recoverCoverAt({ x: candidate.move.x, y: candidate.move.y })
+                    : 0,
+                redirectTarget: recoverRedirectTarget,
+                redirectSuppress: recoverInjection?.role === "cover-fire"
+                    && recoverInjection?.preferSuppression === true,
+                // Issue #91: soft lane positioning. This is candidate
+                // metadata, not a fake reposition+overwatch action; it is
+                // exactly zero outside an active chokepoint-defense lane.
+                laneCoverage: defenseLane
+                    ? laneCoverageScore({
+                        move: candidate.move,
+                        selfPos,
+                        context,
+                        actions: usableActions,
+                        tokenDoc,
+                        perception,
+                        grid
+                    })
+                    : 0
             });
             // Presets may veto candidates outright (e.g. a ranged preset
             // refusing attacks without a resolved line of sight); vetoed
@@ -1894,7 +2398,17 @@ export function createPlannerService({
         diagnostics.chosenStep = null;
         // AimedUntil (issue #15): the booked flag bonus rides into the
         // attack step — the executor clears the flag once the shot lands.
-        const steps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
+        // Issue #93: the pinned bot's free end-of-turn recovery test
+        // rides every scored plan — appended ahead of the end-turn step
+        // with the cover-based modifier of the nearest known threat.
+        // Issue #93 review: cover for the end-of-turn test is probed
+        // from the endpoint of the plan's own movement — a pinned bot
+        // legally crawling into cover this turn tests at +30 there,
+        // while a bot ending in the open tests at +0 even when its
+        // turn-start spot was covered.
+        const scoredSteps = _stepsFor({ candidate: winner, carriedAim, halfMoveLimit });
+        const steps = appendUnpinStep(scoredSteps,
+            unpinModifierSpec(targets, _planEndCentre(scoredSteps)));
         diagnostics.chosenStep = steps.find(step => step.type !== "end-turn")?.id ?? steps[0].id;
 
         // Issue #25 L1: when the commitment layer is on, the scored plan
@@ -1908,9 +2422,13 @@ export function createPlannerService({
         // A bare hold (`[end-turn]`) never commits: the expectedState
         // would carry no threats to drift-check, so a replayed hold stays
         // blind to new contacts — a sealed grenadier kept holding for
-        // turns after the door opened (smoke finding).
+        // turns after the door opened (smoke finding). Issue #93: the
+        // free end-of-turn unpin step does not count as plan content
+        // either — a pinned bot whose only step is the recovery test
+        // still holds, and holds never commit.
         const commitmentPayload = layerFlags.commitment === true && steps.length
-            && steps.some(step => step?.type && step.type !== "end-turn")
+            && steps.some(step => step?.type && step.type !== "end-turn"
+                && step?.input?.unpin !== true)
             ? {
                 source: "planner",
                 ttl: commitment.reactive === true
@@ -2180,9 +2698,13 @@ export function createPlannerService({
 
         // Fast path: the fingerprint covers every field the checks below
         // inspect, so an equal fingerprint means the plan is still valid.
+        // `statusAdjust` (issue #93) reconciles the plan's own status
+        // mutations before hashing — see the statuses check below.
         const live = _staleFingerprint({
             combat, combatant, token: tokenDoc, actor, targetToken, collision,
-            selfStatuses: currentContext.selfStatuses, snapshot
+            selfStatuses: currentContext.selfStatuses,
+            statusAdjust: currentContext.selfStatusAdjust ?? null,
+            snapshot
         });
         if (live === snapshot.staleFingerprint) {
             return { valid: true, reason: null };
@@ -2229,8 +2751,19 @@ export function createPlannerService({
         }
         // Self statuses (pinned/prone/stunned/…) gate which candidates are
         // legal, so any drift invalidates the plan with its own reason.
-        const liveStatuses = _selfStatuses(actor, tokenDoc, currentContext.selfStatuses);
+        // Issue #93: the plan's own end-of-turn steps mutate self statuses
+        // mid-execution — a successful unpin test clears `pinned`, a
+        // drop-prone step applies `prone`. The executor reports those
+        // self-inflicted changes through `currentContext.selfStatusAdjust`
+        // (`added` = statuses the plan applied, `removed` = statuses it
+        // cleared) so they reconcile here instead of reading as external
+        // drift; only GM/system intervention may invalidate the plan.
         const plannedStatuses = Array.isArray(self.statuses) ? self.statuses : [];
+        const liveStatuses = _reconcileSelfStatuses(
+            _selfStatuses(actor, tokenDoc, currentContext.selfStatuses),
+            plannedStatuses,
+            currentContext.selfStatusAdjust ?? null
+        );
         if (liveStatuses.join("|") !== plannedStatuses.join("|")) {
             return { valid: false, reason: STALE_REASONS.statusesChanged };
         }
