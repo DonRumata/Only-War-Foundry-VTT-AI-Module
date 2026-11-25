@@ -72,7 +72,10 @@ import {
 import { weaponEmitters } from "./threat-map.js";
 import {
     SPEC_OPS_PRESET_ID,
-    specOpsTactic
+    checkSpecOpsFlank,
+    specOpsFlankFallback,
+    specOpsTactic,
+    specOpsTokenCenter
 } from "./presets/spec-ops.js";
 
 /** Result statuses of {@link createFireteamService.buildTeamPlan}. */
@@ -1390,6 +1393,41 @@ export function createFireteamService({
     }
 
     /**
+     * Verify the serialized plan, not a score or the proposed anchor.
+     * Commitment and reservation retries can change the actual attack.
+     * @param {object} result Member planner result.
+     * @param {object} context Attack geometry and cutoff.
+     * @returns {object} Flank evidence or rejection reason.
+     */
+    function _flankProof(result, context) {
+        const plan = result?.plan;
+        const steps = plan?.steps ?? [];
+        const index = steps.findIndex(step => step?.type === "attack" || step?.type === "test");
+        if (index < 0) {
+            const reasons = result?.diagnostics?.rejected?.map(entry => entry.reason) ?? [];
+            const reason = ["flank-route-unproven", "flank-angle-unmet"]
+                .find(code => reasons.includes(code)) ?? "flank-attack-unavailable";
+            return { reason };
+        }
+        const attack = steps[index].input;
+        const target = plan.snapshot?.targets?.find(entry => attack?.targetTokenId
+            ? entry.tokenId === attack.targetTokenId
+            : entry.tokenUuid && entry.tokenUuid === attack?.targetTokenUuid);
+        const move = steps.find(step => step?.type === "move");
+        if (move && steps.indexOf(move) > index) return { reason: "flank-route-unproven" };
+        return checkSpecOpsFlank({
+            target,
+            aim: attack?.targetPoint,
+            move: move ? {
+                ...move.input?.to,
+                waypoints: move.input?.waypoints,
+                approximate: move.input?.approximate,
+                cost: move.cost?.movement
+            } : null
+        }, { ...context, selfPos: plan.snapshot?.self });
+    }
+
+    /**
      * Build the phased execution layout. Flank-group members always precede
      * the main group inside every phase; the action phase is gated by a
      * synchronization barrier that requires the detached/mover assignments
@@ -1399,9 +1437,10 @@ export function createFireteamService({
      * @param {Map} input.assignMap `combatantId → assignment`.
      * @param {Map} input.plans `combatantId → planTurn result`.
      * @param {object[]} input.members Assignments with verified rejoin routes.
+     * @param {boolean} [input.flankProven] Stationary flankers are already at their firing cells.
      * @returns {object[]} Phase descriptors `{id, name, barrier, steps}`.
      */
-    function _buildPhases({ ordered, assignMap, plans, members }) {
+    function _buildPhases({ ordered, assignMap, plans, members, flankProven = false }) {
         const sortKey = member => {
             const group = assignMap.get(member.combatantId)?.groupId ?? "main";
             const rank = group === "main" ? 1 : 0;
@@ -1431,7 +1470,7 @@ export function createFireteamService({
             });
         }
         const moverIds = movement.map(step => step.combatantId);
-        const flankIds = sorted
+        const flankIds = flankProven ? [] : sorted
             .filter(member => assignMap.get(member.combatantId)?.groupId === "flank-1")
             .map(member => member.combatantId);
         const required = [...new Set([...flankIds, ...moverIds])];
@@ -2227,9 +2266,21 @@ export function createFireteamService({
             combat,
             context
         });
+        const tacticName = tactic?.name ?? tactic?.tactic ?? null;
+        if (teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+            && Number.isFinite(tactic.flankMinAngleDegrees)) {
+            // Factories can bind a stricter doctrine than the saved
+            // setting; publish precisely the cutoff used by the draft.
+            context = {
+                ...context,
+                specOpsConfig: getSpecOpsConfig({
+                    ...context.specOpsConfig, flankMinAngleDegrees: tactic.flankMinAngleDegrees
+                })
+            };
+        }
         diagnostics.tactic = tactic
             ? _jsonClone({
-                name: tactic.name ?? tactic.tactic ?? null,
+                name: tacticName,
                 reason: tactic.reason ?? null,
                 breakdown: tactic.breakdown ?? null
             })
@@ -2320,8 +2371,14 @@ export function createFireteamService({
         // Team anchor for task-scoped member evaluation (issue #412):
         // the leader position is the cohesion centre and the first
         // rejoin/regroup point of detached maneuvers.
-        const leaderPos = members
-            .find(m => m.combatantId === election.combatantId)?.position ?? null;
+        const leader = members.find(m => m.combatantId === election.combatantId);
+        const leaderPos = leader?.position ?? null;
+        const scene = context.scene ?? combat.scene ?? null;
+        const flankRules = teamPreset === SPEC_OPS_PRESET_ID && tacticName === "flank-and-fix"
+            ? {
+                flankCenter: specOpsTokenCenter(_tokenDoc(leader?.combatant?.token), scene, leaderPos),
+                flankMinAngleDegrees: context.specOpsConfig.flankMinAngleDegrees
+            } : null;
         const rejoinPoints = regroupPoints(members, { leaderId: election.combatantId });
 
         // Planning order: leader first, then flank group, then the rest —
@@ -2363,13 +2420,14 @@ export function createFireteamService({
                 ...(context.readOnly ? {
                     includeNeutral: resolveConfig(member.combatant)?.includeNeutral === true
                 } : {}),
-                tactic: tactic?.name ?? tactic?.tactic ?? null,
+                tactic: tacticName,
                 team: {
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
                     leaderId: election.combatantId,
                     center: leaderPos,
+                    ...flankRules,
                     character,
                     contacts: teamContacts,
                     // The tactic's maneuver anchor: a flanker advances on
@@ -2512,11 +2570,15 @@ export function createFireteamService({
                     .filter(cell => cell.memberId !== member.combatantId)],
                 replanCount: _finiteOr(context.replanCount, 0) + 1,
                 targets: retryTargets,
+                ...(flankRules ? { tactic: tacticName } : {}),
                 team: {
                     teamId,
                     task: assignment.task,
                     groupId: assignment.groupId,
                     leaderId: election.combatantId,
+                    ...(flankRules ? {
+                        ...flankRules, flankPoint: tactic?.objective?.flankPoint ?? null
+                    } : {}),
                     character,
                     contacts: teamContacts
                 }
@@ -2530,6 +2592,41 @@ export function createFireteamService({
                 const key = `${assignment.task}|${retryTarget}`;
                 reservedTargets.set(key, (reservedTargets.get(key) ?? 0) + 1);
             }
+        }
+
+        if (flankRules) {
+            // Check every assigned flanker after all demotions/retargets.
+            // Support is not required to shoot from the flank (or to move).
+            const leaderMove = plans.get(election.combatantId)?.plan?.steps.find(step => step.type === "move");
+            const finalRules = { ...flankRules, flankCenter: leaderMove?.input?.to ?? flankRules.flankCenter };
+            const flankers = ordered.filter(member => assignMap.get(member.combatantId).task === "flank");
+            const attacks = flankers.map(member => {
+                const proof = _flankProof(plans.get(member.combatantId), {
+                    scene, combat, token: tokens.get(member.combatantId), team: finalRules
+                });
+                return { flankerId: member.combatantId, ...proof };
+            });
+            const split = attacks.length > 0 && orderedAssignments.some(a => a.task === "support");
+            const failure = split ? attacks.find(evidence => evidence.reason)
+                : { reason: "flank-roles-unavailable" };
+            if (failure) {
+                const fallback = specOpsFlankFallback(members, tactic, failure);
+                const explicit = Object.entries(context.assignments ?? {})
+                    .filter(([, task]) => task !== "flank");
+                return buildTeamPlan(combat, team, {
+                    ...context,
+                    readOnly: true,
+                    tactic: fallback,
+                    allowFlank: false,
+                    assignments: explicit.length > 0
+                        ? { ...fallback.assignments, ...Object.fromEntries(explicit) } : undefined
+                });
+            }
+            const weakest = attacks.reduce((a, b) => a.angle <= b.angle ? a : b);
+            diagnostics.tactic.breakdown = {
+                ...diagnostics.tactic.breakdown,
+                flank: { ...weakest, feasible: true, minAngle: flankRules.flankMinAngleDegrees }
+            };
         }
 
         // Issue #38 synchronized strike: when the shared convergence target
@@ -2567,7 +2664,7 @@ export function createFireteamService({
         // the configured preferred distance is in scene units. Detached
         // maneuvers need a reachable endpoint, a bounded separation and a
         // legal rejoin point.
-        const grid = (context.scene ?? combat.scene)?.grid;
+        const grid = scene?.grid;
         const size = _finiteOr(grid?.size, 0);
         const unitsPerPixel = size > 0 ? _finiteOr(grid?.distance, 1) / size : 1;
         const projectedCenter = member => {
@@ -2670,7 +2767,8 @@ export function createFireteamService({
             ordered,
             assignMap,
             plans,
-            members: memberEntries
+            members: memberEntries,
+            flankProven: flankRules !== null
         });
         const memberPlans = {};
         for (const member of ordered) {

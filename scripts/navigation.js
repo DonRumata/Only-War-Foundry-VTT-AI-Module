@@ -17,11 +17,10 @@
  *   `canvas.walls.checkCollision` (v13) vs `CONFIG.Canvas.polygonBackends`
  *   / manual geometry (v12+), `measureDistance` (v13) vs `measurePath`
  *   (v14) and the `GridOffset` point conversion APIs.
- * - Difficult terrain: when the platform exposes a token movement-cost
- *   function (`TokenDocument#measureMovementPath`, v13+) the measured cost
- *   is authoritative for the budget check; the internal A* heuristic stays
- *   geometric. Without such an API the cost is approximated and the result
- *   is flagged via `approximations`.
+ * - Difficult terrain: the native token movement-cost API verifies the
+ *   geometric route. If it is too expensive, a bounded retry searches
+ *   alternate paths with measured prefix costs. Without this API the cost
+ *   is approximated and the result is flagged via `approximations`.
  * - Results are deterministic for an identical scene snapshot: neighbour
  *   order, priority-queue tie-breaks and candidate sorting are fixed, and
  *   each result carries a `revision` fingerprint of the inputs.
@@ -76,6 +75,9 @@ export const DEFAULT_SEARCH_LIMIT = 20000;
 
 /** Bound the optional search beyond the current turn's movement budget. */
 const DETOUR_SEARCH_LIMIT = 1024;
+
+/** Bound native prefix measurements when the geometric route is too expensive. */
+const MEASURED_DETOUR_SEARCH_LIMIT = 128;
 
 /** Default bound for returned reachable cells and candidates. */
 export const DEFAULT_RESULT_LIMIT = 512;
@@ -1436,39 +1438,107 @@ function _serializePath(path, context) {
 }
 
 /**
+ * Read the native cost, retaining zero and the impassable Infinity sentinel.
+ * @param {object} context
+ * @param {object[]} points Pixel waypoints.
+ * @returns {number|null}
+ */
+function _measuredCost(context, points) {
+    const cost = context.measureCost?.(points);
+    return typeof cost === "number" && cost >= 0 ? cost : null;
+}
+
+/**
  * Keep the longest stoppable prefix inside both the grid and platform
  * movement budgets. A reserved cell may be traversed but not end a turn.
  * @param {object[]} path Grid offsets including the start.
  * @param {number} costCells Geometric cost of the original path.
  * @param {object} context
  * @param {number} budgetCells
- * @returns {{waypoints: object[], costCells: number, cost: number}}
+ * @returns {{waypoints: object[], costCells: number, cost: number, overBudget?: boolean}}
  */
 function _fitRouteToBudget(path, costCells, context, budgetCells) {
     const waypoints = _serializePath(path, context);
     const distance = context.grid.distance;
     const budget = budgetCells * distance;
     const points = waypoints.map(({ x, y }) => ({ x, y }));
-    const measure = (length, cells) => {
-        const measured = context.measureCost?.(length === points.length ? points : points.slice(0, length));
-        return typeof measured === "number" && measured >= 0 ? measured : cells * distance;
-    };
     if (waypoints.length < 2) return { waypoints, costCells: 0, cost: 0 };
+    let overBudget = false;
     if (costCells <= budgetCells + EPSILON && context.canStop(path.at(-1))) {
-        const cost = measure(waypoints.length, costCells);
-        if (cost <= budget + EPSILON) return { waypoints, costCells, cost };
+        const measured = _measuredCost(context, points);
+        const cost = measured ?? costCells * distance;
+        if (Number.isFinite(cost) && cost <= budget + EPSILON) return { waypoints, costCells, cost };
+        overBudget = measured !== null;
     }
     let best = { waypoints: waypoints.slice(0, 1), costCells: 0, cost: 0 };
     let cells = 0;
-    for (let index = 1; index < path.length; index++) {
+    for (let index = 1; index < path.length - 1; index++) {
         cells += cellPathCost(path[index - 1], path[index], context.grid);
         if (cells > budgetCells + EPSILON) break;
         if (!context.canStop(path[index])) continue;
-        const cost = measure(index + 1, cells);
-        if (cost > budget + EPSILON) break;
+        const cost = _measuredCost(context, points.slice(0, index + 1)) ?? cells * distance;
+        if (!Number.isFinite(cost) || cost > budget + EPSILON) break;
         best = { waypoints: waypoints.slice(0, index + 1), costCells: cells, cost };
     }
-    return best;
+    return { ...best, overBudget };
+}
+
+/**
+ * Try alternative simple paths after the geometric route fails measurement.
+ * Measure from the start, not edge by edge: e.g. Foundry carries the cost
+ * phase of alternating diagonals across the whole path. Do not merge
+ * prefixes at the same offset: they can have different future costs.
+ * Geometry orders the queue but is not a lower bound on measured cost
+ * (terrain can discount movement). Each popped prefix uses at most one
+ * native measurement, including the exact path returned on success.
+ * @param {object} context
+ * @param {object} goal
+ * @param {number} budget Scene units.
+ * @param {number} maxVisited Remaining expansion bound.
+ * @returns {object} `{visited, limited, fitted?}`.
+ */
+function _findMeasuredDetour(context, goal, budget, maxVisited) {
+    const heap = new _MinHeap();
+    const distance = context.grid.distance;
+    const estimate = offset => cellPathCost(offset, goal, context.grid) * distance;
+    const start = context.origin.offset;
+    const h = estimate(start);
+    let serial = 0;
+    let visited = 0;
+    heap.push({ f: h, h, serial: serial++, offset: start, costCells: 0, previous: null });
+
+    while (heap.size) {
+        if (visited >= maxVisited) return { visited, limited: true };
+        const node = heap.pop();
+        visited++;
+        const path = [];
+        for (let step = node; step; step = step.previous) path.push(step.offset);
+        const waypoints = _serializePath(path.reverse(), context);
+        const cost = node.previous ? _measuredCost(context, waypoints.map(({ x, y }) => ({ x, y }))) : 0;
+        // Native costs accumulate nonnegative segments; extending this
+        // prefix cannot make it affordable if it is already over budget.
+        if (!Number.isFinite(cost) || cost > budget + EPSILON) continue;
+        if (node.offset.i === goal.i && node.offset.j === goal.j && context.canStop(node.offset)) {
+            return { visited, limited: false, fitted: { waypoints, costCells: node.costCells, cost } };
+        }
+
+        for (const next of context.neighbors(node.offset)) {
+            const step = context.edgeCost(node.offset, next, next.diagonal === true);
+            if (!Number.isFinite(step) || !context.canStand(next)) continue;
+            if (path.some(({ i, j }) => i === next.i && j === next.j)) continue;
+            if (!context.isOpen(node.offset, next)) continue;
+            const remaining = estimate(next);
+            heap.push({
+                f: cost + (step * distance) + remaining,
+                h: remaining,
+                serial: serial++,
+                offset: next,
+                costCells: node.costCells + step,
+                previous: node
+            });
+        }
+    }
+    return { visited, limited: false };
 }
 
 /**
@@ -1511,6 +1581,9 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
         || !context.moveBlocked(context.origin.point, goalPoint))) {
         return _failure(NAVIGATION_REASONS.pathNotFound, { sceneId: context.sceneId });
     }
+    const maxVisited = followDetour
+        ? Math.min(DETOUR_SEARCH_LIMIT, options.maxVisited ?? DETOUR_SEARCH_LIMIT)
+        : (options.maxVisited ?? DEFAULT_SEARCH_LIMIT);
     const result = searchRoute({
         start,
         goal,
@@ -1525,10 +1598,9 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
             : context.canStop,
         heuristic: offset => heuristicCells(offset, goal, context.grid),
         budget: followDetour ? Infinity : budgetCells,
-        maxVisited: followDetour
-            ? Math.min(DETOUR_SEARCH_LIMIT, options.maxVisited ?? DETOUR_SEARCH_LIMIT)
-            : (options.maxVisited ?? DEFAULT_SEARCH_LIMIT)
+        maxVisited
     });
+    let visitedNodes = result.visited;
 
     const distance = context.grid.distance;
     const budgetMeters = budgetCells * distance;
@@ -1551,10 +1623,10 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
      * @param {object[]} path
      * @param {number} costCells
      * @param {object} meta `{status, reason, exact}`
+     * @param {object} [fitted] Already budget-verified path, if available.
      * @returns {object}
      */
-    function _result(path, costCells, meta) {
-        const fitted = _fitRouteToBudget(path, costCells, context, budgetCells);
+    function _result(path, costCells, meta, fitted = _fitRouteToBudget(path, costCells, context, budgetCells)) {
         const { waypoints } = fitted;
         const trimmed = waypoints.length < path.length;
         const status = trimmed
@@ -1573,7 +1645,7 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
             endpoint,
             exact: !trimmed && meta.exact === true,
             partial: status === NAVIGATION_STATUS.partial,
-            visitedNodes: result.visited,
+            visitedNodes,
             ms: Math.round((_now() - started) * 100) / 100,
             revision,
             approximations,
@@ -1587,9 +1659,23 @@ export function planRouteOnContext(context, destination, budgetCells, options = 
     }
 
     if (result.status === "found") {
-        const reason = followDetour && result.cost <= budgetCells + EPSILON && !context.canStop(goal)
+        let reason = followDetour && result.cost <= budgetCells + EPSILON && !context.canStop(goal)
             ? NAVIGATION_REASONS.endpointOccupied : null;
-        return _result(result.path, result.cost, { status: NAVIGATION_STATUS.ok, exact: true, reason });
+        const fitted = _fitRouteToBudget(result.path, result.cost, context, budgetCells);
+        // Only retry a stoppable goal that had a complete route within
+        // the geometric budget. In particular, keep followDetour's partial
+        // approach when it deliberately routes beyond this turn's budget.
+        if (fitted.overBudget) {
+            const detour = _findMeasuredDetour(context, goal, budgetMeters,
+                Math.min(MEASURED_DETOUR_SEARCH_LIMIT, maxVisited - visitedNodes));
+            visitedNodes += detour.visited;
+            if (detour.fitted) {
+                return _result(detour.fitted.waypoints, detour.fitted.costCells,
+                    { status: NAVIGATION_STATUS.ok, exact: true }, detour.fitted);
+            }
+            if (detour.limited) reason = NAVIGATION_REASONS.searchLimit;
+        }
+        return _result(result.path, result.cost, { status: NAVIGATION_STATUS.ok, exact: true, reason }, fitted);
     }
 
     if (result.status === "limit") {

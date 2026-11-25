@@ -3,11 +3,12 @@
  * only assignments and verified progress survive the change of initiative.
  */
 import { FLAG_KEYS, MODULE_ID } from "../constants.js";
-import { movementCells } from "../navigation.js";
+import { movementCells, NAVIGATION_STATUS, offsetKey } from "../navigation.js";
 import { isLiveOperation, readOperation } from "../operations.js";
 import { isDeadOrDefeated, isHiddenToken } from "../perception.js";
 import { _collisionRevision } from "../planner/documents.js";
 import { SPEC_OPS_PRESET_ID } from "../presets/spec-ops-config.js";
+import { specOpsTokenCenter } from "../presets/spec-ops.js";
 import { getSpecOpsConfig } from "../settings.js";
 import { _docPoint, _findCombatant, _tokenDoc } from "./util.js";
 
@@ -31,8 +32,97 @@ const coordinating = state => state.members.some(member => member.move || member
 const movementLocks = (state, member) => state.members
     .filter(other => other !== member && other.move)
     .flatMap(other => other.move.cells ?? [other.move.destination]);
+const rejoinLocks = (state, memberId, combat) => state.members
+    .filter(other => other.id !== memberId && other.rejoin?.untilRound >= combat.round)
+    .flatMap(other => movementCells(_tokenDoc(_findCombatant(combat, other.id)?.token),
+        [other.rejoin.point]));
 const sameProgress = (a, b) => a?.id === b?.id
     && a?.last?.id === b?.last?.id && a?.inFlight === b?.inFlight;
+
+/**
+ * Find a member's next slot, counting turn indices across round boundaries.
+ * @param {object} combat Live initiative order, including tie breaks.
+ * @param {string} memberId
+ * @param {number} [from] Earliest allowed slot.
+ * @returns {{index: number, round: number}|null}
+ */
+function nextTurnSlot(combat, memberId, from = combat.turn) {
+    if (!Number.isInteger(from) || from < 0 || !Array.isArray(combat.turns)) return null;
+    const order = combat.turns;
+    const turn = order.findIndex(entry => entry?.id === memberId);
+    if (turn < 0) return null;
+    const earliest = from % order.length;
+    const index = from - earliest + turn + (turn < earliest ? order.length : 0);
+    return { index, round: combat.round + Math.floor(index / order.length) };
+}
+
+/**
+ * Fit each remaining phase onto actual initiative slots without sharing a
+ * turn across phases. Only a member's own planned departure starts its clock.
+ * @param {object} state
+ * @param {object} combat
+ * @returns {boolean}
+ */
+function fitsSchedule(state, combat) {
+    if (!state.members.some(member => member.rejoin)) return true;
+    let from = combat.turn;
+    const deadlines = new Map();
+    for (const phase of ["move", "action", "rejoin"]) {
+        let nextPhase = from;
+        for (const member of state.members) {
+            if (!member[phase]) continue;
+            const slot = nextTurnSlot(combat, member.id, from);
+            if (!slot || (phase !== "rejoin" && slot.round >= state.expiresRound)) return false;
+            if (phase === "move" && member.rejoin) {
+                deadlines.set(member.id, slot.round + member.rejoin.maxRounds);
+            } else if (phase === "rejoin"
+                && !(slot.round <= (member.rejoin.untilRound ?? deadlines.get(member.id)))) return false;
+            nextPhase = Math.max(nextPhase, slot.index + 1);
+        }
+        from = nextPhase;
+    }
+    return true;
+}
+
+/**
+ * Drop coordination, but retain legal return turns for members who already left.
+ * @param {object} state
+ * @param {object} combat
+ * @returns {object|null}
+ */
+function returnOnly(state, combat) {
+    const members = state.members.map(member => ({
+        ...member, move: null, action: null,
+        rejoin: Number.isFinite(member.rejoin?.untilRound)
+            && nextTurnSlot(combat, member.id)?.round <= member.rejoin.untilRound ? member.rejoin : null
+    }));
+    return members.some(member => member.rejoin) ? { ...state, members } : null;
+}
+
+/**
+ * Validate the approved route, not a substitute route or the draft's old cell.
+ * Snapshot validation also checks the scene wall revision and self statuses.
+ * @param {object} step
+ * @param {object} token
+ * @param {object} nav
+ * @param {object[]} reservations
+ * @returns {boolean}
+ */
+function validReturnRoute(step, token, nav, reservations) {
+    const { to, waypoints = [] } = step.input;
+    if (nav?.validateEndpoint?.(token, to, { reservations })?.valid !== true) return false;
+    const end = waypoints.at(-1);
+    const route = end?.x === to.x && end?.y === to.y ? waypoints : [...waypoints, to];
+    const locked = new Set(reservations.map(offsetKey));
+    if (movementCells(token, route).some(cell => locked.has(offsetKey(cell)))) return false;
+    const measured = nav.measurePath?.(token, route, { reservations });
+    // Navigation stores costs to three decimal places; apply the same rounding.
+    return measured?.status === NAVIGATION_STATUS.ok
+        && Math.round(measured.cost * 1000) / 1000 <= step.cost?.movement
+        && measured.waypoints?.length === route.length
+        && measured.waypoints.every(({ x, y }, index) =>
+            Math.abs(x - route[index].x) < 0.5 && Math.abs(y - route[index].y) < 0.5);
+}
 
 /**
  * Coordinate only turns claimed by the normal authority service. No
@@ -241,18 +331,30 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             }))?.teamPlan;
             if (!ownsTurn(context, combatant)) return null;
             state = compile(draft, entries, context);
-            if (!state) return fallback();
+            if (!state || !fitsSchedule(state, combat)) return fallback();
             preflight = Object.values(draft.memberPlans).map(memberPlan => memberPlan.snapshot);
         }
         if (state.specOpsConfig) base = { ...base, specOpsConfig: state.specOpsConfig };
         const stopped = stateReason(state, context);
-        if (stopped) return wait(stopped, "interrupt");
+        if (stopped && stopped !== "team-timeout") return wait(stopped, "interrupt");
+        let prioritizingReturn = false;
+        if (stopped || !fitsSchedule(state, combat)) {
+            const returning = returnOnly(state, combat);
+            if (!returning || stateReason(returning, context)) return wait("team-timeout", "interrupt");
+            state = returning;
+            prioritizingReturn = true;
+        }
         const active = state.members.find(member => member.id === combatant.id);
         if (!active) return null;
         const center = state.members.find(member => member.id === state.leaderId)?.position;
         const forMember = member => ({
             teamId: state.teamId, task: member.task, groupId: member.groupId,
-            character: state.character, leaderId: state.leaderId, center, preset: state.teamPreset
+            character: state.character, leaderId: state.leaderId, center, preset: state.teamPreset,
+            ...(member.task === "flank" && state.tactic === "flank-and-fix" && state.specOpsConfig ? {
+                flankCenter: specOpsTokenCenter(_tokenDoc(_findCombatant(combat, state.leaderId)?.token),
+                    combat.scene, center),
+                flankMinAngleDegrees: state.specOpsConfig.flankMinAngleDegrees
+            } : {})
         });
         const movers = state.members.filter(member => member.move);
         let ownMove = null;
@@ -275,9 +377,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
                 x: center.x + ((leader.width ?? 1) * grid.size / 2),
                 y: center.y + ((leader.height ?? 1) * grid.size / 2)
             } : null;
-            const reservations = state.members.filter(member => member !== active && member.rejoin)
-                .flatMap(member => movementCells(_tokenDoc(_findCombatant(combat, member.id)?.token),
-                    [member.rejoin.point]));
+            const reservations = rejoinLocks(state, active.id, combat);
             const rejoin = await fireteam.planRejoin(_tokenDoc(combatant.token), leaderCenter, {
                 grid, preferredCohesion: state.preferredCohesion, navigation: base.navigation,
                 rates: base.rates, reservations
@@ -285,17 +385,17 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             if (!rejoin) return wait("team-rejoin-unavailable", "interrupt");
             const returning = await planner.planTurn(combat, combatant, {
                 ...base, team: forMember(active),
-                teamTurn: rejoin.cost > 0
+                teamTurn: rejoin.route.length > 1
                     ? { phase: "movement", destination: rejoin.point, reservations }
                     : { phase: "wait", reason: "team-regrouped" }
             });
-            return returning?.plan ? wrap(returning, "regroup")
+            return returning?.plan ? wrap(returning, "regroup", prioritizingReturn ? "team-timeout" : null)
                 : wait("team-rejoin-unavailable", "interrupt");
         }
         // Passing a turn never waits on a promise/animation from a different
         // NPC. That NPC must get its normal place in initiative.
         if (movers.length || !active.action) {
-            return wait("team-waiting");
+            return wait(prioritizingReturn ? "team-timeout" : "team-waiting");
         }
         let ownPlan = null;
         const actors = state.actionStarted ? [active] : state.members.filter(member => member.action);
@@ -344,6 +444,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         if (phase === "interrupt") return { valid: true, reason: null };
         const reason = stateReason(state, context);
         if (reason) return fail(reason);
+        if (coordinating(state) && !fitsSchedule(state, context.combat)) return fail("team-timeout");
         for (const snapshot of preflight) {
             const verdict = planner.validateSnapshot({ snapshot }, { combat: context.combat });
             if (!verdict.valid) return verdict;
@@ -355,6 +456,12 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
                 active.move.destination, { reservations: movementLocks(state, active) });
             if (endpoint && endpoint.valid !== true) {
                 return fail("team-route-unavailable");
+            }
+        } else if (phase === "regroup") {
+            const move = plan.steps.find(step => step.type === "move");
+            if (move && !validReturnRoute(move, _tokenDoc(combatant.token),
+                service("navigation", context.planContext?.navigation), rejoinLocks(live, active.id, context.combat))) {
+                return fail("team-rejoin-unavailable");
             }
         } else if (phase === "action") {
             const attackers = state.actionStarted ? [active] : state.members.filter(member => member.action);
@@ -439,7 +546,11 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
             await write(context, combatant, turn, null);
             return;
         }
-        if (phase === "wait") return;
+        const last = { id: context.operation.id, round: context.combat.round, turn: context.combat.turn };
+        if (phase === "wait") {
+            if (turn.reason === "team-timeout") await write(context, combatant, turn, { ...state, last });
+            return;
+        }
         const member = state.members.find(entry => entry.id === combatant.id);
         const moving = phase === "movement" || phase === "regroup";
         const step = plan.steps.find(entry => entry.type === (moving ? "move" : member.action.type));
@@ -462,8 +573,7 @@ export function createTeamTurns({ service, isController, isEnabled, resolveConfi
         const members = state.members.map(entry => entry === member ? replacement : entry);
         const pending = replacement && members.some(entry => entry.move || entry.action || entry.rejoin);
         await write(context, combatant, turn, pending
-            ? { ...state, members, actionStarted: state.actionStarted || phase === "action", inFlight: null,
-                last: { id: context.operation.id, round: context.combat.round, turn: context.combat.turn } }
+            ? { ...state, members, actionStarted: state.actionStarted || phase === "action", inFlight: null, last }
             : null);
     }
 

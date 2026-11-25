@@ -34,7 +34,7 @@
 | [`settings.js`](../scripts/settings.js), [`constants.js`](../scripts/constants.js), [`config-resolver.js`](../scripts/config-resolver.js) | Настройки мира, ключи флагов и read-only `resolveEffectiveConfig`: Combatant → Token → Actor → disabled. |
 | [`authority.js`](../scripts/authority.js), [`operations.js`](../scripts/operations.js) | `electController`, фильтрация хуков, захват и фазы операции на Combat. Нет активного GM → `waiting-for-gm`. |
 | [`perception.js`](../scripts/perception.js) | `visibleTargets`, `buildPerceptionSnapshot`, память и общие контакты. LOS проверяет собственный vision source NPC без записи в коллекцию источников GM. |
-| [`navigation.js`](../scripts/navigation.js), [`threat-map.js`](../scripts/threat-map.js) | Поиск обхода (`searchRoute`), коллизии и проверка стоимости маршрута для текущего хода; опасность позиции (`dangerAt`) по профилям угроз. |
+| [`navigation.js`](../scripts/navigation.js), [`threat-map.js`](../scripts/threat-map.js) | Поиск обхода стен и рельефа, коллизии и проверка стоимости маршрута для текущего хода; опасность позиции (`dangerAt`) по профилям угроз. |
 | [`fireteam.js`](../scripts/fireteam.js) | `buildTeamPlan`: лидер, задачи, мораль и общий фокус; `reserveResources` блокирует клетки маршрутов, `planRejoin` проверяет путь возврата. Конфиг «Спецназа» читается из `settings.js` и передаётся тактике и планам бойцов. |
 | [`reactions.js`](../scripts/reactions.js), [`grudges.js`](../scripts/grudges.js), [`overwatch.js`](../scripts/overwatch.js) | `reactionUsed`, `lastAttacker`, заявка зон (`declare`/`clear`). Overwatch рисуется для GM, но не совершает реакцию сам. |
 | [`ui/preview-dialog.js`](../scripts/ui/preview-dialog.js), [`ui/plan-overlay.js`](../scripts/ui/plan-overlay.js) | `resolvePreview`, устаревание и таймаут; `plan`/`overwatch`/`danger` — клиентские слои GM. Превью плана видит только GM-контроллер. |
@@ -80,7 +80,7 @@
 | Файл | Где искать |
 |---|---|
 | [`executor/steps.js`](../scripts/executor/steps.js) | `_stepMove`, `_stepRoll`, обработчики шагов. Идентификатор броска — `operationId.stepId`. |
-| [`executor/team-turn.js`](../scripts/executor/team-turn.js) | Прогресс манёвра на Combat, фазовый барьер, проверка всех обязательных участников, возврат к лидеру и отмена остатка. |
+| [`executor/team-turn.js`](../scripts/executor/team-turn.js) | Прогресс манёвра на Combat, фазовый барьер, проверка обязательных участников, планирование возврата по инициативе и проверка маршрута перед движением. |
 | [`executor/bookkeeping.js`](../scripts/executor/bookkeeping.js) | Журналы перемещений и replay, запись/отмена `committedPlan` и маркеры исполнения. |
 | [`executor/adjudication.js`](../scripts/executor/adjudication.js) | `gm-confirm` в automatic: GM-карточка, решения и таймаут. |
 | [`executor/damage-wait.js`](../scripts/executor/damage-wait.js) | Связывает карточки урона по `apiOperationId` и ждёт применения всех попаданий; урон применяет система, не AI. |

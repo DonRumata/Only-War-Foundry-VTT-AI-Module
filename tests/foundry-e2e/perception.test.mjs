@@ -100,6 +100,8 @@ async function testServiceRegistered() {
 }
 
 async function testLineOfSightAndTargets() {
+  await page.waitForFunction(id => canvas.ready && !canvas.loading
+    && canvas.visibility.tokenVision && canvas.tokens.get(id)?.hasSight, walledTokenId);
   await page.evaluate(id => canvas.tokens.get(id).control(), walledTokenId);
   await page.waitForFunction(id => canvas.tokens.get(id)?.vision?.active, walledTokenId);
   const result = await page.evaluate((data) => {

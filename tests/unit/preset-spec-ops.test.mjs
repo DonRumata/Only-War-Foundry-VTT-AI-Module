@@ -18,6 +18,7 @@ import {
     FIRETEAM_STATUS,
     createFireteamService
 } from "../../scripts/fireteam.js";
+import { createGridAdapter, createNavigationService } from "../../scripts/navigation.js";
 import {
     PLANNER_STATUS,
     createPlannerService
@@ -331,7 +332,7 @@ test("selectSpecOpsTactic: blocked frontal approach flanks at parity", () => {
     assert.equal(result.breakdown.frontalBlocked, true);
 });
 
-test("selectSpecOpsTactic: single corridor rejects flank and covers/advances", () => {
+test("selectSpecOpsTactic: forbidden flanks in a single corridor cover and advance", () => {
     const members = [memberStub("a", 0, 0), memberStub("b", 200, 0)];
     const targets = [
         { tokenId: "e1", x: 2000, y: 0, canAttack: true },
@@ -341,7 +342,7 @@ test("selectSpecOpsTactic: single corridor rejects flank and covers/advances", (
     // A long wall crosses every approach — frontal and both flank sides.
     const walls = [makeWall([800, -1500, 800, 1500])];
     const result = selectSpecOpsTactic({
-        members, leaderId: "a", targets, context: { walls }
+        members, leaderId: "a", targets, context: { walls, allowFlank: false }
     });
     assert.equal(result.name, "covering-advance");
     assert.equal(result.reason, "outnumbered-no-flank");
@@ -355,7 +356,7 @@ test("selectSpecOpsTactic: single corridor rejects flank and covers/advances", (
         members: [memberStub("a", 0, 0), memberStub("b", 200, 0), memberStub("c", 100, 50)],
         leaderId: "a",
         targets: [{ tokenId: "e1", x: 2000, y: 0, canAttack: true }],
-        context: { walls }
+        context: { walls, allowFlank: false }
     });
     assert.equal(parity.name, "covering-advance");
     assert.equal(parity.reason, "frontal-blocked-no-flank");
@@ -419,7 +420,7 @@ test("selectSpecOpsTactic: capability-based split prefers long-range support", (
             { tokenId: "e3", x: 2200, y: 0, canAttack: true },
             { tokenId: "e4", x: 2150, y: 50, canAttack: true }
         ],
-        context: { walls: [makeWall([800, -1500, 800, 1500])] }
+        context: { allowFlank: false }
     });
     assert.equal(result.name, "covering-advance");
     assert.equal(result.assignments.a, "advance");
@@ -632,15 +633,39 @@ function makeSpecOpsService() {
     return createFireteamService({ planner });
 }
 
-test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", async () => {
+/**
+ * A local square-grid fixture: from a 45° starting position the flanker
+ * can take a native half-move one square east to attack at 90°.
+ */
+function reachableFlank() {
     const flag = { teamId: "alpha", teamPreset: "specOps" };
-    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
-    const second = makeMember({ fireteam: flag, x: 200, y: 0, initiative: 10 });
-    // 2 vs 3 on open ground → flank-and-fix.
-    const world = makeTeamWorld([leader, second], { enemyCount: 3, enemyX: 2000 });
+    const leader = makeMember({ fireteam: flag, x: 200, y: 200, initiative: 20 });
+    const flanker = makeMember({ fireteam: flag, x: 500, y: 300 });
+    const world = makeTeamWorld([leader, flanker], { enemyCount: 3, enemyX: 600, enemyY: 200 });
+    Object.assign(world.scene, {
+        width: 1600,
+        height: 1600,
+        tokens: { contents: [leader.token, flanker.token, ...world.enemies.map(e => e.token)] }
+    });
+    const navigation = createNavigationService({
+        adapter: createGridAdapter({ canvas: { scene: world.scene } })
+    });
+    const context = {
+        seed: 42, targets: injectedTargets(world), navigation, readOnly: true,
+        rates: { half: 1.5, full: 3, charge: 4.5, run: 9 },
+        personality: false
+    };
+    return { leader, flanker, world, context };
+}
+
+test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", async () => {
+    const { world, context, flanker: fixtureFlanker } = reachableFlank();
     const service = makeSpecOpsService();
-    const result = await service.buildTeamPlan(world.combat,
-        { teamId: "alpha" }, { seed: 42, targets: injectedTargets(world) });
+    const result = await service.buildTeamPlan(world.combat, "alpha", {
+        ...context,
+        // Angle is a hard requirement even with no utility weight for it.
+        specOpsConfig: { flankMinAngleDegrees: 89, flankWeight: 0 }
+    });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     const plan = result.teamPlan;
 
@@ -669,10 +694,9 @@ test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", 
     assert.ok(barrier.requiredAssignmentIds.includes(flanker.combatantId));
     const moveIds = plan.phases[0].steps.map(s => s.combatantId);
     const flankIdx = moveIds.indexOf(flanker.combatantId);
-    if (flankIdx >= 0) {
-        for (let i = flankIdx + 1; i < moveIds.length; i++) {
-            assert.equal(byId[moveIds[i]].groupId, "main");
-        }
+    assert.equal(flankIdx, 0, "a real flank move precedes the main group");
+    for (let i = flankIdx + 1; i < moveIds.length; i++) {
+        assert.equal(byId[moveIds[i]].groupId, "main");
     }
 
     // Member plans carry the task-scoped spec-ops breakdown.
@@ -680,6 +704,17 @@ test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", 
     assert.equal(flankPlan?.breakdown?.preset, SPEC_OPS_PRESET_ID);
     assert.equal(flankPlan?.breakdown?.team?.task, "flank");
     assert.equal(flankPlan?.breakdown?.tactic, "flank-and-fix");
+    assert.equal(flankPlan.breakdown.team.flankAngle, 1);
+    const [move, attack] = flankPlan.steps;
+    assert.equal(move.type, "move");
+    assert.equal(attack.type, "attack");
+    assert.equal(attack.input.targetTokenId, world.enemies[0].token.id);
+    assert.equal(move.input.to.x, world.enemies[0].token.x + 50, "firing centre has a 90° attack vector");
+    assert.notEqual(move.input.to.y, world.enemies[0].token.y + 50);
+    assert.equal(plan.diagnostics.tactic.breakdown.flank.angle, 90);
+    const native = context.navigation.planRoute(fixtureFlanker.token, move.input.to, context.rates.half);
+    assert.equal(native.exact, true);
+    assert.deepEqual(move.input.waypoints, native.waypoints);
 
     // Reservations + serializability.
     assert.ok(Array.isArray(plan.reservations.targets));
@@ -689,6 +724,111 @@ test("specOps fireteam builds a flank-and-fix TeamPlan via the tactic factory", 
     assert.equal(roundTrip.id, plan.id);
     assert.equal(roundTrip.tactic, "flank-and-fix");
     assert.equal(roundTrip.diagnostics.tactic.reason, "outnumbered-flank-open");
+
+    const stricter = await service.buildTeamPlan(world.combat, "alpha", {
+        ...context,
+        tactic: createSpecOpsTactic({ flankMinAngleDegrees: 91 })
+    });
+    assert.equal(stricter.teamPlan.tactic, "covering-advance");
+    assert.equal(stricter.teamPlan.diagnostics.tactic.reason, "flank-angle-unmet");
+    assert.equal(stricter.teamPlan.specOpsConfig.flankMinAngleDegrees, 91);
+});
+
+test("specOps rejects the original front-on aim-and-attack at both 60° and 89°", async () => {
+    const flag = { teamId: "alpha", teamPreset: "specOps" };
+    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
+    const flanker = makeMember({ fireteam: flag, x: 200, y: 0 });
+    const world = makeTeamWorld([leader, flanker], { enemyCount: 3, enemyX: 2000 });
+    const service = makeSpecOpsService();
+    for (const flankMinAngleDegrees of [60, 89]) {
+        const { status, teamPlan } = await service.buildTeamPlan(world.combat, "alpha", {
+            seed: 42, targets: injectedTargets(world), moves: [],
+            specOpsConfig: { flankMinAngleDegrees, flankWeight: 20 }
+        });
+        assert.equal(status, FIRETEAM_STATUS.ok);
+        assert.equal(teamPlan.tactic, "covering-advance");
+        assert.equal(teamPlan.diagnostics.tactic.reason, "flank-angle-unmet");
+        assert.deepEqual(teamPlan.diagnostics.tactic.breakdown.flank, {
+            feasible: false, flankerId: flanker.combatant.id, reason: "flank-angle-unmet"
+        });
+        assert.ok(teamPlan.members.every(member => member.task !== "flank"));
+        assert.ok(teamPlan.memberPlans[flanker.combatant.id].steps.some(step => step.type === "attack"),
+            "ordinary front-on fire remains legal in the fallback");
+    }
+});
+
+test("specOps rejects a qualifying-looking endpoint without a complete route", async () => {
+    const { world, context } = reachableFlank();
+    const service = makeSpecOpsService();
+    const endpoint = { x: 650, y: 350, i: 3, j: 6, cost: 1.5, los: true };
+    for (const waypoints of [
+        [], [{ x: 550, y: 350 }, { x: 600, y: 350 }], [{ x: 1050, y: 350 }, endpoint]
+    ]) {
+        const { teamPlan } = await service.buildTeamPlan(world.combat, "alpha", {
+            ...context, moves: [{ ...endpoint, waypoints }]
+        });
+        assert.equal(teamPlan.tactic, "covering-advance");
+        assert.equal(teamPlan.diagnostics.tactic.breakdown.flank.reason, "flank-route-unproven");
+    }
+});
+
+test("specOps recognizes an existing flank using each token's actual centre", async () => {
+    const { leader, flanker, world, context } = reachableFlank();
+    leader.token.width = 2;
+    leader.token.height = 2;
+    world.enemies[0].token.height = 2;
+    flanker.token.width = 2;
+    flanker.token.x = 550;
+    flanker.token.y = 450;
+    const service = makeSpecOpsService();
+    // Test both a perpendicular in-place shot and a valid obtuse bearing.
+    for (const [x, cutoff] of [[550, 90], [950, 130]]) {
+        flanker.token.x = x;
+        const { teamPlan } = await service.buildTeamPlan(world.combat, "alpha", {
+            ...context, moves: [], specOpsConfig: { flankMinAngleDegrees: cutoff }
+        });
+        assert.equal(teamPlan.tactic, "flank-and-fix");
+        assert.equal(teamPlan.members.find(m => m.combatantId === flanker.combatant.id).task, "flank");
+        assert.ok(teamPlan.diagnostics.tactic.breakdown.flank.angle >= cutoff);
+        const { steps } = teamPlan.memberPlans[flanker.combatant.id];
+        assert.ok(steps.some(step => step.type === "attack"));
+        assert.ok(!steps.some(step => step.type === "move"));
+        assert.equal(teamPlan.phases[1].barrier, null, "stationary flankers need no movement proof at execution");
+    }
+});
+
+test("specOps covers and advances at parity if the blocked front has no reachable flank", async () => {
+    const flag = { teamId: "alpha", teamPreset: "specOps" };
+    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
+    const flanker = makeMember({ fireteam: flag, x: 200, y: 0 });
+    const walls = [makeWall([800, -1500, 800, 1500], { sight: 0 })];
+    const world = makeTeamWorld([leader, flanker], { enemyX: 2000, walls });
+    const { teamPlan } = await makeSpecOpsService().buildTeamPlan(world.combat, "alpha", {
+        seed: 42, targets: injectedTargets(world), moves: []
+    });
+    assert.equal(teamPlan.tactic, "covering-advance");
+    assert.equal(teamPlan.diagnostics.tactic.reason, "flank-angle-unmet");
+    assert.equal(teamPlan.diagnostics.tactic.breakdown.frontalBlocked, true);
+    assert.equal(teamPlan.diagnostics.tactic.breakdown.flank.feasible, false);
+});
+
+test("one good flank attack cannot validate another required flanker", async () => {
+    const flag = { teamId: "alpha", teamPreset: "specOps" };
+    const leader = makeMember({ fireteam: flag, x: 200, y: 200, initiative: 20 });
+    const good = makeMember({ fireteam: flag, x: 600, y: 400 });
+    const frontOn = makeMember({ fireteam: flag, x: 500, y: 200 });
+    const world = makeTeamWorld([leader, good, frontOn], { enemyCount: 4, enemyX: 600, enemyY: 200 });
+    const { teamPlan } = await makeSpecOpsService().buildTeamPlan(world.combat, "alpha", {
+        seed: 42, targets: injectedTargets(world), moves: [],
+        assignments: {
+            [leader.combatant.id]: "support",
+            [good.combatant.id]: "flank",
+            [frontOn.combatant.id]: "flank"
+        }
+    });
+    assert.equal(teamPlan.tactic, "covering-advance");
+    assert.equal(teamPlan.diagnostics.tactic.breakdown.flank.flankerId, frontOn.combatant.id);
+    assert.ok(teamPlan.members.every(member => member.task !== "flank"));
 });
 
 test("specOps fireteam builds a coordinated assault at superiority", async () => {
@@ -757,7 +897,8 @@ test("specOps preset on all members triggers the tactic without teamPreset", asy
         { teamId: "alpha" }, { seed: 42, targets: injectedTargets(world) });
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     // Every member resolves to specOps → the spec-ops tactic applies.
-    assert.equal(result.teamPlan.tactic, "flank-and-fix");
+    assert.equal(result.teamPlan.tactic, "covering-advance");
+    assert.equal(result.teamPlan.diagnostics.tactic.reason, "flank-angle-unmet");
 });
 
 test("single specOps member gets the deterministic insufficient-members fallback", async () => {
@@ -775,13 +916,10 @@ test("single specOps member gets the deterministic insufficient-members fallback
 });
 
 test("buildSpecOpsTeamPlan helper wires the tactic factory", async () => {
-    const flag = { teamId: "alpha", teamPreset: "specOps" };
-    const leader = makeMember({ fireteam: flag, x: 0, y: 0, initiative: 20 });
-    const second = makeMember({ fireteam: flag, x: 200, y: 0, initiative: 10 });
-    const world = makeTeamWorld([leader, second], { enemyCount: 3, enemyX: 2000 });
+    const { world, context } = reachableFlank();
     const service = makeSpecOpsService();
     const result = await buildSpecOpsTeamPlan(service, world.combat,
-        { teamId: "alpha" }, { seed: 42, targets: injectedTargets(world) });
+        { teamId: "alpha" }, context);
     assert.equal(result.status, FIRETEAM_STATUS.ok);
     assert.equal(result.teamPlan.tactic, "flank-and-fix");
 
@@ -809,8 +947,9 @@ test("explicit caller assignments and context.tactic override the spec-ops tacti
     });
     assert.equal(forced.status, FIRETEAM_STATUS.ok);
     assert.ok(forced.teamPlan.members.every(m => m.task === "advance"));
-    // The selector still ran and is reported in diagnostics.
-    assert.equal(forced.teamPlan.diagnostics.tactic.name, "flank-and-fix");
+    // An override cannot advertise a flank when it removed every flanker.
+    assert.equal(forced.teamPlan.diagnostics.tactic.name, "covering-advance");
+    assert.equal(forced.teamPlan.diagnostics.tactic.breakdown.flank.reason, "flank-roles-unavailable");
 
     // A caller-provided descriptor replaces the factory entirely.
     const custom = await service.buildTeamPlan(world.combat, { teamId: "alpha" }, {

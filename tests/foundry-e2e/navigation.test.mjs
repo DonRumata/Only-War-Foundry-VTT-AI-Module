@@ -137,6 +137,44 @@ async function testMeasuredTerrainBudget() {
     console.log('native difficult terrain limits measured movement on square grid');
 }
 
+async function testMeasuredTerrainDetour() {
+    const sceneId = await createScene(1);
+    const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
+    const result = await page.evaluate(async ({ sceneId, tokenId }) => {
+        const scene = game.scenes.get(sceneId);
+        const nav = game.modules.get('only-war-ai').api.services.get('navigation');
+        const token = scene.tokens.get(tokenId);
+        await scene.createEmbeddedDocuments('Region', [{
+            name: 'E2E Terrain Detour',
+            // The middle two cells of the straight path are inside; the
+            // next row is clear. Five steps suffice even with no diagonals.
+            shapes: [{ type: 'rectangle', x: 590, y: 490, width: 230, height: 120 }],
+            behaviors: [{ type: 'modifyMovementCost', system: { difficulties: { walk: 5 } } }]
+        }]);
+        const direct = [5, 6, 7, 8].map(j => ({ i: 5, j }));
+        const goal = direct.at(-1);
+        const budget = 5 * scene.grid.distance;
+        const straightCost = nav.measurePath(token, direct).cost;
+        const route = nav.planRoute(token, goal, budget);
+        const checked = nav.measurePath(token, route.waypoints).cost;
+        const cell = nav.findReachable(token, budget).cells.find(({ i, j }) => i === goal.i && j === goal.j);
+        const candidate = nav.findCandidates(token, budget, {
+            target: { x: 850, y: 550 }, count: 1
+        }).candidates[0];
+        return { budget, straightCost, route, checked, cell, candidate };
+    }, { sceneId, tokenId });
+    const { budget, straightCost, route, checked, cell, candidate } = result;
+    assert.ok(straightCost > budget, 'native Region makes the straight route unaffordable');
+    assert.equal(route.exact, true, `affordable terrain detour required: ${route.status}:${route.reason}`);
+    assert.ok(route.waypoints.some(point => point.i !== 5), 'the route leaves the straight row');
+    assert.ok(checked <= budget + 1e-6, 'native measurement verifies the complete detour');
+    assert.ok(Math.abs(checked - route.cost) < 0.001, 'the route reports the measured cost');
+    assert.equal(cell?.cost, route.cost, 'reachable cells carry the same verified cost');
+    assert.equal(candidate?.cost, route.cost);
+    assert.deepEqual(candidate?.waypoints, route.waypoints);
+    console.log('native difficult terrain detours preserve exact reachability and candidate routes');
+}
+
 async function testUnreachableEndpoint() {
     const sceneId = await createScene(1);
     const tokenId = await h.placeToken(page, sceneId, npcId, { x: 500, y: 500 });
@@ -237,6 +275,7 @@ async function cleanup() {
         await testServiceRegistered();
         await testSquareRouteAroundWall();
         await testMeasuredTerrainBudget();
+        await testMeasuredTerrainDetour();
         await testUnreachableEndpoint();
         await testOccupiedEndpoint();
         await testHexScene();

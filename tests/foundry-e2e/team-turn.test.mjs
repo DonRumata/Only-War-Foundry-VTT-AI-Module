@@ -30,10 +30,13 @@ try {
         check(game.user.isGM && game.system.id === 'only-war-local', 'Expected a GM in Only War');
         const initialScene = canvas.scene;
         const initialCombat = game.combat;
-        const original = () => JSON.stringify([
-            initialScene?.toObject(), initialCombat?.toObject(), game.time.worldTime
-        ]);
-        const before = original();
+        const snapshot = () => [
+            ['scene', JSON.stringify(initialScene?.toObject())],
+            ['combats', JSON.stringify(game.combats.contents.map(combat => combat.toObject()))],
+            ['tracker', game.combat?.id ?? null],
+            ['worldTime', JSON.stringify(game.time.worldTime)]
+        ];
+        const before = snapshot();
         const cases = [];
         for (const [interrupt, detached] of [[false, false], [true, false], [false, true]]) {
             const cleanup = [];
@@ -180,21 +183,41 @@ try {
             } finally {
                 authority?.stop();
                 if (combatHook) Hooks.off('updateCombat', combatHook);
+                // Foundry 13 activates the viewed combat after a deletion.
+                // Delete before switching scenes and suppress that activation
+                // even if the tracker falls back to another combat.
+                const tempCombat = cleanup.find(doc => doc.documentName === 'Combat');
+                if (tempCombat) {
+                    const combats = game.combats;
+                    const viewed = Object.getOwnPropertyDescriptor(combats, 'viewed');
+                    Object.defineProperty(combats, 'viewed', { configurable: true, value: undefined });
+                    try {
+                        await tempCombat.delete();
+                    } finally {
+                        if (viewed) Object.defineProperty(combats, 'viewed', viewed);
+                        else delete combats.viewed;
+                    }
+                    cleanup.splice(cleanup.indexOf(tempCombat), 1);
+                }
                 if (initialScene && canvas.scene?.id !== initialScene.id) {
                     await initialScene.view();
                     await waitFor(() => canvas.ready && canvas.scene?.id === initialScene.id, 'restore canvas');
                 }
                 for (const doc of cleanup.reverse()) await doc.delete();
+                if (game.combat !== initialCombat) await ui.combat.render({ combat: initialCombat });
             }
         }
-        return { cases, unchanged: before === original() };
+        const after = snapshot();
+        const changed = before.filter(([, value], i) => after[i][1] !== value).map(([name]) => name);
+        return { cases, unchanged: changed.length === 0, changed };
     }, scriptRoot);
     assert.deepEqual(report.cases, [
         { interrupt: false, moves: 1, attacks: 2 },
         { interrupt: true, moves: 1, attacks: 0 },
         { interrupt: false, moves: 2, attacks: 2 }
     ]);
-    assert.equal(report.unchanged, true, 'existing scene, combat and world time stay unchanged');
+    assert.equal(report.unchanged, true,
+        `existing scene, combat and world time stay unchanged; changed: ${report.changed}`);
     console.log('team-turn.test.mjs PASSED:', report);
 } finally {
     await browser.close();
