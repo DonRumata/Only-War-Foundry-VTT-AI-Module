@@ -28,7 +28,7 @@
  *   elected deterministically by initiative, then hit points, then a
  *   seed-scoped hash tie-break — identical input elects the identical leader.
  * - Sibling services are resolved lazily (`api.services.get("planner" |
- *   "authority")`) or injected via `context`; every lookup degrades safely
+ *   "authority" | "tactics")`) or injected via `context`; every lookup degrades safely
  *   so the service works before/without the other stacked branches.
  */
 import {
@@ -70,11 +70,12 @@ import {
     logDiagnostics
 } from "./settings.js";
 import { weaponEmitters } from "./threat-map.js";
+import { createTacticRegistry } from "./tactics/registry.js";
 import {
     SPEC_OPS_PRESET_ID,
     checkSpecOpsFlank,
+    registerSpecOpsTacticSelector,
     specOpsFlankFallback,
-    specOpsTactic,
     specOpsTokenCenter
 } from "./presets/spec-ops.js";
 
@@ -759,6 +760,7 @@ export function resolveTeamConfig(document) {
  * @param {object} [deps]
  * @param {object} [deps.api] Module API for lazy service lookups.
  * @param {object} [deps.planner] Injected planner service.
+ * @param {object} [deps.tactics] Injected tactic registry service.
  * @param {Function} [deps.resolveConfig] Effective AI config resolver.
  * @param {Function} [deps.log] Diagnostic logger.
  * @returns {object} Fireteam service.
@@ -766,6 +768,7 @@ export function resolveTeamConfig(document) {
 export function createFireteamService({
     api = null,
     planner = null,
+    tactics = null,
     resolveConfig = resolveEffectiveConfig,
     log = (...args) => logDiagnostics(...args)
 } = {}) {
@@ -782,6 +785,25 @@ export function createFireteamService({
         } catch(err) {
             return null;
         }
+    }
+
+    // Headless/direct-use fallback mirroring `_fallbackPlanner`: the canonical
+    // registry lives in `api.services`, but a standalone fireteam service must
+    // keep the historical specOps behaviour without introducing module-global
+    // mutable state.
+    const _fallbackTactics = createTacticRegistry();
+    registerSpecOpsTacticSelector(_fallbackTactics);
+
+    /**
+     * Tactic registry used for preset maneuvers: explicit dependency first,
+     * then the module service registry, then the private specOps fallback.
+     * @param {*} override Injected registry (undefined = registry/fallback).
+     * @returns {object}
+     */
+    function _tactics(override) {
+        if (override !== undefined) return override;
+        if (tactics !== null && tactics !== undefined) return tactics;
+        return _service("tactics") ?? _service("tacticRegistry") ?? _fallbackTactics;
     }
 
     /**
@@ -833,10 +855,20 @@ export function createFireteamService({
      * @param {object} combat Combat document.
      * @param {string} teamId
      * @returns {object[]} Member entries `{combatant, combatantId, tokenId,
-     *   actorId, ids, initiative, hp, defeated, enabled, position}`.
+     *   actorId, ids, initiative, hp, defeated, enabled, position, turnIndex,
+     *   hasActed}`.
      */
     function collectMembers(combat, teamId) {
         if (!combat || !teamId) return [];
+        const turns = _list(combat.turns);
+        const turnIndexes = new Map();
+        turns.forEach((entry, index) => {
+            const id = typeof entry === "string" ? entry : entry?.id;
+            if (id === null || id === undefined) return;
+            const key = String(id);
+            if (!turnIndexes.has(key)) turnIndexes.set(key, index);
+        });
+        const currentTurn = Number.isFinite(combat.turn) ? combat.turn : null;
         const members = [];
         for (const combatant of _list(combat.combatants)) {
             if (!combatant || _isMissing(combatant)) continue;
@@ -850,6 +882,10 @@ export function createFireteamService({
                 ? token.uuid : null;
             const actorUuid = typeof actor?.uuid === "string" && actor.uuid
                 ? actor.uuid : (actor?.id ? `Actor.${actor.id}` : null);
+            const turnKey = combatant.id === null || combatant.id === undefined
+                ? null : String(combatant.id);
+            const turnIndex = turnKey !== null && turnIndexes.has(turnKey)
+                ? turnIndexes.get(turnKey) : null;
             members.push({
                 combatant,
                 combatantId: combatant.id ?? null,
@@ -863,6 +899,8 @@ export function createFireteamService({
                 enabled: config?.enabled === true,
                 preset: config?.preset ?? null,
                 team,
+                turnIndex,
+                hasActed: turnIndex !== null && currentTurn !== null && turnIndex < currentTurn,
                 position: _tokenPosition(token)
             });
         }
@@ -1787,13 +1825,15 @@ export function createFireteamService({
     }
 
     /**
-     * Resolve the bounded team tactic for this plan (issue #412).
-     * `context.tactic` may be a tactic factory `(input) => descriptor` or
-     * a ready serializable descriptor `{name, reason, assignments,
-     * allowFlank, regroup, objective, maxDetachedPhases, breakdown}`; it
-     * defaults to the spec-ops selector when the team runs on
-     * `teamPreset === "specOps"` or every member resolves to `specOps`.
-     * `context.tactic === null`/`false` explicitly disables the hook.
+     * Resolve the bounded team tactic for this plan (issues #412/#92).
+     * Explicit `context.tactic` keeps the legacy caller-override contract: a
+     * tactic factory `(input) => descriptor` or a ready serializable
+     * descriptor `{name, reason, assignments, allowFlank, regroup, objective,
+     * maxDetachedPhases, breakdown}`; `null`/`false` explicitly disables the
+     * hook. Without an explicit override the per-preset tactic registry is
+     * consulted — specOps is just the registered baseline maneuver, while
+     * assault/rangedCover/hold currently have no selectors and fall back to
+     * the default fireteam policy.
      * @param {object} input
      * @param {object[]} input.members Filtered member entries.
      * @param {string|null} input.leaderId Elected leader combatant id.
@@ -1805,30 +1845,38 @@ export function createFireteamService({
      * @returns {object|null} Tactic descriptor or null (default policy).
      */
     function _resolveTactic({ members, leaderId, teamId, teamPreset, seed, combat, context }) {
-        let source = context.tactic;
-        if (source === undefined) {
-            if (teamPreset === SPEC_OPS_PRESET_ID) source = specOpsTactic;
-        }
-        if (source === undefined || source === null || source === false) return null;
-        if (typeof source === "function") {
-            try {
-                return source({
-                    members,
-                    leaderId,
-                    teamId,
-                    seed,
-                    targets: context.tacticTargets ?? (Array.isArray(context.targets) ? context.targets : null),
-                    objective: context.objective ?? null,
-                    casualties: _finiteOr(context.casualties, 0),
-                    scene: context.scene ?? combat?.scene ?? null,
-                    combat,
-                    context
-                }) ?? null;
-            } catch(err) {
-                return { name: null, reason: "tactic-error" };
+        const selectorInput = {
+            members,
+            leaderId,
+            teamId,
+            seed,
+            targets: context.tacticTargets ?? (Array.isArray(context.targets) ? context.targets : null),
+            objective: context.objective ?? null,
+            casualties: _finiteOr(context.casualties, 0),
+            scene: context.scene ?? combat?.scene ?? null,
+            combat,
+            context
+        };
+        const source = context.tactic;
+        if (source !== undefined) {
+            if (source === null || source === false) return null;
+            if (typeof source === "function") {
+                try {
+                    return source(selectorInput) ?? null;
+                } catch(err) {
+                    return { name: null, reason: "tactic-error" };
+                }
             }
+            return typeof source === "object" ? source : null;
         }
-        return typeof source === "object" ? source : null;
+        if (!teamPreset) return null;
+        const tactics = _tactics(context.tactics ?? context.tacticRegistry);
+        if (!tactics || typeof tactics.resolveTactic !== "function") return null;
+        try {
+            return tactics.resolveTactic(teamPreset, selectorInput) ?? null;
+        } catch(err) {
+            return { name: null, reason: "tactic-error" };
+        }
     }
 
     // --- L2 morale (issue #26) ------------------------------------------------
@@ -2230,7 +2278,7 @@ export function createFireteamService({
      *   `objective`, `assignments`, `allowFlank`, `regroup`, `tactic`,
      *   `casualties`, `detachedUntilPhase`, `maxDetachedPhases`,
      *   `preferredCohesion`, `specOpsConfig`, `targets`, `actions`, `moves`, `perception`,
-     *   `navigation`, `authority`, `planner`, `taskCapacities`,
+     *   `navigation`, `authority`, `planner`, `tactics`, `taskCapacities`,
      *   `replanCount`. Runtime drafts use `readOnly` (no morale/GM flags,
      *   independent member LOS) and pass `tacticTargets` only to the
      *   maneuver selector, not as attackable targets for each member.

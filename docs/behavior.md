@@ -484,8 +484,12 @@ adjudicated-manual, adjudicated-skill-test`.
   для прохода. После перепланирования конфликтующие маршруты не принимаются.
 - Лидер: flagged > инициатива > HP > seeded-хэш > id.
 - `buildTeamPlan`: фазы 0 movement → 1 action → 2 regroup; конвергенция
-  фокус-файра когда Σ EV ≥ wounds цели (#16); `specOpsTactic` hook;
+  фокус-файра когда Σ EV ≥ wounds цели (#16); командный манёвр резолвится
+  через per-preset tactic registry (issue #92; explicit `context.tactic`
+  по-прежнему выше, specOps зарегистрирован базовым селектором);
   `leader-lost` инвалидирует план.
+- `collectMembers` дополнительно отдаёт тактикам `turnIndex` из
+  `combat.turns` и `hasActed` для текущего раунда (`turn:null` — false).
 
 ### Исполнение TeamPlan в бою
 
